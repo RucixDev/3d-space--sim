@@ -7,34 +7,27 @@ int test_proc() {
 
   stellar::sim::UniverseConfig cfg;
   cfg.seed = 12345;
-  cfg.systemCount = 10;
+  cfg.systemCountHint = 10;
 
   stellar::sim::Universe a(cfg);
   stellar::sim::Universe b(cfg);
 
-  a.generate();
-  b.generate();
+  // Determinism check: first N systems should match.
+  for (std::size_t i = 0; i < cfg.systemCountHint; ++i) {
+    const auto sa = a.system(i);
+    const auto sb = b.system(i);
 
-  if (a.size() != b.size()) {
-    std::cerr << "[test_proc] size mismatch\n";
-    ++fails;
-  }
-
-  // Determinism check: first system star name + planet count should match.
-  if (a.size() > 0 && b.size() > 0) {
-    const auto& sa = a.system(0);
-    const auto& sb = b.system(0);
-
-    if (sa.primary.name != sb.primary.name) {
-      std::cerr << "[test_proc] star name mismatch: " << sa.primary.name << " vs " << sb.primary.name << "\n";
+    if (sa->primary.name != sb->primary.name) {
+      std::cerr << "[test_proc] star name mismatch at " << i << ": "
+                << sa->primary.name << " vs " << sb->primary.name << "\n";
       ++fails;
     }
-    if (sa.planets.size() != sb.planets.size()) {
-      std::cerr << "[test_proc] planet count mismatch\n";
+    if (sa->planets.size() != sb->planets.size()) {
+      std::cerr << "[test_proc] planet count mismatch at " << i << "\n";
       ++fails;
     }
-    if (sa.id != sb.id) {
-      std::cerr << "[test_proc] id mismatch\n";
+    if (sa->id != sb->id) {
+      std::cerr << "[test_proc] id mismatch at " << i << "\n";
       ++fails;
     }
   }
@@ -43,13 +36,11 @@ int test_proc() {
   stellar::sim::UniverseConfig cfg2 = cfg;
   cfg2.seed = 54321;
   stellar::sim::Universe c(cfg2);
-  c.generate();
-
-  if (a.size() > 0 && c.size() > 0) {
-    if (a.system(0).primary.name == c.system(0).primary.name && a.system(0).id == c.system(0).id) {
-      std::cerr << "[test_proc] different seed produced identical first system (unexpected)\n";
-      ++fails;
-    }
+  const auto a0 = a.system(0);
+  const auto c0 = c.system(0);
+  if (a0->primary.name == c0->primary.name && a0->id == c0->id) {
+    std::cerr << "[test_proc] different seed produced identical first system (unexpected)\n";
+    ++fails;
   }
 
   return fails;

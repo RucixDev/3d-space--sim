@@ -22,7 +22,7 @@ void printHelp() {
     "Options:\n"
     "  --help                Show this help\n"
     "  --seed <u64>           Galaxy seed (default: 1)\n"
-    "  --systems <n>          Number of systems to generate (default: 20)\n"
+    "  --systems <n>          Number of systems to sample/list (default: 20)\n"
     "  --list                List system summaries\n"
     "  --pick <index>         Print details for one system (0-based)\n"
     "  --time <days>          Show planet positions at this time (default: 0)\n"
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
 
   stellar::sim::UniverseConfig cfg;
   cfg.seed = 1;
-  cfg.systemCount = 20;
+  cfg.systemCountHint = 20;
 
   bool list = false;
   std::optional<std::size_t> pick;
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
       if (!v) return 2;
       const auto n = parseNumber<std::size_t>(*v);
       if (!n) { std::cerr << "Invalid systems count: " << *v << "\n"; return 2; }
-      cfg.systemCount = *n;
+      cfg.systemCountHint = *n;
     } else if (arg == "--list") {
       list = true;
     } else if (arg == "--pick") {
@@ -160,30 +160,23 @@ int main(int argc, char** argv) {
   }
 
   stellar::sim::Universe universe(cfg);
-  universe.generate();
-
-  if (universe.size() == 0) {
-    std::cerr << "No systems generated.\n";
-    return 1;
-  }
 
   if (list) {
-    for (std::size_t i = 0; i < universe.size(); ++i) {
-      printSystemSummary(i, universe.system(i));
+    for (std::size_t i = 0; i < cfg.systemCountHint; ++i) {
+      const auto sys = universe.system(i);
+      printSystemSummary(i, *sys);
     }
   }
 
   if (pick) {
-    if (*pick >= universe.size()) {
-      std::cerr << "Pick index out of range: " << *pick << " (size=" << universe.size() << ")\n";
-      return 2;
-    }
-    printSystemDetails(universe.system(*pick), timeDays);
+    const auto sys = universe.system(*pick);
+    printSystemDetails(*sys, timeDays);
   }
 
   if (!list && !pick) {
     // Default behavior: print the first system.
-    printSystemDetails(universe.system(0), timeDays);
+    const auto sys = universe.system(0);
+    printSystemDetails(*sys, timeDays);
   }
 
   return 0;

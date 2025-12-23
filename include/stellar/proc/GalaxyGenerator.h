@@ -25,6 +25,10 @@ class GalaxyGenerator {
 public:
   explicit GalaxyGenerator(GalaxyGenConfig cfg) : m_cfg(cfg) {}
 
+  // Deterministically generate a single system stub for a given index.
+  // Uses per-index RNG, so adding more systems does not change existing ones.
+  GalaxySystemStub stubAt(std::size_t index) const;
+
   std::vector<GalaxySystemStub> generate() const;
 
 private:
