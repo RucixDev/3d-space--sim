@@ -1,67 +1,186 @@
 #include "stellar/sim/Universe.h"
 
+#include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
+#include "stellar/core/Random.h"
+#include "stellar/proc/NameGenerator.h"
+#include "stellar/proc/SystemGenerator.h"
+#include "stellar/econ/Economy.h"
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 
 namespace stellar::sim {
 
-Universe::Universe(UniverseConfig cfg)
-  : m_cfg(cfg)
-  , m_galaxy(proc::GalaxyGenConfig{
-      .seed = m_cfg.seed,
-      .systemCount = m_cfg.systemCountHint,
-      .radiusLy = m_cfg.radiusLy,
-      .thicknessLy = m_cfg.thicknessLy,
-    })
-  , m_sysgen(proc::SystemGenConfig{ .galaxySeed = m_cfg.seed })
-{
-  // Avoid pathological configs.
-  if (m_cfg.systemCacheSize == 0) {
-    m_cfg.systemCacheSize = 1;
-  }
+static proc::SectorCoord decodeSector(SystemId id, core::u32& outLocalIndex) {
+  const auto unbias = [](core::u16 b) -> core::i32 { return static_cast<core::i32>(b) - 32768; };
+
+  const core::u16 bx = static_cast<core::u16>((id >> 48) & 0xFFFFu);
+  const core::u16 by = static_cast<core::u16>((id >> 32) & 0xFFFFu);
+  const core::u16 bz = static_cast<core::u16>((id >> 16) & 0xFFFFu);
+  const core::u16 bi = static_cast<core::u16>((id >> 0)  & 0xFFFFu);
+
+  outLocalIndex = static_cast<core::u32>(bi);
+  return proc::SectorCoord{ unbias(bx), unbias(by), unbias(bz) };
 }
 
-void Universe::reset() {
-  m_lru.clear();
-  m_cache.clear();
+Universe::Universe(core::u64 seed, proc::GalaxyParams params)
+: seed_(seed),
+  galaxyParams_(params),
+  galaxyGen_(seed, params) {
+  factions_ = generateFactions(seed_, 8);
 }
 
-Universe::SystemHandle Universe::system(SystemIndex index) {
-  // Hit cache
-  if (auto it = m_cache.find(index); it != m_cache.end()) {
-    // Move to front (MRU)
-    m_lru.splice(m_lru.begin(), m_lru, it->second.lruIt);
-    it->second.lruIt = m_lru.begin();
-    return it->second.sys;
-  }
-
-  // Miss: generate deterministically.
-  const auto stub = m_galaxy.stubAt(index);
-  auto sys = std::make_shared<StarSystem>(m_sysgen.generate(stub));
-
-  // Insert into LRU
-  m_lru.push_front(index);
-  m_cache.emplace(index, CacheEntry{sys, m_lru.begin()});
-
-  // Evict
-  while (m_cache.size() > m_cfg.systemCacheSize && !m_lru.empty()) {
-    const auto victim = m_lru.back();
-    m_lru.pop_back();
-    m_cache.erase(victim);
-  }
-
-  return sys;
+void Universe::setCacheCaps(std::size_t sectorCap, std::size_t systemCap, std::size_t stationCap) {
+  sectorCache_.setCapacity(sectorCap);
+  systemCache_.setCapacity(systemCap);
+  stationEconomyCache_.setCapacity(stationCap);
 }
 
-void Universe::prewarm(std::size_t count) {
-  std::ostringstream oss;
-  oss << "Prewarming universe cache with " << count << " systems...";
-  STELLAR_LOG_INFO(oss.str());
+proc::Sector Universe::sector(const proc::SectorCoord& coord) {
+  if (auto* cached = sectorCache_.get(coord)) return *cached;
+  auto sec = galaxyGen_.generateSector(coord, factions_);
+  return sectorCache_.put(coord, std::move(sec));
+}
 
-  for (std::size_t i = 0; i < count; ++i) {
-    (void)system(i);
+std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
+                                              double radiusLy,
+                                              std::size_t maxResults) {
+  std::vector<SystemStub> out;
+  if (radiusLy <= 0.0) return out;
+
+  const double r2 = radiusLy * radiusLy;
+  const double s = galaxyParams_.sectorSizeLy;
+
+  const proc::SectorCoord minC{
+    static_cast<core::i32>(std::floor((posLy.x - radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.y - radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.z - radiusLy) / s)),
+  };
+  const proc::SectorCoord maxC{
+    static_cast<core::i32>(std::floor((posLy.x + radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.y + radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.z + radiusLy) / s)),
+  };
+
+  struct Item { SystemStub stub; double d2; };
+  std::vector<Item> items;
+
+  for (core::i32 x = minC.x; x <= maxC.x; ++x) {
+    for (core::i32 y = minC.y; y <= maxC.y; ++y) {
+      for (core::i32 z = minC.z; z <= maxC.z; ++z) {
+        const proc::SectorCoord c{x,y,z};
+        const proc::Sector sec = sector(c);
+
+        for (const auto& stub : sec.systems) {
+          const math::Vec3d d = stub.posLy - posLy;
+          const double dd = d.lengthSq();
+          if (dd <= r2) items.push_back(Item{stub, dd});
+        }
+      }
+    }
+  }
+
+  std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    return a.stub.id < b.stub.id;
+  });
+
+  if (items.size() > maxResults) items.resize(maxResults);
+
+  out.reserve(items.size());
+  for (auto& it : items) out.push_back(std::move(it.stub));
+  return out;
+}
+
+std::optional<SystemStub> Universe::findClosestSystem(const math::Vec3d& posLy, double maxRadiusLy) {
+  auto list = queryNearby(posLy, maxRadiusLy, 64);
+  if (list.empty()) return std::nullopt;
+
+  // queryNearby is distance-sorted already
+  return list.front();
+}
+
+const StarSystem& Universe::getSystem(SystemId id, const SystemStub* hintStub) {
+  if (auto* cached = systemCache_.get(id)) return *cached;
+
+  SystemStub stub{};
+  bool haveStub = false;
+
+  if (hintStub && hintStub->id == id) {
+    stub = *hintStub;
+    haveStub = true;
+  } else {
+    // Decode sector from id and search it.
+    core::u32 localIndex = 0;
+    const proc::SectorCoord c = decodeSector(id, localIndex);
+
+    const proc::Sector sec = sector(c);
+
+    auto it = std::lower_bound(sec.systems.begin(), sec.systems.end(), id,
+                               [](const SystemStub& s, SystemId idv) { return s.id < idv; });
+    if (it != sec.systems.end() && it->id == id) {
+      stub = *it;
+      haveStub = true;
+    } else {
+      std::ostringstream oss;
+      oss << "Universe::getSystem: stub not found for id=" << id
+          << " (sector " << c.x << "," << c.y << "," << c.z
+          << " localIndex=" << localIndex << "). Generating fallback stub.";
+      stellar::core::log(stellar::core::LogLevel::Warn, oss.str());
+
+      // Fallback: still deterministic from id + seed, but without real galaxy position.
+      stub.id = id;
+      stub.seed = core::hashCombine(seed_, static_cast<core::u64>(id));
+      proc::NameGenerator ng(stub.seed);
+      stub.name = ng.systemName();
+      stub.posLy = {0,0,0};
+      stub.primaryClass = StarClass::G;
+      stub.planetCount = 6;
+      stub.stationCount = 1;
+      stub.factionId = 0;
+      haveStub = true;
+    }
+  }
+
+  (void)haveStub;
+
+  StarSystem sys = proc::generateSystem(stub, factions_);
+  return systemCache_.put(id, std::move(sys));
+}
+
+econ::StationEconomyState& Universe::stationEconomy(const Station& station, double timeDays) {
+  econ::StationEconomyState* st = stationEconomyCache_.get(station.id);
+  if (!st) {
+    core::SplitMix64 rng(core::hashCombine(seed_, static_cast<core::u64>(station.id)));
+    econ::StationEconomyState init = econ::makeInitialState(station.economyModel, rng);
+    st = &stationEconomyCache_.put(station.id, std::move(init));
+  }
+
+  core::SplitMix64 rng(core::hashCombine(seed_, static_cast<core::u64>(station.id)));
+  econ::updateEconomyTo(*st, station.economyModel, timeDays, rng);
+  return *st;
+}
+
+std::vector<StationEconomyOverride> Universe::exportStationOverrides() const {
+  std::vector<StationEconomyOverride> out;
+
+  auto snap = stationEconomyCache_.snapshot();
+  out.reserve(snap.size());
+  for (auto& kv : snap) {
+    StationEconomyOverride ov{};
+    ov.stationId = kv.first;
+    ov.state = std::move(kv.second);
+    out.push_back(std::move(ov));
+  }
+
+  return out;
+}
+
+void Universe::importStationOverrides(const std::vector<StationEconomyOverride>& overrides) {
+  for (const auto& ov : overrides) {
+    stationEconomyCache_.put(ov.stationId, ov.state);
   }
 }
 

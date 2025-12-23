@@ -1,94 +1,55 @@
 #include "stellar/proc/NameGenerator.h"
 
-#include <algorithm>
+#include <array>
 #include <cctype>
-#include <span>
-#include <string>
-#include <vector>
 
 namespace stellar::proc {
-namespace {
-  constexpr const char* consonants[] = {
-    "b","c","d","f","g","h","j","k","l","m","n","p","qu","r","s","t","v","w","x","y","z",
-    "br","cr","dr","fr","gr","kr","pr","tr","vr",
-    "ch","sh","th","st","sk","sl","sm","sn","sp","sw"
-  };
 
-  constexpr const char* vowels[] = {
-    "a","e","i","o","u",
-    "ae","ai","ao","au",
-    "ea","ei","eo","eu",
-    "ia","ie","io","iu",
-    "oa","oe","oi","ou",
-    "ua","ue","ui","uo"
-  };
+static const std::array<const char*, 32> kSyllA = {
+  "al","an","ar","as","be","ca","ce","da","de","el","en","er","es","fa","fi","ga",
+  "ha","he","ia","in","is","ka","ke","la","le","li","ma","me","na","ne","or","ra"
+};
 
-  constexpr const char* endings[] = {
-    "","n","s","r","th","m","x","on","ar","is","us","or","ion","ara","ea","ium"
-  };
+static const std::array<const char*, 32> kSyllB = {
+  "bar","bel","car","cer","dan","del","dor","far","fen","gar","gen","hal","hel","ian","iel","jor",
+  "kal","kel","lar","len","mir","nal","ner","nor","par","pel","ran","rel","sar","sel","tor","ven"
+};
 
-  std::string capitalize(std::string s) {
-    if (!s.empty()) {
-      s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
-    }
-    return s;
+static const std::array<const char*, 24> kSyllC = {
+  "a","e","i","o","u","ae","ia","io","oa","ul","ur","on","en","is","as","os","ar","or","ir","ium","ara","ora","eus","is"
+};
+
+static std::string capitalize(std::string s) {
+  if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+  return s;
+}
+
+std::string NameGenerator::systemName() {
+  const int parts = rng_.range(2, 3);
+  std::string s;
+  if (parts == 2) {
+    s = std::string(kSyllB[rng_.range<int>(0, static_cast<int>(kSyllB.size()-1))]) +
+        std::string(kSyllC[rng_.range<int>(0, static_cast<int>(kSyllC.size()-1))]);
+  } else {
+    s = std::string(kSyllA[rng_.range<int>(0, static_cast<int>(kSyllA.size()-1))]) +
+        std::string(kSyllB[rng_.range<int>(0, static_cast<int>(kSyllB.size()-1))]) +
+        std::string(kSyllC[rng_.range<int>(0, static_cast<int>(kSyllC.size()-1))]);
   }
-} // namespace
+  return capitalize(s);
+}
 
-NameGenerator::NameGenerator(stellar::core::u64 seed) : m_seed(seed) {}
+std::string NameGenerator::planetName(const std::string& sys, int index) {
+  // e.g. "Orion III"
+  static const char* romans[] = {"I","II","III","IV","V","VI","VII","VIII","IX","X","XI","XII"};
+  const int r = (index >= 0 && index < 12) ? index : (index % 12);
+  return sys + " " + romans[r];
+}
 
-std::string NameGenerator::makeName(stellar::core::SplitMix64& rng, int minSyllables, int maxSyllables) const {
-  minSyllables = std::max(1, minSyllables);
-  maxSyllables = std::max(minSyllables, maxSyllables);
-
-  const int syllables = rng.range<int>(minSyllables, maxSyllables);
-
-  std::string out;
-  out.reserve(static_cast<std::size_t>(syllables) * 4u + 4u);
-
-  for (int i = 0; i < syllables; ++i) {
-    // Occasionally start with a vowel for variety.
-    const bool startWithVowel = (i == 0) && rng.chance(0.2);
-
-    if (!startWithVowel) {
-      const auto* c = rng.pick(std::span(consonants));
-      out += c;
-    }
-
-    const auto* v = rng.pick(std::span(vowels));
-    out += v;
-
-    // Small chance of consonant cluster mid-name
-    if (rng.chance(0.15)) {
-      const auto* c2 = rng.pick(std::span(consonants));
-      out += c2;
-    }
-  }
-
-  // Optional ending
-  if (rng.chance(0.6)) {
-    out += rng.pick(std::span(endings));
-  }
-
-  // Optional numeric suffix (rare)
-  if (rng.chance(0.05)) {
-    const int n = rng.range<int>(1, 999);
-    out += "-";
-    out += std::to_string(n);
-  }
-
-  // Use stored seed to lightly perturb (so two NameGenerator instances can differ).
-  // (This is intentionally subtle.)
-  if ((m_seed & 1ull) == 0ull && !out.empty()) {
-    // Very rarely swap two characters
-    if (out.size() > 4 && rng.chance(0.02)) {
-      const auto a = rng.range<std::size_t>(1u, out.size() - 2u);
-      const auto b = rng.range<std::size_t>(1u, out.size() - 2u);
-      std::swap(out[a], out[b]);
-    }
-  }
-
-  return capitalize(out);
+std::string NameGenerator::stationName(const std::string& sys, int index) {
+  // e.g. "Orion Station Alpha"
+  static const char* greek[] = {"Alpha","Beta","Gamma","Delta","Epsilon","Zeta","Eta","Theta","Iota","Kappa","Lambda","Mu","Nu","Xi","Omicron","Pi","Rho","Sigma","Tau","Upsilon","Phi","Chi","Psi","Omega"};
+  const int g = (index >= 0) ? (index % (int)(sizeof(greek)/sizeof(greek[0]))) : 0;
+  return sys + " Station " + greek[g];
 }
 
 } // namespace stellar::proc

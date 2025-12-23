@@ -1,69 +1,139 @@
 #pragma once
 
 #include "stellar/core/Types.h"
+#include "stellar/econ/Economy.h"
 #include "stellar/proc/GalaxyGenerator.h"
-#include "stellar/proc/SystemGenerator.h"
-#include "stellar/sim/Celestial.h"
+#include "stellar/sim/Faction.h"
+#include "stellar/sim/System.h"
+#include "stellar/sim/SaveGame.h"
 
-#include <cstddef>
 #include <list>
-#include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace stellar::sim {
 
-struct UniverseConfig {
-  stellar::core::u64 seed = 1;
-
-  // Optional hint for tooling/sandbox apps that want to sample the universe.
-  // The Universe itself is effectively infinite: any system index can be requested.
-  std::size_t systemCountHint = 1000;
-
-  // LRU cache size for streamed star systems.
-  // (Systems are deterministic, so they can be regenerated if evicted.)
-  std::size_t systemCacheSize = 512;
-
-  // Simple disc galaxy shape in light-years
-  double radiusLy = 50000.0;
-  double thicknessLy = 2000.0;
-};
-
+// A streaming universe:
+// - galaxy is generated in fixed-size sectors on-demand
+// - star systems are generated on-demand from system stubs
 class Universe {
 public:
-  explicit Universe(UniverseConfig cfg);
+  explicit Universe(core::u64 seed, proc::GalaxyParams params = {});
 
-  using SystemIndex = std::size_t;
-  using SystemHandle = std::shared_ptr<const StarSystem>;
+  core::u64 seed() const { return seed_; }
+  const proc::GalaxyParams& galaxyParams() const { return galaxyParams_; }
 
-  // Clears internal caches. Universe data is generated on-demand.
-  void reset();
+  const std::vector<Faction>& factions() const { return factions_; }
 
-  // Returns a deterministic star system for the given index.
-  // Note: the returned shared_ptr keeps the system alive even if it is evicted from the cache.
-  SystemHandle system(SystemIndex index);
+  // Return stubs for systems within `radiusLy` of `posLy`.
+  // Deterministic order by distance, then by id.
+  std::vector<SystemStub> queryNearby(const math::Vec3d& posLy,
+                                      double radiusLy,
+                                      std::size_t maxResults = 256);
 
-  const UniverseConfig& config() const { return m_cfg; }
+  // Find closest system stub within `maxRadiusLy` (returns nullopt if none found).
+  std::optional<SystemStub> findClosestSystem(const math::Vec3d& posLy, double maxRadiusLy);
 
-  std::size_t cachedSystemCount() const { return m_cache.size(); }
+  // Generate (or fetch cached) full system data.
+  const StarSystem& getSystem(SystemId id, const SystemStub* hintStub = nullptr);
 
-  // Convenience: warm up the cache with the first N systems.
-  void prewarm(std::size_t count);
+  // Economy state access for a station. Will create deterministic initial state if missing,
+  // then advance it to `timeDays`.
+  econ::StationEconomyState& stationEconomy(const Station& station, double timeDays);
+
+  // Persist/restore known station economy states (only what you have in cache / visited).
+  std::vector<StationEconomyOverride> exportStationOverrides() const;
+  void importStationOverrides(const std::vector<StationEconomyOverride>& overrides);
+
+  void setCacheCaps(std::size_t sectorCap, std::size_t systemCap, std::size_t stationCap);
 
 private:
-  struct CacheEntry {
-    SystemHandle sys;
-    std::list<SystemIndex>::iterator lruIt;
+  template <class Key, class Value, class Hash = std::hash<Key>>
+  class LruCache {
+  public:
+    explicit LruCache(std::size_t cap = 128) : cap_(cap) {}
+
+    void setCapacity(std::size_t cap) { cap_ = cap; evictIfNeeded(); }
+    std::size_t capacity() const { return cap_; }
+    std::size_t size() const { return map_.size(); }
+
+    Value* get(const Key& key) {
+      auto it = map_.find(key);
+      if (it == map_.end()) return nullptr;
+      touch(it);
+      return &it->second.value;
+    }
+
+    const Value* get(const Key& key) const {
+      auto it = map_.find(key);
+      if (it == map_.end()) return nullptr;
+      // const cache doesn't update LRU; ok for now
+      return &it->second.value;
+    }
+
+    Value& put(const Key& key, Value value) {
+      auto it = map_.find(key);
+      if (it != map_.end()) {
+        it->second.value = std::move(value);
+        touch(it);
+        return it->second.value;
+      }
+
+      order_.push_front(key);
+      Entry e;
+      e.value = std::move(value);
+      e.it = order_.begin();
+      map_.emplace(key, std::move(e));
+
+      evictIfNeeded();
+      return map_.find(key)->second.value;
+    }
+
+    std::unordered_map<Key, Value, Hash> snapshot() const {
+      std::unordered_map<Key, Value, Hash> r;
+      r.reserve(map_.size());
+      for (const auto& kv : map_) {
+        r.emplace(kv.first, kv.second.value);
+      }
+      return r;
+    }
+
+  private:
+    struct Entry {
+      Value value{};
+      typename std::list<Key>::iterator it{};
+    };
+
+    void touch(typename std::unordered_map<Key, Entry, Hash>::iterator it) {
+      order_.erase(it->second.it);
+      order_.push_front(it->first);
+      it->second.it = order_.begin();
+    }
+
+    void evictIfNeeded() {
+      while (map_.size() > cap_) {
+        const Key& key = order_.back();
+        map_.erase(key);
+        order_.pop_back();
+      }
+    }
+
+    std::size_t cap_{128};
+    std::list<Key> order_{};
+    std::unordered_map<Key, Entry, Hash> map_{};
   };
 
-  UniverseConfig m_cfg{};
+  proc::Sector sector(const proc::SectorCoord& coord);
 
-  // Stateless procedural generators (deterministic per index).
-  proc::GalaxyGenerator m_galaxy;
-  proc::SystemGenerator m_sysgen;
+  core::u64 seed_{0};
+  proc::GalaxyParams galaxyParams_{};
+  proc::GalaxyGenerator galaxyGen_{0, {}};
 
-  // LRU cache
-  std::list<SystemIndex> m_lru; // front = most recently used
-  std::unordered_map<SystemIndex, CacheEntry> m_cache;
+  std::vector<Faction> factions_{};
+
+  LruCache<proc::SectorCoord, proc::Sector, proc::SectorCoordHash> sectorCache_{256};
+  LruCache<SystemId, StarSystem> systemCache_{256};
+  LruCache<StationId, econ::StationEconomyState> stationEconomyCache_{512};
 };
 
 } // namespace stellar::sim

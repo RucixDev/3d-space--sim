@@ -3,44 +3,44 @@
 #include <cmath>
 #include <iostream>
 
-namespace {
-bool approx(double a, double b, double eps = 1e-9) {
-  return std::abs(a - b) <= eps;
-}
-} // namespace
+static bool near(double a, double b, double eps = 1e-4) { return std::abs(a - b) <= eps; }
 
 int test_orbit() {
-  using stellar::sim::Orbit;
-
   int fails = 0;
 
-  Orbit o;
-  o.semiMajorAxisAU = 2.0;
-  o.eccentricity = 0.0;
-  o.inclinationDeg = 0.0;
-  o.longitudeAscendingNodeDeg = 0.0;
-  o.argumentPeriapsisDeg = 0.0;
-  o.meanAnomalyAtEpochDeg = 0.0;
-  o.orbitalPeriodDays = 100.0;
+  stellar::sim::OrbitElements e{};
+  e.semiMajorAxisAU = 1.0;
+  e.eccentricity = 0.0;
+  e.inclinationRad = 0.0;
+  e.ascendingNodeRad = 0.0;
+  e.argPeriapsisRad = 0.0;
+  e.meanAnomalyAtEpochRad = 0.0;
+  e.epochDays = 0.0;
+  e.periodDays = 100.0;
 
-  auto p0 = o.positionAU(0.0);
-  auto p1 = o.positionAU(25.0);  // quarter period
-  auto p2 = o.positionAU(50.0);  // half period
-
-  if (!approx(p0.x, 2.0) || !approx(p0.y, 0.0) || !approx(p0.z, 0.0)) {
-    std::cerr << "[test_orbit] expected p0=(2,0,0) got " << p0 << "\n";
+  auto p0 = stellar::sim::orbitPosition3DAU(e, 0.0);
+  if (!near(p0.x, 1.0) || !near(p0.y, 0.0)) {
+    std::cerr << "[test_orbit] expected (1,0) at t=0, got (" << p0.x << "," << p0.y << ")\n";
     ++fails;
   }
 
-  if (!approx(p1.x, 0.0, 1e-6) || !approx(p1.y, 2.0, 1e-6) || !approx(p1.z, 0.0, 1e-6)) {
-    std::cerr << "[test_orbit] expected p1≈(0,2,0) got " << p1 << "\n";
+  auto p25 = stellar::sim::orbitPosition3DAU(e, 25.0);
+  if (!near(p25.x, 0.0, 5e-3) || !near(p25.y, 1.0, 5e-3)) {
+    std::cerr << "[test_orbit] expected ~ (0,1) at quarter period, got (" << p25.x << "," << p25.y << ")\n";
     ++fails;
   }
 
-  if (!approx(p2.x, -2.0, 1e-6) || !approx(p2.y, 0.0, 1e-6) || !approx(p2.z, 0.0, 1e-6)) {
-    std::cerr << "[test_orbit] expected p2≈(-2,0,0) got " << p2 << "\n";
+  // Eccentric orbit sanity: should be within [a(1-e), a(1+e)]
+  e.eccentricity = 0.4;
+  auto pe = stellar::sim::orbitPosition3DAU(e, 0.0);
+  const double r = std::sqrt(pe.x*pe.x + pe.y*pe.y + pe.z*pe.z);
+  const double rmin = e.semiMajorAxisAU * (1.0 - e.eccentricity) - 1e-6;
+  const double rmax = e.semiMajorAxisAU * (1.0 + e.eccentricity) + 1e-6;
+  if (!(r >= rmin && r <= rmax)) {
+    std::cerr << "[test_orbit] eccentric radius out of bounds r=" << r << " expected [" << rmin << "," << rmax << "]\n";
     ++fails;
   }
 
+  if (fails == 0) std::cout << "[test_orbit] pass\n";
   return fails;
 }

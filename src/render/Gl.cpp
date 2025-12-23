@@ -1,27 +1,8 @@
 #include "stellar/render/Gl.h"
 
-#include <sstream>
+#include "stellar/core/Log.h"
 
 namespace stellar::render::gl {
-
-PFNGLVIEWPORTPROC Viewport = nullptr;
-PFNGLCLEARCOLORPROC ClearColor = nullptr;
-PFNGLCLEARPROC Clear = nullptr;
-PFNGLENABLEPROC Enable = nullptr;
-PFNGLDISABLEPROC Disable = nullptr;
-PFNGLBLENDFUNCPROC BlendFunc = nullptr;
-
-PFNGLGENVERTEXARRAYSPROC GenVertexArrays = nullptr;
-PFNGLBINDVERTEXARRAYPROC BindVertexArray = nullptr;
-PFNGLDELETEVERTEXARRAYSPROC DeleteVertexArrays = nullptr;
-
-PFNGLGENBUFFERSPROC GenBuffers = nullptr;
-PFNGLBINDBUFFERPROC BindBuffer = nullptr;
-PFNGLBUFFERDATAPROC BufferData = nullptr;
-PFNGLDELETEBUFFERSPROC DeleteBuffers = nullptr;
-
-PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray = nullptr;
-PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer = nullptr;
 
 PFNGLCREATESHADERPROC CreateShader = nullptr;
 PFNGLSHADERSOURCEPROC ShaderSource = nullptr;
@@ -38,73 +19,108 @@ PFNGLGETPROGRAMINFOLOGPROC GetProgramInfoLog = nullptr;
 PFNGLUSEPROGRAMPROC UseProgram = nullptr;
 PFNGLDELETEPROGRAMPROC DeleteProgram = nullptr;
 
-PFNGLDRAWARRAYSPROC DrawArrays = nullptr;
-
 PFNGLGETUNIFORMLOCATIONPROC GetUniformLocation = nullptr;
+PFNGLUNIFORM1IPROC Uniform1i = nullptr;
+PFNGLUNIFORM1FPROC Uniform1f = nullptr;
+PFNGLUNIFORM3FPROC Uniform3f = nullptr;
 PFNGLUNIFORMMATRIX4FVPROC UniformMatrix4fv = nullptr;
 
-namespace {
-template <typename T>
-bool loadOne(T& outFn, GLGetProcAddressFn getProc, const char* name, std::ostringstream& missing) {
-  outFn = reinterpret_cast<T>(getProc(name));
-  if (!outFn) {
-    missing << "  - " << name << "\n";
-    return false;
-  }
-  return true;
+PFNGLGENVERTEXARRAYSPROC GenVertexArrays = nullptr;
+PFNGLBINDVERTEXARRAYPROC BindVertexArray = nullptr;
+PFNGLDELETEVERTEXARRAYSPROC DeleteVertexArrays = nullptr;
+
+PFNGLGENBUFFERSPROC GenBuffers = nullptr;
+PFNGLBINDBUFFERPROC BindBuffer = nullptr;
+PFNGLBUFFERDATAPROC BufferData = nullptr;
+PFNGLBUFFERSUBDATAPROC BufferSubData = nullptr;
+PFNGLDELETEBUFFERSPROC DeleteBuffers = nullptr;
+
+PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray = nullptr;
+PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer = nullptr;
+PFNGLVERTEXATTRIBDIVISORPROC VertexAttribDivisor = nullptr;
+
+PFNGLDRAWARRAYSINSTANCEDPROC DrawArraysInstanced = nullptr;
+PFNGLDRAWELEMENTSINSTANCEDPROC DrawElementsInstanced = nullptr;
+
+PFNGLACTIVETEXTUREPROC ActiveTexture = nullptr;
+PFNGLGENTEXTURESPROC GenTextures = nullptr;
+PFNGLBINDTEXTUREPROC BindTexture = nullptr;
+PFNGLTEXIMAGE2DPROC TexImage2D = nullptr;
+PFNGLTEXPARAMETERIPROC TexParameteri = nullptr;
+PFNGLGENERATEMIPMAPPROC GenerateMipmap = nullptr;
+PFNGLDELETETEXTURESPROC DeleteTextures = nullptr;
+
+template <class T>
+static T loadProc(const char* name) {
+  return reinterpret_cast<T>(SDL_GL_GetProcAddress(name));
 }
-}
 
-bool load(GLGetProcAddressFn getProc, std::string* outError) {
-  std::ostringstream missing;
-  bool ok = true;
+bool load() {
+  CreateShader = loadProc<PFNGLCREATESHADERPROC>("glCreateShader");
+  ShaderSource = loadProc<PFNGLSHADERSOURCEPROC>("glShaderSource");
+  CompileShader = loadProc<PFNGLCOMPILESHADERPROC>("glCompileShader");
+  GetShaderiv = loadProc<PFNGLGETSHADERIVPROC>("glGetShaderiv");
+  GetShaderInfoLog = loadProc<PFNGLGETSHADERINFOLOGPROC>("glGetShaderInfoLog");
+  DeleteShader = loadProc<PFNGLDELETESHADERPROC>("glDeleteShader");
 
-  ok &= loadOne(Viewport, getProc, "glViewport", missing);
-  ok &= loadOne(ClearColor, getProc, "glClearColor", missing);
-  ok &= loadOne(Clear, getProc, "glClear", missing);
-  ok &= loadOne(Enable, getProc, "glEnable", missing);
-  ok &= loadOne(Disable, getProc, "glDisable", missing);
-  ok &= loadOne(BlendFunc, getProc, "glBlendFunc", missing);
+  CreateProgram = loadProc<PFNGLCREATEPROGRAMPROC>("glCreateProgram");
+  AttachShader = loadProc<PFNGLATTACHSHADERPROC>("glAttachShader");
+  LinkProgram = loadProc<PFNGLLINKPROGRAMPROC>("glLinkProgram");
+  GetProgramiv = loadProc<PFNGLGETPROGRAMIVPROC>("glGetProgramiv");
+  GetProgramInfoLog = loadProc<PFNGLGETPROGRAMINFOLOGPROC>("glGetProgramInfoLog");
+  UseProgram = loadProc<PFNGLUSEPROGRAMPROC>("glUseProgram");
+  DeleteProgram = loadProc<PFNGLDELETEPROGRAMPROC>("glDeleteProgram");
 
-  ok &= loadOne(GenVertexArrays, getProc, "glGenVertexArrays", missing);
-  ok &= loadOne(BindVertexArray, getProc, "glBindVertexArray", missing);
-  ok &= loadOne(DeleteVertexArrays, getProc, "glDeleteVertexArrays", missing);
+  GetUniformLocation = loadProc<PFNGLGETUNIFORMLOCATIONPROC>("glGetUniformLocation");
+  Uniform1i = loadProc<PFNGLUNIFORM1IPROC>("glUniform1i");
+  Uniform1f = loadProc<PFNGLUNIFORM1FPROC>("glUniform1f");
+  Uniform3f = loadProc<PFNGLUNIFORM3FPROC>("glUniform3f");
+  UniformMatrix4fv = loadProc<PFNGLUNIFORMMATRIX4FVPROC>("glUniformMatrix4fv");
 
-  ok &= loadOne(GenBuffers, getProc, "glGenBuffers", missing);
-  ok &= loadOne(BindBuffer, getProc, "glBindBuffer", missing);
-  ok &= loadOne(BufferData, getProc, "glBufferData", missing);
-  ok &= loadOne(DeleteBuffers, getProc, "glDeleteBuffers", missing);
+  GenVertexArrays = loadProc<PFNGLGENVERTEXARRAYSPROC>("glGenVertexArrays");
+  BindVertexArray = loadProc<PFNGLBINDVERTEXARRAYPROC>("glBindVertexArray");
+  DeleteVertexArrays = loadProc<PFNGLDELETEVERTEXARRAYSPROC>("glDeleteVertexArrays");
 
-  ok &= loadOne(EnableVertexAttribArray, getProc, "glEnableVertexAttribArray", missing);
-  ok &= loadOne(VertexAttribPointer, getProc, "glVertexAttribPointer", missing);
+  GenBuffers = loadProc<PFNGLGENBUFFERSPROC>("glGenBuffers");
+  BindBuffer = loadProc<PFNGLBINDBUFFERPROC>("glBindBuffer");
+  BufferData = loadProc<PFNGLBUFFERDATAPROC>("glBufferData");
+  BufferSubData = loadProc<PFNGLBUFFERSUBDATAPROC>("glBufferSubData");
+  DeleteBuffers = loadProc<PFNGLDELETEBUFFERSPROC>("glDeleteBuffers");
 
-  ok &= loadOne(CreateShader, getProc, "glCreateShader", missing);
-  ok &= loadOne(ShaderSource, getProc, "glShaderSource", missing);
-  ok &= loadOne(CompileShader, getProc, "glCompileShader", missing);
-  ok &= loadOne(GetShaderiv, getProc, "glGetShaderiv", missing);
-  ok &= loadOne(GetShaderInfoLog, getProc, "glGetShaderInfoLog", missing);
-  ok &= loadOne(DeleteShader, getProc, "glDeleteShader", missing);
+  EnableVertexAttribArray = loadProc<PFNGLENABLEVERTEXATTRIBARRAYPROC>("glEnableVertexAttribArray");
+  VertexAttribPointer = loadProc<PFNGLVERTEXATTRIBPOINTERPROC>("glVertexAttribPointer");
+  VertexAttribDivisor = loadProc<PFNGLVERTEXATTRIBDIVISORPROC>("glVertexAttribDivisor");
 
-  ok &= loadOne(CreateProgram, getProc, "glCreateProgram", missing);
-  ok &= loadOne(AttachShader, getProc, "glAttachShader", missing);
-  ok &= loadOne(LinkProgram, getProc, "glLinkProgram", missing);
-  ok &= loadOne(GetProgramiv, getProc, "glGetProgramiv", missing);
-  ok &= loadOne(GetProgramInfoLog, getProc, "glGetProgramInfoLog", missing);
-  ok &= loadOne(UseProgram, getProc, "glUseProgram", missing);
-  ok &= loadOne(DeleteProgram, getProc, "glDeleteProgram", missing);
+  DrawArraysInstanced = loadProc<PFNGLDRAWARRAYSINSTANCEDPROC>("glDrawArraysInstanced");
+  DrawElementsInstanced = loadProc<PFNGLDRAWELEMENTSINSTANCEDPROC>("glDrawElementsInstanced");
 
-  ok &= loadOne(DrawArrays, getProc, "glDrawArrays", missing);
+  ActiveTexture = loadProc<PFNGLACTIVETEXTUREPROC>("glActiveTexture");
+  GenTextures = loadProc<PFNGLGENTEXTURESPROC>("glGenTextures");
+  BindTexture = loadProc<PFNGLBINDTEXTUREPROC>("glBindTexture");
+  TexImage2D = loadProc<PFNGLTEXIMAGE2DPROC>("glTexImage2D");
+  TexParameteri = loadProc<PFNGLTEXPARAMETERIPROC>("glTexParameteri");
+  GenerateMipmap = loadProc<PFNGLGENERATEMIPMAPPROC>("glGenerateMipmap");
+  DeleteTextures = loadProc<PFNGLDELETETEXTURESPROC>("glDeleteTextures");
 
-  ok &= loadOne(GetUniformLocation, getProc, "glGetUniformLocation", missing);
-  ok &= loadOne(UniformMatrix4fv, getProc, "glUniformMatrix4fv", missing);
+  const bool ok =
+      CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog &&
+      CreateProgram && AttachShader && LinkProgram && GetProgramiv && GetProgramInfoLog && UseProgram &&
+      GenVertexArrays && BindVertexArray &&
+      GenBuffers && BindBuffer && BufferData &&
+      EnableVertexAttribArray && VertexAttribPointer &&
+      DrawElementsInstanced &&
+      ActiveTexture && GenTextures && BindTexture && TexImage2D && TexParameteri;
 
-  if (!ok && outError) {
-    std::ostringstream oss;
-    oss << "Failed to load required OpenGL symbols:\n" << missing.str();
-    *outError = oss.str();
+  if (!ok) {
+    stellar::core::log(stellar::core::LogLevel::Error, "OpenGL loader: missing required functions (context too old?)");
   }
 
   return ok;
+}
+
+const char* glVersionString() {
+  const auto* s = glGetString(GL_VERSION);
+  return s ? reinterpret_cast<const char*>(s) : "(null)";
 }
 
 } // namespace stellar::render::gl

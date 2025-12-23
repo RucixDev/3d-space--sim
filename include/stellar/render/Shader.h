@@ -1,8 +1,7 @@
 #pragma once
 
-#include "stellar/render/Gl.h"
-
 #include <string>
+#include <string_view>
 
 namespace stellar::render {
 
@@ -14,17 +13,23 @@ public:
   ShaderProgram(const ShaderProgram&) = delete;
   ShaderProgram& operator=(const ShaderProgram&) = delete;
 
-  bool create(const char* vertexSrc, const char* fragmentSrc, std::string* outError = nullptr);
-  void destroy();
+  ShaderProgram(ShaderProgram&&) noexcept;
+  ShaderProgram& operator=(ShaderProgram&&) noexcept;
+
+  bool build(std::string_view vertexSrc, std::string_view fragmentSrc, std::string* outError = nullptr);
 
   void bind() const;
 
-  gl::GLuint id() const { return m_program; }
+  int uniformLocation(const char* name) const;
+  void setUniformMat4(const char* name, const float* mat4) const;
+  void setUniform1i(const char* name, int v) const;
+  void setUniform1f(const char* name, float v) const;
+  void setUniform3f(const char* name, float x, float y, float z) const;
 
-  gl::GLint uniformLocation(const char* name) const;
+  unsigned int handle() const { return program_; }
 
 private:
-  gl::GLuint m_program = 0;
+  unsigned int program_{0};
 };
 
 } // namespace stellar::render

@@ -1,70 +1,52 @@
 #include "stellar/sim/Faction.h"
 
+#include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
+#include "stellar/proc/NameGenerator.h"
 
 #include <array>
-#include <span>
-#include <string>
+#include <cmath>
 
 namespace stellar::sim {
-namespace {
 
-constexpr std::array<const char*, 8> kGovSuffix = {
-  "Union",
-  "Federation",
-  "Republic",
-  "Consortium",
-  "Collective",
-  "Directorate",
-  "Kingdom",
-  "Free State",
-};
+std::vector<Faction> generateFactions(core::u64 seed, int count) {
+  std::vector<Faction> out;
+  out.reserve(static_cast<std::size_t>(count + 1));
 
-constexpr std::array<const char*, 6> kGovPrefix = {
-  "United",
-  "Outer",
-  "Core",
-  "New",
-  "Greater",
-  "Independent",
-};
+  // id=0 reserved
+  out.push_back(Faction{});
 
-}
+  static const std::array<const char*, 6> suffix = {"Union","League","Combine","Consortium","Republic","Directorate"};
 
-FactionGenerator::FactionGenerator(stellar::core::u64 universeSeed, std::size_t factionCount)
-  : m_seed(universeSeed)
-  , m_count(factionCount)
-  , m_names(stellar::core::deriveSeed(universeSeed, "factions"))
-{
-  if (m_count == 0) m_count = 1;
-}
+  for (int i = 0; i < count; ++i) {
+    const core::u32 id = static_cast<core::u32>(i + 1);
+    core::SplitMix64 rng(core::hashCombine(seed, static_cast<core::u64>(id) * 0x9E3779B97F4A7C15ull));
 
-Faction FactionGenerator::faction(std::size_t index) const {
-  const auto base = stellar::core::deriveSeed(m_seed, "faction");
-  const auto id = stellar::core::deriveSeed(base, static_cast<stellar::core::u64>(index));
+    proc::NameGenerator ng(core::hashCombine(seed, id));
+    std::string name = ng.systemName() + " " + suffix[rng.range<int>(0, static_cast<int>(suffix.size()-1))];
 
-  stellar::core::SplitMix64 rng(id);
+    // Place faction homes with a disc-ish distribution.
+    const double r = 20000.0 * std::sqrt(rng.nextDouble()); // within 20k ly for now
+    const double a = rng.nextDouble() * 6.283185307179586;
+    const double z = (rng.nextDouble() - 0.5) * 600.0; // +-300 ly
 
-  Faction f;
-  f.id = id;
+    math::Vec3d home{ r * std::cos(a), r * std::sin(a), z };
 
-  const std::string coreName = m_names.makeName(rng, 2, 4);
-  const std::string prefix = rng.chance(0.35) ? std::string(rng.pick(std::span(kGovPrefix))) + " " : std::string();
-  const std::string suffix = std::string(rng.pick(std::span(kGovSuffix)));
+    Faction f{};
+    f.id = id;
+    f.name = std::move(name);
+    f.homePosLy = home;
+    f.influenceRadiusLy = 800.0 + 1200.0 * rng.nextDouble();
+    f.taxRate = 0.01 + 0.05 * rng.nextDouble();
+    f.industryBias = rng.range(-1.0, 1.0);
 
-  f.name = prefix + coreName + " " + suffix;
+    // simple bright-ish color
+    f.color = {0.2 + 0.8*rng.nextDouble(), 0.2 + 0.8*rng.nextDouble(), 0.2 + 0.8*rng.nextDouble()};
 
-  // Lightly correlated attributes.
-  f.techLevel = rng.uniform(0.15, 0.95);
-  f.wealth = std::clamp(rng.uniform(0.10, 0.95) * (0.60 + 0.60 * f.techLevel), 0.0, 1.0);
-  f.lawfulness = std::clamp(rng.uniform(0.05, 0.95) * (0.60 + 0.40 * f.wealth), 0.0, 1.0);
-  return f;
-}
+    out.push_back(std::move(f));
+  }
 
-std::size_t FactionGenerator::controllingFactionIndex(stellar::core::u64 systemId) const {
-  const auto mapSeed = stellar::core::deriveSeed(m_seed, "faction_map");
-  const auto h = stellar::core::hashCombine(systemId, mapSeed);
-  return static_cast<std::size_t>(h % static_cast<stellar::core::u64>(m_count));
+  return out;
 }
 
 } // namespace stellar::sim

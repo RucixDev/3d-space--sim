@@ -1,239 +1,189 @@
 #include "stellar/proc/SystemGenerator.h"
 
 #include "stellar/core/Random.h"
+#include "stellar/econ/Economy.h"
 #include "stellar/math/Math.h"
+#include "stellar/proc/NameGenerator.h"
 
 #include <algorithm>
 #include <cmath>
-#include <string>
-#include <vector>
 
 namespace stellar::proc {
-namespace {
 
-struct StarClassSpec {
-  stellar::sim::StarClass cls;
-  double weight;    // relative
-  double massMin;
-  double massMax;
-};
+static sim::Star makeStar(sim::StarClass cls, core::SplitMix64& rng) {
+  sim::Star s{};
+  s.cls = cls;
 
-constexpr StarClassSpec kStarClasses[] = {
-  // Very rough main-sequence distribution (massive stars are rare).
-  { stellar::sim::StarClass::O, 0.00003, 16.0, 50.0 },
-  { stellar::sim::StarClass::B, 0.00130,  2.1, 16.0 },
-  { stellar::sim::StarClass::A, 0.00600,  1.4,  2.1 },
-  { stellar::sim::StarClass::F, 0.03000,  1.04, 1.4 },
-  { stellar::sim::StarClass::G, 0.07600,  0.80, 1.04 },
-  { stellar::sim::StarClass::K, 0.12100,  0.45, 0.80 },
-  { stellar::sim::StarClass::M, 0.76567,  0.08, 0.45 },
-};
+  auto rr = [&](double a, double b) { return rng.range(a, b); };
 
-stellar::sim::StarClass pickStarClass(stellar::core::SplitMix64& rng) {
-  double total = 0.0;
-  for (const auto& s : kStarClasses) total += s.weight;
-
-  const double r = rng.uniform(0.0, total);
-  double accum = 0.0;
-  for (const auto& s : kStarClasses) {
-    accum += s.weight;
-    if (r <= accum) return s.cls;
+  switch (cls) {
+    case sim::StarClass::O:
+      s.massSol = rr(16.0, 60.0);
+      s.radiusSol = rr(6.0, 15.0);
+      s.luminositySol = rr(30000.0, 500000.0);
+      s.temperatureK = rr(30000.0, 50000.0);
+      break;
+    case sim::StarClass::B:
+      s.massSol = rr(2.1, 16.0);
+      s.radiusSol = rr(2.0, 6.0);
+      s.luminositySol = rr(25.0, 30000.0);
+      s.temperatureK = rr(10000.0, 30000.0);
+      break;
+    case sim::StarClass::A:
+      s.massSol = rr(1.4, 2.1);
+      s.radiusSol = rr(1.4, 2.5);
+      s.luminositySol = rr(5.0, 25.0);
+      s.temperatureK = rr(7500.0, 10000.0);
+      break;
+    case sim::StarClass::F:
+      s.massSol = rr(1.04, 1.4);
+      s.radiusSol = rr(1.15, 1.6);
+      s.luminositySol = rr(1.5, 5.0);
+      s.temperatureK = rr(6000.0, 7500.0);
+      break;
+    case sim::StarClass::G:
+      s.massSol = rr(0.8, 1.04);
+      s.radiusSol = rr(0.9, 1.2);
+      s.luminositySol = rr(0.6, 1.6);
+      s.temperatureK = rr(5200.0, 6000.0);
+      break;
+    case sim::StarClass::K:
+      s.massSol = rr(0.45, 0.8);
+      s.radiusSol = rr(0.7, 0.95);
+      s.luminositySol = rr(0.08, 0.6);
+      s.temperatureK = rr(3700.0, 5200.0);
+      break;
+    case sim::StarClass::M:
+    default:
+      s.massSol = rr(0.08, 0.45);
+      s.radiusSol = rr(0.1, 0.7);
+      s.luminositySol = rr(0.0001, 0.08);
+      s.temperatureK = rr(2400.0, 3700.0);
+      break;
   }
-  return stellar::sim::StarClass::G;
+  return s;
 }
 
-StarClassSpec specFor(stellar::sim::StarClass cls) {
-  for (const auto& s : kStarClasses) {
-    if (s.cls == cls) return s;
+static sim::PlanetType pickPlanetType(double aAU, core::SplitMix64& rng) {
+  // crude zone heuristic + randomness
+  const double r = rng.nextDouble();
+  if (aAU < 0.6) {
+    return (r < 0.7) ? sim::PlanetType::Rocky : sim::PlanetType::Desert;
   }
-  return { stellar::sim::StarClass::G, 1.0, 0.8, 1.04 };
+  if (aAU < 2.0) {
+    if (r < 0.5) return sim::PlanetType::Rocky;
+    if (r < 0.8) return sim::PlanetType::Ocean;
+    return sim::PlanetType::Ice;
+  }
+  if (aAU < 6.0) {
+    return (r < 0.3) ? sim::PlanetType::GasGiant : sim::PlanetType::Ice;
+  }
+  return (r < 0.6) ? sim::PlanetType::GasGiant : sim::PlanetType::Ice;
 }
 
-// Rough main-sequence approximations.
-// (These are intentionally simple — good enough for a game starting point.)
-double approxLuminositySolar(double massSolar) {
-  const double m = std::max(0.08, massSolar);
-  if (m < 0.43) {
-    return 0.23 * std::pow(m, 2.3);
+static void setPlanetMassRadius(sim::Planet& p, core::SplitMix64& rng) {
+  auto rr = [&](double a, double b) { return rng.range(a, b); };
+  switch (p.type) {
+    case sim::PlanetType::GasGiant:
+      p.radiusEarth = rr(3.0, 11.0);
+      p.massEarth = rr(20.0, 320.0);
+      break;
+    case sim::PlanetType::Ocean:
+      p.radiusEarth = rr(0.8, 2.2);
+      p.massEarth = rr(0.6, 8.0);
+      break;
+    case sim::PlanetType::Ice:
+      p.radiusEarth = rr(0.4, 1.6);
+      p.massEarth = rr(0.2, 5.0);
+      break;
+    case sim::PlanetType::Desert:
+      p.radiusEarth = rr(0.6, 2.0);
+      p.massEarth = rr(0.4, 7.0);
+      break;
+    case sim::PlanetType::Rocky:
+    default:
+      p.radiusEarth = rr(0.3, 1.8);
+      p.massEarth = rr(0.1, 6.0);
+      break;
   }
-  if (m < 2.0) {
-    return std::pow(m, 4.0);
-  }
-  if (m < 20.0) {
-    return 1.5 * std::pow(m, 3.5);
-  }
-  return 32000.0 * m; // very rough
 }
 
-double approxRadiusSolar(double massSolar) {
-  const double m = std::max(0.08, massSolar);
-  return std::pow(m, 0.8);
-}
-
-double approxTemperatureK(double luminositySolar, double radiusSolar) {
-  // From L ∝ R^2 T^4 -> T ∝ (L / R^2)^(1/4)
-  const double ratio = std::max(1e-9, luminositySolar / (radiusSolar * radiusSolar));
-  return 5778.0 * std::pow(ratio, 0.25);
-}
-
-std::string romanNumeral(int n) {
-  struct Entry { int value; const char* numeral; };
-  constexpr Entry table[] = {
-    {1000, "M"}, {900, "CM"}, {500, "D"}, {400, "CD"},
-    {100, "C"}, {90, "XC"}, {50, "L"}, {40, "XL"},
-    {10, "X"}, {9, "IX"}, {5, "V"}, {4, "IV"}, {1, "I"}
-  };
-
-  std::string out;
-  for (const auto& e : table) {
-    while (n >= e.value) {
-      out += e.numeral;
-      n -= e.value;
-    }
+static econ::StationType pickStationType(core::SplitMix64& rng, double bias) {
+  // bias -1..+1 (agri <-> industrial)
+  const double r = rng.nextDouble();
+  if (r < 0.15) return econ::StationType::Outpost;
+  if (r < 0.35) return econ::StationType::Mining;
+  if (r < 0.55) return econ::StationType::Refinery;
+  if (r < 0.75) {
+    return (bias < 0.0) ? econ::StationType::Agricultural : econ::StationType::Industrial;
   }
-  return out;
+  if (r < 0.88) return econ::StationType::TradeHub;
+  if (r < 0.96) return econ::StationType::Research;
+  return econ::StationType::Shipyard;
 }
 
-stellar::sim::PlanetType pickPlanetType(double aAU, double snowLineAU, stellar::core::SplitMix64& rng) {
-  // Allow occasional asteroid belts in inner system.
-  if (aAU < snowLineAU && rng.chance(0.10)) {
-    return stellar::sim::PlanetType::AsteroidBelt;
-  }
-
-  if (aAU < snowLineAU) {
-    return stellar::sim::PlanetType::Rocky;
-  }
-
-  // Beyond snow line: mix of ices and giants
-  const double far = aAU / std::max(0.1, snowLineAU);
-
-  const double gasChance = std::clamp(0.10 + 0.15 * (far - 1.0), 0.10, 0.65);
-  if (rng.chance(gasChance)) {
-    // Split between gas and ice giants
-    return rng.chance(0.75) ? stellar::sim::PlanetType::GasGiant : stellar::sim::PlanetType::IceGiant;
-  }
-
-  return stellar::sim::PlanetType::Ice;
+static const sim::Faction* findFaction(core::u32 id, const std::vector<sim::Faction>& factions) {
+  for (const auto& f : factions) if (f.id == id) return &f;
+  return nullptr;
 }
 
-double rockyRadiusKmFromMass(double massEarth) {
-  // Very rough scaling (for small rocky planets)
-  const double m = std::max(0.05, massEarth);
-  return 6371.0 * std::pow(m, 0.27);
-}
+sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<sim::Faction>& factions) {
+  core::SplitMix64 rng(stub.seed);
 
-double icyRadiusKmFromMass(double massEarth) {
-  const double m = std::max(0.05, massEarth);
-  return 6371.0 * 1.10 * std::pow(m, 0.28);
-}
+  sim::StarSystem sys{};
+  sys.stub = stub;
 
-} // namespace
+  sys.star = makeStar(stub.primaryClass, rng);
 
-SystemGenerator::SystemGenerator(SystemGenConfig cfg)
-  : m_cfg(cfg)
-  , m_names(stellar::core::deriveSeed(cfg.galaxySeed, "names"))
-{}
+  NameGenerator ng(stub.seed);
 
-stellar::sim::StarSystem SystemGenerator::generate(const GalaxySystemStub& stub) const {
-  stellar::sim::StarSystem sys;
-  sys.id = stub.id;
-  sys.positionLy = stub.positionLy;
+  // Planets
+  double a = rng.range(0.25, 0.6); // start AU
+  const int nPlanets = std::max(0, stub.planetCount);
 
-  // Seed per-system generator from galaxy seed + stub id.
-  stellar::core::SplitMix64 rng(stellar::core::deriveSeed(m_cfg.galaxySeed, stub.id));
+  sys.planets.reserve(static_cast<std::size_t>(nPlanets));
 
-  // --- Star ---
-  sys.primary.starClass = pickStarClass(rng);
-  const auto spec = specFor(sys.primary.starClass);
+  for (int i = 0; i < nPlanets; ++i) {
+    sim::Planet p{};
+    p.name = ng.planetName(stub.name, i);
+    a *= rng.range(1.35, 1.9);
+    a += rng.range(0.05, 0.25);
 
-  sys.primary.massSolar = rng.uniform(spec.massMin, spec.massMax);
-  sys.primary.radiusSolar = approxRadiusSolar(sys.primary.massSolar);
-  sys.primary.luminositySolar = approxLuminositySolar(sys.primary.massSolar);
-  sys.primary.temperatureK = approxTemperatureK(sys.primary.luminositySolar, sys.primary.radiusSolar);
+    p.orbit.semiMajorAxisAU = a;
+    p.orbit.eccentricity = rng.range(0.0, 0.18);
+    p.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(6.0));
+    p.orbit.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
+    p.orbit.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
+    p.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
+    p.orbit.epochDays = 0.0;
 
-  sys.primary.name = m_names.makeName(rng, 2, 4);
+    // Kepler-ish: P(years)^2 = a(AU)^3 / M(star)
+    const double years = std::sqrt((a*a*a) / std::max(0.08, sys.star.massSol));
+    p.orbit.periodDays = years * 365.25;
 
-  // --- Planets ---
-  const int maxPlanets = (sys.primary.massSolar < 0.35) ? 8 : 12;
-  const int targetPlanets = rng.range<int>(0, maxPlanets);
-
-  const double snowLineAU = 2.7 * std::sqrt(std::max(0.001, sys.primary.luminositySolar));
-  double aAU = rng.uniform(0.15, 0.45) * std::sqrt(std::max(0.05, sys.primary.luminositySolar));
-
-  bool madeBelt = false;
-
-  for (int i = 0; i < targetPlanets; ++i) {
-    if (i > 0) {
-      aAU *= rng.uniform(1.35, 2.20);
-    }
-
-    // Stop if we're too far out for this lightweight model.
-    if (aAU > 80.0) break;
-
-    auto type = pickPlanetType(aAU, snowLineAU, rng);
-
-    // Keep asteroid belts rare (at most one per system for now)
-    if (type == stellar::sim::PlanetType::AsteroidBelt) {
-      if (madeBelt) type = stellar::sim::PlanetType::Rocky;
-      madeBelt = true;
-    }
-
-    stellar::sim::Planet p;
-    p.type = type;
-
-    // Rough mass / radius distributions
-    switch (p.type) {
-      case stellar::sim::PlanetType::Rocky: {
-        // Bias toward small planets
-        const double x = rng.nextDouble01();
-        p.massEarth = 0.08 + 8.0 * x * x; // square biases small
-        p.radiusKm = rockyRadiusKmFromMass(p.massEarth);
-        break;
-      }
-      case stellar::sim::PlanetType::Ice: {
-        const double x = rng.nextDouble01();
-        p.massEarth = 0.1 + 20.0 * x * x;
-        p.radiusKm = icyRadiusKmFromMass(p.massEarth);
-        break;
-      }
-      case stellar::sim::PlanetType::GasGiant: {
-        const double x = rng.nextDouble01();
-        p.massEarth = 40.0 + 300.0 * x;
-        // Radius saturates for big gas giants; keep it in a plausible range.
-        p.radiusKm = 6371.0 * rng.uniform(9.0, 15.0);
-        break;
-      }
-      case stellar::sim::PlanetType::IceGiant: {
-        const double x = rng.nextDouble01();
-        p.massEarth = 10.0 + 60.0 * x;
-        p.radiusKm = 6371.0 * rng.uniform(3.0, 6.0);
-        break;
-      }
-      case stellar::sim::PlanetType::AsteroidBelt: {
-        p.massEarth = 0.0001 * rng.uniform(0.1, 5.0);
-        p.radiusKm = 0.0;
-        break;
-      }
-    }
-
-    // Orbit
-    p.orbit.semiMajorAxisAU = aAU;
-    p.orbit.eccentricity = rng.uniform(0.0, 0.20);
-    p.orbit.inclinationDeg = rng.uniform(0.0, 5.0);
-    p.orbit.longitudeAscendingNodeDeg = rng.uniform(0.0, 360.0);
-    p.orbit.argumentPeriapsisDeg = rng.uniform(0.0, 360.0);
-    p.orbit.meanAnomalyAtEpochDeg = rng.uniform(0.0, 360.0);
-
-    const double periodYears = std::sqrt((aAU * aAU * aAU) / std::max(0.08, sys.primary.massSolar));
-    p.orbit.orbitalPeriodDays = periodYears * 365.25;
-
-    // Equilibrium temperature (very rough)
-    p.equilibriumTempK = 278.0 * std::pow(std::max(0.001, sys.primary.luminositySolar), 0.25) / std::sqrt(std::max(0.05, aAU));
-
-    // Name: StarName + Roman numeral
-    p.name = sys.primary.name + " " + romanNumeral(i + 1);
+    p.type = pickPlanetType(a, rng);
+    setPlanetMassRadius(p, rng);
 
     sys.planets.push_back(std::move(p));
+  }
+
+  // Stations
+  const int nStations = std::max(0, stub.stationCount);
+  sys.stations.reserve(static_cast<std::size_t>(nStations));
+
+  const sim::Faction* fac = findFaction(stub.factionId, factions);
+  const double fee = fac ? fac->taxRate : 0.02;
+  const double bias = fac ? fac->industryBias : 0.0;
+
+  for (int i = 0; i < nStations; ++i) {
+    sim::Station st{};
+    st.id = core::hashCombine(static_cast<core::u64>(stub.id), static_cast<core::u64>(i + 1));
+    st.name = ng.stationName(stub.name, i);
+    st.factionId = stub.factionId;
+    st.feeRate = fee;
+    st.type = pickStationType(rng, bias);
+    st.economyModel = econ::makeEconomyModel(st.type, bias);
+    sys.stations.push_back(std::move(st));
   }
 
   return sys;

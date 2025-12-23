@@ -1,12 +1,25 @@
 #pragma once
 
 #include <cstdlib>
-#include <iostream>
+#include <string_view>
 
-#ifndef STELLAR_ASSERT
-  #define STELLAR_ASSERT(expr)     do {       if (!(expr)) {         std::cerr << "STELLAR_ASSERT failed: " #expr "\n"                   << "  at " << __FILE__ << ":" << __LINE__ << "\n";         std::abort();       }     } while (0)
-#endif
+namespace stellar::core {
 
-#ifndef STELLAR_ASSERT_MSG
-  #define STELLAR_ASSERT_MSG(expr, msg)     do {       if (!(expr)) {         std::cerr << "STELLAR_ASSERT failed: " #expr "\n"                   << "  message: " << (msg) << "\n"                   << "  at " << __FILE__ << ":" << __LINE__ << "\n";         std::abort();       }     } while (0)
-#endif
+// Minimal assert helper. Kept small on purpose.
+[[noreturn]] void panic(std::string_view message, const char* file, int line);
+
+} // namespace stellar::core
+
+#define STELLAR_ASSERT(expr) \
+  do { \
+    if (!(expr)) { \
+      ::stellar::core::panic("Assertion failed: " #expr, __FILE__, __LINE__); \
+    } \
+  } while (0)
+
+#define STELLAR_ASSERT_MSG(expr, msg) \
+  do { \
+    if (!(expr)) { \
+      ::stellar::core::panic((msg), __FILE__, __LINE__); \
+    } \
+  } while (0)

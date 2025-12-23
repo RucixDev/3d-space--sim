@@ -1,38 +1,55 @@
 #pragma once
 
-#include "stellar/core/Random.h"
+#include "stellar/core/Types.h"
 #include "stellar/math/Vec3.h"
+#include "stellar/sim/Celestial.h"
+#include "stellar/sim/Faction.h"
 
-#include <cstddef>
 #include <vector>
 
 namespace stellar::proc {
 
-struct GalaxySystemStub {
-  stellar::core::u64 id = 0;
-  stellar::math::Vec3d positionLy{};
+struct GalaxyParams {
+  double sectorSizeLy{10.0};          // edge length of a sector cube
+  double radiusLy{50000.0};           // approximate disc radius
+  double thicknessLy{1000.0};         // disc thickness (full)
+  double radialScaleLengthLy{15000.0}; // exponential falloff scale
+  double baseMeanSystemsPerSector{5.0}; // at r=0
 };
 
-struct GalaxyGenConfig {
-  stellar::core::u64 seed = 1;
-  std::size_t systemCount = 1000;
+struct SectorCoord {
+  core::i32 x{0}, y{0}, z{0};
 
-  double radiusLy = 50000.0;
-  double thicknessLy = 2000.0;
+  bool operator==(const SectorCoord& o) const { return x==o.x && y==o.y && z==o.z; }
+};
+
+struct Sector {
+  SectorCoord coord{};
+  std::vector<sim::SystemStub> systems{};
+};
+
+struct SectorCoordHash {
+  std::size_t operator()(const SectorCoord& c) const noexcept;
 };
 
 class GalaxyGenerator {
 public:
-  explicit GalaxyGenerator(GalaxyGenConfig cfg) : m_cfg(cfg) {}
+  GalaxyGenerator(core::u64 seed, GalaxyParams params);
 
-  // Deterministically generate a single system stub for a given index.
-  // Uses per-index RNG, so adding more systems does not change existing ones.
-  GalaxySystemStub stubAt(std::size_t index) const;
+  core::u64 seed() const { return seed_; }
+  const GalaxyParams& params() const { return params_; }
 
-  std::vector<GalaxySystemStub> generate() const;
+  SectorCoord sectorOf(const math::Vec3d& posLy) const;
+
+  // Generate the systems contained in a sector (deterministic).
+  Sector generateSector(const SectorCoord& coord, const std::vector<sim::Faction>& factions) const;
+
+  // Create a globally unique system id from (sector, localIndex).
+  sim::SystemId makeSystemId(const SectorCoord& coord, core::u32 localIndex) const;
 
 private:
-  GalaxyGenConfig m_cfg{};
+  core::u64 seed_{0};
+  GalaxyParams params_{};
 };
 
 } // namespace stellar::proc

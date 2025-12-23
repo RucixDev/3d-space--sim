@@ -6,16 +6,19 @@
 
 namespace stellar::proc {
 
-// A tiny deterministic syllable-based name generator.
-// You can replace this later with Markov chains, real star catalogs, etc.
+// Deterministic, lightweight name generator (syllable-based).
 class NameGenerator {
 public:
-  explicit NameGenerator(stellar::core::u64 seed);
+  explicit NameGenerator(core::u64 seed = 0) : rng_(seed) {}
 
-  std::string makeName(stellar::core::SplitMix64& rng, int minSyllables = 2, int maxSyllables = 4) const;
+  void reseed(core::u64 seed) { rng_.reseed(seed); }
+
+  std::string systemName();
+  std::string planetName(const std::string& systemName, int index);
+  std::string stationName(const std::string& systemName, int index);
 
 private:
-  stellar::core::u64 m_seed = 0;
+  core::SplitMix64 rng_;
 };
 
 } // namespace stellar::proc

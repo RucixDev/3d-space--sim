@@ -5,73 +5,70 @@
 #include <cmath>
 
 namespace stellar::sim {
-namespace {
-  double wrapTwoPi(double x) {
-    x = std::fmod(x, stellar::math::twoPi);
-    if (x < 0.0) x += stellar::math::twoPi;
-    return x;
+
+static double normalizeAngle(double a) {
+  const double twoPi = 2.0 * stellar::math::kPi;
+  a = std::fmod(a, twoPi);
+  if (a < 0) a += twoPi;
+  return a;
+}
+
+double solveKepler(double meanAnomalyRad, double e, int iterations) {
+  const double M = normalizeAngle(meanAnomalyRad);
+  double E = (e < 0.8) ? M : stellar::math::kPi;
+
+  for (int i = 0; i < iterations; ++i) {
+    const double f = E - e * std::sin(E) - M;
+    const double fp = 1.0 - e * std::cos(E);
+    E = E - f / fp;
   }
+  return E;
+}
 
-  // Solve Kepler's equation: E - e sin(E) = M
-  // Returns E (eccentric anomaly) in radians.
-  double solveKepler(double M, double e) {
-    // Good initial guess:
-    double E = (e < 0.8) ? M : stellar::math::pi;
+math::Vec3d orbitPositionAU(const OrbitElements& el, double timeDays) {
+  const double n = (2.0 * stellar::math::kPi) / el.periodDays; // mean motion rad/day
+  const double M = el.meanAnomalyAtEpochRad + n * (timeDays - el.epochDays);
+  const double E = solveKepler(M, el.eccentricity);
 
-    // Newton-Raphson iterations
-    for (int i = 0; i < 12; ++i) {
-      const double f = E - e * std::sin(E) - M;
-      const double fp = 1.0 - e * std::cos(E);
-      const double dE = f / fp;
-      E -= dE;
-      if (std::abs(dE) < 1e-12) break;
-    }
-    return E;
-  }
-} // namespace
+  const double cosE = std::cos(E);
+  const double sinE = std::sin(E);
 
-stellar::math::Vec3d Orbit::positionAU(double daysSinceEpoch) const {
-  const double a = semiMajorAxisAU;
-  const double e = stellar::math::clamp(eccentricity, 0.0, 0.999999);
+  const double a = el.semiMajorAxisAU;
+  const double r = a * (1.0 - el.eccentricity * cosE);
 
-  const double P = (orbitalPeriodDays <= 0.0) ? 1.0 : orbitalPeriodDays;
-  const double n = stellar::math::twoPi / P; // mean motion rad/day
+  // True anomaly
+  const double v = std::atan2(std::sqrt(1.0 - el.eccentricity*el.eccentricity) * sinE,
+                              cosE - el.eccentricity);
 
-  const double M0 = stellar::math::degToRad(meanAnomalyAtEpochDeg);
-  const double M = wrapTwoPi(M0 + n * daysSinceEpoch);
+  return { r * std::cos(v), r * std::sin(v), 0.0 };
+}
 
-  const double E = solveKepler(M, e);
+math::Vec3d orbitPosition3DAU(const OrbitElements& el, double timeDays) {
+  const math::Vec3d p = orbitPositionAU(el, timeDays);
 
-  // True anomaly ν
-  const double sinE2 = std::sin(E * 0.5);
-  const double cosE2 = std::cos(E * 0.5);
-  const double sqrt1pe = std::sqrt(1.0 + e);
-  const double sqrt1me = std::sqrt(1.0 - e);
-  const double nu = 2.0 * std::atan2(sqrt1pe * sinE2, sqrt1me * cosE2);
+  const double cosO = std::cos(el.ascendingNodeRad);
+  const double sinO = std::sin(el.ascendingNodeRad);
+  const double cosi = std::cos(el.inclinationRad);
+  const double sini = std::sin(el.inclinationRad);
+  const double cosw = std::cos(el.argPeriapsisRad);
+  const double sinw = std::sin(el.argPeriapsisRad);
 
-  // Radius
-  const double r = a * (1.0 - e * std::cos(E));
+  // Rotation Rz(O) * Rx(i) * Rz(w)
+  const double x = p.x;
+  const double y = p.y;
 
-  // Angles
-  const double i = stellar::math::degToRad(inclinationDeg);
-  const double Omega = stellar::math::degToRad(longitudeAscendingNodeDeg);
-  const double omega = stellar::math::degToRad(argumentPeriapsisDeg);
+  const double x1 = cosw*x - sinw*y;
+  const double y1 = sinw*x + cosw*y;
 
-  const double cosO = std::cos(Omega);
-  const double sinO = std::sin(Omega);
-  const double cosi = std::cos(i);
-  const double sini = std::sin(i);
+  const double x2 = x1;
+  const double y2 = cosi*y1;
+  const double z2 = sini*y1;
 
-  const double arg = omega + nu;
-  const double cosA = std::cos(arg);
-  const double sinA = std::sin(arg);
+  const double x3 = cosO*x2 - sinO*y2;
+  const double y3 = sinO*x2 + cosO*y2;
+  const double z3 = z2;
 
-  // Inertial coordinates (standard orbital element transform)
-  const double x = r * (cosO * cosA - sinO * sinA * cosi);
-  const double y = r * (sinO * cosA + cosO * sinA * cosi);
-  const double z = r * (sinA * sini);
-
-  return {x, y, z};
+  return {x3, y3, z3};
 }
 
 } // namespace stellar::sim

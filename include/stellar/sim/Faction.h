@@ -1,44 +1,23 @@
 #pragma once
 
 #include "stellar/core/Types.h"
-#include "stellar/proc/NameGenerator.h"
+#include "stellar/math/Vec3.h"
 
-#include <cstddef>
 #include <string>
+#include <vector>
 
 namespace stellar::sim {
 
 struct Faction {
-  stellar::core::u64 id = 0;
-  std::string name;
-
-  // Simple 0..1 attributes used by procedural economy / game rules.
-  double techLevel = 0.5;
-  double lawfulness = 0.5;
-  double wealth = 0.5;
+  core::u32 id{0};              // 0 reserved for "Independent"
+  std::string name{"Independent"};
+  math::Vec3d homePosLy{0,0,0}; // galaxy-space
+  math::Vec3d color{0.8,0.8,0.8};
+  double influenceRadiusLy{0.0}; // how far this faction tends to own stations
+  double taxRate{0.02};          // market fee baseline
+  double industryBias{0.0};      // -1..+1 (agri <-> industrial)
 };
 
-// Deterministic faction generator / registry.
-// Factions are generated purely from universeSeed + faction index, so they don't need persistence.
-class FactionGenerator {
-public:
-  explicit FactionGenerator(stellar::core::u64 universeSeed, std::size_t factionCount = 32);
-
-  std::size_t count() const { return m_count; }
-
-  Faction faction(std::size_t index) const;
-
-  // Maps a star system id to its controlling faction index.
-  std::size_t controllingFactionIndex(stellar::core::u64 systemId) const;
-
-  Faction controllingFaction(stellar::core::u64 systemId) const {
-    return faction(controllingFactionIndex(systemId));
-  }
-
-private:
-  stellar::core::u64 m_seed = 0;
-  std::size_t m_count = 0;
-  stellar::proc::NameGenerator m_names;
-};
+std::vector<Faction> generateFactions(core::u64 seed, int count);
 
 } // namespace stellar::sim

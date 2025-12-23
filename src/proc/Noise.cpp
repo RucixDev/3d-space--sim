@@ -1,77 +1,69 @@
 #include "stellar/proc/Noise.h"
 
 #include "stellar/core/Hash.h"
-#include "stellar/math/Math.h"
 
 #include <cmath>
 
 namespace stellar::proc {
-namespace {
-  stellar::core::u64 mix64(stellar::core::u64 z) {
-    // SplitMix64 finalizer.
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-  }
 
-  double u64ToUnitDouble(stellar::core::u64 x) {
-    // 53 bits to [0,1)
-    const stellar::core::u64 mantissa = x >> 11;
-    return static_cast<double>(mantissa) * (1.0 / 9007199254740992.0);
-  }
-
-  double lerp(double a, double b, double t) {
-    return a + (b - a) * t;
-  }
-} // namespace
-
-double valueNoise2D(int x, int y, stellar::core::u64 seed) {
-  using stellar::core::u64;
-
-  u64 h = seed;
-  h = stellar::core::hashCombine(h, static_cast<u64>(static_cast<std::uint32_t>(x)));
-  h = stellar::core::hashCombine(h, static_cast<u64>(static_cast<std::uint32_t>(y)));
-  h = mix64(h);
-  return u64ToUnitDouble(h);
+static inline double hash01(stellar::core::u64 h) {
+  // map to [0,1)
+  return (double)((h >> 11) & ((1ull<<53)-1)) / (double)(1ull<<53);
 }
 
-double valueNoise2D(double x, double y, stellar::core::u64 seed) {
+double valueNoise2D(core::u64 seed, int x, int y) {
+  core::u64 h = seed;
+  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(x)));
+  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(y)));
+  return hash01(h);
+}
+
+double valueNoise3D(core::u64 seed, int x, int y, int z) {
+  core::u64 h = seed;
+  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(x)));
+  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(y)));
+  h = core::hashCombine(h, static_cast<core::u64>(static_cast<core::i64>(z)));
+  return hash01(h);
+}
+
+static inline double fade(double t) {
+  // Smoothstep-like (Perlin fade)
+  return t*t*t*(t*(t*6 - 15) + 10);
+}
+
+static inline double lerp(double a, double b, double t) { return a + (b-a)*t; }
+
+double smoothNoise2D(core::u64 seed, double x, double y) {
   const int x0 = static_cast<int>(std::floor(x));
   const int y0 = static_cast<int>(std::floor(y));
   const int x1 = x0 + 1;
   const int y1 = y0 + 1;
 
-  const double fx = x - static_cast<double>(x0);
-  const double fy = y - static_cast<double>(y0);
+  const double tx = x - x0;
+  const double ty = y - y0;
 
-  const double sx = stellar::math::smoothstep(fx);
-  const double sy = stellar::math::smoothstep(fy);
+  const double n00 = valueNoise2D(seed, x0, y0);
+  const double n10 = valueNoise2D(seed, x1, y0);
+  const double n01 = valueNoise2D(seed, x0, y1);
+  const double n11 = valueNoise2D(seed, x1, y1);
 
-  const double n00 = valueNoise2D(x0, y0, seed);
-  const double n10 = valueNoise2D(x1, y0, seed);
-  const double n01 = valueNoise2D(x0, y1, seed);
-  const double n11 = valueNoise2D(x1, y1, seed);
+  const double u = fade(tx);
+  const double v = fade(ty);
 
-  const double ix0 = lerp(n00, n10, sx);
-  const double ix1 = lerp(n01, n11, sx);
-  return lerp(ix0, ix1, sy);
+  const double a = lerp(n00, n10, u);
+  const double b = lerp(n01, n11, u);
+  return lerp(a, b, v);
 }
 
-double fbm2D(double x, double y, stellar::core::u64 seed, int octaves, double lacunarity, double gain) {
-  double sum = 0.0;
+double fbm2D(core::u64 seed, double x, double y, int octaves, double lacunarity, double gain) {
   double amp = 0.5;
   double freq = 1.0;
-
-  double norm = 0.0;
-
+  double sum = 0.0;
   for (int i = 0; i < octaves; ++i) {
-    sum += amp * valueNoise2D(x * freq, y * freq, seed + static_cast<stellar::core::u64>(i) * 1013ull);
-    norm += amp;
-    amp *= gain;
+    sum += amp * smoothNoise2D(seed + static_cast<core::u64>(i)*1013ull, x * freq, y * freq);
     freq *= lacunarity;
+    amp *= gain;
   }
-
-  if (norm > 0.0) sum /= norm;
   return sum;
 }
 

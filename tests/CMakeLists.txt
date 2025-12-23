@@ -1,9 +1,11 @@
 add_executable(stellar_tests
   main.cpp
   test_orbit.cpp
-  test_proc.cpp
+  test_streaming.cpp
+  test_economy.cpp
 )
 
+target_compile_features(stellar_tests PRIVATE cxx_std_20)
 target_link_libraries(stellar_tests PRIVATE stellar::stellar)
 
 add_test(NAME stellar_tests COMMAND stellar_tests)

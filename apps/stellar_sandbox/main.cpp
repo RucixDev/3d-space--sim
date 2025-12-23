@@ -1,182 +1,104 @@
 #include "stellar/core/Log.h"
+#include "stellar/proc/GalaxyGenerator.h"
 #include "stellar/sim/Universe.h"
 
-#include <charconv>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
-#include <optional>
-#include <sstream>
 #include <string>
-#include <string_view>
 
-namespace {
+using namespace stellar;
 
-void printHelp() {
-  std::cout <<
-    "stellar_sandbox — Procedural space sim starter\n"
-    "\n"
-    "Usage:\n"
-    "  stellar_sandbox [options]\n"
-    "\n"
-    "Options:\n"
-    "  --help                Show this help\n"
-    "  --seed <u64>           Galaxy seed (default: 1)\n"
-    "  --systems <n>          Number of systems to sample/list (default: 20)\n"
-    "  --list                List system summaries\n"
-    "  --pick <index>         Print details for one system (0-based)\n"
-    "  --time <days>          Show planet positions at this time (default: 0)\n"
-    "  --log <level>          trace|debug|info|warn|error|off (default: info)\n"
-    "\n";
-}
+static sim::StarClass parseStarClass(sim::StarClass c) { return c; }
 
-template <typename T>
-std::optional<T> parseNumber(std::string_view s) {
-  T value{};
-  auto first = s.data();
-  auto last = s.data() + s.size();
-  auto [ptr, ec] = std::from_chars(first, last, value);
-  if (ec != std::errc{} || ptr != last) return std::nullopt;
-  return value;
-}
-
-std::optional<stellar::core::LogLevel> parseLogLevel(std::string_view s) {
-  using stellar::core::LogLevel;
-  if (s == "trace") return LogLevel::Trace;
-  if (s == "debug") return LogLevel::Debug;
-  if (s == "info")  return LogLevel::Info;
-  if (s == "warn")  return LogLevel::Warn;
-  if (s == "error") return LogLevel::Error;
-  if (s == "off")   return LogLevel::Off;
-  return std::nullopt;
-}
-
-void printSystemSummary(std::size_t index, const stellar::sim::StarSystem& sys) {
-  std::cout
-    << "[" << index << "] "
-    << sys.primary.name << " (class " << stellar::sim::toString(sys.primary.starClass) << ")"
-    << " planets=" << sys.planets.size()
-    << " posLy=" << sys.positionLy
-    << " id=" << sys.id
-    << "\n";
-}
-
-void printSystemDetails(const stellar::sim::StarSystem& sys, double timeDays) {
-  using std::cout;
-
-  cout << "\n=== Star System: " << sys.primary.name << " ===\n";
-  cout << "ID: " << sys.id << "\n";
-  cout << "Position (ly): " << sys.positionLy << "\n";
-  cout << "\n-- Star --\n";
-  cout << "Class: " << stellar::sim::toString(sys.primary.starClass) << "\n";
-  cout << std::fixed << std::setprecision(3);
-  cout << "Mass (solar): " << sys.primary.massSolar << "\n";
-  cout << "Radius (solar): " << sys.primary.radiusSolar << "\n";
-  cout << "Luminosity (solar): " << sys.primary.luminositySolar << "\n";
-  cout << "Temperature (K): " << sys.primary.temperatureK << "\n";
-
-  cout << "\n-- Planets (" << sys.planets.size() << ") --\n";
-  for (std::size_t i = 0; i < sys.planets.size(); ++i) {
-    const auto& p = sys.planets[i];
-    cout << "\n[" << i << "] " << p.name << "\n";
-    cout << "Type: " << stellar::sim::toString(p.type) << "\n";
-    cout << "Mass (Earth): " << p.massEarth << "\n";
-    cout << "Radius (km): " << p.radiusKm << "\n";
-    cout << "Semi-major axis (AU): " << p.orbit.semiMajorAxisAU << "\n";
-    cout << "Eccentricity: " << p.orbit.eccentricity << "\n";
-    cout << "Period (days): " << p.orbit.orbitalPeriodDays << "\n";
-    cout << "Equilibrium T (K): " << p.equilibriumTempK << "\n";
-
-    const auto pos = p.orbit.positionAU(timeDays);
-    cout << "Position at t=" << timeDays << " days (AU): " << pos << "\n";
+static const char* starClassName(sim::StarClass c) {
+  switch (c) {
+    case sim::StarClass::O: return "O";
+    case sim::StarClass::B: return "B";
+    case sim::StarClass::A: return "A";
+    case sim::StarClass::F: return "F";
+    case sim::StarClass::G: return "G";
+    case sim::StarClass::K: return "K";
+    case sim::StarClass::M: return "M";
+    default: return "?";
   }
-  cout << "\n";
 }
 
-} // namespace
+static void printHelp() {
+  std::cout << "stellar_sandbox\n"
+            << "  --seed <u64>           Galaxy seed (default: 1337)\n"
+            << "  --pos <x y z>          Query position in ly (default: 0 0 0)\n"
+            << "  --radius <ly>          Query radius in ly (default: 50)\n"
+            << "  --limit <n>            Max systems (default: 32)\n";
+}
 
 int main(int argc, char** argv) {
-  stellar::core::setLogLevel(stellar::core::LogLevel::Info);
+  core::setLogLevel(core::LogLevel::Info);
 
-  stellar::sim::UniverseConfig cfg;
-  cfg.seed = 1;
-  cfg.systemCountHint = 20;
-
-  bool list = false;
-  std::optional<std::size_t> pick;
-  double timeDays = 0.0;
+  core::u64 seed = 1337;
+  math::Vec3d posLy{0,0,0};
+  double radiusLy = 50.0;
+  std::size_t limit = 32;
 
   for (int i = 1; i < argc; ++i) {
-    const std::string_view arg = argv[i];
-
-    auto requireValue = [&](std::string_view opt) -> std::optional<std::string_view> {
-      if (i + 1 >= argc) {
-        std::cerr << "Missing value for " << opt << "\n";
-        return std::nullopt;
-      }
-      return std::string_view(argv[++i]);
-    };
-
-    if (arg == "--help" || arg == "-h") {
+    std::string a = argv[i];
+    if (a == "--help" || a == "-h") {
       printHelp();
       return 0;
-    } else if (arg == "--seed") {
-      const auto v = requireValue(arg);
-      if (!v) return 2;
-      const auto n = parseNumber<stellar::core::u64>(*v);
-      if (!n) { std::cerr << "Invalid seed: " << *v << "\n"; return 2; }
-      cfg.seed = *n;
-    } else if (arg == "--systems") {
-      const auto v = requireValue(arg);
-      if (!v) return 2;
-      const auto n = parseNumber<std::size_t>(*v);
-      if (!n) { std::cerr << "Invalid systems count: " << *v << "\n"; return 2; }
-      cfg.systemCountHint = *n;
-    } else if (arg == "--list") {
-      list = true;
-    } else if (arg == "--pick") {
-      const auto v = requireValue(arg);
-      if (!v) return 2;
-      const auto n = parseNumber<std::size_t>(*v);
-      if (!n) { std::cerr << "Invalid index: " << *v << "\n"; return 2; }
-      pick = *n;
-    } else if (arg == "--time") {
-      const auto v = requireValue(arg);
-      if (!v) return 2;
-      const auto n = parseNumber<double>(*v);
-      if (!n) { std::cerr << "Invalid time: " << *v << "\n"; return 2; }
-      timeDays = *n;
-    } else if (arg == "--log") {
-      const auto v = requireValue(arg);
-      if (!v) return 2;
-      const auto lvl = parseLogLevel(*v);
-      if (!lvl) { std::cerr << "Invalid log level: " << *v << "\n"; return 2; }
-      stellar::core::setLogLevel(*lvl);
+    } else if (a == "--seed" && i + 1 < argc) {
+      seed = static_cast<core::u64>(std::strtoull(argv[++i], nullptr, 10));
+    } else if (a == "--pos" && i + 3 < argc) {
+      posLy.x = std::atof(argv[++i]);
+      posLy.y = std::atof(argv[++i]);
+      posLy.z = std::atof(argv[++i]);
+    } else if (a == "--radius" && i + 1 < argc) {
+      radiusLy = std::atof(argv[++i]);
+    } else if (a == "--limit" && i + 1 < argc) {
+      limit = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
     } else {
-      std::cerr << "Unknown option: " << arg << "\n";
+      std::cerr << "Unknown arg: " << a << "\n";
       printHelp();
-      return 2;
+      return 1;
     }
   }
 
-  stellar::sim::Universe universe(cfg);
+  sim::Universe u(seed);
 
-  if (list) {
-    for (std::size_t i = 0; i < cfg.systemCountHint; ++i) {
-      const auto sys = universe.system(i);
-      printSystemSummary(i, *sys);
+  const auto systems = u.queryNearby(posLy, radiusLy, limit);
+
+  std::cout << "Seed: " << seed << "\n";
+  std::cout << "Query @ (" << posLy.x << "," << posLy.y << "," << posLy.z << ") radius=" << radiusLy << " ly\n";
+  std::cout << "Found " << systems.size() << " systems\n\n";
+
+  for (const auto& s : systems) {
+    const math::Vec3d d = s.posLy - posLy;
+    const double dist = std::sqrt(d.lengthSq());
+
+    std::cout << std::setw(14) << s.id
+              << "  " << std::setw(14) << s.name
+              << "  class=" << starClassName(s.primaryClass)
+              << "  dist=" << std::fixed << std::setprecision(2) << dist << " ly"
+              << "  planets=" << s.planetCount
+              << "  stations=" << s.stationCount
+              << "  faction=" << s.factionId
+              << "\n";
+  }
+
+  if (!systems.empty()) {
+    std::cout << "\n--- Example system detail: " << systems.front().name << " ---\n";
+    const auto& sys = u.getSystem(systems.front().id, &systems.front());
+    std::cout << "Star mass=" << sys.star.massSol << " Sol, lum=" << sys.star.luminositySol << " Sol\n";
+    std::cout << "Planets:\n";
+    for (const auto& p : sys.planets) {
+      std::cout << "  - " << p.name
+                << " a=" << p.orbit.semiMajorAxisAU << " AU"
+                << " e=" << p.orbit.eccentricity
+                << " period=" << p.orbit.periodDays << " days\n";
     }
-  }
-
-  if (pick) {
-    const auto sys = universe.system(*pick);
-    printSystemDetails(*sys, timeDays);
-  }
-
-  if (!list && !pick) {
-    // Default behavior: print the first system.
-    const auto sys = universe.system(0);
-    printSystemDetails(*sys, timeDays);
+    std::cout << "Stations:\n";
+    for (const auto& st : sys.stations) {
+      std::cout << "  - " << st.name << " (fee=" << st.feeRate << ")\n";
+    }
   }
 
   return 0;

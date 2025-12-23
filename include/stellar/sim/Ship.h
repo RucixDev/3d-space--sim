@@ -1,48 +1,86 @@
 #pragma once
 
+#include "stellar/math/Quat.h"
 #include "stellar/math/Vec3.h"
 
 namespace stellar::sim {
 
-// Input state for a simple 6DOF-ish ship model.
-// Thrust values are expected to be in [-1, 1].
-struct ShipControls {
-  double thrustForward = 0.0; // + forward, - backward
-  double thrustRight = 0.0;   // + right, - left
-  double thrustUp = 0.0;      // + up, - down
+// Units for ship dynamics:
+// - position: km (kilometers) in local system frame
+// - linear velocity: km/s
+// - angular velocity: rad/s
+struct ShipInput {
+  // Translation thruster intent in body-local axes:
+  //  X = right, Y = up, Z = forward
+  // Range typically [-1,1].
+  math::Vec3d thrustLocal{0,0,0};
 
-  // Mouse/keyboard look deltas in degrees (applied this frame)
-  double yawDeltaDeg = 0.0;
-  double pitchDeltaDeg = 0.0;
+  // Rotation thruster intent in body-local axes (pitch/yaw/roll):
+  //  X = pitch (nose up positive), Y = yaw (turn right positive), Z = roll (right wing down positive)
+  // Range typically [-1,1].
+  math::Vec3d torqueLocal{0,0,0};
 
-  bool brake = false;
-  bool boost = false;
+  bool boost{false};
+  bool brake{false};
+  bool dampers{true};
 };
 
-// Lightweight player ship state.
-// Units:
-// - positionAU: AU
-// - velocityAUPerDay: AU/day
-struct Ship {
-  stellar::math::Vec3d positionAU{0.0, 0.0, 5.0};
-  stellar::math::Vec3d velocityAUPerDay{0.0, 0.0, 0.0};
+class Ship {
+public:
+  Ship();
 
-  double yawDeg = 0.0;
-  double pitchDeg = 0.0;
+  // State
+  math::Vec3d positionKm() const { return posKm_; }
+  math::Vec3d velocityKmS() const { return velKmS_; }
+  math::Quatd orientation() const { return orient_; }
+  math::Vec3d angularVelocityRadS() const { return angVelRadS_; }
 
-  // Tuning
-  double maxAccelAUPerDay2 = 25.0;
-  double boostAccelAUPerDay2 = 75.0;
-  double maxSpeedAUPerDay = 8.0;
-  double brakeStrengthPerSecond = 3.0;
+  void setPositionKm(const math::Vec3d& p) { posKm_ = p; }
+  void setVelocityKmS(const math::Vec3d& v) { velKmS_ = v; }
+  void setOrientation(const math::Quatd& q) { orient_ = q.normalized(); }
+  void setAngularVelocityRadS(const math::Vec3d& w) { angVelRadS_ = w; }
 
-  // Orientation basis vectors in world space
-  stellar::math::Vec3d forward() const;
-  stellar::math::Vec3d right() const;
-  stellar::math::Vec3d up() const;
+  // Params
+  double massKg() const { return massKg_; }
+  math::Vec3d inertiaDiagKgKm2() const { return inertiaDiagKgKm2_; }
 
-  // Integrate ship state.
-  void step(const ShipControls& c, double dtSeconds);
+  void setMassKg(double m) { massKg_ = m; }
+  void setInertiaDiagKgKm2(const math::Vec3d& i) { inertiaDiagKgKm2_ = i; }
+
+  // Thruster limits (force in kN translated into km/s^2 via mass)
+  void setMaxLinearAccelKmS2(double a) { maxLinAccelKmS2_ = a; }
+  void setMaxAngularAccelRadS2(double a) { maxAngAccelRadS2_ = a; }
+
+  void setDampingLinear(double d) { dampingLinear_ = d; }     // per-second
+  void setDampingAngular(double d) { dampingAngular_ = d; }   // per-second
+
+  // Update physics
+  void step(double dtSeconds, const ShipInput& input);
+
+  // Convenience vectors in world space
+  math::Vec3d forward() const { return orient_.rotate({0,0,1}); }
+  math::Vec3d right() const { return orient_.rotate({1,0,0}); }
+  math::Vec3d up() const { return orient_.rotate({0,1,0}); }
+
+private:
+  // Mass properties
+  double massKg_{1.0e5}; // 100t
+  // For simplicity: diagonal inertia in (kg*km^2) (km to keep magnitudes reasonable).
+  math::Vec3d inertiaDiagKgKm2_{ 2.0e4, 2.0e4, 3.0e4 };
+
+  // Limits
+  double maxLinAccelKmS2_{0.05};     // km/s^2 (~50 m/s^2) (arcade-ish but usable)
+  double maxAngAccelRadS2_{0.8};     // rad/s^2
+
+  // Dampers (simple exponential decay)
+  double dampingLinear_{0.15};       // 1/s
+  double dampingAngular_{0.25};      // 1/s
+
+  // State
+  math::Vec3d posKm_{0,0,0};
+  math::Vec3d velKmS_{0,0,0};
+  math::Quatd orient_{1,0,0,0};
+  math::Vec3d angVelRadS_{0,0,0};
 };
 
 } // namespace stellar::sim

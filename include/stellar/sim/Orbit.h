@@ -1,27 +1,17 @@
 #pragma once
 
 #include "stellar/math/Vec3.h"
+#include "stellar/sim/Celestial.h"
 
 namespace stellar::sim {
 
-// Simple Keplerian orbit (two-body) for procedural solar system simulation.
-// Units:
-// - semiMajorAxisAU: AU
-// - orbitalPeriodDays: days
-// - angles: degrees
-struct Orbit {
-  double semiMajorAxisAU = 1.0;
-  double eccentricity = 0.0;
+// Solve Kepler's equation for eccentric anomaly E given mean anomaly M and eccentricity e.
+double solveKepler(double meanAnomalyRad, double eccentricity, int iterations = 8);
 
-  double inclinationDeg = 0.0;              // i
-  double longitudeAscendingNodeDeg = 0.0;   // Ω
-  double argumentPeriapsisDeg = 0.0;        // ω
-  double meanAnomalyAtEpochDeg = 0.0;       // M0 at t=0
+// Position in orbital plane (AU) at a given time in days.
+math::Vec3d orbitPositionAU(const OrbitElements& el, double timeDays);
 
-  double orbitalPeriodDays = 365.25;
-
-  // Returns position in AU relative to the primary body.
-  stellar::math::Vec3d positionAU(double daysSinceEpoch) const;
-};
+// Full 3D position (AU) with inclination, node, argument of periapsis applied.
+math::Vec3d orbitPosition3DAU(const OrbitElements& el, double timeDays);
 
 } // namespace stellar::sim

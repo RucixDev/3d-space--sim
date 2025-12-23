@@ -4,17 +4,16 @@
 
 namespace stellar::proc {
 
-// Deterministic 2D value noise and fBm (fractal brownian motion) helpers.
-// Useful for later: terrain, gas giant bands, nebula density fields, etc.
+// 2D/3D value noise helpers for procedural fields.
+// This is intentionally tiny; replace with Perlin/Simplex later if needed.
 
-// Lattice noise at integer coordinates, returns [0,1).
-double valueNoise2D(int x, int y, stellar::core::u64 seed);
+double valueNoise2D(core::u64 seed, int x, int y);
+double valueNoise3D(core::u64 seed, int x, int y, int z);
 
-// Continuous value noise at real coordinates, returns ~[0,1).
-double valueNoise2D(double x, double y, stellar::core::u64 seed);
+// Smooth value noise sampled at fractional coordinates.
+double smoothNoise2D(core::u64 seed, double x, double y);
 
-// Fractal brownian motion: sum of multiple octaves of value noise.
-double fbm2D(double x, double y, stellar::core::u64 seed,
-            int octaves = 5, double lacunarity = 2.0, double gain = 0.5);
+// Fractional Brownian motion (fBm) using smoothNoise2D.
+double fbm2D(core::u64 seed, double x, double y, int octaves = 5, double lacunarity = 2.0, double gain = 0.5);
 
 } // namespace stellar::proc

@@ -1,145 +1,161 @@
 #include "stellar/sim/SaveGame.h"
 
-#include "stellar/sim/Market.h"
+#include "stellar/core/Log.h"
 
-#include <charconv>
-#include <cstddef>
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
-#include <string_view>
-#include <system_error>
-#include <type_traits>
 
 namespace stellar::sim {
-namespace {
 
-std::string trim(std::string s) {
-  auto isSpace = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
-  while (!s.empty() && isSpace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-  while (!s.empty() && isSpace(static_cast<unsigned char>(s.back()))) s.pop_back();
-  return s;
-}
-
-template <typename T>
-bool parseInt(std::string_view s, T& out) {
-  static_assert(std::is_integral_v<T>);
-  const char* first = s.data();
-  const char* last = s.data() + s.size();
-  auto [ptr, ec] = std::from_chars(first, last, out);
-  return ec == std::errc{} && ptr == last;
-}
-
-bool parseDouble(std::string_view s, double& out) {
-  std::string tmp(s);
-  char* end = nullptr;
-  out = std::strtod(tmp.c_str(), &end);
-  return end && end == tmp.c_str() + tmp.size();
-}
-
-bool parseVec3(std::string_view s, stellar::math::Vec3d& out) {
-  // Expect x,y,z
-  const std::string tmp(s);
-  std::istringstream iss(tmp);
-  char comma1 = 0;
-  char comma2 = 0;
-  double x = 0.0, y = 0.0, z = 0.0;
-  if (!(iss >> x)) return false;
-  if (!(iss >> comma1) || comma1 != ',') return false;
-  if (!(iss >> y)) return false;
-  if (!(iss >> comma2) || comma2 != ',') return false;
-  if (!(iss >> z)) return false;
-  out = {x, y, z};
-  return true;
-}
-
-std::string vec3ToString(const stellar::math::Vec3d& v) {
-  std::ostringstream oss;
-  oss << v.x << "," << v.y << "," << v.z;
-  return oss.str();
-}
-
-}
-
-bool writeSave(const SaveGame& save, const std::filesystem::path& path, std::string* outError) {
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    if (outError) *outError = "Failed to open save file for writing: " + path.string();
+bool saveToFile(const SaveGame& s, const std::string& path) {
+  std::ofstream f(path, std::ios::out | std::ios::trunc);
+  if (!f) {
+    stellar::core::log(stellar::core::LogLevel::Error, "SaveGame: failed to open file for writing: " + path);
     return false;
   }
 
-  out << "version=" << save.version << "\n";
-  out << "universe_seed=" << save.universeSeed << "\n";
-  out << "system_index=" << save.currentSystemIndex << "\n";
-  out << "sim_time_days=" << save.simTimeDays << "\n";
-  out << "ship.pos_au=" << vec3ToString(save.ship.positionAU) << "\n";
-  out << "ship.vel_au_per_day=" << vec3ToString(save.ship.velocityAUPerDay) << "\n";
-  out << "ship.yaw_deg=" << save.ship.yawDeg << "\n";
-  out << "ship.pitch_deg=" << save.ship.pitchDeg << "\n";
-  out << "credits=" << save.credits << "\n";
-  out << "selected_commodity=" << save.selectedCommodity << "\n";
+  f.setf(std::ios::fixed);
+  f.precision(8);
 
-  for (std::size_t i = 0; i < kCommodityCount; ++i) {
-    const auto c = static_cast<Commodity>(i);
-    out << "cargo." << commodityKey(c) << "=" << save.cargo.units[i] << "\n";
+  f << "StellarForgeSave " << s.version << "\n";
+  f << "seed " << s.seed << "\n";
+  f << "timeDays " << s.timeDays << "\n";
+  f << "currentSystem " << s.currentSystem << "\n";
+  f << "dockedStation " << s.dockedStation << "\n";
+
+  f << "shipPosKm " << s.shipPosKm.x << " " << s.shipPosKm.y << " " << s.shipPosKm.z << "\n";
+  f << "shipVelKmS " << s.shipVelKmS.x << " " << s.shipVelKmS.y << " " << s.shipVelKmS.z << "\n";
+  f << "shipOrient " << s.shipOrient.w << " " << s.shipOrient.x << " " << s.shipOrient.y << " " << s.shipOrient.z << "\n";
+  f << "shipAngVel " << s.shipAngVelRadS.x << " " << s.shipAngVelRadS.y << " " << s.shipAngVelRadS.z << "\n";
+
+  f << "credits " << s.credits << "\n";
+
+  f << "cargo";
+  for (double u : s.cargo) f << " " << u;
+  f << "\n";
+
+  f << "station_overrides " << s.stationOverrides.size() << "\n";
+  for (const auto& ov : s.stationOverrides) {
+    f << "station " << ov.stationId << "\n";
+    f << "lastUpdateDay " << ov.state.lastUpdateDay << "\n";
+    f << "lastSampleDay " << ov.state.lastSampleDay << "\n";
+
+    f << "inventory";
+    for (double v : ov.state.inventory) f << " " << v;
+    f << "\n";
+
+    // history per commodity
+    for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+      const auto& hist = ov.state.history[i];
+      f << "history " << i << " " << hist.size();
+      for (const auto& p : hist) f << " " << p.day << " " << p.price;
+      f << "\n";
+    }
+
+    f << "endstation\n";
   }
 
   return true;
 }
 
-std::optional<SaveGame> readSave(const std::filesystem::path& path, std::string* outError) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    if (outError) *outError = "Failed to open save file for reading: " + path.string();
-    return std::nullopt;
+static bool expectToken(std::istream& in, const char* tok) {
+  std::string s;
+  if (!(in >> s)) return false;
+  return s == tok;
+}
+
+bool loadFromFile(const std::string& path, SaveGame& out) {
+  std::ifstream f(path);
+  if (!f) {
+    stellar::core::log(stellar::core::LogLevel::Warn, "SaveGame: file not found: " + path);
+    return false;
   }
 
-  SaveGame save;
+  std::string header;
+  if (!(f >> header)) return false;
+  if (header != "StellarForgeSave") {
+    stellar::core::log(stellar::core::LogLevel::Error, "SaveGame: bad header");
+    return false;
+  }
 
-  std::string line;
-  while (std::getline(in, line)) {
-    line = trim(line);
-    if (line.empty() || line[0] == '#') continue;
+  int version = 0;
+  if (!(f >> version)) return false;
+  out = SaveGame{};
+  out.version = version;
 
-    const auto eq = line.find('=');
-    if (eq == std::string::npos) continue;
-
-    const std::string key = trim(line.substr(0, eq));
-    const std::string val = trim(line.substr(eq + 1));
-
-    if (key == "version") {
-      parseInt(val, save.version);
-    } else if (key == "universe_seed") {
-      parseInt(val, save.universeSeed);
-    } else if (key == "system_index") {
-      parseInt(val, save.currentSystemIndex);
-    } else if (key == "sim_time_days") {
-      parseDouble(val, save.simTimeDays);
-    } else if (key == "ship.pos_au") {
-      parseVec3(val, save.ship.positionAU);
-    } else if (key == "ship.vel_au_per_day") {
-      parseVec3(val, save.ship.velocityAUPerDay);
-    } else if (key == "ship.yaw_deg") {
-      parseDouble(val, save.ship.yawDeg);
-    } else if (key == "ship.pitch_deg") {
-      parseDouble(val, save.ship.pitchDeg);
+  std::string key;
+  while (f >> key) {
+    if (key == "seed") {
+      f >> out.seed;
+    } else if (key == "timeDays") {
+      f >> out.timeDays;
+    } else if (key == "currentSystem") {
+      f >> out.currentSystem;
+    } else if (key == "dockedStation") {
+      f >> out.dockedStation;
+    } else if (key == "shipPosKm") {
+      f >> out.shipPosKm.x >> out.shipPosKm.y >> out.shipPosKm.z;
+    } else if (key == "shipVelKmS") {
+      f >> out.shipVelKmS.x >> out.shipVelKmS.y >> out.shipVelKmS.z;
+    } else if (key == "shipOrient") {
+      f >> out.shipOrient.w >> out.shipOrient.x >> out.shipOrient.y >> out.shipOrient.z;
+    } else if (key == "shipAngVel") {
+      f >> out.shipAngVelRadS.x >> out.shipAngVelRadS.y >> out.shipAngVelRadS.z;
     } else if (key == "credits") {
-      parseDouble(val, save.credits);
-    } else if (key == "selected_commodity") {
-      parseInt(val, save.selectedCommodity);
-    } else if (key.rfind("cargo.", 0) == 0) {
-      const auto commodityStr = key.substr(6);
-      for (std::size_t i = 0; i < kCommodityCount; ++i) {
-        const auto c = static_cast<Commodity>(i);
-        if (commodityStr == commodityKey(c)) {
-          parseInt(val, save.cargo.units[i]);
-          break;
+      f >> out.credits;
+    } else if (key == "cargo") {
+      for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
+    } else if (key == "station_overrides") {
+      std::size_t n = 0;
+      f >> n;
+      out.stationOverrides.clear();
+      out.stationOverrides.reserve(n);
+
+      for (std::size_t si = 0; si < n; ++si) {
+        StationEconomyOverride ov{};
+        if (!expectToken(f, "station")) return false;
+        f >> ov.stationId;
+
+        // Parse station block until endstation
+        std::string sk;
+        while (f >> sk) {
+          if (sk == "endstation") break;
+          if (sk == "lastUpdateDay") {
+            f >> ov.state.lastUpdateDay;
+          } else if (sk == "lastSampleDay") {
+            f >> ov.state.lastSampleDay;
+          } else if (sk == "inventory") {
+            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> ov.state.inventory[i];
+          } else if (sk == "history") {
+            std::size_t cid = 0;
+            std::size_t count = 0;
+            f >> cid >> count;
+            if (cid >= econ::kCommodityCount) return false;
+            auto& hist = ov.state.history[cid];
+            hist.clear();
+            hist.reserve(count);
+            for (std::size_t j = 0; j < count; ++j) {
+              econ::PricePoint p{};
+              f >> p.day >> p.price;
+              hist.push_back(p);
+            }
+          } else {
+            // Unknown token: attempt to skip line
+            std::string line;
+            std::getline(f, line);
+          }
         }
+
+        out.stationOverrides.push_back(std::move(ov));
       }
+    } else {
+      // Unknown key: skip rest of line
+      std::string line;
+      std::getline(f, line);
     }
   }
 
-  return save;
+  return true;
 }
 
 } // namespace stellar::sim

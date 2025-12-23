@@ -1,38 +1,44 @@
 #pragma once
 
-#include "stellar/core/Types.h"
+#include "stellar/econ/Economy.h"
+#include "stellar/math/Quat.h"
 #include "stellar/math/Vec3.h"
-#include "stellar/sim/Market.h"
+#include "stellar/sim/Celestial.h"
 
-#include <filesystem>
-#include <optional>
+#include <array>
 #include <string>
+#include <vector>
 
 namespace stellar::sim {
 
-struct ShipState {
-  stellar::math::Vec3d positionAU{0.0, 0.0, 5.0};
-  stellar::math::Vec3d velocityAUPerDay{0.0, 0.0, 0.0};
-  double yawDeg = 0.0;
-  double pitchDeg = 0.0;
+struct StationEconomyOverride {
+  StationId stationId{0};
+  econ::StationEconomyState state{};
 };
 
 struct SaveGame {
-  int version = 1;
+  int version{1};
 
-  stellar::core::u64 universeSeed = 1;
-  std::size_t currentSystemIndex = 0;
-  double simTimeDays = 0.0;
+  core::u64 seed{0};
+  double timeDays{0.0};
 
-  ShipState ship;
+  SystemId currentSystem{0};
+  StationId dockedStation{0};
 
-  double credits = 1000.0;
-  CargoHold cargo;
+  // Player ship
+  math::Vec3d shipPosKm{0,0,0};
+  math::Vec3d shipVelKmS{0,0,0};
+  math::Quatd shipOrient{1,0,0,0};
+  math::Vec3d shipAngVelRadS{0,0,0};
 
-  std::size_t selectedCommodity = 0;
+  // Economy
+  double credits{1000.0};
+  std::array<double, econ::kCommodityCount> cargo{}; // units
+
+  std::vector<StationEconomyOverride> stationOverrides{};
 };
 
-bool writeSave(const SaveGame& save, const std::filesystem::path& path, std::string* outError = nullptr);
-std::optional<SaveGame> readSave(const std::filesystem::path& path, std::string* outError = nullptr);
+bool saveToFile(const SaveGame& s, const std::string& path);
+bool loadFromFile(const std::string& path, SaveGame& out);
 
 } // namespace stellar::sim

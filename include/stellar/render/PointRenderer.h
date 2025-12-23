@@ -1,43 +1,37 @@
 #pragma once
 
-#include "stellar/math/Mat4.h"
-#include "stellar/render/Gl.h"
 #include "stellar/render/Shader.h"
 
-#include <span>
-#include <string>
+#include <vector>
 
 namespace stellar::render {
 
 struct PointVertex {
-  float px = 0.0f;
-  float py = 0.0f;
-  float pz = 0.0f;
-
-  float r = 1.0f;
-  float g = 1.0f;
-  float b = 1.0f;
-
-  float size = 4.0f;
+  float px, py, pz;
+  float cr, cg, cb;
+  float size;
 };
 
 class PointRenderer {
 public:
+  PointRenderer() = default;
+  ~PointRenderer();
+
+  PointRenderer(const PointRenderer&) = delete;
+  PointRenderer& operator=(const PointRenderer&) = delete;
+
   bool init(std::string* outError = nullptr);
-  void shutdown();
 
-  void resize(int width, int height);
-
-  void beginFrame(float clearR, float clearG, float clearB, float clearA = 1.0f);
-  void drawPoints(std::span<const PointVertex> pts, const stellar::math::Mat4f& viewProj);
+  void setViewProj(const float* view, const float* proj);
+  void drawPoints(const std::vector<PointVertex>& points);
 
 private:
-  ShaderProgram m_program;
-  gl::GLuint m_vao = 0;
-  gl::GLuint m_vbo = 0;
-  gl::GLint m_uVP = -1;
-  int m_width = 1;
-  int m_height = 1;
+  ShaderProgram shader_{};
+  unsigned int vao_{0};
+  unsigned int vbo_{0};
+
+  float view_[16]{};
+  float proj_[16]{};
 };
 
 } // namespace stellar::render

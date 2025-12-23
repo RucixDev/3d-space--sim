@@ -1,19 +1,21 @@
 #include <iostream>
 
 int test_orbit();
-int test_proc();
+int test_streaming();
+int test_economy();
 
 int main() {
-  int failures = 0;
+  int fails = 0;
 
-  failures += test_orbit();
-  failures += test_proc();
+  fails += test_orbit();
+  fails += test_streaming();
+  fails += test_economy();
 
-  if (failures == 0) {
-    std::cout << "[stellar_tests] All tests passed.\n";
+  if (fails == 0) {
+    std::cout << "[stellar_tests] ALL PASS\n";
     return 0;
   }
 
-  std::cerr << "[stellar_tests] Failures: " << failures << "\n";
+  std::cerr << "[stellar_tests] FAILS=" << fails << "\n";
   return 1;
 }
