@@ -57,11 +57,12 @@ public:
   void setDampingLinear(double d) { dampingLinear_ = d; }     // per-second
   void setDampingAngular(double d) { dampingAngular_ = d; }   // per-second
 
-  double dampingLinear() const { return dampingLinear_; }
-  double dampingAngular() const { return dampingAngular_; }
-
   // Update physics
   void step(double dtSeconds, const ShipInput& input);
+
+  // Only update angular state (orientation + angular velocity) without changing
+  // linear position/velocity. Useful for simplified flight models like supercruise.
+  void stepAngularOnly(double dtSeconds, const ShipInput& input);
 
   // Convenience vectors in world space
   math::Vec3d forward() const { return orient_.rotate({0,0,1}); }

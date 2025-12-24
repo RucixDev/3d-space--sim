@@ -15,39 +15,25 @@ struct Station {
   double feeRate{0.0};          // market fee rate (0..1)
   econ::StationEconomyModel economyModel{};
 
-  // Physical orbit around the system primary (origin).
-  // Units: AU for orbit elements, days for period/epoch.
+  // In-system physical placement (simple Keplerian orbit around the primary star).
+  // Units:
+  //  - orbit.semiMajorAxisAU: AU
+  //  - angles: radians
+  //  - orbit.periodDays: days
   OrbitElements orbit{};
 
-  // Visual scale hint (km). Gameplay currently treats stations as points, but this
-  // can be used for rendering and safe-zone logic.
-  double radiusKm{5.0};
+  // Physical size (used for simple collision / docking distances).
+  double radiusKm{6.0};
 
-  // Docking/traffic control parameters.
-  struct Docking {
-    // Range in which docking clearance can be requested.
-    double commsRangeKm{25.0};
+  // Docking / approach corridor parameters (local frame defined by station position
+  // and the star at the origin; corridor axis points away from the star).
+  double corridorLengthKm{120.0};
+  double corridorRadiusKm{25.0};
+  double corridorSpeedLimitKmS{0.12};
+  double corridorAlignCos{0.90};
 
-    // Approach corridor: cylinder from the docking port outward.
-    // Corridor axis points away from the star (radial) at the station's position.
-    double corridorLengthKm{50.0};
-    double corridorRadiusKm{8.0};
-
-    // Must be within this distance (km) to complete docking.
-    double dockRangeKm{1.5};
-
-    // Relative speed cap (km/s) to dock.
-    double speedLimitKmS{0.25};
-
-    // Minimum alignment with docking axis to dock. (1.0 = perfect)
-    double alignCosMin{0.95};
-
-    // Clearance timer (minutes) once granted.
-    double clearanceDurationMin{10.0};
-
-    // Cooldown after a denial (seconds).
-    double deniedCooldownSec{60.0};
-  } docking{};
+  // Comms range required to request docking.
+  double commsRangeKm{2500.0};
 };
 
 struct StarSystem {

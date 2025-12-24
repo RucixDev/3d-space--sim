@@ -4,6 +4,7 @@
 #include "stellar/math/Quat.h"
 #include "stellar/math/Vec3.h"
 #include "stellar/sim/Celestial.h"
+#include "stellar/sim/Mission.h"
 
 #include <array>
 #include <string>
@@ -17,7 +18,7 @@ struct StationEconomyOverride {
 };
 
 struct SaveGame {
-  int version{1};
+  int version{2};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -34,6 +35,21 @@ struct SaveGame {
   // Economy
   double credits{1000.0};
   std::array<double, econ::kCommodityCount> cargo{}; // units
+
+  // Player state / progression
+  double hull{100.0};
+  double hullMax{100.0};
+
+  double fuel{20.0};
+  double fuelMax{20.0};
+
+  double cargoCapacity{120.0}; // simple capacity in "units"
+
+  // FSD / hyperspace
+  double fsdCooldownSec{0.0};
+
+  // Active missions
+  std::vector<Mission> missions{};
 
   std::vector<StationEconomyOverride> stationOverrides{};
 };

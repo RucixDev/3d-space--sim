@@ -34,6 +34,30 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   for (double u : s.cargo) f << " " << u;
   f << "\n";
 
+  // Player state / progression
+  f << "hull " << s.hull << " " << s.hullMax << "\n";
+  f << "fuel " << s.fuel << " " << s.fuelMax << "\n";
+  f << "cargoCapacity " << s.cargoCapacity << "\n";
+  f << "fsdCooldownSec " << s.fsdCooldownSec << "\n";
+
+  // Missions
+  f << "missions " << s.missions.size() << "\n";
+  for (const auto& m : s.missions) {
+    f << "mission "
+      << m.id << " "
+      << static_cast<int>(m.type) << " "
+      << m.originSystem << " "
+      << m.originStation << " "
+      << m.destSystem << " "
+      << m.destStation << " "
+      << static_cast<int>(m.commodity) << " "
+      << m.units << " "
+      << (m.scanned ? 1 : 0) << " "
+      << m.rewardCredits << " "
+      << m.expiryDay
+      << "\n";
+  }
+
   f << "station_overrides " << s.stationOverrides.size() << "\n";
   for (const auto& ov : s.stationOverrides) {
     f << "station " << ov.stationId << "\n";
@@ -105,6 +129,33 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.credits;
     } else if (key == "cargo") {
       for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
+    } else if (key == "hull") {
+      f >> out.hull >> out.hullMax;
+    } else if (key == "fuel") {
+      f >> out.fuel >> out.fuelMax;
+    } else if (key == "cargoCapacity") {
+      f >> out.cargoCapacity;
+    } else if (key == "fsdCooldownSec") {
+      f >> out.fsdCooldownSec;
+    } else if (key == "missions") {
+      std::size_t n = 0;
+      f >> n;
+      out.missions.clear();
+      out.missions.reserve(n);
+
+      for (std::size_t i = 0; i < n; ++i) {
+        if (!expectToken(f, "mission")) return false;
+        Mission m{};
+        int type = 0;
+        int comm = 0;
+        int scanned = 0;
+        f >> m.id >> type >> m.originSystem >> m.originStation >> m.destSystem >> m.destStation;
+        f >> comm >> m.units >> scanned >> m.rewardCredits >> m.expiryDay;
+        m.type = static_cast<MissionType>(type);
+        m.commodity = static_cast<econ::CommodityId>(comm);
+        m.scanned = (scanned != 0);
+        out.missions.push_back(std::move(m));
+      }
     } else if (key == "station_overrides") {
       std::size_t n = 0;
       f >> n;

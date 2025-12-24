@@ -21,27 +21,14 @@ It’s inspired by the *kind* of open-ended space adventure pioneered by games l
 New in this build:
 
 - **Streaming universe**: systems are generated **on-demand** (infinite indices) with an **LRU cache**
-- **Renderer layer**: a minimal OpenGL point renderer (GL function loading via SDL's `SDL_GL_GetProcAddress`)
-- **Player ship**: flight model + navigation modes (**normal flight / supercruise / docked**)
-- **Targeting / nav**: select a **station or planet** as a navigation target (HUD marker)
-- **Supercruise**: high-speed travel mode with simplified physics
-- **Supercruise assist**: optional **"7-second" approach throttle hold** + **auto-drop** near target
-- **Docking**: station approach corridor + speed limit + alignment requirement
-- **Docking clearance**: **request docking** (not always granted; must be within range)
-- **Approach autopilot**: station approach autopilot that lines you up with the corridor and respects limits
-- **Time compression UX**: PageUp/PageDown time acceleration with safety clamps (CTRL to force)
-- **Factions + markets**: deterministic faction generation + per-system market generation
-- **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
-
-Gameplay / UX additions (Elite/Pioneer-style progression):
-
-- **Targeting system**: select a **station or planet** as your nav target (HUD marker)
-- **Supercruise**: a high-speed travel mode with simplified physics
-  - Optional **Supercruise Assist**: **7-second-rule** style auto-throttle + auto-drop
-- **Docking approach corridor**: visual corridor line + corridor constraints
-- **Approach autopilot**: holds corridor + respects speed limit (when a station is targeted)
-- **Request docking clearance**: docking is not always allowed; you must request permission
-- **Time compression hotkeys** with safety clamps (hold CTRL to force)
+- **Renderer layer**: a minimal OpenGL instanced mesh renderer + line/point renderers (GL function loading via SDL's `SDL_GL_GetProcAddress`)
+- **Player ship**: input + 6DOF physics + optional approach autopilot
+- **In-system travel**: time warp hotkeys + a basic **supercruise** mode with **7-second rule** assist
+- **Docking loop**: request docking clearance, approach corridor guidance, speed limit & alignment checks
+- **FSD / hyperspace**: jump between systems (fuel + cooldown) and arrive near a chosen destination station
+- **Station gameplay**: services (repairs/refuel) + market gated by docking/fees + simple shipyard upgrades
+- **Missions**: courier, delivery, and bounty-scan style missions to drive progression
+- **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo + station economy overrides + mission log
 
 ## Build
 
@@ -56,7 +43,7 @@ By default the project builds:
 ### Linux / macOS
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build --parallel
 ./build/apps/stellar_sandbox/stellar_sandbox --help
 ```
 
@@ -70,7 +57,7 @@ cmake --build build --config Release
 If you only want the headless library + sandbox/tests (no SDL/OpenGL), configure with:
 
 ```bash
-cmake -S . -B build -DSTELLAR_BUILD_GAME=OFF
+cmake -S . -B build -DSTELLAR_ENABLE_RENDER=OFF -DSTELLAR_ENABLE_IMGUI=OFF
 ```
 
 ## Run the sandbox
@@ -117,49 +104,26 @@ Then:
 ./build/apps/stellar_game/stellar_game
 ```
 
-### Controls (prototype)
-
-UI / windows:
-
-- **TAB**: toggle Galaxy window
-- **F1**: toggle Flight window
-- **F2**: toggle Economy window
-- **F3**: toggle Nav window
-- **F4**: toggle HUD overlay
-
-Flight:
-
-- **WASD + R/F**: translate (normal flight)
-- **Arrow keys**: pitch/yaw
-- **Q/E**: roll
-- **LShift**: boost
-- **X**: brake (normal) / throttle cut (supercruise)
-- **Z/C**: dampers on/off
-- **V**: camera toggle (chase/cockpit)
-
-Navigation:
-
-- **T**: cycle target (stations + planets)
-- **Y**: clear target
-- **P**: toggle **Approach Autopilot** (normal) / **Supercruise Assist** (supercruise)
-- **J**: toggle supercruise
-
-Docking:
-
-- **L**: request docking clearance (must be within range)
-- **G**: dock / undock
-
-Time / sim:
-
-- **PageUp / PageDown**: time compression
-- **Home**: 1x time
-- **End**: max time
-- Hold **CTRL** to force time compression beyond safety clamps
-- **Space**: pause
-- **F5**: save
-- **F9**: load
-
 The game will auto-load `savegame.txt` if present; press **F5** to save.
+
+### Key controls (prototype)
+
+- **W/S**: forward/back
+- **A/D**: strafe left/right
+- **Q/E**: down/up
+- **Z/X**: roll
+- **Right mouse (hold)**: mouse look
+- **P**: toggle approach autopilot (corridor + speed limit)
+- **L**: request docking clearance
+- **G**: dock / undock
+- **J**: toggle supercruise
+- **V**: toggle supercruise assist (7-second rule)
+- **T**: cycle nav targets (stations)
+- **K**: scan (for bounty-scan missions)
+- **[ / ]**: time warp down/up
+- **F1..F4**: toggle UI windows (HUD, Dock, Galaxy/FSD, Missions)
+- **F5**: save, **F9**: load
+- **H**: help overlay
 
 ## Next steps you can add easily
 

@@ -184,59 +184,83 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
     st.type = pickStationType(rng, bias);
     st.economyModel = econ::makeEconomyModel(st.type, bias);
 
-    // Place stations on simple low-eccentricity star orbits.
-    // Prefer parking them near an existing planet orbit so the system feels "lived in".
-    double aAU = 1.0;
+    // Place stations in a simple orbit around the primary star.
+    // We bias them near an existing planet orbit when possible.
+    double aStationAU = rng.range(0.35, 2.5);
     if (!sys.planets.empty()) {
-      const int pidx = (int)rng.range(0.0, (double)sys.planets.size());
-      aAU = sys.planets[(std::size_t)std::min(pidx, (int)sys.planets.size() - 1)].orbit.semiMajorAxisAU;
-      aAU *= rng.range(0.98, 1.03);
-    } else {
-      aAU = rng.range(0.6, 4.0);
+      const int pi = rng.range<int>(0, (int)sys.planets.size() - 1);
+      const double base = sys.planets[(std::size_t)pi].orbit.semiMajorAxisAU;
+      aStationAU = std::max(0.20, base + rng.range(-0.03, 0.03));
     }
 
-    st.orbit.semiMajorAxisAU = aAU;
-    st.orbit.eccentricity = rng.range(0.0, 0.02);
-    st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(2.0));
+    st.orbit.semiMajorAxisAU = aStationAU;
+    st.orbit.eccentricity = rng.range(0.0, 0.05);
+    st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(4.0));
     st.orbit.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
     st.orbit.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
     st.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
     st.orbit.epochDays = 0.0;
 
     // Kepler-ish: P(years)^2 = a(AU)^3 / M(star)
-    const double years = std::sqrt((aAU*aAU*aAU) / std::max(0.08, sys.star.massSol));
+    const double years = std::sqrt((aStationAU*aStationAU*aStationAU) / std::max(0.08, sys.star.massSol));
     st.orbit.periodDays = years * 365.25;
 
-    // Docking parameters by station type (tuned for "early playable" feel).
-    // Values are intentionally generous compared to real scales.
+    // Docking / size parameters by station type.
+    // Units: km, km/s
     switch (st.type) {
       case econ::StationType::Outpost:
-        st.radiusKm = 3.0;
-        st.docking.commsRangeKm = 22.0;
-        st.docking.corridorLengthKm = 45.0;
-        st.docking.corridorRadiusKm = 6.0;
-        st.docking.dockRangeKm = 1.2;
-        st.docking.speedLimitKmS = 0.22;
+        st.radiusKm = rng.range(4.0, 7.0);
+        st.corridorLengthKm = 90.0;
+        st.corridorRadiusKm = 22.0;
+        st.corridorSpeedLimitKmS = 0.10;
+        st.corridorAlignCos = 0.88;
+        st.commsRangeKm = 2200.0;
+        break;
+      case econ::StationType::Mining:
+      case econ::StationType::Refinery:
+        st.radiusKm = rng.range(6.0, 10.0);
+        st.corridorLengthKm = 120.0;
+        st.corridorRadiusKm = 26.0;
+        st.corridorSpeedLimitKmS = 0.11;
+        st.corridorAlignCos = 0.90;
+        st.commsRangeKm = 2600.0;
+        break;
+      case econ::StationType::Agricultural:
+      case econ::StationType::Industrial:
+        st.radiusKm = rng.range(7.0, 12.0);
+        st.corridorLengthKm = 140.0;
+        st.corridorRadiusKm = 30.0;
+        st.corridorSpeedLimitKmS = 0.12;
+        st.corridorAlignCos = 0.91;
+        st.commsRangeKm = 3000.0;
+        break;
+      case econ::StationType::Research:
+        st.radiusKm = rng.range(6.0, 10.0);
+        st.corridorLengthKm = 150.0;
+        st.corridorRadiusKm = 28.0;
+        st.corridorSpeedLimitKmS = 0.10;
+        st.corridorAlignCos = 0.92;
+        st.commsRangeKm = 3200.0;
         break;
       case econ::StationType::TradeHub:
+        st.radiusKm = rng.range(10.0, 16.0);
+        st.corridorLengthKm = 170.0;
+        st.corridorRadiusKm = 36.0;
+        st.corridorSpeedLimitKmS = 0.12;
+        st.corridorAlignCos = 0.91;
+        st.commsRangeKm = 3800.0;
+        break;
       case econ::StationType::Shipyard:
-        st.radiusKm = 8.0;
-        st.docking.commsRangeKm = 35.0;
-        st.docking.corridorLengthKm = 70.0;
-        st.docking.corridorRadiusKm = 10.0;
-        st.docking.dockRangeKm = 2.0;
-        st.docking.speedLimitKmS = 0.28;
+        st.radiusKm = rng.range(12.0, 20.0);
+        st.corridorLengthKm = 200.0;
+        st.corridorRadiusKm = 40.0;
+        st.corridorSpeedLimitKmS = 0.12;
+        st.corridorAlignCos = 0.92;
+        st.commsRangeKm = 4200.0;
         break;
       default:
-        st.radiusKm = 5.0;
-        st.docking.commsRangeKm = 28.0;
-        st.docking.corridorLengthKm = 55.0;
-        st.docking.corridorRadiusKm = 8.0;
-        st.docking.dockRangeKm = 1.5;
-        st.docking.speedLimitKmS = 0.25;
         break;
     }
-
     sys.stations.push_back(std::move(st));
   }
 
