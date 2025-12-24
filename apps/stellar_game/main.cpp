@@ -562,7 +562,11 @@ int main(int argc, char** argv) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
-  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  // Note: Docking is only available in Dear ImGui's "docking" branch.
+  // The project pins ImGui's mainline tag by default, so keep docking optional.
+  // (If you later switch to the docking branch, feel free to re-enable this.)
+  // io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   ImGui::StyleColorsDark();
 
   ImGui_ImplSDL2_InitForOpenGL(window, glContext);
@@ -638,6 +642,9 @@ int main(int argc, char** argv) {
   double fsdRangeLy = 18.0;
   double fsdReadyDay = 0.0;
 
+  // Heat (0..100). Kept intentionally simple for early gameplay feedback.
+  double heat = 0.0;
+
   // Missions + reputation
   core::u64 nextMissionId = 1;
   std::vector<sim::Mission> missions;
@@ -691,11 +698,12 @@ int main(int argc, char** argv) {
   double supercruiseMaxSpeedKmS = 18000.0;
 
   // FSD / hyperspace (system-to-system)
-  enum class FsdState { Idle, Charging, Travelling };
+  enum class FsdState { Idle, Charging, Jumping };
   FsdState fsdState = FsdState::Idle;
   sim::SystemId fsdTargetSystem{0};
   double fsdChargeRemainingSec = 0.0;
   double fsdTravelRemainingSec = 0.0;
+  double fsdTravelTotalSec = 0.0;
   double fsdFuelCost = 0.0;
   double fsdJumpDistanceLy = 0.0;
 
@@ -815,8 +823,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   const double kFsdFuelBase = 2.0;
   const double kFsdFuelPerLy = 0.5;
   const double kFsdChargeSec = 4.0;
+  const double kFsdCooldownSec = 25.0;
 
-  auto fsdBaseRangeLyNow = [&]() -> double {
+  auto fsdBaseRangeLy = [&]() -> double {
     const double cap = std::max(1.0, cargoCapacityKg);
     const double load = std::clamp(cargoMassKg(cargo) / cap, 0.0, 1.0);
     // Cargo load reduces effective range a bit (keeps hauling interesting).
@@ -829,7 +838,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   };
 
   auto fsdCurrentRangeLy = [&]() -> double {
-    return std::min(fsdBaseRangeLyNow(), fsdFuelLimitedRangeLy());
+    return std::min(fsdBaseRangeLy(), fsdFuelLimitedRangeLy());
   };
 
   auto fsdFuelCostFor = [&](double distanceLy) -> double {
@@ -889,7 +898,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     const sim::StarSystem& destSys = universe.getSystem(destId);
     const double distLy = (destSys.stub.posLy - currentSystem->stub.posLy).length();
 
-    const double rangeLy = fsdBaseRangeLyNow();
+    const double rangeLy = fsdBaseRangeLy();
     if (distLy > rangeLy + 1e-9) {
       toast(toasts, "Out of jump range (plot a multi-jump route).", 2.5);
       return;
@@ -907,6 +916,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     fsdFuelCost = fuelCost;
     fsdChargeRemainingSec = kFsdChargeSec;
     fsdTravelRemainingSec = 0.0;
+    fsdTravelTotalSec = 0.0;
     fsdState = FsdState::Charging;
 
     autopilot = false;
@@ -1138,14 +1148,15 @@ policeAlertUntilDays = 0.0;
                   const auto& p = currentSystem->planets[target.index];
                   scanLockedId = (core::u64)target.index;
                   scanDurationSec = 5.0;
-                  scanRangeKm = std::max(200000.0, p.radiusKm * 45.0);
+                  const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
+                  scanRangeKm = std::max(200000.0, rKm * 45.0);
                   scanLabel = "Planet scan: " + p.name;
                   ok = true;
                 } else if (target.kind == TargetKind::Star) {
                   scanLockedId = currentSystem->stub.id;
                   scanDurationSec = 2.5;
                   scanRangeKm = 1.0e18; // anywhere in-system for now
-                  scanLabel = std::string("Star scan: ") + starClassName(currentSystem->starClass);
+                  scanLabel = std::string("Star scan: ") + starClassName(currentSystem->star.cls);
                   ok = true;
                 }
 
@@ -1323,6 +1334,7 @@ if (event.key.keysym.sym == SDLK_y) {
           // Fire laser
           if (playerLaserCooldown <= 0.0 && !docked && fsdState == FsdState::Idle && !supercruise) {
             playerLaserCooldown = 0.18; // rate of fire
+            heat = std::min(120.0, heat + 2.5);
             const double rangeKm = 120000.0;
             const double dmg = 18.0;
 
@@ -1591,11 +1603,12 @@ if (bestIdx >= 0) {
         if (fsdChargeRemainingSec <= 0.0) {
           // Consume fuel at the moment we enter hyperspace.
           fuel = std::clamp(fuel - fsdFuelCost, 0.0, fuelMax);
-          fsdState = FsdState::Travelling;
-          fsdTravelRemainingSec = 1.25 + fsdJumpDistanceLy * 0.08;
+          fsdState = FsdState::Jumping;
+          fsdTravelTotalSec = 1.25 + fsdJumpDistanceLy * 0.08;
+          fsdTravelRemainingSec = fsdTravelTotalSec;
           toast(toasts, "FSD: entering hyperspace...", 1.8);
         }
-      } else if (fsdState == FsdState::Travelling) {
+      } else if (fsdState == FsdState::Jumping) {
         fsdTravelRemainingSec = std::max(0.0, fsdTravelRemainingSec - dtReal);
         if (fsdTravelRemainingSec <= 0.0) {
           const auto& nextSystem = universe.getSystem(fsdTargetSystem);
@@ -1621,7 +1634,7 @@ if (bestIdx >= 0) {
           galaxySelectedSystemId = currentSystem->stub.id;
 
           // Cooldown (sim time)
-          fsdReadyDay = timeDays + (25.0 / 86400.0);
+          fsdReadyDay = timeDays + (kFsdCooldownSec / 86400.0);
 
           // Advance route cursor if this jump matches the plotted route.
           if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && navRoute[navRouteHop + 1] == currentSystem->stub.id) {
@@ -1645,6 +1658,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           fsdTargetSystem = 0;
           fsdJumpDistanceLy = 0.0;
           fsdFuelCost = 0.0;
+          fsdTravelTotalSec = 0.0;
           fsdJustArrived = true;
         }
       }
@@ -2235,7 +2249,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
             if (p.type == sim::PlanetType::Ice) typeMul = 1.15;
             if (p.type == sim::PlanetType::GasGiant) typeMul = 1.45;
 
-            const double base = 240.0 + p.radiusKm * 0.03;
+            const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
+            const double base = 240.0 + radiusKm * 0.03;
             const double value = base * typeMul + (p.orbit.semiMajorAxisAU * 22.0);
             explorationDataCr += value;
 
@@ -2257,7 +2272,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         if (scannedKeys.find(key) == scannedKeys.end()) {
           scannedKeys.insert(key);
 
-          const double value = 220.0 + (double)currentSystem->starClass * 80.0;
+          const double value = 220.0 + (double)static_cast<int>(currentSystem->star.cls) * 80.0;
           explorationDataCr += value;
           completeScan("Star scan logged (+data " + std::to_string((int)value) + " cr).", 2.2);
         } else {
@@ -2309,6 +2324,27 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
   scanProgressSec = 0.0;
 }
 
+      // --- Heat model (real-time) ---
+      {
+        double heatIn = 0.0;
+        if (!docked) {
+          if (input.boost) heatIn += 18.0;
+          if (supercruise) heatIn += 6.0;
+          if (fsdState == FsdState::Charging) heatIn += 12.0;
+          if (fsdState == FsdState::Jumping) heatIn += 16.0;
+        }
+
+        const double coolRate = docked ? 20.0 : 10.0;
+        heat += (heatIn - coolRate) * dtReal;
+        heat = std::clamp(heat, 0.0, 120.0);
+
+        // Very simple overheat consequence for now: take slow hull damage.
+        if (heat > 100.0) {
+          const double over = heat - 100.0;
+          playerHull = std::max(0.0, playerHull - over * 0.08 * dtReal);
+        }
+      }
+
       timeDays += dtSim / 86400.0;
 
       // --- Mission deadlines / docked completion ---
@@ -2343,7 +2379,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
                 m.leg = 1;
                 toast(toasts, "Multi-hop delivery: leg 1/2 complete.", 2.5);
               } else if (atFinal && (m.viaSystem == 0 || m.leg >= 1)) {
-                const auto cid = (econ::CommodityId)m.commodity;
+                const econ::CommodityId cid = m.commodity;
                 const double have = cargo[(std::size_t)cid];
                 if (have + 1e-6 >= m.units) {
                   cargo[(std::size_t)cid] -= m.units;
@@ -2383,6 +2419,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
       fsdTargetSystem = 0;
       fsdChargeRemainingSec = 0.0;
       fsdTravelRemainingSec = 0.0;
+      fsdTravelTotalSec = 0.0;
       navAutoRun = false;
       beams.clear();
       contacts.clear();
@@ -2565,10 +2602,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
 
     // ---- UI ----
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplSDL2_NewFrame(window);
+    ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+    // DockSpace is only available in Dear ImGui's docking branch; keep UI
+    // functional without it (windows will simply be floating).
 
     // HUD overlay: target marker + crosshair + toasts
     {
@@ -2589,9 +2627,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         const auto& p = currentSystem->planets[target.index];
         tgtKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
         tgtLabel = p.name;
-} else if (target.kind == TargetKind::Star) {
-  tgtKm = math::Vec3d{0,0,0};
-  tgtLabel = std::string("Star ") + starClassName(currentSystem->starClass);
+      } else if (target.kind == TargetKind::Star) {
+        tgtKm = math::Vec3d{0,0,0};
+        tgtLabel = std::string("Star ") + starClassName(currentSystem->star.cls);
       } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
         const auto& c = contacts[target.index];
         if (c.alive) {
@@ -2651,11 +2689,35 @@ if (showShip) {
     ImGui::TextDisabled("K cancels scan.");
   }
 
-  if (fsdState != FsdState::Idle) {
-    ImGui::Separator();
-    ImGui::Text("FSD: %s", (fsdState == FsdState::Charging) ? "Charging" :
-                         (fsdState == FsdState::Jumping) ? "Jumping" : "Cooling");
-    ImGui::ProgressBar((float)(fsdTimer / fsdTotal), ImVec2(-1, 0));
+  // FSD status (Charging / Jumping / Cooling)
+  {
+    const bool cooling = (fsdState == FsdState::Idle && timeDays < fsdReadyDay);
+    if (fsdState != FsdState::Idle || cooling) {
+      ImGui::Separator();
+
+      const char* label = "Idle";
+      double timer = 0.0;
+      double total = 1.0;
+
+      if (fsdState == FsdState::Charging) {
+        label = "Charging";
+        total = kFsdChargeSec;
+        timer = std::clamp(total - fsdChargeRemainingSec, 0.0, total);
+      } else if (fsdState == FsdState::Jumping) {
+        label = "Jumping";
+        total = std::max(0.001, fsdTravelTotalSec);
+        timer = std::clamp(total - fsdTravelRemainingSec, 0.0, total);
+      } else {
+        // Cooldown uses simulated time.
+        label = "Cooling";
+        total = kFsdCooldownSec;
+        const double remain = std::max(0.0, (fsdReadyDay - timeDays) * 86400.0);
+        timer = std::clamp(total - remain, 0.0, total);
+      }
+
+      ImGui::Text("FSD: %s", label);
+      ImGui::ProgressBar((float)std::clamp(timer / total, 0.0, 1.0), ImVec2(-1, 0));
+    }
   }
 
   if (supercruise) {
@@ -2700,7 +2762,7 @@ if (showShip) {
     const auto& c = contacts[target.index];
     ImGui::Text("Target: %s [%s] (%.0f km)", c.name.c_str(), contactRoleName(c.role), (c.ship.positionKm() - ship.positionKm()).length());
   } else if (target.kind == TargetKind::Star) {
-    ImGui::Text("Target: Star (%s)", starClassName(currentSystem->starClass));
+    ImGui::Text("Target: Star (%s)", starClassName(currentSystem->star.cls));
   } else {
     ImGui::Text("Target: (none)  [T station / B planet / N contact / U star]");
   }
@@ -2732,10 +2794,10 @@ if (showScanner) {
 
   ImGui::Text("System: %s", currentSystem->stub.name.c_str());
   ImGui::Text("Star: %s | Mass %.2f | Radius %.2f | Temp %.0fK",
-              starClassName(currentSystem->starClass),
-              currentSystem->starMassSolar,
-              currentSystem->starRadiusSolar,
-              currentSystem->starTempK);
+              starClassName(currentSystem->star.cls),
+              currentSystem->star.massSol,
+              currentSystem->star.radiusSol,
+              currentSystem->star.temperatureK);
 
   const bool starScanned = (scannedKeys.find(scanKeyStar(currentSystem->stub.id)) != scannedKeys.end());
 
@@ -2768,13 +2830,14 @@ if (showScanner) {
       scanLockedId = currentSystem->stub.id;
       scanDurationSec = 2.5;
       scanRangeKm = 1.0e18;
-      scanLabel = std::string("Star scan: ") + starClassName(currentSystem->starClass);
+      scanLabel = std::string("Star scan: ") + starClassName(currentSystem->star.cls);
       ok = true;
     } else if (kind == TargetKind::Planet && idx < currentSystem->planets.size()) {
       const auto& p = currentSystem->planets[idx];
       scanLockedId = (core::u64)idx;
       scanDurationSec = 5.0;
-      scanRangeKm = std::max(200000.0, p.radiusKm * 45.0);
+      const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
+      scanRangeKm = std::max(200000.0, rKm * 45.0);
       scanLabel = "Planet scan: " + p.name;
       ok = true;
     } else if (kind == TargetKind::Station && idx < currentSystem->stations.size()) {
@@ -2843,9 +2906,10 @@ if (showScanner) {
     }
 
     if (scanned) {
-      const double periodDays = sim::orbitPeriodSec(p.orbit, currentSystem->starMassSolar) / 86400.0;
+      const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
+      const double periodDays = p.orbit.periodDays;
       ImGui::TextDisabled("Type: %s | Radius: %.0f km | a: %.2f AU | Period: %.1f d",
-                          planetTypeName(p.type), p.radiusKm, p.orbit.semiMajorAxisAU, periodDays);
+                          planetTypeName(p.type), radiusKm, p.orbit.semiMajorAxisAU, periodDays);
     } else {
       ImGui::TextDisabled("Type: ??? | Radius: ??? | Orbit: ???");
     }
@@ -3175,12 +3239,12 @@ if (canTrade) {
             out = "Courier: Deliver data to " + stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ")";
           } break;
           case sim::MissionType::Delivery: {
-            const auto cid = (econ::CommodityId)m.commodity;
+            const econ::CommodityId cid = m.commodity;
             out = "Delivery: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name)
                 + " to " + stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ")";
           } break;
           case sim::MissionType::MultiDelivery: {
-            const auto cid = (econ::CommodityId)m.commodity;
+            const econ::CommodityId cid = m.commodity;
             out = "Multi-hop: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name);
             if (m.viaSystem != 0 && m.viaStation != 0) {
               out += " via " + stationNameById(m.viaSystem, m.viaStation) + " (" + systemNameById(m.viaSystem) + ")";
@@ -3315,15 +3379,15 @@ if (canTrade) {
                     m.reward = 350.0 + distLy * 110.0;
                   } else if (r < 0.70) {
                     m.type = sim::MissionType::Delivery;
-                    const auto cid = (econ::CommodityId)(mrng.nextU32() % econ::kCommodityCount);
-                    m.commodity = (core::u8)cid;
+                    const auto cid = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
+                    m.commodity = cid;
                     m.units = 25 + (mrng.nextU32() % 120);
                     m.reward = 250.0 + distLy * 120.0 + (double)m.units * 6.0;
                     m.cargoProvided = (mrng.nextUnit() < 0.25);
                   } else if (r < 0.85 && dests.size() >= 2) {
                     m.type = sim::MissionType::MultiDelivery;
-                    const auto cid = (econ::CommodityId)(mrng.nextU32() % econ::kCommodityCount);
-                    m.commodity = (core::u8)cid;
+                    const auto cid = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
+                    m.commodity = cid;
                     m.units = 20 + (mrng.nextU32() % 100);
                     m.reward = 400.0 + distLy * 150.0 + (double)m.units * 8.0;
                     m.cargoProvided = (mrng.nextUnit() < 0.35);
@@ -3374,7 +3438,7 @@ if (canTrade) {
 
                 bool canAccept = (missions.size() < 16);
                 if (offer.cargoProvided) {
-                  const auto cid = (econ::CommodityId)offer.commodity;
+                  const econ::CommodityId cid = offer.commodity;
                   const double addKg = (double)offer.units * econ::commodityDef(cid).massKg;
                   canAccept = canAccept && (cargoMassKg(cargo) + addKg <= cargoCapacityKg + 1e-6);
                 }
@@ -3389,7 +3453,7 @@ if (canTrade) {
                   m.scanned = false;
 
                   if (m.cargoProvided) {
-                    const auto cid = (econ::CommodityId)m.commodity;
+                    const econ::CommodityId cid = m.commodity;
                     const double addKg = (double)m.units * econ::commodityDef(cid).massKg;
                     if (cargoMassKg(cargo) + addKg > cargoCapacityKg + 1e-6) {
                       toast(toasts, "Cargo too full to accept this mission.", 2.0);
@@ -3649,7 +3713,7 @@ if (showContacts) {
 
           if (!navRoute.empty()) {
             const int totalJumps = (int)navRoute.size() - 1;
-            const int remaining = std::max(0, totalJumps - navRouteHop);
+            const int remaining = std::max(0, totalJumps - (int)navRouteHop);
             double totalDist = 0.0;
             double totalFuel = 0.0;
             for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {

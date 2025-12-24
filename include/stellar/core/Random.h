@@ -36,6 +36,10 @@ public:
     return static_cast<double>(nextU64() >> 11) * inv;
   }
 
+  // Alias kept for older gameplay/proc-gen code.
+  // Returns a double in [0,1).
+  double nextUnit() { return nextDouble(); }
+
   // Inclusive range for integers
   template <class Int, std::enable_if_t<std::is_integral_v<Int>, int> = 0>
   Int range(Int minInclusive, Int maxInclusive) {

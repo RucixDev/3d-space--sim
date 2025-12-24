@@ -5,6 +5,10 @@
 
 #include <SDL.h>
 #include <SDL_opengl.h>
+// SDL provides a portable OpenGL extension header that defines the PFNGL*PROC
+// function pointer typedefs on platforms where system OpenGL headers may be
+// incomplete (notably Windows' legacy gl.h).
+#include <SDL_opengl_glext.h>
 
 namespace stellar::render::gl {
 
