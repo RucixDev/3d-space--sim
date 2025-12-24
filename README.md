@@ -26,14 +26,9 @@ New in this build:
 - **Factions + markets**: deterministic faction generation + per-system market generation
 - **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
 
-Gameplay prototype upgrades:
-
-- **Physical stations**: stations now have **orbital placement** in-system (not just menus)
-- **Docking loop**: fly within docking range and press **G** to dock/undock
-  - **Trading requires docking** at the station you're viewing in the Market window
-- **Targeting + assist**: cycle targets with **T** and toggle **autopilot** with **P**
-- **Hyperjump uses Fuel**: while docked, use the **Galaxy** window to select a destination and jump (consumes `Fuel` commodity)
-- **HUD + nav windows**: always-on HUD plus a simple System/Nav window (toggle with **F3/F4**)
+- **In-system time acceleration**: PageUp/PageDown time compression with safety clamps (hold CTRL to override)
+- **Docking corridor + docking state**: stations have physical orbits; dock/undock with **G** (trading requires docking)
+- **Supercruise-like mode**: toggle with **J**, throttle with **W/S** (simplified high-speed travel)
 
 ## Build
 
