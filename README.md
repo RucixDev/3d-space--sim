@@ -42,19 +42,15 @@ This repo contains:
 ## Controls (quick)
 - Translate: **W/S** (forward/back), **A/D** (strafe), **R/F** (up/down)
 - Rotate: **Arrow keys** (pitch/yaw), **Q/E** (roll)
-- Mouse flight: **Right Mouse** or **M** (Esc to release)
 - Boost: **LShift**   Brake: **X**
 - Dampers: **Z** on / **C** off
-- Target station: **T** (cycle)
-- Target planet: **B** (cycle)
-- Target contact: **N** (cycle)
-- Clear target: **Y**
+- Targets: **T** station, **B** planet, **N** contact, **U** star | clear target: **Y**
 - Request clearance: **L**
 - Dock/Undock: **G**
 - Autopilot approach: **P**
 - Fire laser: **Left Mouse**
 - FSD jump: **J** (to selected system in Galaxy)
-- UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions
+- UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions, **F6** Scanner
 - Save/Load: **F5 / F9**
 - Pause: **Space**
 
@@ -78,13 +74,6 @@ ctest --test-dir build --output-on-failure
 
 ### GitHub Actions / Autotools templates
 Some CI templates run `./configure && make`. This repo now includes a **compat** `configure` script + `Makefile` that delegate to CMake.
-
-If `./configure` fails with **Permission denied** (common when files were uploaded
-via GitHub's web UI), run it via the shell instead:
-
-```bash
-sh ./configure
-```
 
 ## Project structure
 - `include/stellar/...` core types, math, sim, econ, render

@@ -1,5 +1,6 @@
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
+#include "stellar/core/Hash.h"
 #include "stellar/econ/Market.h"
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/render/Camera.h"
@@ -60,6 +61,18 @@ static const char* starClassName(sim::StarClass c) {
     default: return "?";
   }
 }
+static const char* planetTypeName(sim::PlanetType t) {
+  switch (t) {
+    case sim::PlanetType::Rocky:    return "Rocky";
+    case sim::PlanetType::Desert:   return "Desert";
+    case sim::PlanetType::Ocean:    return "Ocean";
+    case sim::PlanetType::Ice:      return "Ice";
+    case sim::PlanetType::GasGiant: return "Gas Giant";
+    default: return "Unknown";
+  }
+}
+
+
 
 static const char* stationTypeName(econ::StationType t) {
   switch (t) {
@@ -250,23 +263,45 @@ struct ClearanceState {
   double cooldownUntilDays{0.0};
 };
 
-enum class TargetKind : int { None=0, Station=1, Planet=2, Contact=3 };
+enum class TargetKind : int { None=0, Station=1, Planet=2, Contact=3, Star=4 };
 
 struct Target {
   TargetKind kind{TargetKind::None};
   std::size_t index{0}; // station/planet/contact index
 };
 
+enum class ContactRole : int { Pirate=0, Trader=1, Police=2 };
+
+static const char* contactRoleName(ContactRole r) {
+  switch (r) {
+    case ContactRole::Pirate: return "Pirate";
+    case ContactRole::Trader: return "Trader";
+    case ContactRole::Police: return "Police";
+    default: return "?";
+  }
+}
+
 struct Contact {
   core::u64 id{0};
   std::string name;
   sim::Ship ship{};
-  bool pirate{false};
+
+  ContactRole role{ContactRole::Pirate};
+  core::u32 factionId{0}; // police/trader affiliation; 0 for pirates / independent
+  std::size_t homeStationIndex{0}; // best-effort "patrol" anchor (index into system stations)
 
   bool missionTarget{false};
 
+  // Behavior flags
+  bool hostileToPlayer{false}; // police become hostile when you're wanted / shoot them
+  double fleeUntilDays{0.0};   // traders flee after being attacked
+
+  // Combat stats
   double shield{60.0};
   double hull{70.0};
+
+  // Traders can have an approximate loot value (paid on destruction for now).
+  double cargoValueCr{0.0};
 
   double fireCooldown{0.0}; // seconds
   bool alive{true};
@@ -592,6 +627,7 @@ int main(int argc, char** argv) {
 
   // Economy
   double credits = 2500.0;
+  double explorationDataCr = 0.0; // sellable scan data
   std::array<double, econ::kCommodityCount> cargo{};
   double cargoCapacityKg = 420.0;
   int selectedStationIndex = 0;
@@ -607,6 +643,13 @@ int main(int argc, char** argv) {
   std::vector<sim::Mission> missions;
   std::unordered_map<core::u32, double> repByFaction;
 
+  // Law / crime (per-faction bounties)
+  std::unordered_map<core::u32, double> bountyByFaction;
+  double policeAlertUntilDays = 0.0;
+
+  // Exploration / discovery
+  std::unordered_set<core::u64> scannedKeys; // scanned bodies/stations in the universe (player-local)
+
   // Cached mission board offers (regenerated when docking / day changes)
   std::vector<sim::Mission> missionOffers;
   sim::StationId missionOffersStationId = 0;
@@ -621,6 +664,8 @@ int main(int argc, char** argv) {
   std::vector<Contact> contacts;
   core::SplitMix64 rng(seed ^ 0xC0FFEEu);
   double nextPirateSpawnDays = 0.01; // soon after start
+  double nextTraderSpawnDays = 0.008;
+  double nextPoliceSpawnDays = 0.006;
 
   // Beams (for laser visuals)
   struct Beam { math::Vec3d aU, bU; float r,g,b; double ttl; };
@@ -635,19 +680,15 @@ int main(int argc, char** argv) {
   bool showEconomy = true;
   bool showMissions = true;
   bool showContacts = true;
+  bool showScanner = true;
 
   // Flight assistance
   bool autopilot = false;
 
-  // Mouse flight (optional): mouse-driven pitch/yaw while the cursor is captured.
-  // Toggle with Right Mouse or M. Press Esc to release capture.
-  bool mouseFlight = false;
-  bool invertMouseY = false;
-  float mouseSensitivity = 0.010f; // normalized torque input per pixel (tune in UI)
-
   // Supercruise-lite
   bool supercruise = false;
   bool supercruiseAssist = true;
+  double supercruiseMaxSpeedKmS = 18000.0;
 
   // FSD / hyperspace (system-to-system)
   enum class FsdState { Idle, Charging, Travelling };
@@ -664,32 +705,19 @@ int main(int argc, char** argv) {
   std::size_t navRouteHop = 0;
   bool navAutoRun = false;
 
-  // Bounty scan interaction
+  // Scanner interaction (bounty scan + exploration scans)
   bool scanning = false;
+  Target scanLockedTarget{};
+  core::u64 scanLockedId = 0;
+  std::string scanLabel;
   double scanProgressSec = 0.0;
+  double scanDurationSec = 4.0;
+  double scanRangeKm = 80000.0;
 
   // Target
   Target target{};
 
   std::vector<ToastMsg> toasts;
-
-  auto setMouseFlight = [&](bool enabled) {
-    if (mouseFlight == enabled) return;
-    mouseFlight = enabled;
-
-    SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE);
-    SDL_ShowCursor(enabled ? SDL_DISABLE : SDL_ENABLE);
-
-    // Flush any pending relative motion so we don't get a "jump" on toggle.
-    int dx = 0, dy = 0;
-    (void)SDL_GetRelativeMouseState(&dx, &dy);
-
-    if (enabled) {
-      toast(toasts, "Mouse flight: ON (RMB/M to toggle, Esc to release)", 2.5);
-    } else {
-      toast(toasts, "Mouse flight: OFF", 1.5);
-    }
-  };
 
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
     if (sys.stations.empty()) {
@@ -740,6 +768,44 @@ int main(int argc, char** argv) {
     if (factionId == 0) return;
     repByFaction[factionId] = clampRep(getRep(factionId) + delta);
   };
+
+auto getBounty = [&](core::u32 factionId) -> double {
+  auto it = bountyByFaction.find(factionId);
+  return it == bountyByFaction.end() ? 0.0 : std::max(0.0, it->second);
+};
+
+auto addBounty = [&](core::u32 factionId, double deltaCr) {
+  if (factionId == 0) return;
+  bountyByFaction[factionId] = std::max(0.0, getBounty(factionId) + deltaCr);
+};
+
+auto clearBounty = [&](core::u32 factionId) {
+  if (factionId == 0) return;
+  bountyByFaction[factionId] = 0.0;
+};
+
+auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalty, const std::string& reason) {
+  if (factionId == 0) return;
+  addBounty(factionId, bountyAddCr);
+  addRep(factionId, repPenalty);
+  policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (120.0 / 86400.0)); // 2 minutes
+  nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
+  toast(toasts, "Crime (" + factionName(factionId) + "): " + reason, 3.0);
+};
+
+// Scan/discovery keys (player-local)
+const auto scanKeyStar = [&](sim::SystemId sysId) -> core::u64 {
+  return core::hashCombine((core::u64)sysId, 0x53544152ULL); // 'STAR'
+};
+const auto scanKeyPlanet = [&](sim::SystemId sysId, std::size_t planetIndex) -> core::u64 {
+  return core::hashCombine((core::u64)sysId, core::hashCombine(0x504C414EULL, (core::u64)planetIndex)); // 'PLAN'
+};
+const auto scanKeyStation = [&](sim::StationId stId) -> core::u64 {
+  return core::hashCombine((core::u64)stId, 0x53544154ULL); // 'STAT'
+};
+const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
+  return core::hashCombine((core::u64)sysId, 0x434F4D50ULL); // 'COMP'
+};
 
   auto effectiveFeeRate = [&](const sim::Station& st) -> double {
     return applyRepToFee(st.feeRate, getRep(st.factionId));
@@ -855,17 +921,12 @@ int main(int argc, char** argv) {
   auto last = std::chrono::high_resolution_clock::now();
 
   SDL_SetRelativeMouseMode(SDL_FALSE);
-  SDL_ShowCursor(SDL_ENABLE);
 
   while (running) {
     // Timing
     auto now = std::chrono::high_resolution_clock::now();
     const double dtReal = std::chrono::duration<double>(now - last).count();
     last = now;
-
-    // Per-frame mouse deltas (used for mouse flight).
-    double mouseDx = 0.0;
-    double mouseDy = 0.0;
 
     // Events
     SDL_Event event;
@@ -876,21 +937,7 @@ int main(int argc, char** argv) {
       if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-        if (event.key.keysym.sym == SDLK_ESCAPE) {
-          // Escape either releases mouse flight (if active) or quits.
-          if (mouseFlight) {
-            setMouseFlight(false);
-          } else {
-            running = false;
-          }
-        }
-
-        if (event.key.keysym.sym == SDLK_m) {
-          // Toggle mouse flight.
-          if (!io.WantCaptureKeyboard) {
-            setMouseFlight(!mouseFlight);
-          }
-        }
+        if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
 
         if (event.key.keysym.sym == SDLK_F5) {
           sim::SaveGame s{};
@@ -925,6 +972,14 @@ int main(int argc, char** argv) {
             s.reputation.push_back(r);
           }
           s.stationOverrides = universe.exportStationOverrides();
+// Exploration / law
+s.explorationDataCr = explorationDataCr;
+s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
+s.bounties.clear();
+for (const auto& [fid, b] : bountyByFaction) {
+  if (b > 0.0) s.bounties.push_back({fid, b});
+}
+
 
           if (sim::saveToFile(s, savePath)) {
             toast(toasts, "Saved to " + savePath, 2.5);
@@ -964,6 +1019,15 @@ int main(int argc, char** argv) {
             repByFaction.clear();
             for (const auto& r : s.reputation) repByFaction[r.factionId] = r.rep;
 
+// Exploration / law
+explorationDataCr = s.explorationDataCr;
+scannedKeys.clear();
+for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
+
+bountyByFaction.clear();
+for (const auto& b : s.bounties) bountyByFaction[b.factionId] = b.bountyCr;
+policeAlertUntilDays = 0.0;
+
             docked = (s.dockedStation != 0);
             dockedStationId = s.dockedStation;
             selectedStationIndex = 0;
@@ -976,6 +1040,9 @@ int main(int argc, char** argv) {
             // clear transient runtime things
             contacts.clear();
             beams.clear();
+          nextPirateSpawnDays = timeDays + (rng.range(25.0, 55.0) / 86400.0);
+          nextTraderSpawnDays = timeDays + (rng.range(15.0, 35.0) / 86400.0);
+          nextPoliceSpawnDays = timeDays + (rng.range(10.0, 25.0) / 86400.0);
             autopilot = false;
             supercruise = false;
             fsdState = FsdState::Idle;
@@ -985,6 +1052,9 @@ int main(int argc, char** argv) {
             navAutoRun = false;
             scanning = false;
             scanProgressSec = 0.0;
+            scanLockedId = 0;
+            scanLabel.clear();
+            scanLockedTarget = Target{};
             clearances.clear();
             target = Target{};
 
@@ -999,6 +1069,7 @@ int main(int argc, char** argv) {
         if (event.key.keysym.sym == SDLK_F2) showEconomy = !showEconomy;
         if (event.key.keysym.sym == SDLK_F4) showMissions = !showMissions;
         if (event.key.keysym.sym == SDLK_F3) showContacts = !showContacts;
+        if (event.key.keysym.sym == SDLK_F6) showScanner = !showScanner;
 
         if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
 
@@ -1013,7 +1084,7 @@ int main(int argc, char** argv) {
             toast(toasts, "Supercruise disengaged.", 1.5);
           } else {
             if (target.kind == TargetKind::None) {
-              toast(toasts, "Set a target (T/B/N) to use supercruise.", 2.5);
+              toast(toasts, "Set a target (T station / B planet) to use supercruise.", 2.5);
             } else {
               supercruise = true;
               autopilot = false;
@@ -1024,17 +1095,69 @@ int main(int argc, char** argv) {
         }
 
         if (event.key.keysym.sym == SDLK_k) {
-          // Bounty scan action
-          if (scanning) {
-            scanning = false;
-            scanProgressSec = 0.0;
-            toast(toasts, "Scan cancelled.", 1.5);
-          } else {
-            scanning = true;
-            scanProgressSec = 0.0;
-            toast(toasts, "Scanning...", 1.5);
+            // Scanner action (mission scans + exploration scans)
+            if (scanning) {
+              scanning = false;
+              scanProgressSec = 0.0;
+              scanLockedId = 0;
+              scanLabel.clear();
+              toast(toasts, "Scan cancelled.", 1.5);
+            } else {
+              if (docked) {
+                toast(toasts, "Undock to scan.", 1.8);
+              } else if (supercruise || fsdState != FsdState::Idle) {
+                toast(toasts, "Scanning unavailable in supercruise / hyperspace.", 2.0);
+              } else if (target.kind == TargetKind::None) {
+                toast(toasts, "No scan target selected. (Use T/B/N/U or System Scanner)", 2.5);
+              } else {
+                // Lock scan to current target so cycling targets cancels the scan.
+                scanLockedTarget = target;
+                scanLockedId = 0;
+                scanLabel.clear();
+                scanProgressSec = 0.0;
+
+                bool ok = false;
+
+                if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+                  const auto& c = contacts[target.index];
+                  if (c.alive) {
+                    scanLockedId = c.id;
+                    scanDurationSec = 4.0;
+                    scanRangeKm = 85000.0;
+                    scanLabel = "Contact scan: " + c.name;
+                    ok = true;
+                  }
+                } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+                  const auto& st = currentSystem->stations[target.index];
+                  scanLockedId = st.id;
+                  scanDurationSec = 3.0;
+                  scanRangeKm = std::max(25000.0, st.commsRangeKm * 0.9);
+                  scanLabel = "Station scan: " + st.name;
+                  ok = true;
+                } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+                  const auto& p = currentSystem->planets[target.index];
+                  scanLockedId = (core::u64)target.index;
+                  scanDurationSec = 5.0;
+                  scanRangeKm = std::max(200000.0, p.radiusKm * 45.0);
+                  scanLabel = "Planet scan: " + p.name;
+                  ok = true;
+                } else if (target.kind == TargetKind::Star) {
+                  scanLockedId = currentSystem->stub.id;
+                  scanDurationSec = 2.5;
+                  scanRangeKm = 1.0e18; // anywhere in-system for now
+                  scanLabel = std::string("Star scan: ") + starClassName(currentSystem->starClass);
+                  ok = true;
+                }
+
+                if (ok) {
+                  scanning = true;
+                  toast(toasts, scanLabel + " (hold steady)...", 2.0);
+                } else {
+                  toast(toasts, "Invalid scan target.", 2.0);
+                }
+              }
+            }
           }
-        }
 
         if (event.key.keysym.sym == SDLK_j) {
           // Jump to next hop in the plotted route, otherwise jump to selected system.
@@ -1044,64 +1167,63 @@ int main(int argc, char** argv) {
             startFsdJumpTo(galaxySelectedSystemId);
           }
         }
-        if (event.key.keysym.sym == SDLK_t) {
-          // cycle station targets
-          if (!currentSystem->stations.empty()) {
-            if (target.kind != TargetKind::Station) {
-              target.kind = TargetKind::Station;
-              target.index = 0;
-            } else {
-              target.index = (target.index + 1) % currentSystem->stations.size();
-            }
-          }
-        }
+if (event.key.keysym.sym == SDLK_t) {
+  // cycle station targets
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+  if (!currentSystem->stations.empty()) {
+    if (target.kind != TargetKind::Station) {
+      target.kind = TargetKind::Station;
+      target.index = 0;
+    } else {
+      target.index = (target.index + 1) % currentSystem->stations.size();
+    }
+  }
+}
 
-        if (event.key.keysym.sym == SDLK_b) {
-          // Cycle planet targets (bodies) for supercruise.
-          if (!currentSystem->planets.empty()) {
-            if (target.kind != TargetKind::Planet) {
-              target.kind = TargetKind::Planet;
-              target.index = 0;
-            } else {
-              target.index = (target.index + 1) % currentSystem->planets.size();
-            }
-          }
-        }
+if (event.key.keysym.sym == SDLK_b) {
+  // cycle planet targets
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+  if (!currentSystem->planets.empty()) {
+    if (target.kind != TargetKind::Planet) {
+      target.kind = TargetKind::Planet;
+      target.index = 0;
+    } else {
+      target.index = (target.index + 1) % currentSystem->planets.size();
+    }
+  }
+}
 
-        if (event.key.keysym.sym == SDLK_n) {
-          // Cycle contacts (prefers living pirates).
-          if (!contacts.empty()) {
-            std::size_t start = (target.kind == TargetKind::Contact) ? (target.index + 1) : 0;
-            bool found = false;
+if (event.key.keysym.sym == SDLK_n) {
+  // cycle contact targets (alive only)
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+  if (!contacts.empty()) {
+    std::size_t start = 0;
+    if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+      start = (target.index + 1) % contacts.size();
+    }
+    std::size_t idx = start;
+    for (std::size_t step = 0; step < contacts.size(); ++step) {
+      if (contacts[idx].alive) {
+        target.kind = TargetKind::Contact;
+        target.index = idx;
+        break;
+      }
+      idx = (idx + 1) % contacts.size();
+    }
+  }
+}
 
-            // First pass: living pirates.
-            for (std::size_t i = 0; i < contacts.size(); ++i) {
-              std::size_t idx = (start + i) % contacts.size();
-              if (contacts[idx].alive && contacts[idx].pirate) {
-                target.kind = TargetKind::Contact;
-                target.index = idx;
-                found = true;
-                break;
-              }
-            }
+if (event.key.keysym.sym == SDLK_u) {
+  // target system primary star (for scanning / nav reference)
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+  target.kind = TargetKind::Star;
+  target.index = 0;
+}
 
-            // Second pass: any living contact.
-            if (!found) {
-              for (std::size_t i = 0; i < contacts.size(); ++i) {
-                std::size_t idx = (start + i) % contacts.size();
-                if (contacts[idx].alive) {
-                  target.kind = TargetKind::Contact;
-                  target.index = idx;
-                  found = true;
-                  break;
-                }
-              }
-            }
-
-            if (!found) toast(toasts, "No living contacts.", 2.0);
-          }
-        }
-        if (event.key.keysym.sym == SDLK_y) target = Target{};
+if (event.key.keysym.sym == SDLK_y) {
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+  target = Target{};
+}
 
         if (event.key.keysym.sym == SDLK_l) {
           // Request docking clearance from targeted station
@@ -1196,19 +1318,6 @@ int main(int argc, char** argv) {
         }
       }
 
-      if (event.type == SDL_MOUSEMOTION) {
-        if (mouseFlight && !io.WantCaptureMouse) {
-          mouseDx += (double)event.motion.xrel;
-          mouseDy += (double)event.motion.yrel;
-        }
-      }
-
-      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
-        if (!io.WantCaptureMouse) {
-          setMouseFlight(!mouseFlight);
-        }
-      }
-
       if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
         if (!io.WantCaptureMouse) {
           // Fire laser
@@ -1244,27 +1353,62 @@ int main(int argc, char** argv) {
             const math::Vec3d bKm = aKm + dir * bestT;
             beams.push_back({toRenderU(aKm), toRenderU(bKm), 1.0f, 0.25f, 0.25f, 0.10});
 
-            if (bestIdx >= 0) {
-              auto& hit = contacts[(std::size_t)bestIdx];
-              applyDamage(dmg, hit.shield, hit.hull);
-              if (hit.hull <= 0.0) {
-                const core::u64 deadId = hit.id;
-                hit.alive = false;
-                toast(toasts, "Target destroyed. +500 cr", 2.5);
-                credits += 500.0;
+if (bestIdx >= 0) {
+  auto& hit = contacts[(std::size_t)bestIdx];
 
-                // Bounty kill missions
-                for (auto& m : missions) {
-                  if (m.completed || m.failed) continue;
-                  if (m.type == sim::MissionType::BountyKill && m.targetNpcId == deadId && m.toSystem == currentSystem->stub.id) {
-                    m.completed = true;
-                    credits += m.reward;
-                    addRep(m.factionId, +2.0);
-                    toast(toasts, "Mission complete: bounty target eliminated. +" + std::to_string((int)m.reward) + " cr", 3.0);
-                  }
-                }
-              }
-            }
+  // Apply damage
+  applyDamage(dmg, hit.shield, hit.hull);
+
+  // Crimes / reactions (on hit)
+  if (hit.alive && hit.role == ContactRole::Trader) {
+    hit.fleeUntilDays = timeDays + (180.0 / 86400.0); // flee ~3 minutes
+    commitCrime(hit.factionId, 250.0, -5.0, "Assault on trader");
+  }
+  if (hit.alive && hit.role == ContactRole::Police) {
+    hit.hostileToPlayer = true;
+    commitCrime(hit.factionId, 600.0, -10.0, "Assault on security");
+  }
+
+  // If destroyed
+  if (hit.hull <= 0.0) {
+    const core::u64 deadId = hit.id;
+    const ContactRole deadRole = hit.role;
+    const core::u32 deadFaction = hit.factionId;
+    const double lootCr = hit.cargoValueCr;
+
+    hit.alive = false;
+
+    if (deadRole == ContactRole::Pirate) {
+      const double bountyCr = 450.0;
+      credits += bountyCr;
+      toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
+
+      const core::u32 lf = currentSystem ? currentSystem->stub.factionId : 0;
+      if (lf != 0) addRep(lf, +0.5);
+    } else if (deadRole == ContactRole::Trader) {
+      // Piracy payout (simplified as immediate credits)
+      const double payout = std::max(0.0, lootCr);
+      credits += payout;
+      toast(toasts, "Trader destroyed. Loot +" + std::to_string((int)payout) + " cr (WANTED!)", 3.0);
+
+      commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+    } else if (deadRole == ContactRole::Police) {
+      toast(toasts, "Security destroyed. (WANTED!)", 3.0);
+      commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+    }
+
+    // Bounty kill missions (pirate targets)
+    for (auto& m : missions) {
+      if (m.completed || m.failed) continue;
+      if (m.type == sim::MissionType::BountyKill && m.targetNpcId == deadId && m.toSystem == currentSystem->stub.id) {
+        m.completed = true;
+        credits += m.reward;
+        addRep(m.factionId, +2.0);
+        toast(toasts, "Mission complete: bounty target eliminated. +" + std::to_string((int)m.reward) + " cr", 3.0);
+      }
+    }
+  }
+}
           }
         }
       }
@@ -1293,13 +1437,6 @@ int main(int argc, char** argv) {
 
       input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
       input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
-
-      // Mouse flight (captured mouse) feeds pitch/yaw.
-      if (mouseFlight) {
-        const double invY = invertMouseY ? -1.0 : 1.0;
-        input.torqueLocal.y += (double)mouseDx * (double)mouseSensitivity;
-        input.torqueLocal.x += (-(double)mouseDy) * (double)mouseSensitivity * invY;
-      }
 
       input.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
       input.brake = keys[SDL_SCANCODE_X] != 0;
@@ -1362,27 +1499,19 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Cargo affects normal handling: a fully-loaded ship accelerates and turns a bit worse.
-    const double cargoLoad = std::clamp(cargoMassKg(cargo) / std::max(1.0, cargoCapacityKg), 0.0, 1.0);
-    const double linHandlingMult = (1.0 - 0.25 * cargoLoad);
-    const double angHandlingMult = (1.0 - 0.20 * cargoLoad);
-
     // Supercruise-lite: fast in-system travel assist to current target.
     // Inspired by the "supercruise" style travel in games like Elite Dangerous.
     if (supercruise && !docked && !captureKeys && fsdState == FsdState::Idle) {
       // Simple interdiction: don't allow supercruise if a pirate is nearby.
       bool interdicted = false;
       for (const auto& c : contacts) {
-        if (!c.alive || !c.pirate) continue;
+        if (!c.alive || c.role != ContactRole::Pirate) continue;
         const double d = (c.ship.positionKm() - ship.positionKm()).length();
         if (d < 120000.0) { interdicted = true; break; }
       }
 
       if (interdicted) {
         supercruise = false;
-        // Restore normal handling immediately (we may have been in supercruise last frame).
-        ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
-        ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
         toast(toasts, "Supercruise blocked: hostile contact nearby.", 2.0);
       } else {
         std::optional<math::Vec3d> destPosKm;
@@ -1407,8 +1536,6 @@ int main(int argc, char** argv) {
 
         if (!destPosKm) {
           supercruise = false;
-          ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
-          ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
           toast(toasts, "Supercruise requires a station/planet target.", 2.0);
         } else {
           const math::Vec3d rel = *destPosKm - ship.positionKm();
@@ -1419,8 +1546,8 @@ int main(int argc, char** argv) {
             supercruise = false;
             // Drop to a safe approach speed relative to destination.
             ship.setVelocityKmS(destVelKmS + dir * 0.12);
-            ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
-            ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
+            ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
+            ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
             toast(toasts, "Dropped from supercruise.", 1.6);
           } else {
             // Crank the ship up for supercruise, but keep controls simple.
@@ -1450,8 +1577,8 @@ int main(int argc, char** argv) {
       }
     } else {
       // Restore normal handling when not in supercruise.
-      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2 * linHandlingMult);
-      ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2 * angHandlingMult);
+      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
+      ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
     }
 
     // Sim step
@@ -1484,6 +1611,9 @@ int main(int argc, char** argv) {
           beams.clear();
           scanning = false;
           scanProgressSec = 0.0;
+          scanLockedId = 0;
+          scanLabel.clear();
+          scanLockedTarget = Target{};
           target = Target{};
 
           // Spawn near the first station.
@@ -1501,6 +1631,13 @@ int main(int argc, char** argv) {
               toast(toasts, "Route complete.", 2.0);
             }
           }
+// QoL: auto-select the next hop in the Galaxy UI after each jump.
+if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
+  galaxySelectedSystemId = navRoute[navRouteHop + 1];
+} else {
+  galaxySelectedSystemId = currentSystem->stub.id;
+}
+
 
           toast(toasts, std::string("Arrived in ") + currentSystem->stub.name + ".", 2.0);
 
@@ -1567,148 +1704,394 @@ int main(int argc, char** argv) {
         }
       }
 
-      const bool combatSimEnabled = (fsdState == FsdState::Idle && !supercruise);
-      if (combatSimEnabled) {
-      // Spawn pirates occasionally (simple "threat" loop).
-      if (timeDays >= nextPirateSpawnDays && contacts.size() < 8) {
-        nextPirateSpawnDays = timeDays + (rng.range(120.0, 220.0) / 86400.0); // every ~2-4 minutes
+const bool combatSimEnabled = (fsdState == FsdState::Idle && !supercruise);
+if (combatSimEnabled) {
+  // ---- Spawns / combat / traffic ----
 
-        Contact p{};
-        p.id = std::max<core::u64>(1, rng.nextU64());
-        p.pirate = true;
-        p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
-        p.ship.setMaxLinearAccelKmS2(0.06);
-        p.ship.setMaxAngularAccelRadS2(0.9);
+  int alivePirates = 0;
+int aliveTraders = 0;
+int alivePolice = 0;
+int aliveTotal = 0;
+for (const auto& c : contacts) {
+  if (!c.alive) continue;
+  ++aliveTotal;
+  if (c.role == ContactRole::Pirate) ++alivePirates;
+  if (c.role == ContactRole::Trader) ++aliveTraders;
+  if (c.role == ContactRole::Police) ++alivePolice;
+}
 
-        // Spawn somewhere near the player, but not too close.
-        const math::Vec3d randDir = math::Vec3d{rng.range(-1.0,1.0), rng.range(-0.3,0.3), rng.range(-1.0,1.0)}.normalized();
-        const double distKm = rng.range(50000.0, 120000.0);
-        p.ship.setPositionKm(ship.positionKm() + randDir * distKm);
-        p.ship.setVelocityKmS(ship.velocityKmS());
-        p.ship.setOrientation(quatFromTo({0,0,1}, (-randDir).normalized()));
+  const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
+  const double localRep = getRep(localFaction);
+  const double localBounty = getBounty(localFaction);
+  const bool playerWantedHere = (localFaction != 0) && (localBounty > 0.0);
 
-        contacts.push_back(std::move(p));
-        toast(toasts, "Contact: pirate detected!", 3.0);
-      }
+  // Simple helper for random directions.
+  auto randDir = [&]() -> math::Vec3d {
+    return math::Vec3d{rng.range(-1.0,1.0), rng.range(-0.3,0.3), rng.range(-1.0,1.0)}.normalized();
+  };
 
-      // Ensure mission bounty targets exist in their target system.
-      if (!docked && !missions.empty()) {
-        for (const auto& m : missions) {
-          if (m.completed || m.failed) continue;
-          if (!((m.type == sim::MissionType::BountyScan) || (m.type == sim::MissionType::BountyKill))) {
-            continue;
-          }
-          if (m.toSystem != currentSystem->stub.id) continue;
-          if (m.targetNpcId == 0) continue;
+  auto chooseHomeStation = [&]() -> std::size_t {
+    if (!currentSystem || currentSystem->stations.empty()) return 0;
+    return (std::size_t)(rng.nextU64() % (core::u64)currentSystem->stations.size());
+  };
 
-          bool present = false;
-          for (auto& c : contacts) {
-            if (c.alive && c.id == m.targetNpcId) {
-              c.missionTarget = true;
-              present = true;
-              break;
-            }
-          }
-          if (present) continue;
+  auto spawnNearStation = [&](std::size_t stIdx, double minDistMul, double maxDistMul, sim::Ship& outShip) {
+    if (!currentSystem || currentSystem->stations.empty()) {
+      // fallback: near player
+      const math::Vec3d d = randDir();
+      const double distKm = rng.range(60000.0, 130000.0);
+      outShip.setPositionKm(ship.positionKm() + d * distKm);
+      outShip.setVelocityKmS(ship.velocityKmS());
+      outShip.setOrientation(quatFromTo({0,0,1}, (-d).normalized()));
+      return;
+    }
+    stIdx = std::min(stIdx, currentSystem->stations.size() - 1);
+    const auto& st = currentSystem->stations[stIdx];
+    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+    const math::Vec3d axis = stQ.rotate({0,0,1});
+    const math::Vec3d tangent = stQ.rotate({1,0,0});
 
-          // Spawn a distinct target pirate.
-          Contact tgt{};
-          tgt.id = m.targetNpcId;
-          tgt.pirate = true;
-          tgt.missionTarget = true;
-          tgt.name = "Bounty Target";
-          tgt.shield = 80.0;
-          tgt.hull = 90.0;
-          tgt.ship.setMaxLinearAccelKmS2(0.07);
-          tgt.ship.setMaxAngularAccelRadS2(1.0);
+    const double distKm = rng.range(st.radiusKm * minDistMul, st.radiusKm * maxDistMul);
+    const math::Vec3d p = stPos + axis * distKm + tangent * rng.range(-st.radiusKm*2.0, st.radiusKm*2.0);
+    outShip.setPositionKm(p);
+    outShip.setVelocityKmS(stationVelKmS(st, timeDays));
+    outShip.setOrientation(quatFromTo({0,0,1}, (stPos - p).normalized()));
+  };
 
-          const math::Vec3d randDir = math::Vec3d{rng.range(-1.0,1.0), rng.range(-0.2,0.2), rng.range(-1.0,1.0)}.normalized();
-          const double distKm = rng.range(60000.0, 140000.0);
-          tgt.ship.setPositionKm(ship.positionKm() + randDir * distKm);
-          tgt.ship.setVelocityKmS(ship.velocityKmS());
-          tgt.ship.setOrientation(quatFromTo({0,0,1}, (-randDir).normalized()));
+  auto spawnPirate = [&]() {
+    Contact p{};
+    p.id = std::max<core::u64>(1, rng.nextU64());
+    p.role = ContactRole::Pirate;
+    p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
+    p.ship.setMaxLinearAccelKmS2(0.06);
+    p.ship.setMaxAngularAccelRadS2(0.9);
 
-          contacts.push_back(std::move(tgt));
-          break; // spawn at most one target per frame
+    // Spawn somewhere near the player, but not too close.
+    const math::Vec3d d = randDir();
+    const double distKm = rng.range(55000.0, 120000.0);
+    p.ship.setPositionKm(ship.positionKm() + d * distKm);
+    p.ship.setVelocityKmS(ship.velocityKmS());
+    p.ship.setOrientation(quatFromTo({0,0,1}, (-d).normalized()));
+
+    contacts.push_back(std::move(p));
+    toast(toasts, "Contact: pirate detected!", 3.0);
+  };
+
+  auto spawnTrader = [&]() {
+    Contact t{};
+    t.id = std::max<core::u64>(1, rng.nextU64());
+    t.role = ContactRole::Trader;
+    t.factionId = localFaction;
+    t.homeStationIndex = chooseHomeStation();
+    t.name = "Trader " + std::to_string((int)contacts.size() + 1);
+    t.shield = 35.0;
+    t.hull = 55.0;
+    t.cargoValueCr = rng.range(350.0, 900.0);
+
+    t.ship.setMaxLinearAccelKmS2(0.05);
+    t.ship.setMaxAngularAccelRadS2(0.6);
+    spawnNearStation(t.homeStationIndex, 18.0, 30.0, t.ship);
+
+    contacts.push_back(std::move(t));
+  };
+
+  auto spawnPolice = [&]() {
+    Contact p{};
+    p.id = std::max<core::u64>(1, rng.nextU64());
+    p.role = ContactRole::Police;
+    p.factionId = localFaction;
+    p.homeStationIndex = chooseHomeStation();
+    p.name = "Security " + std::to_string((int)contacts.size() + 1);
+    p.shield = 90.0;
+    p.hull = 90.0;
+
+    p.ship.setMaxLinearAccelKmS2(0.075);
+    p.ship.setMaxAngularAccelRadS2(1.05);
+    spawnNearStation(p.homeStationIndex, 16.0, 22.0, p.ship);
+
+    contacts.push_back(std::move(p));
+    toast(toasts, "Local security on patrol.", 2.0);
+  };
+
+  // Pirates occasionally (baseline threat).
+  if (timeDays >= nextPirateSpawnDays && alivePirates < 4 && aliveTotal < 14) {
+    nextPirateSpawnDays = timeDays + (rng.range(120.0, 220.0) / 86400.0); // every ~2-4 minutes
+    spawnPirate();
+    ++alivePirates;
+    ++aliveTotal;
+  }
+
+  // Traders / traffic: gives you something to pirate (but doing so triggers police).
+  if (timeDays >= nextTraderSpawnDays && aliveTraders < 3 && currentSystem && !currentSystem->stations.empty() && aliveTotal < 14) {
+    nextTraderSpawnDays = timeDays + (rng.range(70.0, 140.0) / 86400.0);
+    spawnTrader();
+    ++aliveTraders;
+    ++aliveTotal;
+  }
+
+  // Police / patrols: scale with threat + your legal status.
+  if (localFaction != 0) {
+    int desiredPolice = 1;
+    if (playerWantedHere) desiredPolice += 2;
+    if (alivePirates > 0) desiredPolice += 1;
+    if (localRep < -25.0) desiredPolice += 1;
+    desiredPolice = std::clamp(desiredPolice, 0, 5);
+
+    // If recently alerted by a crime, tighten the spawn interval.
+    const double spawnMinSec = (policeAlertUntilDays > timeDays) ? 12.0 : 55.0;
+    const double spawnMaxSec = (policeAlertUntilDays > timeDays) ? 24.0 : 95.0;
+
+    if (timeDays >= nextPoliceSpawnDays && alivePolice < desiredPolice && aliveTotal < 16) {
+      nextPoliceSpawnDays = timeDays + (rng.range(spawnMinSec, spawnMaxSec) / 86400.0);
+      spawnPolice();
+      ++alivePolice;
+      ++aliveTotal;
+    }
+  }
+
+  // Ensure mission bounty targets exist in their target system.
+  if (!docked && !missions.empty()) {
+    for (const auto& m : missions) {
+      if (m.completed || m.failed) continue;
+      if (!((m.type == sim::MissionType::BountyScan) || (m.type == sim::MissionType::BountyKill))) continue;
+      if (m.toSystem != currentSystem->stub.id) continue;
+      if (m.targetNpcId == 0) continue;
+
+      bool present = false;
+      for (auto& c : contacts) {
+        if (c.alive && c.id == m.targetNpcId) {
+          c.missionTarget = true;
+          present = true;
+          break;
         }
       }
+      if (present) continue;
 
-      // Contacts AI + combat
-      for (auto& c : contacts) {
-        if (!c.alive) continue;
+      // Spawn a distinct target pirate.
+      Contact tgt{};
+      tgt.id = m.targetNpcId;
+      tgt.role = ContactRole::Pirate;
+      tgt.missionTarget = true;
+      tgt.name = "Bounty Target";
+      tgt.shield = 80.0;
+      tgt.hull = 90.0;
+      tgt.ship.setMaxLinearAccelKmS2(0.07);
+      tgt.ship.setMaxAngularAccelRadS2(1.0);
 
-        // cooldowns
-        c.fireCooldown = std::max(0.0, c.fireCooldown - dtSim);
-        if (c.pirate) {
-          // chase player
-          sim::ShipInput ai{};
-          ai.dampers = true;
+      const math::Vec3d d = randDir();
+      const double distKm = rng.range(65000.0, 150000.0);
+      tgt.ship.setPositionKm(ship.positionKm() + d * distKm);
+      tgt.ship.setVelocityKmS(ship.velocityKmS());
+      tgt.ship.setOrientation(quatFromTo({0,0,1}, (-d).normalized()));
 
-          const math::Vec3d to = ship.positionKm() - c.ship.positionKm();
-          const double dist = to.length();
-          const math::Vec3d toN = (dist > 1e-6) ? to / dist : math::Vec3d{0,0,1};
+      contacts.push_back(std::move(tgt));
+      break; // spawn at most one target per frame
+    }
+  }
 
-          // Face player
-          const math::Vec3d desiredFwdWorld = toN;
-          const math::Vec3d desiredFwdLocal = c.ship.orientation().conjugate().rotate(desiredFwdWorld);
-          const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
-          const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
-          ai.torqueLocal.x = std::clamp(pitchErr * 1.8, -1.0, 1.0);
-          ai.torqueLocal.y = std::clamp(yawErr * 1.8, -1.0, 1.0);
+  // Find a nearby pirate index (for police).
+  auto nearestPirateIndex = [&](const math::Vec3d& fromKm, double maxDistKm) -> std::optional<std::size_t> {
+    double bestD = maxDistKm;
+    std::optional<std::size_t> best{};
+    for (std::size_t i = 0; i < contacts.size(); ++i) {
+      const auto& c = contacts[i];
+      if (!c.alive || c.role != ContactRole::Pirate) continue;
+      const double d = (c.ship.positionKm() - fromKm).length();
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  };
 
-          // Thrust: try to keep a standoff distance.
-          const double desiredDist = 35000.0;
-          double vAim = 0.0;
-          if (dist > desiredDist) vAim = std::min(0.22, 0.000004 * (dist - desiredDist));
-          if (dist < desiredDist*0.6) vAim = -0.12;
+  auto chaseTarget = [&](sim::Ship& selfShip,
+                         sim::ShipInput& ai,
+                         const math::Vec3d& targetPosKm,
+                         const math::Vec3d& targetVelKmS,
+                         double desiredDistKm,
+                         double maxSpeedKmS,
+                         double faceGain) {
+    ai.dampers = true;
 
-          const math::Vec3d desiredVel = ship.velocityKmS() + toN * vAim;
-          const math::Vec3d dv = desiredVel - c.ship.velocityKmS();
-          const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
-          ai.thrustLocal = c.ship.orientation().conjugate().rotate(accelWorldDir);
+    const math::Vec3d to = targetPosKm - selfShip.positionKm();
+    const double dist = to.length();
+    const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
 
-          c.ship.step(dtSim, ai);
+    // Face target
+    const math::Vec3d desiredFwdWorld = toN;
+    const math::Vec3d desiredFwdLocal = selfShip.orientation().conjugate().rotate(desiredFwdWorld);
+    const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
+    const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
+    ai.torqueLocal.x = std::clamp(pitchErr * faceGain, -1.0, 1.0);
+    ai.torqueLocal.y = std::clamp(yawErr * faceGain, -1.0, 1.0);
+    ai.torqueLocal.z = 0.0;
 
-          // Fire if aligned
-          if (c.fireCooldown <= 0.0 && dist < 90000.0) {
-            const double aim = math::dot(c.ship.forward().normalized(), toN);
-            if (aim > 0.992) {
-              c.fireCooldown = 0.35;
-              const double dmg = 11.0;
+    // Speed control
+    double vAim = 0.0;
+    if (dist > desiredDistKm) vAim = std::min(maxSpeedKmS, 0.000004 * (dist - desiredDistKm));
+    if (dist < desiredDistKm * 0.60) vAim = -0.10;
+
+    const math::Vec3d desiredVel = targetVelKmS + toN * vAim;
+    const math::Vec3d dv = desiredVel - selfShip.velocityKmS();
+    const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
+    ai.thrustLocal = selfShip.orientation().conjugate().rotate(accelWorldDir);
+  };
+
+  // Contacts AI + combat
+  for (auto& c : contacts) {
+    if (!c.alive) continue;
+
+    // cooldowns
+    c.fireCooldown = std::max(0.0, c.fireCooldown - dtSim);
+
+    // ---- PIRATES ----
+    if (c.role == ContactRole::Pirate) {
+      sim::ShipInput ai{};
+      chaseTarget(c.ship, ai, ship.positionKm(), ship.velocityKmS(), 35000.0, 0.22, 1.8);
+      c.ship.step(dtSim, ai);
+
+      // Fire if aligned
+      const math::Vec3d to = ship.positionKm() - c.ship.positionKm();
+      const double dist = to.length();
+      if (c.fireCooldown <= 0.0 && dist < 90000.0) {
+        const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
+        const double aim = math::dot(c.ship.forward().normalized(), toN);
+        if (aim > 0.992) {
+          c.fireCooldown = 0.35;
+          const double dmg = 11.0;
+          applyDamage(dmg, playerShield, playerHull);
+
+          const math::Vec3d aKm = c.ship.positionKm();
+          const math::Vec3d bKm = ship.positionKm();
+          beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.95f, 0.45f, 0.10f, 0.08});
+        }
+      }
+      continue;
+    }
+
+    // ---- TRADERS ----
+    if (c.role == ContactRole::Trader) {
+      sim::ShipInput ai{};
+      ai.dampers = true;
+
+      const bool fleeing = (timeDays < c.fleeUntilDays);
+      if (fleeing) {
+        // Run away from player.
+        const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
+        const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
+        chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 200000.0, ship.velocityKmS(), 0.0, 0.25, 1.4);
+      } else if (currentSystem && !currentSystem->stations.empty()) {
+        // Lazy orbit/patrol around their home station.
+        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const double baseR = st.radiusKm * 26.0;
+        const double ang = std::fmod((double)(c.id % 1000) * 0.01 + timeDays * 0.75, 2.0 * math::kPi);
+        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.15*std::sin(ang*0.7), std::sin(ang)} * baseR;
+        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.18, 1.2);
+      }
+
+      c.ship.step(dtSim, ai);
+      continue;
+    }
+
+    // ---- POLICE ----
+    if (c.role == ContactRole::Police) {
+      // Police engage if you're wanted here, or if you attacked security.
+      const bool hostile = c.hostileToPlayer || (c.factionId != 0 && getBounty(c.factionId) > 0.0) || (c.factionId != 0 && getRep(c.factionId) < -45.0);
+
+      // If not hostile to player, try to engage pirates near the player.
+      std::optional<std::size_t> pirateIdx{};
+      if (!hostile) {
+        pirateIdx = nearestPirateIndex(c.ship.positionKm(), 140000.0);
+      }
+
+      sim::ShipInput ai{};
+      if (hostile) {
+        chaseTarget(c.ship, ai, ship.positionKm(), ship.velocityKmS(), 42000.0, 0.26, 2.0);
+      } else if (pirateIdx) {
+        const auto& p = contacts[*pirateIdx];
+        chaseTarget(c.ship, ai, p.ship.positionKm(), p.ship.velocityKmS(), 42000.0, 0.26, 2.0);
+      } else if (currentSystem && !currentSystem->stations.empty()) {
+        // Patrol around home station.
+        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const double baseR = st.radiusKm * 22.0;
+        const double ang = std::fmod((double)(c.id % 1000) * 0.012 + timeDays * 1.10, 2.0 * math::kPi);
+        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.10*std::sin(ang*0.6), std::sin(ang)} * baseR;
+        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
+      }
+
+      c.ship.step(dtSim, ai);
+
+      // Fire if aligned (at player OR pirate target).
+      const math::Vec3d targetPos = hostile ? ship.positionKm()
+                                            : (pirateIdx ? contacts[*pirateIdx].ship.positionKm() : math::Vec3d{0,0,0});
+      const bool hasTarget = hostile || (bool)pirateIdx;
+      if (hasTarget) {
+        const math::Vec3d to = targetPos - c.ship.positionKm();
+        const double dist = to.length();
+        if (c.fireCooldown <= 0.0 && dist < 95000.0) {
+          const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
+          const double aim = math::dot(c.ship.forward().normalized(), toN);
+          if (aim > 0.993) {
+            c.fireCooldown = 0.28;
+            const double dmg = 12.0;
+
+            if (hostile) {
               applyDamage(dmg, playerShield, playerHull);
-
               const math::Vec3d aKm = c.ship.positionKm();
               const math::Vec3d bKm = ship.positionKm();
-              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.95f, 0.45f, 0.10f, 0.08});
+              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
+            } else if (pirateIdx) {
+              auto& p = contacts[*pirateIdx];
+              applyDamage(dmg, p.shield, p.hull);
+              const math::Vec3d aKm = c.ship.positionKm();
+              const math::Vec3d bKm = p.ship.positionKm();
+              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
+              if (p.hull <= 0.0) {
+                p.alive = false;
+                credits += 180.0;
+                toast(toasts, "Security destroyed a pirate (+180).", 2.0);
+              }
             }
           }
         }
       }
+      continue;
+    }
+  }
 
-      // Station turrets: in station vicinity, help against pirates.
-      for (const auto& st : currentSystem->stations) {
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
-        const double zoneKm = st.radiusKm * 25.0;
-        const double distShip = (ship.positionKm() - stPos).length();
-        if (distShip > zoneKm) continue; // only if player is nearby
+  // Station turrets:
+  // - Help against pirates
+  // - If you are WANTED with the station's faction, the station will also chip at you near the no-fire zone.
+  for (const auto& st : currentSystem->stations) {
+    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const double zoneKm = st.radiusKm * 25.0;
+    const double distShip = (ship.positionKm() - stPos).length();
 
-        // Shoot a pirate every so often
-        for (auto& c : contacts) {
-          if (!c.alive || !c.pirate) continue;
-          const double d = (c.ship.positionKm() - stPos).length();
-          if (d < zoneKm) {
-            // apply light damage (feel of station defenses)
-            applyDamage(4.0 * dtSim, c.shield, c.hull);
-            if (c.hull <= 0.0) {
-              c.alive = false;
-              credits += 250.0;
-              toast(toasts, "Station defenses destroyed a pirate (+250).", 2.5);
-            }
-          }
+    // Only if player is nearby.
+    if (distShip > zoneKm) continue;
+
+    // Shoot pirates in zone
+    for (auto& c : contacts) {
+      if (!c.alive || c.role != ContactRole::Pirate) continue;
+      const double d = (c.ship.positionKm() - stPos).length();
+      if (d < zoneKm) {
+        applyDamage(4.0 * dtSim, c.shield, c.hull);
+        if (c.hull <= 0.0) {
+          c.alive = false;
+          credits += 250.0;
+          toast(toasts, "Station defenses destroyed a pirate (+250).", 2.5);
         }
       }
+    }
 
-      }
+    // Station security vs wanted player
+    if (st.factionId != 0 && getBounty(st.factionId) > 0.0) {
+      // very light pressure - enough to create urgency without insta-kill
+      applyDamage(1.5 * dtSim, playerShield, playerHull);
+    }
+  }
+}
 
       // Collisions (player with station hull)
       if (!docked) {
@@ -1745,46 +2128,186 @@ int main(int argc, char** argv) {
         }
       }
 
-      // --- Bounty scan progress ---
-      if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
-        bool valid = false;
-        if (target.kind == TargetKind::Contact && target.index < (int)contacts.size()) {
-          auto& c = contacts[(std::size_t)target.index];
-          if (c.alive) {
-            const double dist = (c.ship.positionKm() - ship.positionKm()).length();
-            if (dist <= scanRangeKm) {
-              // Find an active bounty-scan mission for this target.
-              for (auto& m : missions) {
-                if (m.completed || m.failed) continue;
-                if (m.type != sim::MissionType::BountyScan) continue;
-                if (m.toSystem != currentSystem->stub.id) continue;
-                if (m.targetNpcId != c.id) continue;
+// --- Scanner progress (missions + exploration) ---
+if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
+  bool valid = false;
 
-                valid = true;
-                scanProgressSec += dtReal;
-                if (scanProgressSec >= scanRequiredSec && !m.scanned) {
-                  m.scanned = true;
-                  m.completed = true;
-                  credits += m.reward;
-                  addRep(m.factionId, +2.0);
-                  toast(toasts, "Mission complete: bounty scan uploaded! +" + std::to_string((int)m.reward) + " cr", 3.0);
-                  scanning = false;
-                  scanProgressSec = 0.0;
-                }
-                break;
-              }
+  // If the player changes target while scanning, cancel.
+  if (target.kind != scanLockedTarget.kind || target.index != scanLockedTarget.index) {
+    scanning = false;
+    scanProgressSec = 0.0;
+    scanLockedId = 0;
+    scanLabel.clear();
+  } else {
+    auto completeScan = [&](const std::string& msg, double toastSec) {
+      scanning = false;
+      scanProgressSec = 0.0;
+      scanLockedId = 0;
+      scanLabel.clear();
+      scanLockedTarget = Target{};
+      scanLockedId = 0;
+      scanLabel.clear();
+      toast(toasts, msg, toastSec);
+    };
+
+    // --- CONTACT SCAN (primarily for bounty-scan missions) ---
+    if (scanLockedTarget.kind == TargetKind::Contact && scanLockedTarget.index < contacts.size()) {
+      auto& c = contacts[scanLockedTarget.index];
+      if (c.alive && c.id == scanLockedId) {
+        const double dist = (c.ship.positionKm() - ship.positionKm()).length();
+        if (dist <= scanRangeKm) {
+          valid = true;
+          scanProgressSec += dtReal;
+
+          if (scanProgressSec >= scanDurationSec) {
+            bool completedAnyMission = false;
+
+            // Find an active bounty-scan mission for this target.
+            for (auto& m : missions) {
+              if (m.completed || m.failed) continue;
+              if (m.type != sim::MissionType::BountyScan) continue;
+              if (m.toSystem != currentSystem->stub.id) continue;
+              if (m.targetNpcId != c.id) continue;
+
+              m.scanned = true;
+              m.completed = true;
+              credits += m.reward;
+              addRep(m.factionId, +2.0);
+              toast(toasts, "Mission complete: bounty scan uploaded! +" + std::to_string((int)m.reward) + " cr", 3.0);
+              completedAnyMission = true;
+              break;
+            }
+
+            if (completedAnyMission) {
+              scanning = false;
+              scanProgressSec = 0.0;
+              scanLockedId = 0;
+              scanLabel.clear();
+            } else {
+              completeScan("Scan complete.", 1.6);
             }
           }
         }
-
-        if (!valid) {
-          // Cancel silently if the target / mission is no longer valid.
-          scanning = false;
-          scanProgressSec = 0.0;
-        }
-      } else if (!scanning) {
-        scanProgressSec = 0.0;
       }
+    }
+
+    // --- STATION SCAN ---
+    if (!valid && scanLockedTarget.kind == TargetKind::Station && scanLockedTarget.index < currentSystem->stations.size()) {
+      const auto& st = currentSystem->stations[scanLockedTarget.index];
+      if (st.id == scanLockedId) {
+        const double dist = (stationPosKm(st, timeDays) - ship.positionKm()).length();
+        if (dist <= scanRangeKm) {
+          valid = true;
+          scanProgressSec += dtReal;
+
+          if (scanProgressSec >= scanDurationSec) {
+            const core::u64 key = scanKeyStation(st.id);
+            if (scannedKeys.find(key) == scannedKeys.end()) {
+              scannedKeys.insert(key);
+
+              const double value = 180.0 + (double)st.type * 40.0;
+              explorationDataCr += value;
+              completeScan("Station scan logged (+data " + std::to_string((int)value) + " cr).", 2.5);
+            } else {
+              completeScan("Station already scanned.", 1.8);
+            }
+          }
+        }
+      }
+    }
+
+    // --- PLANET SCAN ---
+    if (!valid && scanLockedTarget.kind == TargetKind::Planet && scanLockedTarget.index < currentSystem->planets.size()) {
+      const auto& p = currentSystem->planets[scanLockedTarget.index];
+      const math::Vec3d pPosKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
+      const double dist = (pPosKm - ship.positionKm()).length();
+      if (dist <= scanRangeKm) {
+        valid = true;
+        scanProgressSec += dtReal;
+
+        if (scanProgressSec >= scanDurationSec) {
+          const core::u64 key = scanKeyPlanet(currentSystem->stub.id, scanLockedTarget.index);
+          if (scannedKeys.find(key) == scannedKeys.end()) {
+            scannedKeys.insert(key);
+
+            double typeMul = 1.0;
+            if (p.type == sim::PlanetType::Ocean) typeMul = 1.25;
+            if (p.type == sim::PlanetType::Ice) typeMul = 1.15;
+            if (p.type == sim::PlanetType::GasGiant) typeMul = 1.45;
+
+            const double base = 240.0 + p.radiusKm * 0.03;
+            const double value = base * typeMul + (p.orbit.semiMajorAxisAU * 22.0);
+            explorationDataCr += value;
+
+            completeScan("Planet scan logged (+data " + std::to_string((int)value) + " cr).", 2.5);
+          } else {
+            completeScan("Planet already scanned.", 1.8);
+          }
+        }
+      }
+    }
+
+    // --- STAR SCAN ---
+    if (!valid && scanLockedTarget.kind == TargetKind::Star) {
+      valid = true;
+      scanProgressSec += dtReal;
+
+      if (scanProgressSec >= scanDurationSec) {
+        const core::u64 key = scanKeyStar(currentSystem->stub.id);
+        if (scannedKeys.find(key) == scannedKeys.end()) {
+          scannedKeys.insert(key);
+
+          const double value = 220.0 + (double)currentSystem->starClass * 80.0;
+          explorationDataCr += value;
+          completeScan("Star scan logged (+data " + std::to_string((int)value) + " cr).", 2.2);
+        } else {
+          completeScan("Star already scanned.", 1.8);
+        }
+      }
+    }
+
+    // If we successfully scanned something, check "system completion" bonus once.
+    if (!scanning) {
+      const bool starDone = scannedKeys.find(scanKeyStar(currentSystem->stub.id)) != scannedKeys.end();
+      bool planetsDone = true;
+      for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+        if (scannedKeys.find(scanKeyPlanet(currentSystem->stub.id, i)) == scannedKeys.end()) {
+          planetsDone = false;
+          break;
+        }
+      }
+      bool stationsDone = true;
+      for (const auto& st : currentSystem->stations) {
+        if (scannedKeys.find(scanKeyStation(st.id)) == scannedKeys.end()) {
+          stationsDone = false;
+          break;
+        }
+      }
+
+      if (starDone && planetsDone && stationsDone) {
+        const core::u64 compKey = scanKeySystemComplete(currentSystem->stub.id);
+        if (scannedKeys.find(compKey) == scannedKeys.end()) {
+          scannedKeys.insert(compKey);
+          const double bonus = 600.0 + 90.0 * (double)currentSystem->planets.size() + 120.0 * (double)currentSystem->stations.size();
+          explorationDataCr += bonus;
+          const core::u32 lf = currentSystem ? currentSystem->stub.factionId : 0;
+          if (lf != 0) addRep(lf, +1.0);
+          toast(toasts, "System survey complete! Bonus data +" + std::to_string((int)bonus) + " cr.", 3.0);
+        }
+      }
+    }
+
+    if (!valid) {
+      // Cancel silently if the target became invalid or we drifted out of range.
+      scanning = false;
+      scanProgressSec = 0.0;
+      scanLockedId = 0;
+      scanLabel.clear();
+    }
+  }
+} else if (!scanning) {
+  scanProgressSec = 0.0;
+}
 
       timeDays += dtSim / 86400.0;
 
@@ -2014,9 +2537,10 @@ int main(int argc, char** argv) {
     // Contacts (pirates)
     for (const auto& c : contacts) {
       if (!c.alive) continue;
-      const float r = c.pirate ? 1.0f : 0.6f;
-      const float g = c.pirate ? 0.25f : 0.7f;
-      const float b = c.pirate ? 0.25f : 0.8f;
+      float r = 0.65f, g = 0.75f, b = 0.85f;
+      if (c.role == ContactRole::Pirate) { r = 1.0f; g = 0.25f; b = 0.25f; }
+      if (c.role == ContactRole::Police) { r = 0.35f; g = 0.75f; b = 1.0f; }
+      if (c.role == ContactRole::Trader) { r = 0.45f; g = 0.95f; b = 0.45f; }
       cubes.push_back(makeInst(toRenderU(c.ship.positionKm()),
                                {0.25, 0.18, 0.45},
                                c.ship.orientation(),
@@ -2065,11 +2589,14 @@ int main(int argc, char** argv) {
         const auto& p = currentSystem->planets[target.index];
         tgtKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
         tgtLabel = p.name;
+} else if (target.kind == TargetKind::Star) {
+  tgtKm = math::Vec3d{0,0,0};
+  tgtLabel = std::string("Star ") + starClassName(currentSystem->starClass);
       } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
         const auto& c = contacts[target.index];
         if (c.alive) {
           tgtKm = c.ship.positionKm();
-          tgtLabel = c.name;
+          tgtLabel = c.name + std::string(" [") + contactRoleName(c.role) + "]";
         }
       }
 
@@ -2091,107 +2618,292 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (showShip) {
-      ImGui::Begin("Ship / Flight");
+if (showShip) {
+  ImGui::Begin("Ship / Status");
 
-      const auto pos = ship.positionKm();
-      const auto vel = ship.velocityKmS();
-      const auto wv  = ship.angularVelocityRadS();
+  ImGui::Text("System: %s", currentSystem->stub.name.c_str());
 
-      ImGui::Text("Time: %.2f days  (x%.1f) %s", timeDays, timeScale, paused ? "[PAUSED]" : "");
-      ImGui::SliderFloat("Time scale (sim sec / real sec)", (float*)&timeScale, 0.0f, 2000.0f);
+  const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
+  if (localFaction != 0) {
+    ImGui::Text("Local faction: %s | Rep %.1f | Bounty %.0f",
+                factionName(localFaction).c_str(),
+                getRep(localFaction),
+                getBounty(localFaction));
+  } else {
+    ImGui::Text("Local faction: (none)");
+  }
 
-      ImGui::Separator();
-      ImGui::Text("Hull: %.0f / 100   Shield: %.0f / 100", playerHull, playerShield);
-      ImGui::Text("Laser cooldown: %.2fs", playerLaserCooldown);
-      ImGui::Text("Fuel: %.1f / %.1f", fuel, fuelMax);
+  ImGui::Separator();
 
-      {
-        const double cap = std::max(1.0, cargoCapacityKg);
-        const double load = std::clamp(cargoMassKg(cargo) / cap, 0.0, 1.0);
-        const double linMult = (1.0 - 0.25 * load);
-        const double angMult = (1.0 - 0.20 * load);
-        ImGui::Text("Cargo load: %.0f%%   Handling: x%.2f accel, x%.2f turn", load * 100.0, linMult, angMult);
-      }
+  ImGui::Text("Credits: %.0f | Exploration data: %.0f cr", credits, explorationDataCr);
+  ImGui::Text("Fuel: %.1f | Heat: %.0f", fuel, heat);
+  ImGui::Text("Cargo: %.0f / %.0f kg", cargoMassKg(cargo), cargoCapacityKg);
+  ImGui::Text("Shield: %.0f Hull: %.0f", playerShield, playerHull);
 
-      const double jrMax = fsdBaseRangeLy();
-      const double jrNow = fsdCurrentRangeLy();
-      ImGui::Text("FSD range: %.1f ly (current) / %.1f ly (max)", jrNow, jrMax);
-      if (fsdState == FsdState::Charging) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "FSD CHARGING (%.1fs)", fsdChargeRemainingSec);
-      } else if (fsdState == FsdState::Travelling) {
-        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "IN HYPERSPACE (%.1fs)", fsdTravelRemainingSec);
-      } else {
-        const bool ready = (timeDays >= fsdReadyDay);
-        ImGui::Text("FSD: %s  (J to jump)", ready ? "READY" : "COOLDOWN");
-      }
+  ImGui::Text("Ship pos: (%.0f,%.0f,%.0f) km", ship.positionKm().x, ship.positionKm().y, ship.positionKm().z);
+  ImGui::Text("Vel: %.3f km/s", ship.velocityKmS().length());
 
-      if (docked) {
-        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "DOCKED");
-      } else {
-        ImGui::TextDisabled("Not docked");
-      }
+  if (scanning) {
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.9f, 0.95f, 1.0f, 1.0f), "%s", scanLabel.empty() ? "Scanning..." : scanLabel.c_str());
+    const float frac = (float)std::clamp(scanProgressSec / std::max(0.01, scanDurationSec), 0.0, 1.0);
+    ImGui::ProgressBar(frac, ImVec2(-1, 0));
+    ImGui::TextDisabled("K cancels scan.");
+  }
 
-      ImGui::Checkbox("Autopilot (P)", &autopilot);
+  if (fsdState != FsdState::Idle) {
+    ImGui::Separator();
+    ImGui::Text("FSD: %s", (fsdState == FsdState::Charging) ? "Charging" :
+                         (fsdState == FsdState::Jumping) ? "Jumping" : "Cooling");
+    ImGui::ProgressBar((float)(fsdTimer / fsdTotal), ImVec2(-1, 0));
+  }
 
-      // Mouse flight settings
-      bool mf = mouseFlight;
-      if (ImGui::Checkbox("Mouse flight (M/RMB)", &mf)) {
-        setMouseFlight(mf);
-      }
-      ImGui::SameLine();
-      ImGui::Checkbox("Invert mouse Y", &invertMouseY);
-      ImGui::SliderFloat("Mouse sensitivity", &mouseSensitivity, 0.002f, 0.030f, "%.4f");
+  if (supercruise) {
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "Supercruise: ACTIVE");
+  }
 
-      if (supercruise) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "SUPERCRUISE");
-      }
+  // Navigation / route status
+  if (navRoute.size() >= 2) {
+    ImGui::Separator();
+    const int totalJumps = (int)navRoute.size() - 1;
+    const int remaining = std::max(0, totalJumps - (int)navRouteHop);
 
-      if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
-        ImGui::Text("Route: hop %d/%d  (J: next hop)", (int)navRouteHop + 1, (int)navRoute.size() - 1);
-      }
-
-      if (scanning) {
-        ImGui::TextColored(ImVec4(0.95f, 0.9f, 0.6f, 1.0f), "Scanning... %.0f%% (K to cancel)", (scanProgressSec / scanDurationSec) * 100.0);
-      }
-
-      if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
-        const auto& st = currentSystem->stations[target.index];
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
-        const double dist = (pos - stPos).length();
-        auto it = clearances.find(st.id);
-        bool clearance = (it != clearances.end() && it->second.granted && timeDays <= it->second.expiresDays);
-        ImGui::Separator();
-        ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), dist);
-        ImGui::Text("Clearance: %s", clearance ? "GRANTED" : "NONE");
-        ImGui::TextDisabled("Docking: request clearance (L), fly through slot, then press G.");
-      } else {
-        ImGui::TextDisabled("Target: (none)  [T stations, B planets, N contacts]");
-      }
-
-      ImGui::Separator();
-      ImGui::Text("Pos (km):   [%.1f %.1f %.1f]", pos.x, pos.y, pos.z);
-      ImGui::Text("Vel (km/s): [%.3f %.3f %.3f] |v|=%.3f", vel.x, vel.y, vel.z, vel.length());
-      ImGui::Text("AngVel (rad/s): [%.3f %.3f %.3f]", wv.x, wv.y, wv.z);
-
-      ImGui::TextDisabled("Controls:");
-      ImGui::BulletText("Translate: WASD + R/F (up/down)");
-      ImGui::BulletText("Rotate: Arrow keys + Q/E roll");
-      ImGui::BulletText("Mouse flight: Right Mouse / M (Esc to release)");
-      ImGui::BulletText("Boost: LShift   Brake: X");
-      ImGui::BulletText("Dampers: Z (on) / C (off)");
-      ImGui::BulletText("Target: T (stations), B (planets), N (contacts), Y (clear)");
-      ImGui::BulletText("Docking: L (request clearance), G (dock/undock)");
-      ImGui::BulletText("Supercruise-lite: H (to target)");
-      ImGui::BulletText("FSD jump: J (route hop or selected system)");
-      ImGui::BulletText("Scan (bounty missions): K");
-      ImGui::BulletText("Fire: Left Mouse");
-      ImGui::BulletText("Pause: Space   Save: F5   Load: F9");
-      ImGui::BulletText("Missions: F4");
-
-      ImGui::End();
+    double remDist = 0.0;
+    double remFuel = 0.0;
+    for (std::size_t i = navRouteHop; i + 1 < navRoute.size(); ++i) {
+      const auto& a = universe.getSystem(navRoute[i]).stub;
+      const auto& b = universe.getSystem(navRoute[i + 1]).stub;
+      const double d = (b.posLy - a.posLy).length();
+      remDist += d;
+      remFuel += fsdFuelCostFor(d);
     }
+
+    ImGui::Text("Route: %d jumps (%d remaining) | est fuel %.1f", totalJumps, remaining, remFuel);
+    ImGui::TextDisabled("Auto-run: %s", navAutoRun ? "ON" : "OFF");
+
+    if (remFuel > fuel + 1e-6) {
+      ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "Fuel shortfall: +%.1f", remFuel - fuel);
+    }
+  }
+
+  // Target summary
+  ImGui::Separator();
+  if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+    const auto& st = currentSystem->stations[target.index];
+    ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), (stationPosKm(st, timeDays) - ship.positionKm()).length());
+  } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+    const auto& p = currentSystem->planets[target.index];
+    const math::Vec3d pPos = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
+    ImGui::Text("Target: %s (%.0f km)", p.name.c_str(), (pPos - ship.positionKm()).length());
+  } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+    const auto& c = contacts[target.index];
+    ImGui::Text("Target: %s [%s] (%.0f km)", c.name.c_str(), contactRoleName(c.role), (c.ship.positionKm() - ship.positionKm()).length());
+  } else if (target.kind == TargetKind::Star) {
+    ImGui::Text("Target: Star (%s)", starClassName(currentSystem->starClass));
+  } else {
+    ImGui::Text("Target: (none)  [T station / B planet / N contact / U star]");
+  }
+
+  ImGui::Separator();
+  ImGui::TextDisabled("Controls:");
+  ImGui::BulletText("WASD / QE translate, Mouse or Arrows rotate");
+  ImGui::BulletText("H toggle supercruise (target station/planet)");
+  ImGui::BulletText("J engage FSD jump (uses plotted route if present)");
+  ImGui::BulletText("P autopilot to station (needs docking clearance)");
+  ImGui::BulletText("T/B/N/U cycle targets, Y clear target");
+  ImGui::BulletText("K scan target (missions + exploration scans)");
+  ImGui::BulletText("L request docking clearance");
+  ImGui::BulletText("TAB Galaxy map, F1 Ship, F2 Market, F3 Contacts, F4 Missions, F6 Scanner");
+  ImGui::BulletText("F5 quicksave, F9 quickload");
+
+  ImGui::Separator();
+  float scMax = (float)supercruiseMaxSpeedKmS;
+  if (ImGui::SliderFloat("Supercruise max speed (km/s)", &scMax, 4000.0f, 60000.0f, "%.0f")) {
+    supercruiseMaxSpeedKmS = (double)scMax;
+  }
+  ImGui::Checkbox("Supercruise assist", &supercruiseAssist);
+
+  ImGui::End();
+}
+
+if (showScanner) {
+  ImGui::Begin("System Scanner");
+
+  ImGui::Text("System: %s", currentSystem->stub.name.c_str());
+  ImGui::Text("Star: %s | Mass %.2f | Radius %.2f | Temp %.0fK",
+              starClassName(currentSystem->starClass),
+              currentSystem->starMassSolar,
+              currentSystem->starRadiusSolar,
+              currentSystem->starTempK);
+
+  const bool starScanned = (scannedKeys.find(scanKeyStar(currentSystem->stub.id)) != scannedKeys.end());
+
+  // Quick UI helper: start a scan for a given target.
+  auto uiStartScan = [&](TargetKind kind, std::size_t idx) {
+    if (scanning) {
+      toast(toasts, "Already scanning. (K cancels)", 2.0);
+      return;
+    }
+    if (docked) {
+      toast(toasts, "Undock to scan.", 1.8);
+      return;
+    }
+    if (supercruise || fsdState != FsdState::Idle) {
+      toast(toasts, "Scanning unavailable in supercruise / hyperspace.", 2.0);
+      return;
+    }
+
+    target.kind = kind;
+    target.index = idx;
+
+    scanLockedTarget = target;
+    scanLockedId = 0;
+    scanLabel.clear();
+    scanProgressSec = 0.0;
+
+    bool ok = false;
+
+    if (kind == TargetKind::Star) {
+      scanLockedId = currentSystem->stub.id;
+      scanDurationSec = 2.5;
+      scanRangeKm = 1.0e18;
+      scanLabel = std::string("Star scan: ") + starClassName(currentSystem->starClass);
+      ok = true;
+    } else if (kind == TargetKind::Planet && idx < currentSystem->planets.size()) {
+      const auto& p = currentSystem->planets[idx];
+      scanLockedId = (core::u64)idx;
+      scanDurationSec = 5.0;
+      scanRangeKm = std::max(200000.0, p.radiusKm * 45.0);
+      scanLabel = "Planet scan: " + p.name;
+      ok = true;
+    } else if (kind == TargetKind::Station && idx < currentSystem->stations.size()) {
+      const auto& st = currentSystem->stations[idx];
+      scanLockedId = st.id;
+      scanDurationSec = 3.0;
+      scanRangeKm = std::max(25000.0, st.commsRangeKm * 0.9);
+      scanLabel = "Station scan: " + st.name;
+      ok = true;
+    }
+
+    if (ok) {
+      scanning = true;
+      toast(toasts, scanLabel + " (hold steady)...", 2.0);
+    } else {
+      toast(toasts, "Invalid scan target.", 2.0);
+    }
+  };
+
+  ImGui::Separator();
+
+  // Survey status
+  int scannedPlanets = 0;
+  for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+    if (scannedKeys.find(scanKeyPlanet(currentSystem->stub.id, i)) != scannedKeys.end()) ++scannedPlanets;
+  }
+  int scannedStations = 0;
+  for (const auto& st : currentSystem->stations) {
+    if (scannedKeys.find(scanKeyStation(st.id)) != scannedKeys.end()) ++scannedStations;
+  }
+
+  ImGui::Text("Survey: Star %s | Planets %d/%d | Stations %d/%d",
+              starScanned ? "OK" : "UNSCANNED",
+              scannedPlanets, (int)currentSystem->planets.size(),
+              scannedStations, (int)currentSystem->stations.size());
+
+  if (!starScanned) {
+    if (ImGui::Button("Target Star")) {
+      target.kind = TargetKind::Star;
+      target.index = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Scan Star")) {
+      uiStartScan(TargetKind::Star, 0);
+    }
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Planets");
+
+  for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+    const auto& p = currentSystem->planets[i];
+    const bool scanned = (scannedKeys.find(scanKeyPlanet(currentSystem->stub.id, i)) != scannedKeys.end());
+
+    ImGui::PushID((int)i);
+
+    ImGui::Text("%s %s", p.name.c_str(), scanned ? "" : "(unscanned)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Target##p")) {
+      target.kind = TargetKind::Planet;
+      target.index = i;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Scan##p")) {
+      uiStartScan(TargetKind::Planet, i);
+    }
+
+    if (scanned) {
+      const double periodDays = sim::orbitPeriodSec(p.orbit, currentSystem->starMassSolar) / 86400.0;
+      ImGui::TextDisabled("Type: %s | Radius: %.0f km | a: %.2f AU | Period: %.1f d",
+                          planetTypeName(p.type), p.radiusKm, p.orbit.semiMajorAxisAU, periodDays);
+    } else {
+      ImGui::TextDisabled("Type: ??? | Radius: ??? | Orbit: ???");
+    }
+
+    ImGui::Separator();
+    ImGui::PopID();
+  }
+
+  ImGui::Text("Stations");
+
+  for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+    const auto& st = currentSystem->stations[i];
+    const bool scanned = (scannedKeys.find(scanKeyStation(st.id)) != scannedKeys.end());
+
+    ImGui::PushID((int)(1000 + i));
+
+    ImGui::Text("%s %s", st.name.c_str(), scanned ? "" : "(unscanned)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Target##s")) {
+      target.kind = TargetKind::Station;
+      target.index = i;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Scan##s")) {
+      uiStartScan(TargetKind::Station, i);
+    }
+
+    if (scanned) {
+      ImGui::TextDisabled("Type: %s | Faction: %s | Fee: %.1f%%",
+                          stationTypeName(st.type),
+                          factionName(st.factionId).c_str(),
+                          st.feeRate * 100.0);
+    } else {
+      ImGui::TextDisabled("Type: ??? | Faction: ??? | Services: ???");
+    }
+
+    ImGui::Separator();
+    ImGui::PopID();
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Exploration data bank: %.0f cr", explorationDataCr);
+  if (docked && selectedStationIndex >= 0 && selectedStationIndex < (int)currentSystem->stations.size()) {
+    if (explorationDataCr > 0.0) {
+      if (ImGui::Button("Sell exploration data here")) {
+        credits += explorationDataCr;
+        toast(toasts, "Sold exploration data +" + std::to_string((int)explorationDataCr) + " cr.", 2.5);
+        explorationDataCr = 0.0;
+      }
+    } else {
+      ImGui::TextDisabled("No data to sell.");
+    }
+  } else {
+    ImGui::TextDisabled("Dock at a station to sell exploration data.");
+  }
+
+  ImGui::End();
+}
 
     if (showEconomy) {
       beginStationSelectorHUD(*currentSystem, selectedStationIndex, docked, dockedStationId);
@@ -2309,6 +3021,41 @@ int main(int argc, char** argv) {
             ImGui::TextDisabled("(%.0f cr)", rangeUpgradeCost);
           }
         }
+
+// Exploration / legal services
+if (canTrade) {
+  ImGui::Separator();
+  ImGui::Text("Exploration Data");
+  ImGui::Text("Bank: %.0f cr", explorationDataCr);
+  if (explorationDataCr > 0.0) {
+    if (ImGui::Button("Sell all exploration data")) {
+      credits += explorationDataCr;
+      toast(toasts, "Sold exploration data +" + std::to_string((int)explorationDataCr) + " cr.", 2.5);
+      explorationDataCr = 0.0;
+      addRep(station.factionId, +0.5);
+    }
+  } else {
+    ImGui::TextDisabled("No scan data to sell.");
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Legal");
+  const double bounty = getBounty(station.factionId);
+  ImGui::Text("Outstanding bounty (this faction): %.0f cr", bounty);
+  if (bounty > 0.0) {
+    if (ImGui::Button("Pay bounty")) {
+      if (credits >= bounty) {
+        credits -= bounty;
+        clearBounty(station.factionId);
+        toast(toasts, "Bounty cleared.", 2.0);
+      } else {
+        toast(toasts, "Not enough credits to pay bounty.", 2.0);
+      }
+    }
+  } else {
+    ImGui::TextDisabled("No bounty.");
+  }
+}
 
         static int selectedCommodity = 0;
         ImGui::SliderInt("Plot commodity", &selectedCommodity, 0, (int)econ::kCommodityCount - 1);
@@ -2677,37 +3424,77 @@ int main(int argc, char** argv) {
       ImGui::End();
     }
 
-    if (showContacts) {
-      ImGui::Begin("Contacts / Combat");
+if (showContacts) {
+  ImGui::Begin("Contacts / Combat");
 
-      int alivePirates = 0;
-      for (const auto& c : contacts) if (c.alive && c.pirate) ++alivePirates;
-      ImGui::Text("Alive pirates: %d", alivePirates);
+  int alivePirates = 0;
+  int aliveTraders = 0;
+  int alivePolice = 0;
+  for (const auto& c : contacts) {
+    if (!c.alive) continue;
+    if (c.role == ContactRole::Pirate) ++alivePirates;
+    if (c.role == ContactRole::Trader) ++aliveTraders;
+    if (c.role == ContactRole::Police) ++alivePolice;
+  }
 
-      if (ImGui::Button("Panic: clear pirates")) {
-        for (auto& c : contacts) c.alive = false;
-        toast(toasts, "Contacts cleared.", 2.0);
-      }
+  const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
+  if (localFaction != 0) {
+    ImGui::Text("Local faction: %s | Rep %.1f | Bounty %.0f",
+                factionName(localFaction).c_str(),
+                getRep(localFaction),
+                getBounty(localFaction));
+  } else {
+    ImGui::Text("Local faction: (none)");
+  }
 
-      ImGui::Separator();
+  ImGui::Text("Pirates: %d   Traders: %d   Police: %d", alivePirates, aliveTraders, alivePolice);
 
-      for (std::size_t i = 0; i < contacts.size(); ++i) {
-        const auto& c = contacts[i];
-        if (!c.alive) continue;
+  if (ImGui::Button("Panic: clear contacts")) {
+    for (auto& c : contacts) c.alive = false;
+    toast(toasts, "Contacts cleared.", 2.0);
+  }
 
-        ImGui::PushID((int)i);
-        ImGui::Text("%s %s%s", c.name.c_str(), c.pirate ? "[PIRATE]" : "", c.missionTarget ? " [BOUNTY]" : "");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Target")) {
-          target.kind = TargetKind::Contact;
-          target.index = i;
-        }
-        ImGui::TextDisabled("Hull %.0f  Shield %.0f", c.hull, c.shield);
-        ImGui::PopID();
-      }
+  ImGui::Separator();
 
-      ImGui::End();
+  for (std::size_t i = 0; i < contacts.size(); ++i) {
+    const auto& c = contacts[i];
+    if (!c.alive) continue;
+
+    const double distKm = (c.ship.positionKm() - ship.positionKm()).length();
+
+    ImGui::PushID((int)i);
+
+    std::string tag = std::string("[") + contactRoleName(c.role) + "]";
+    if (c.missionTarget) tag += " [BOUNTY]";
+    if (c.role == ContactRole::Police) {
+      const bool hostile = c.hostileToPlayer || (c.factionId != 0 && getBounty(c.factionId) > 0.0);
+      if (hostile) tag += " [HOSTILE]";
     }
+
+    ImGui::Text("%s %s", c.name.c_str(), tag.c_str());
+    if (c.factionId != 0) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(%s)", factionName(c.factionId).c_str());
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Target")) {
+      target.kind = TargetKind::Contact;
+      target.index = i;
+    }
+
+    ImGui::TextDisabled("Dist %.0f km | Hull %.0f | Shield %.0f", distKm, c.hull, c.shield);
+
+    if (c.role == ContactRole::Trader) {
+      ImGui::TextDisabled("Cargo value ~%.0f cr (piracy is illegal).", c.cargoValueCr);
+    }
+
+    ImGui::Separator();
+    ImGui::PopID();
+  }
+
+  ImGui::End();
+}
 
     if (showGalaxy) {
       ImGui::Begin("Galaxy / Streaming");

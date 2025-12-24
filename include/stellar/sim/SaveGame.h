@@ -23,6 +23,13 @@ struct FactionReputation {
   double rep{0.0}; // roughly [-100,+100]
 };
 
+// Simple bounty record (per faction id).
+// If non-zero, local police will treat the player as WANTED in that faction's space.
+struct FactionBounty {
+  core::u32 factionId{0};
+  double bountyCr{0.0};
+};
+
 // Lightweight "gameplay" mission representation.
 // Stored in the save file so early progression loops (cargo delivery/courier/bounties)
 // persist across runs.
@@ -77,7 +84,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{3};
+  int version{4};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -95,6 +102,10 @@ struct SaveGame {
   double credits{1000.0};
   std::array<double, econ::kCommodityCount> cargo{}; // units
 
+  // Exploration
+  double explorationDataCr{0.0};
+  std::vector<core::u64> scannedKeys{};
+
   // Ship meta/progression
   double fuel{45.0};
   double fuelMax{45.0};
@@ -109,6 +120,9 @@ struct SaveGame {
 
   // Reputation
   std::vector<FactionReputation> reputation{};
+
+  // Law / bounties
+  std::vector<FactionBounty> bounties{};
 
   std::vector<StationEconomyOverride> stationOverrides{};
 };
