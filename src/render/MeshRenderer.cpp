@@ -20,7 +20,8 @@ layout(location=1) in vec3 aNrm;
 layout(location=2) in vec2 aUv;
 
 layout(location=3) in vec4 iPosScale; // xyz + scale
-layout(location=4) in vec3 iColor;
+layout(location=4) in vec4 iQuat;     // (w,x,y,z)
+layout(location=5) in vec3 iColor;
 
 uniform mat4 uView;
 uniform mat4 uProj;
@@ -29,12 +30,21 @@ out vec2 vUv;
 out vec3 vColor;
 out vec3 vNrm;
 
+vec3 quatRotate(vec4 q, vec3 v) {
+  // q = (w,x,y,z)
+  vec3 u = q.yzw;
+  float s = q.x;
+  vec3 t = 2.0 * cross(u, v);
+  return v + s * t + cross(u, t);
+}
+
 void main() {
-  vec3 pos = aPos * iPosScale.w + iPosScale.xyz;
+  vec4 q = normalize(iQuat);
+  vec3 pos = quatRotate(q, aPos * iPosScale.w) + iPosScale.xyz;
   gl_Position = uProj * uView * vec4(pos, 1.0);
   vUv = aUv;
   vColor = iColor;
-  vNrm = aNrm;
+  vNrm = quatRotate(q, aNrm);
 }
 )GLSL";
 
@@ -101,10 +111,15 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
   gl::VertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, px));
   gl::VertexAttribDivisor(3, 1);
 
-  // location 4: vec3 color
+  // location 4: vec4 quat
   gl::EnableVertexAttribArray(4);
-  gl::VertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, cr));
+  gl::VertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, qw));
   gl::VertexAttribDivisor(4, 1);
+
+  // location 5: vec3 color
+  gl::EnableVertexAttribArray(5);
+  gl::VertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, cr));
+  gl::VertexAttribDivisor(5, 1);
 
   mesh_->drawInstanced(static_cast<std::uint32_t>(instances.size()));
 }

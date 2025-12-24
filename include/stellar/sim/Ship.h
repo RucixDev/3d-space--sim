@@ -51,6 +51,9 @@ public:
   void setMaxLinearAccelKmS2(double a) { maxLinAccelKmS2_ = a; }
   void setMaxAngularAccelRadS2(double a) { maxAngAccelRadS2_ = a; }
 
+  double maxLinearAccelKmS2() const { return maxLinAccelKmS2_; }
+  double maxAngularAccelRadS2() const { return maxAngAccelRadS2_; }
+
   void setDampingLinear(double d) { dampingLinear_ = d; }     // per-second
   void setDampingAngular(double d) { dampingAngular_ = d; }   // per-second
 

@@ -11,6 +11,11 @@ namespace stellar::render {
 struct InstanceData {
   float px, py, pz;
   float scale;
+
+  // Per-instance orientation quaternion (w,x,y,z).
+  // Identity = (1,0,0,0).
+  float qw, qx, qy, qz;
+
   float cr, cg, cb;
 };
 

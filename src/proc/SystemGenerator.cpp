@@ -122,6 +122,51 @@ static econ::StationType pickStationType(core::SplitMix64& rng, double bias) {
   return econ::StationType::Shipyard;
 }
 
+static double stationRadiusKm(econ::StationType t) {
+  // Very rough proxy for station size. This is only used for docking cues / soft collision.
+  switch (t) {
+    case econ::StationType::Outpost:       return 6.0;
+    case econ::StationType::Agricultural: return 10.0;
+    case econ::StationType::Mining:       return 10.0;
+    case econ::StationType::Refinery:     return 12.0;
+    case econ::StationType::Industrial:   return 15.0;
+    case econ::StationType::Research:     return 10.0;
+    case econ::StationType::TradeHub:     return 18.0;
+    case econ::StationType::Shipyard:     return 26.0;
+    default:                              return 12.0;
+  }
+}
+
+static sim::OrbitElements makeStationOrbit(const sim::Star& star,
+                                          const std::vector<sim::Planet>& planets,
+                                          core::SplitMix64& rng) {
+  sim::OrbitElements el{};
+
+  // Place stations close to a planet orbit most of the time (gives the player a sensible
+  // "destination" in-system). If no planets exist, just pick a reasonable AU range.
+  double a = 0.0;
+  if (!planets.empty()) {
+    const int pIdx = rng.range<int>(0, (int)planets.size() - 1);
+    const double baseA = planets[(std::size_t)pIdx].orbit.semiMajorAxisAU;
+    const double jitter = rng.range(-0.03, 0.03) * baseA;
+    a = std::max(0.12, baseA + jitter);
+  } else {
+    a = rng.range(0.25, 4.0);
+  }
+
+  el.semiMajorAxisAU = a;
+  el.eccentricity = rng.range(0.0, 0.06);
+  el.inclinationRad = rng.range(0.0, stellar::math::degToRad(3.0));
+  el.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  el.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  el.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
+  el.epochDays = 0.0;
+
+  const double years = std::sqrt((a*a*a) / std::max(0.08, star.massSol));
+  el.periodDays = years * 365.25;
+  return el;
+}
+
 static const sim::Faction* findFaction(core::u32 id, const std::vector<sim::Faction>& factions) {
   for (const auto& f : factions) if (f.id == id) return &f;
   return nullptr;
@@ -183,6 +228,10 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
     st.feeRate = fee;
     st.type = pickStationType(rng, bias);
     st.economyModel = econ::makeEconomyModel(st.type, bias);
+
+    // Physical placement (simple Kepler orbit) + size.
+    st.orbit = makeStationOrbit(sys.star, sys.planets, rng);
+    st.radiusKm = stationRadiusKm(st.type);
     sys.stations.push_back(std::move(st));
   }
 
