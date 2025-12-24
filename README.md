@@ -9,27 +9,36 @@ This repo contains:
 
 ## What’s playable right now (prototype “feel” pass)
 
-### Stations that exist in-world (with orientation)
-- Stations are placed on **orbits** in the current system.
-- Stations have **visible geometry** (ring + central body + a highlighted docking frame).
-- Stations slowly **spin**, so orientation matters when approaching.
+### Stations + docking
+- Stations orbit planets and broadcast a **comms range**.
+- You can request docking clearance (**L**) and dock (**G**) when in range.
+- While docked you can use basic services:
+  - **Repair** (cost scales with damage)
+  - **Refuel** (buys Fuel from the station and fills your tank)
+  - **Shipyard upgrades** (at Shipyards): cargo rack + fuel tank upgrades
 
-### “Mail-slot” style docking (with clearance)
-- Target a station: **T** cycles stations.
-- Request docking clearance: **L** (must be in comms range).
-- Fly through the **mail-slot** (stay aligned, stay under speed limit).
-- Press **G** to dock / undock.
+### Economy / market prototype
+- Each station has its own inventory and prices (simple supply/demand model).
+- Buy & sell commodities.
+- Cargo is now **mass-limited (kg)** instead of infinite.
 
-### Combat-lite loop (pirates + basic weapon)
-- Pirates periodically spawn as contacts and will **pursue and fire** on the player.
-- Player weapon: **laser (Left Mouse)**.
-- If you die: you **respawn** and lose cargo + 10% credits (so pirates matter).
-- Stations provide light **defensive fire** against pirates near the station.
+### In-system flight
+- 6DOF-ish flight with dampers / boost / brake.
+- Autopilot can fly to the current target.
 
-### Market + basic services gating
-- **Buying/Selling is disabled unless docked at that station.**
-- While docked you can use a basic **Repair** service.
+### Galaxy streaming
+- A simple galaxy map that streams nearby systems from a procedural seed.
 
+### FSD jump (early hyperspace loop)
+- Select a destination system in the **Galaxy** window and press **J** (or click the button).
+- Requires being undocked, not mass-locked near a station, and having enough fuel.
+- Has a short **charge** and **cooldown** (balance tuning is placeholder).
+
+### Missions (early)
+- Dock at a station and open the **Missions** window (**F4**).
+- Accept **Courier** and **Delivery** jobs.
+- Delivery jobs may require you to buy cargo, or may provide cargo up-front (requires cargo space).
+- Complete by docking at the destination station before the deadline.
 ## Controls (quick)
 - Translate: **W/S** (forward/back), **A/D** (strafe), **R/F** (up/down)
 - Rotate: **Arrow keys** (pitch/yaw), **Q/E** (roll)
@@ -40,7 +49,8 @@ This repo contains:
 - Dock/Undock: **G**
 - Autopilot approach: **P**
 - Fire laser: **Left Mouse**
-- UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts
+- FSD jump: **J** (to selected system in Galaxy)
+- UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions
 - Save/Load: **F5 / F9**
 - Pause: **Space**
 
@@ -73,6 +83,6 @@ Some CI templates run `./configure && make`. This repo now includes a **compat**
 
 ## Next “feel” upgrades worth doing
 - Supercruise + nav assist (“7-second rule”)
-- FSD/hyperspace loop (fuel + cooldown + arrival at station)
-- Missions (courier/delivery/bounty) + reputation
+- Mission variety (bounty / passenger / multi-hop) + reputation
+- Mission board persistence + better failure/penalty handling
 - NPC traffic that actually moves station inventories/prices
