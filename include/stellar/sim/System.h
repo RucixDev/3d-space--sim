@@ -15,25 +15,21 @@ struct Station {
   double feeRate{0.0};          // market fee rate (0..1)
   econ::StationEconomyModel economyModel{};
 
-  // Physical placement (for in-system flight / docking).
-  // Orbits the system primary at the given Keplerian elements.
+  // Physical placement (currently: heliocentric orbit).
   OrbitElements orbit{};
 
-  // Approximate physical radius of the station (km). Used for docking checks.
-  double radiusKm{25.0};
+  // Physical scale for rendering + navigation. This is NOT (yet) used for
+  // collision.
+  double radiusKm{12.0};
 
-  // Simple docking approach "corridor" (cylinder) extending out from the station.
-  // The corridor axis is defined at runtime (see game prototype) and is intended
-  // to enforce safe approach speed and alignment.
-  double corridorLengthKm{50.0};
-  double corridorRadiusKm{15.0};
-
-  // Speed limit inside the corridor (km/s). 0.10 km/s = 100 m/s.
-  double corridorSpeedLimitKmS{0.10};
-
-  // Alignment requirement inside corridor: ship must face the entrance within
-  // a cone of this half-angle (degrees).
-  double corridorAlignHalfAngleDeg{20.0};
+  // Docking parameters.
+  // - You must be within dockingRangeKm
+  // - Approach must be within dockingCorridorHalfAngleRad of the corridor axis
+  // - Relative speed must be <= dockingSpeedLimitKmS
+  double dockingRangeKm{60.0};
+  double dockingCorridorLengthKm{3000.0};
+  double dockingCorridorHalfAngleRad{0.25}; // ~14 degrees
+  double dockingSpeedLimitKmS{0.10};        // ~100 m/s
 };
 
 struct StarSystem {

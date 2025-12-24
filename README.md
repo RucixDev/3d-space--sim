@@ -23,12 +23,13 @@ New in this build:
 - **Streaming universe**: systems are generated **on-demand** (infinite indices) with an **LRU cache**
 - **Renderer layer**: a minimal OpenGL point renderer (GL function loading via SDL's `SDL_GL_GetProcAddress`)
 - **Player ship**: simple input + physics integration (AU/day units)
+- **Targeting + nav HUD**: select a planet/station as a nav target, with an on-screen marker
+- **Docking corridor**: stations have an approach corridor, speed limit, and alignment requirement
+- **Autopilot**: a basic approach assist that keeps you on the station corridor and respects the speed limit
+- **Supercruise**: high-speed in-system travel with simplified physics + auto-drop near the target
+- **Time compression UX**: discrete in-system time acceleration levels with safety clamping
 - **Factions + markets**: deterministic faction generation + per-system market generation
 - **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
-
-- **In-system time acceleration**: PageUp/PageDown time compression with safety clamps (hold CTRL to override)
-- **Docking corridor + docking state**: stations have physical orbits; dock/undock with **G** (trading requires docking)
-- **Supercruise-like mode**: toggle with **J**, throttle with **W/S** (simplified high-speed travel)
 
 ## Build
 
@@ -105,6 +106,38 @@ Then:
 ```
 
 The game will auto-load `savegame.txt` if present; press **F5** to save.
+
+### Prototype controls
+
+Flight:
+
+- Translate: **WASD** + **R/F** (up/down)
+- Rotate: **Arrow keys** + **Q/E** (roll)
+- Boost: **LShift**
+- Brake: **X**
+- Dampers: **Z** (on) / **C** (off)
+
+Navigation:
+
+- Cycle targets: **T**
+- Clear target: **Y**
+- Autopilot toggle: **P**
+- Dock / Undock: **G**
+
+Supercruise:
+
+- Toggle: **J**
+- Throttle while in supercruise: **W/S** (and **X** to cut throttle)
+
+Time:
+
+- Time compression: **PgUp/PgDn** (Home = 1x, End = max)
+- Hold **Ctrl** to force the requested time compression (bypasses the safety clamp)
+- Pause: **Space**
+
+UI:
+
+- Toggle windows: **TAB** (Galaxy), **F1** (Flight), **F2** (Economy), **F3** (Nav), **F4** (HUD)
 
 ## Next steps you can add easily
 
