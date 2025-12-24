@@ -30,31 +30,34 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
 
   f << "credits " << s.credits << "\n";
 
+  // Ship meta / progression
+  f << "fuel " << s.fuel << "\n";
+  f << "fuelMax " << s.fuelMax << "\n";
+  f << "hull " << s.hull << "\n";
+  f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
+  f << "fsdReadyDay " << s.fsdReadyDay << "\n";
+
   f << "cargo";
   for (double u : s.cargo) f << " " << u;
   f << "\n";
 
-  // Player state / progression
-  f << "hull " << s.hull << " " << s.hullMax << "\n";
-  f << "fuel " << s.fuel << " " << s.fuelMax << "\n";
-  f << "cargoCapacity " << s.cargoCapacity << "\n";
-  f << "fsdCooldownSec " << s.fsdCooldownSec << "\n";
-
   // Missions
+  f << "nextMissionId " << s.nextMissionId << "\n";
   f << "missions " << s.missions.size() << "\n";
   for (const auto& m : s.missions) {
     f << "mission "
       << m.id << " "
       << static_cast<int>(m.type) << " "
-      << m.originSystem << " "
-      << m.originStation << " "
-      << m.destSystem << " "
-      << m.destStation << " "
+      << m.fromSystem << " " << m.fromStation << " "
+      << m.toSystem << " " << m.toStation << " "
       << static_cast<int>(m.commodity) << " "
       << m.units << " "
-      << (m.scanned ? 1 : 0) << " "
-      << m.rewardCredits << " "
-      << m.expiryDay
+      << m.targetNpcId << " "
+      << m.reward << " "
+      << m.deadlineDay << " "
+      << (m.completed ? 1 : 0) << " "
+      << (m.failed ? 1 : 0) << " "
+      << (m.cargoProvided ? 1 : 0)
       << "\n";
   }
 
@@ -127,33 +130,54 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.shipAngVelRadS.x >> out.shipAngVelRadS.y >> out.shipAngVelRadS.z;
     } else if (key == "credits") {
       f >> out.credits;
+    } else if (key == "fuel") {
+      f >> out.fuel;
+    } else if (key == "fuelMax") {
+      f >> out.fuelMax;
+    } else if (key == "hull") {
+      f >> out.hull;
+    } else if (key == "cargoCapacityKg") {
+      f >> out.cargoCapacityKg;
+    } else if (key == "fsdReadyDay") {
+      f >> out.fsdReadyDay;
     } else if (key == "cargo") {
       for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
-    } else if (key == "hull") {
-      f >> out.hull >> out.hullMax;
-    } else if (key == "fuel") {
-      f >> out.fuel >> out.fuelMax;
-    } else if (key == "cargoCapacity") {
-      f >> out.cargoCapacity;
-    } else if (key == "fsdCooldownSec") {
-      f >> out.fsdCooldownSec;
+    } else if (key == "nextMissionId") {
+      f >> out.nextMissionId;
     } else if (key == "missions") {
       std::size_t n = 0;
       f >> n;
       out.missions.clear();
       out.missions.reserve(n);
-
       for (std::size_t i = 0; i < n; ++i) {
-        if (!expectToken(f, "mission")) return false;
+        std::string tok;
+        if (!(f >> tok) || tok != "mission") return false;
+
         Mission m{};
         int type = 0;
-        int comm = 0;
-        int scanned = 0;
-        f >> m.id >> type >> m.originSystem >> m.originStation >> m.destSystem >> m.destStation;
-        f >> comm >> m.units >> scanned >> m.rewardCredits >> m.expiryDay;
+        int commodity = 0;
+        int completed = 0;
+        int failed = 0;
+        int cargoProvided = 0;
+        f >> m.id
+          >> type
+          >> m.fromSystem >> m.fromStation
+          >> m.toSystem >> m.toStation
+          >> commodity
+          >> m.units
+          >> m.targetNpcId
+          >> m.reward
+          >> m.deadlineDay
+          >> completed
+          >> failed
+          >> cargoProvided;
+
         m.type = static_cast<MissionType>(type);
-        m.commodity = static_cast<econ::CommodityId>(comm);
-        m.scanned = (scanned != 0);
+        m.commodity = static_cast<econ::CommodityId>(commodity);
+        m.completed = (completed != 0);
+        m.failed = (failed != 0);
+        m.cargoProvided = (cargoProvided != 0);
+
         out.missions.push_back(std::move(m));
       }
     } else if (key == "station_overrides") {

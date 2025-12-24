@@ -5,8 +5,17 @@ project(stellar_forge LANGUAGES CXX)
 include(FetchContent)
 include(CTest)
 
+# Legacy option preserved for older build scripts / README snippets.
+# Prefer STELLAR_ENABLE_RENDER + STELLAR_ENABLE_IMGUI going forward.
+option(STELLAR_BUILD_GAME "(DEPRECATED) Build the SDL/OpenGL game prototype" ON)
+
 option(STELLAR_ENABLE_RENDER "Build OpenGL/SDL rendering module and the game app" ON)
 option(STELLAR_ENABLE_IMGUI  "Enable Dear ImGui UI (requires STELLAR_ENABLE_RENDER)" ON)
+
+if (NOT STELLAR_BUILD_GAME)
+  set(STELLAR_ENABLE_RENDER OFF CACHE BOOL "" FORCE)
+  set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
+endif()
 
 option(STELLAR_FETCH_SDL2 "Fetch SDL2 if not found via find_package (render builds only)" ON)
 option(STELLAR_FETCH_IMGUI "Fetch Dear ImGui (render+imgui builds only)" ON)

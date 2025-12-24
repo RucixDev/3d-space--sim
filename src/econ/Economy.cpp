@@ -24,14 +24,20 @@ StationEconomyModel makeEconomyModel(StationType type, double bias) {
   StationEconomyModel m{};
   m.type = type;
 
+  // Keep station inventories intentionally a bit tight so that trading/missions can
+  // actually create shortages and price spikes. (This is a gameplay-oriented model,
+  // not a realistic macro-economy.)
+  const double kStockScale = 0.65;
+
   setAll(m.productionPerDay, 0.0);
   setAll(m.consumptionPerDay, 0.0);
   setAll(m.desiredStock, 0.0);
   setAll(m.capacity, 0.0);
 
   auto D = [&](CommodityId id, double desired) {
+    desired *= kStockScale;
     m.desiredStock[idx(id)] = desired;
-    m.capacity[idx(id)] = desired * 2.5;
+    m.capacity[idx(id)] = desired * 1.8;
   };
   auto P = [&](CommodityId id, double prod) { m.productionPerDay[idx(id)] = prod; };
   auto C = [&](CommodityId id, double cons) { m.consumptionPerDay[idx(id)] = cons; };

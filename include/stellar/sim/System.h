@@ -7,6 +7,27 @@
 
 namespace stellar::sim {
 
+// Simple docking/approach parameters for gameplay.
+// These are intentionally "game-y" and can be iterated on as we add real station meshes.
+struct DockingParams {
+  // Physical station radius (used for docking offset / visuals).
+  double radiusKm{6.0};
+
+  // Comms range to request docking.
+  double commsRangeKm{50000.0};
+
+  // Approach corridor (cylinder) in the station's local approach axis.
+  // The axis is defined in gameplay code; currently it is the outward radial from the star.
+  double corridorRadiusKm{80.0};
+  double corridorLengthKm{1800.0};
+
+  // Maximum relative speed allowed inside the corridor for docking.
+  double speedLimitKmS{0.12};
+
+  // Alignment requirement: ship must face within acos(alignCos) of the corridor axis (inbound).
+  double alignCos{0.9659258263}; // cos(15 deg)
+};
+
 struct Station {
   StationId id{0};
   std::string name;
@@ -15,25 +36,11 @@ struct Station {
   double feeRate{0.0};          // market fee rate (0..1)
   econ::StationEconomyModel economyModel{};
 
-  // In-system physical placement (simple Keplerian orbit around the primary star).
-  // Units:
-  //  - orbit.semiMajorAxisAU: AU
-  //  - angles: radians
-  //  - orbit.periodDays: days
+  // Orbital parameters (around the system's primary star).
   OrbitElements orbit{};
 
-  // Physical size (used for simple collision / docking distances).
-  double radiusKm{6.0};
-
-  // Docking / approach corridor parameters (local frame defined by station position
-  // and the star at the origin; corridor axis points away from the star).
-  double corridorLengthKm{120.0};
-  double corridorRadiusKm{25.0};
-  double corridorSpeedLimitKmS{0.12};
-  double corridorAlignCos{0.90};
-
-  // Comms range required to request docking.
-  double commsRangeKm{2500.0};
+  // Docking/approach parameters.
+  DockingParams docking{};
 };
 
 struct StarSystem {

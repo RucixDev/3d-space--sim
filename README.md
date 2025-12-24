@@ -21,14 +21,20 @@ It’s inspired by the *kind* of open-ended space adventure pioneered by games l
 New in this build:
 
 - **Streaming universe**: systems are generated **on-demand** (infinite indices) with an **LRU cache**
-- **Renderer layer**: a minimal OpenGL instanced mesh renderer + line/point renderers (GL function loading via SDL's `SDL_GL_GetProcAddress`)
-- **Player ship**: input + 6DOF physics + optional approach autopilot
-- **In-system travel**: time warp hotkeys + a basic **supercruise** mode with **7-second rule** assist
-- **Docking loop**: request docking clearance, approach corridor guidance, speed limit & alignment checks
-- **FSD / hyperspace**: jump between systems (fuel + cooldown) and arrive near a chosen destination station
-- **Station gameplay**: services (repairs/refuel) + market gated by docking/fees + simple shipyard upgrades
-- **Missions**: courier, delivery, and bounty-scan style missions to drive progression
-- **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo + station economy overrides + mission log
+- **Renderer layer**: a minimal OpenGL point renderer (GL function loading via SDL's `SDL_GL_GetProcAddress`)
+- **Player ship**: simple input + physics integration
+- **Factions + markets**: deterministic faction generation + per-system market generation
+- **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
+
+Early gameplay loops added in this pass:
+
+- **Supercruise** (high-speed in-system travel) + **7-second rule** approach assist
+- **Docking corridors** + **request docking** clearance (traffic can deny)
+- **Station services gating** (market/refuel/repairs/missions require docking)
+- **FSD hyperspace jump** (fuel + cooldown + arrival near destination station)
+- **NPC traffic** (traders affect station inventories) + **simple interdictions**
+- **Fuel scoop + heat** loop (scoop near star, too close overheats)
+- **Missions**: courier, delivery cargo, bounty scan
 
 ## Build
 
@@ -43,7 +49,7 @@ By default the project builds:
 ### Linux / macOS
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build -j
 ./build/apps/stellar_sandbox/stellar_sandbox --help
 ```
 
@@ -59,6 +65,8 @@ If you only want the headless library + sandbox/tests (no SDL/OpenGL), configure
 ```bash
 cmake -S . -B build -DSTELLAR_ENABLE_RENDER=OFF -DSTELLAR_ENABLE_IMGUI=OFF
 ```
+
+(Legacy alias still supported: `-DSTELLAR_BUILD_GAME=OFF`)
 
 ## Run the sandbox
 
@@ -104,26 +112,31 @@ Then:
 ./build/apps/stellar_game/stellar_game
 ```
 
-The game will auto-load `savegame.txt` if present; press **F5** to save.
+The game will auto-load `savegame.txt` if present.
 
-### Key controls (prototype)
+This prototype now auto-saves periodically. Use `rm savegame.txt` to reset.
 
-- **W/S**: forward/back
-- **A/D**: strafe left/right
-- **Q/E**: down/up
-- **Z/X**: roll
-- **Right mouse (hold)**: mouse look
-- **P**: toggle approach autopilot (corridor + speed limit)
-- **L**: request docking clearance
-- **G**: dock / undock
-- **J**: toggle supercruise
-- **V**: toggle supercruise assist (7-second rule)
-- **T**: cycle nav targets (stations)
-- **K**: scan (for bounty-scan missions)
-- **[ / ]**: time warp down/up
-- **F1..F4**: toggle UI windows (HUD, Dock, Galaxy/FSD, Missions)
-- **F5**: save, **F9**: load
-- **H**: help overlay
+### Controls (prototype)
+
+- Flight:
+  - W/S: forward/back thrust
+  - A/D: strafe left/right
+  - Space/Ctrl: up/down
+  - Arrow keys: pitch/yaw
+  - Q/E: roll
+  - Shift: boost, X: brake, F: toggle dampers
+- Targeting / travel:
+  - T: cycle stations, Y: cycle planets, G: clear target
+  - B: toggle supercruise, PageUp/PageDown: throttle, Z: toggle supercruise assist
+  - 1..5: time acceleration (Pioneer-style; only when safe)
+- Docking:
+  - L: request docking
+  - P: toggle approach autopilot
+  - U: undock (when docked)
+- Ship systems:
+  - O: toggle fuel scoop
+- UI:
+  - F1 help, F2 nav, F3 station/services, F4 galaxy map, F5 missions
 
 ## Next steps you can add easily
 
