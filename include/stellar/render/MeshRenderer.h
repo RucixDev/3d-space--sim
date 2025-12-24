@@ -9,9 +9,13 @@
 namespace stellar::render {
 
 struct InstanceData {
+  // Position in world units
   float px, py, pz;
+  // Scale (uniform)
   float scale;
+  // Rotation (unit quaternion)
   float qw, qx, qy, qz;
+  // Vertex tint
   float cr, cg, cb;
 };
 

@@ -1,8 +1,7 @@
 #include "stellar/core/Log.h"
-#include "stellar/core/SplitMix64.h"
+#include "stellar/core/Random.h"
 #include "stellar/econ/Market.h"
 #include "stellar/econ/RoutePlanner.h"
-#include "stellar/math/Math.h"
 #include "stellar/render/Camera.h"
 #include "stellar/render/Gl.h"
 #include "stellar/render/LineRenderer.h"
@@ -18,16 +17,20 @@
 #include <SDL.h>
 #include <SDL_opengl.h>
 
-#include <imgui.h>
 #include <backends/imgui_impl_opengl3.h>
 #include <backends/imgui_impl_sdl2.h>
+#include <imgui.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace stellar;
@@ -39,22 +42,6 @@ static constexpr double kRENDER_UNIT_KM = 1.0e6; // 1 unit = 1 million km
 
 static void matToFloat(const math::Mat4d& m, float out[16]) {
   for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(m.m[i]);
-}
-
-static double clampd(double v, double lo, double hi) {
-  return std::max(lo, std::min(hi, v));
-}
-
-static math::Vec3d clampLen(const math::Vec3d& v, double maxLen) {
-  const double len = v.length();
-  if (len <= maxLen || len <= 1e-12) return v;
-  return v * (maxLen / len);
-}
-
-static math::Vec3d safeNormalize(const math::Vec3d& v, const math::Vec3d& fallback = {0, 0, 1}) {
-  const double len = v.length();
-  if (len <= 1e-12) return fallback;
-  return v * (1.0 / len);
 }
 
 static const char* starClassName(sim::StarClass c) {
@@ -84,378 +71,349 @@ static const char* stationTypeName(econ::StationType t) {
   }
 }
 
-// Orbit state (pos + vel) in kilometers / km/s.
-static void orbitStateKm(const sim::OrbitElements& el,
-                         double timeDays,
-                         math::Vec3d* outPosKm,
-                         math::Vec3d* outVelKmS) {
-  const math::Vec3d p0Km = sim::orbitPosition3DAU(el, timeDays) * kAU_KM;
-  if (outPosKm) *outPosKm = p0Km;
-
-  if (outVelKmS) {
-    // Finite difference over a small interval (seconds) to estimate orbital velocity.
-    const double dtSec = 60.0;
-    const double dtDays = dtSec / 86400.0;
-    const math::Vec3d p1Km = sim::orbitPosition3DAU(el, timeDays + dtDays) * kAU_KM;
-    *outVelKmS = (p1Km - p0Km) * (1.0 / dtSec);
-  }
+static double clampd(double v, double a, double b) {
+  return std::max(a, std::min(v, b));
 }
 
-enum class TargetKind : int {
-  None = 0,
-  Station,
-  Planet,
-};
-
-struct NavTarget {
-  TargetKind kind{TargetKind::None};
-  std::size_t index{0};
-
-  bool isValid(const sim::StarSystem& sys) const {
-    switch (kind) {
-      case TargetKind::Station: return index < sys.stations.size();
-      case TargetKind::Planet: return index < sys.planets.size();
-      default: return false;
-    }
-  }
-
-  void clear() {
-    kind = TargetKind::None;
-    index = 0;
-  }
-};
-
-struct BodyState {
-  math::Vec3d posKm{0, 0, 0};
-  math::Vec3d velKmS{0, 0, 0};
-  double radiusKm{0.0};
-  const char* kindLabel{""};
-  std::string name;
-};
-
-static bool getTargetState(const sim::StarSystem& sys,
-                           const NavTarget& t,
-                           double timeDays,
-                           BodyState* out) {
-  if (!out) return false;
-
-  if (!t.isValid(sys)) return false;
-
-  if (t.kind == TargetKind::Station) {
-    const auto& st = sys.stations[t.index];
-    orbitStateKm(st.orbit, timeDays, &out->posKm, &out->velKmS);
-    out->radiusKm = st.radiusKm;
-    out->kindLabel = "Station";
-    out->name = st.name;
-    return true;
-  }
-  if (t.kind == TargetKind::Planet) {
-    const auto& p = sys.planets[t.index];
-    orbitStateKm(p.orbit, timeDays, &out->posKm, &out->velKmS);
-    out->radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
-    out->kindLabel = "Planet";
-    out->name = p.name;
-    return true;
-  }
-
-  return false;
+static math::Vec3d safeNorm(const math::Vec3d& v, const math::Vec3d& fallback = {0, 0, 1}) {
+  const double len = v.length();
+  if (len <= 1e-12) return fallback;
+  return v * (1.0 / len);
 }
 
-struct CorridorInfo {
-  bool inside{false};
-  double axialKm{0.0};
-  double lateralKm{0.0};
-  double cosToAxis{0.0};
-  math::Vec3d axisOut{0, 0, 1};
-};
-
-static CorridorInfo stationCorridorInfo(const sim::Station& st,
-                                        const math::Vec3d& shipPosKm,
-                                        const math::Vec3d& stPosKm) {
-  CorridorInfo info{};
-  info.axisOut = safeNormalize(stPosKm, {0, 0, 1});
-
-  const math::Vec3d rel = shipPosKm - stPosKm;
-  const double dist = rel.length();
-
-  if (dist <= 1e-9) {
-    info.inside = true;
-    return info;
-  }
-
-  const math::Vec3d relN = rel * (1.0 / dist);
-  info.cosToAxis = math::dot(relN, info.axisOut);
-  info.axialKm = math::dot(rel, info.axisOut);
-  const math::Vec3d relPerp = rel - info.axisOut * info.axialKm;
-  info.lateralKm = relPerp.length();
-
-  const double cosHalf = std::cos(st.dockingCorridorHalfAngleRad);
-  const bool correctSide = (info.axialKm > 0.0);
-  const bool withinCone = (info.cosToAxis >= cosHalf);
-  const bool withinLen = (info.axialKm <= st.dockingCorridorLengthKm);
-  info.inside = correctSide && withinCone && withinLen;
-  return info;
+static math::Vec3d orbitPosKm(const sim::OrbitElements& el, double timeDays) {
+  return sim::orbitPosition3DAU(el, timeDays) * kAU_KM;
 }
 
-struct DockCheck {
-  bool ok{false};
-  bool inCorridor{false};
-  double distKm{0.0};
-  double relSpeedKmS{0.0};
-  double cosAlign{0.0};
-};
-
-static DockCheck canDock(const sim::Ship& ship,
-                         const sim::Station& st,
-                         const math::Vec3d& stPosKm,
-                         const math::Vec3d& stVelKmS) {
-  DockCheck c{};
-  const math::Vec3d rel = ship.positionKm() - stPosKm;
-  c.distKm = rel.length();
-
-  const CorridorInfo corridor = stationCorridorInfo(st, ship.positionKm(), stPosKm);
-  c.inCorridor = corridor.inside;
-
-  const math::Vec3d vRel = ship.velocityKmS() - stVelKmS;
-  c.relSpeedKmS = vRel.length();
-
-  const math::Vec3d dirToStation = safeNormalize(stPosKm - ship.positionKm(), ship.forward());
-  c.cosAlign = math::dot(ship.forward(), dirToStation);
-
-  const double cosAlignReq = std::cos(stellar::math::degToRad(12.0));
-
-  c.ok = (c.distKm <= st.dockingRangeKm) &&
-         c.inCorridor &&
-         (c.relSpeedKmS <= st.dockingSpeedLimitKmS) &&
-         (c.cosAlign >= cosAlignReq);
-  return c;
+static math::Vec3d orbitVelKmS(const sim::OrbitElements& el, double timeDays) {
+  // Finite-difference (central) derivative.
+  const double dtDays = 1.0e-4; // 8.64 seconds
+  const double dtSec = dtDays * 86400.0;
+  const math::Vec3d p0 = orbitPosKm(el, timeDays - dtDays);
+  const math::Vec3d p1 = orbitPosKm(el, timeDays + dtDays);
+  return (p1 - p0) * (1.0 / (2.0 * dtSec));
 }
 
-// Project a world-space position (in render units) to screen coordinates.
-// Returns true if the point is in front of the camera (w>0). The marker may still be offscreen.
-static bool projectToScreen(const math::Vec3d& posU,
+static bool projectToScreen(const math::Vec3d& worldU,
                             const math::Mat4d& view,
                             const math::Mat4d& proj,
-                            const ImVec2& vpPos,
-                            const ImVec2& vpSize,
-                            ImVec2* outPx,
-                            bool* outOnScreen = nullptr,
-                            ImVec2* outNdc = nullptr) {
+                            int screenW,
+                            int screenH,
+                            ImVec2& outPx,
+                            bool& outBehind) {
+  // clip = proj * view * vec4(world,1)
   const math::Mat4d vp = proj * view;
 
-  // Column-major matrix * column vec4
-  const double x = vp.m[0] * posU.x + vp.m[4] * posU.y + vp.m[8] * posU.z + vp.m[12] * 1.0;
-  const double y = vp.m[1] * posU.x + vp.m[5] * posU.y + vp.m[9] * posU.z + vp.m[13] * 1.0;
-  const double z = vp.m[2] * posU.x + vp.m[6] * posU.y + vp.m[10] * posU.z + vp.m[14] * 1.0;
-  const double w = vp.m[3] * posU.x + vp.m[7] * posU.y + vp.m[11] * posU.z + vp.m[15] * 1.0;
+  const double x = vp.m[0] * worldU.x + vp.m[4] * worldU.y + vp.m[8] * worldU.z + vp.m[12];
+  const double y = vp.m[1] * worldU.x + vp.m[5] * worldU.y + vp.m[9] * worldU.z + vp.m[13];
+  const double z = vp.m[2] * worldU.x + vp.m[6] * worldU.y + vp.m[10] * worldU.z + vp.m[14];
+  const double w = vp.m[3] * worldU.x + vp.m[7] * worldU.y + vp.m[11] * worldU.z + vp.m[15];
 
-  (void)z;
-  if (w <= 1e-9) {
-    if (outOnScreen) *outOnScreen = false;
+  if (std::abs(w) < 1e-9) {
+    outPx = ImVec2(0, 0);
+    outBehind = true;
     return false;
   }
 
   const double ndcX = x / w;
   const double ndcY = y / w;
+  const double ndcZ = z / w;
 
-  if (outNdc) *outNdc = ImVec2((float)ndcX, (float)ndcY);
+  outBehind = (ndcZ < 0.0);
 
-  const bool on = (ndcX >= -1.0 && ndcX <= 1.0 && ndcY >= -1.0 && ndcY <= 1.0);
-  if (outOnScreen) *outOnScreen = on;
+  // Convert to pixels
+  const float px = (float)((ndcX * 0.5 + 0.5) * (double)screenW);
+  const float py = (float)((-ndcY * 0.5 + 0.5) * (double)screenH);
+  outPx = ImVec2(px, py);
 
-  // Map NDC -> pixel
-  const float px = vpPos.x + (float)((ndcX * 0.5 + 0.5) * vpSize.x);
-  const float py = vpPos.y + (float)((1.0 - (ndcY * 0.5 + 0.5)) * vpSize.y);
-  if (outPx) *outPx = ImVec2(px, py);
-  return true;
+  return (ndcX >= -1.2 && ndcX <= 1.2 && ndcY >= -1.2 && ndcY <= 1.2);
 }
 
 struct Toast {
-  std::string msg;
-  double timer{0.0};
-
-  void show(std::string m, double seconds = 2.5) {
-    msg = std::move(m);
-    timer = seconds;
-  }
+  std::string text;
+  double untilSec{0.0};
 };
 
-// Pioneer-style time compression levels (sim seconds per real second).
-static constexpr std::array<double, 8> kTimeLevels = {
-    1.0,   // 1x
-    5.0,   // 5x
-    10.0,  // 10x
-    50.0,  // 50x
-    100.0, // 100x
-    500.0, // 500x
-    1000.0, // 1000x
-    5000.0, // 5000x
+static void pushToast(std::vector<Toast>& toasts, const std::string& msg, double nowSec, double durSec = 2.5) {
+  toasts.push_back({msg, nowSec + durSec});
+}
+
+static void drawToasts(std::vector<Toast>& toasts, double nowSec) {
+  // Drop expired
+  toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [&](const Toast& t) { return nowSec > t.untilSec; }),
+               toasts.end());
+  if (toasts.empty()) return;
+
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
+
+  const float pad = 10.0f;
+  ImVec2 p = ImVec2(vp->Pos.x + pad, vp->Pos.y + pad);
+
+  for (const auto& t : toasts) {
+    const float alpha = (float)clampd((t.untilSec - nowSec) / 0.35, 0.0, 1.0);
+    const ImU32 bg = IM_COL32(20, 20, 24, (int)(200 * alpha));
+    const ImU32 fg = IM_COL32(220, 220, 235, (int)(255 * alpha));
+
+    const ImVec2 sz = ImGui::CalcTextSize(t.text.c_str());
+    const ImVec2 boxMin = p;
+    const ImVec2 boxMax = ImVec2(p.x + sz.x + 18.0f, p.y + sz.y + 12.0f);
+
+    dl->AddRectFilled(boxMin, boxMax, bg, 6.0f);
+    dl->AddRect(boxMin, boxMax, IM_COL32(80, 80, 95, (int)(200 * alpha)), 6.0f);
+    dl->AddText(ImVec2(p.x + 9.0f, p.y + 6.0f), fg, t.text.c_str());
+
+    p.y += (sz.y + 16.0f);
+  }
+}
+
+enum class FlightMode : int {
+  Normal = 0,
+  Supercruise = 1,
+  Docked = 2,
 };
 
-static int maxTimeLevelIndex() {
-  return (int)kTimeLevels.size() - 1;
+enum class TargetKind : int {
+  None = 0,
+  Station = 1,
+  Planet = 2,
+};
+
+struct NavTarget {
+  TargetKind kind{TargetKind::None};
+  int index{-1};
+};
+
+enum class ClearanceState : int {
+  None = 0,
+  Granted = 1,
+  Denied = 2,
+};
+
+struct DockingClearance {
+  sim::StationId stationId{0};
+  ClearanceState state{ClearanceState::None};
+  double untilTimeDays{0.0};
+};
+
+static std::optional<int> findStationIndexById(const sim::StarSystem& sys, sim::StationId id) {
+  for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+    if (sys.stations[i].id == id) return (int)i;
+  }
+  return std::nullopt;
 }
 
-static double timeScaleForIndex(int idx) {
-  idx = std::max(0, std::min(idx, maxTimeLevelIndex()));
-  return kTimeLevels[(std::size_t)idx];
+static std::optional<int> findNearestStationIndex(const sim::StarSystem& sys, double timeDays, const math::Vec3d& shipPosKm) {
+  if (sys.stations.empty()) return std::nullopt;
+  double bestD2 = 1e300;
+  int best = 0;
+  for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+    const auto& st = sys.stations[i];
+    const math::Vec3d p = orbitPosKm(st.orbit, timeDays);
+    const double d2 = (p - shipPosKm).lengthSq();
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      best = (int)i;
+    }
+  }
+  return best;
 }
 
-static int allowedTimeLevelIndex(const sim::StarSystem& sys,
-                                 const sim::Ship& ship,
-                                 double timeDays,
-                                 bool docked,
-                                 bool supercruise,
-                                 bool autopilot,
-                                 bool manualInputActive) {
-  if (supercruise) return 0; // keep supercruise stable / deterministic
-  if (docked) return maxTimeLevelIndex();
-
-  const math::Vec3d shipPos = ship.positionKm();
-  const double shipSpeed = ship.velocityKmS().length();
-
-  // Find nearest distance-to-surface among star/planets/stations.
-  double nearestSurfaceKm = 1.0e30;
-
-  // Star
-  {
-    const double rStarKm = sys.star.radiusSol * kSOLAR_RADIUS_KM;
-    const double d = shipPos.length() - rStarKm;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, d);
+static void spawnNearStation(sim::Ship& ship, const sim::StarSystem& sys, double timeDays, int stationIndex) {
+  if (sys.stations.empty()) {
+    ship.setPositionKm({0, 0, -8000.0});
+    ship.setVelocityKmS({0, 0, 0});
+    ship.setAngularVelocityRadS({0, 0, 0});
+    ship.setOrientation(math::Quatd::identity());
+    return;
   }
 
-  // Planets
-  for (const auto& p : sys.planets) {
-    math::Vec3d pPosKm{};
-    orbitStateKm(p.orbit, timeDays, &pPosKm, nullptr);
-    const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
-    const double d = (shipPos - pPosKm).length() - rKm;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, d);
+  stationIndex = std::clamp(stationIndex, 0, (int)sys.stations.size() - 1);
+  const auto& st = sys.stations[(std::size_t)stationIndex];
+
+  const math::Vec3d stPos = orbitPosKm(st.orbit, timeDays);
+  const math::Vec3d stVel = orbitVelKmS(st.orbit, timeDays);
+  const math::Vec3d approachDir = safeNorm(stPos);
+
+  // Spawn outside the corridor, facing the station.
+  const double spawnAxial = st.docking.corridorLengthKm + std::max(10.0, st.docking.commsRangeKm * 0.5);
+  ship.setPositionKm(stPos + approachDir * spawnAxial);
+  ship.setVelocityKmS(stVel);
+  ship.setAngularVelocityRadS({0, 0, 0});
+
+  // Point nose along -approachDir (towards station).
+  // Build a quaternion from a "look" direction by aligning local +Z to desired.
+  const math::Vec3d fwd = safeNorm(-approachDir);
+  const math::Vec3d up = {0, 1, 0};
+  const math::Vec3d right = safeNorm(math::cross(up, fwd), {1, 0, 0});
+  const math::Vec3d up2 = math::cross(fwd, right);
+
+  // Convert basis to quaternion (column-major rotation matrix).
+  const double m00 = right.x, m01 = up2.x, m02 = fwd.x;
+  const double m10 = right.y, m11 = up2.y, m12 = fwd.y;
+  const double m20 = right.z, m21 = up2.z, m22 = fwd.z;
+
+  const double tr = m00 + m11 + m22;
+  math::Quatd q;
+  if (tr > 0.0) {
+    const double S = std::sqrt(tr + 1.0) * 2.0;
+    q.w = 0.25 * S;
+    q.x = (m21 - m12) / S;
+    q.y = (m02 - m20) / S;
+    q.z = (m10 - m01) / S;
+  } else if ((m00 > m11) && (m00 > m22)) {
+    const double S = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
+    q.w = (m21 - m12) / S;
+    q.x = 0.25 * S;
+    q.y = (m01 + m10) / S;
+    q.z = (m02 + m20) / S;
+  } else if (m11 > m22) {
+    const double S = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
+    q.w = (m02 - m20) / S;
+    q.x = (m01 + m10) / S;
+    q.y = 0.25 * S;
+    q.z = (m12 + m21) / S;
+  } else {
+    const double S = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
+    q.w = (m10 - m01) / S;
+    q.x = (m02 + m20) / S;
+    q.y = (m12 + m21) / S;
+    q.z = 0.25 * S;
   }
 
-  // Stations
-  for (const auto& st : sys.stations) {
-    math::Vec3d stPosKm{};
-    orbitStateKm(st.orbit, timeDays, &stPosKm, nullptr);
-    const double d = (shipPos - stPosKm).length() - st.radiusKm;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, d);
-  }
-
-  nearestSurfaceKm = std::max(0.0, nearestSurfaceKm);
-
-  int maxIdx = maxTimeLevelIndex();
-
-  // Safety clamp by proximity.
-  if (nearestSurfaceKm < 200.0) {
-    maxIdx = 0;
-  } else if (nearestSurfaceKm < 1500.0) {
-    maxIdx = std::min(maxIdx, 1); // 5x
-  } else if (nearestSurfaceKm < 8000.0) {
-    maxIdx = std::min(maxIdx, 2); // 10x
-  } else if (nearestSurfaceKm < 50000.0) {
-    maxIdx = std::min(maxIdx, 3); // 50x
-  } else if (nearestSurfaceKm < 250000.0) {
-    maxIdx = std::min(maxIdx, 4); // 100x
-  }
-
-  // Safety clamp by speed.
-  if (shipSpeed > 5.0) {
-    maxIdx = std::min(maxIdx, 1);
-  } else if (shipSpeed > 2.0) {
-    maxIdx = std::min(maxIdx, 2);
-  } else if (shipSpeed > 0.8) {
-    maxIdx = std::min(maxIdx, 3);
-  }
-
-  // Manual control should keep time compression modest.
-  if (manualInputActive && !autopilot) {
-    maxIdx = std::min(maxIdx, 2); // 10x max while actively flying
-  }
-
-  return std::max(0, maxIdx);
+  ship.setOrientation(q.normalized());
 }
 
-static double supercruiseMaxSpeedKmS(const sim::StarSystem& sys,
-                                     const math::Vec3d& shipPosKm,
-                                     double timeDays) {
-  // Very simple "gravity well" limiter: max speed is proportional to the
-  // distance to the nearest body's surface, clamped.
-  double nearestSurfaceKm = 1.0e30;
-
-  // Star
-  {
-    const double rStarKm = sys.star.radiusSol * kSOLAR_RADIUS_KM;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, shipPosKm.length() - rStarKm);
-  }
-
-  // Planets
-  for (const auto& p : sys.planets) {
-    math::Vec3d pPosKm{};
-    orbitStateKm(p.orbit, timeDays, &pPosKm, nullptr);
-    const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, (shipPosKm - pPosKm).length() - rKm);
-  }
-
-  // Stations
-  for (const auto& st : sys.stations) {
-    math::Vec3d stPosKm{};
-    orbitStateKm(st.orbit, timeDays, &stPosKm, nullptr);
-    nearestSurfaceKm = std::min(nearestSurfaceKm, (shipPosKm - stPosKm).length() - st.radiusKm);
-  }
-
-  nearestSurfaceKm = std::max(0.0, nearestSurfaceKm);
-
-  const double minKmS = 5.0;
-  const double maxKmS = 20000.0;
-  const double scaled = nearestSurfaceKm * 0.01; // 100,000 km -> 1000 km/s
-  return clampd(minKmS + scaled, minKmS, maxKmS);
-}
-
-static bool canEnterSupercruise(const sim::StarSystem& sys,
-                                const math::Vec3d& shipPosKm,
-                                double timeDays,
-                                std::string* outReason) {
-  // "Mass lock": disallow if too close to a body.
-  double nearestSurfaceKm = 1.0e30;
-
-  // Star
-  {
-    const double rStarKm = sys.star.radiusSol * kSOLAR_RADIUS_KM;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, shipPosKm.length() - rStarKm);
-  }
-  // Planets
-  for (const auto& p : sys.planets) {
-    math::Vec3d pPosKm{};
-    orbitStateKm(p.orbit, timeDays, &pPosKm, nullptr);
-    const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
-    nearestSurfaceKm = std::min(nearestSurfaceKm, (shipPosKm - pPosKm).length() - rKm);
-  }
-  // Stations
-  for (const auto& st : sys.stations) {
-    math::Vec3d stPosKm{};
-    orbitStateKm(st.orbit, timeDays, &stPosKm, nullptr);
-    nearestSurfaceKm = std::min(nearestSurfaceKm, (shipPosKm - stPosKm).length() - st.radiusKm);
-  }
-
-  nearestSurfaceKm = std::max(0.0, nearestSurfaceKm);
-
-  if (nearestSurfaceKm < 2500.0) {
-    if (outReason) *outReason = "Too close to a body (mass lock).";
-    return false;
-  }
+static bool stationDockingGeometry(const sim::Station& st,
+                                  double timeDays,
+                                  math::Vec3d& outPosKm,
+                                  math::Vec3d& outVelKmS,
+                                  math::Vec3d& outApproachDir) {
+  outPosKm = orbitPosKm(st.orbit, timeDays);
+  outVelKmS = orbitVelKmS(st.orbit, timeDays);
+  outApproachDir = safeNorm(outPosKm);
   return true;
 }
 
-static bool beginStationSelectHUD(const sim::StarSystem& sys, int& stationIndex, const char* title) {
+static bool isInDockingCorridor(const sim::Station& st,
+                               const math::Vec3d& stationPosKm,
+                               const math::Vec3d& approachDir,
+                               const math::Vec3d& shipPosKm,
+                               double& outAxial,
+                               double& outRadial) {
+  const math::Vec3d rel = shipPosKm - stationPosKm;
+  const double axial = math::dot(rel, approachDir);
+  const math::Vec3d radialV = rel - approachDir * axial;
+  const double radial = radialV.length();
+
+  outAxial = axial;
+  outRadial = radial;
+
+  return axial >= 0.0 && axial <= st.docking.corridorLengthKm && radial <= st.docking.corridorRadiusKm;
+}
+
+static bool canDockNow(const sim::Station& st,
+                       const math::Vec3d& stationPosKm,
+                       const math::Vec3d& stationVelKmS,
+                       const math::Vec3d& approachDir,
+                       const sim::Ship& ship,
+                       const DockingClearance& clearance,
+                       double timeDays,
+                       double& outDistKm,
+                       double& outRelSpeedKmS,
+                       double& outAlignCos,
+                       bool& outInCorridor) {
+  const math::Vec3d rel = ship.positionKm() - stationPosKm;
+  const math::Vec3d relV = ship.velocityKmS() - stationVelKmS;
+  const double dist = rel.length();
+  const double relSpeed = relV.length();
+
+  double axial = 0.0;
+  double radial = 0.0;
+  const bool inCorridor = isInDockingCorridor(st, stationPosKm, approachDir, ship.positionKm(), axial, radial);
+
+  // Ship should point "in" along -approachDir.
+  const math::Vec3d requiredFwd = -approachDir;
+  const double alignCos = math::dot(safeNorm(ship.forward()), safeNorm(requiredFwd));
+
+  const bool clearanceOk = (clearance.state == ClearanceState::Granted &&
+                            clearance.stationId == st.id &&
+                            timeDays <= clearance.untilTimeDays);
+
+  outDistKm = dist;
+  outRelSpeedKmS = relSpeed;
+  outAlignCos = alignCos;
+  outInCorridor = inCorridor;
+
+  return clearanceOk && inCorridor && dist <= st.docking.dockRangeKm && relSpeed <= st.docking.speedLimitKmS &&
+         alignCos >= st.docking.alignCosMin;
+}
+
+static void stepShipSubdiv(sim::Ship& ship, double dtSeconds, const sim::ShipInput& input) {
+  const double maxStep = 0.05; // seconds
+  if (dtSeconds <= 0.0) return;
+  const int steps = std::clamp((int)std::ceil(dtSeconds / maxStep), 1, 256);
+  const double h = dtSeconds / (double)steps;
+  for (int i = 0; i < steps; ++i) ship.step(h, input);
+}
+
+static double maxAllowedTimeScale(const sim::StarSystem& sys,
+                                 double timeDays,
+                                 const sim::Ship& ship,
+                                 FlightMode mode) {
+  if (mode == FlightMode::Supercruise) return 1.0;
+  if (mode == FlightMode::Docked) return 12000.0;
+
+  const math::Vec3d pos = ship.positionKm();
+  const double speed = ship.velocityKmS().length();
+
+  // Very high speeds: keep time scale low so controls remain usable.
+  if (speed > 20.0) return 1.0;
+  if (speed > 8.0) return 5.0;
+
+  // Distance to star surface.
+  const double starRadKm = sys.star.radiusSol * kSOLAR_RADIUS_KM;
+  double minDistKm = std::max(0.0, pos.length() - starRadKm);
+
+  // Planets
+  for (const auto& p : sys.planets) {
+    const math::Vec3d ppos = orbitPosKm(p.orbit, timeDays);
+    const double rad = p.radiusEarth * kEARTH_RADIUS_KM;
+    const double d = std::max(0.0, (ppos - pos).length() - rad);
+    minDistKm = std::min(minDistKm, d);
+  }
+
+  // Stations
+  for (const auto& st : sys.stations) {
+    const math::Vec3d spos = orbitPosKm(st.orbit, timeDays);
+    const double d = std::max(0.0, (spos - pos).length() - st.radiusKm);
+    minDistKm = std::min(minDistKm, d);
+  }
+
+  // Safety tiers (km)
+  if (minDistKm < 20.0) return 1.0;
+  if (minDistKm < 80.0) return 10.0;
+  if (minDistKm < 300.0) return 50.0;
+  if (minDistKm < 1500.0) return 250.0;
+  return 12000.0;
+}
+
+static bool beginStationSelectionUI(const sim::StarSystem& sys, int& stationIndex, bool docked, std::string_view dockedName) {
   bool changed = false;
 
-  ImGui::Begin(title);
+  ImGui::Begin("Dock / Market");
 
   ImGui::Text("System: %s  (Star %s, planets %d, stations %d)",
               sys.stub.name.c_str(),
               starClassName(sys.stub.primaryClass),
               sys.stub.planetCount,
               sys.stub.stationCount);
+
+  if (docked) {
+    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "Docked at: %s", std::string(dockedName).c_str());
+  } else {
+    ImGui::TextDisabled("Not docked");
+  }
 
   if (!sys.stations.empty()) {
     std::vector<const char*> names;
@@ -475,6 +433,365 @@ static bool beginStationSelectHUD(const sim::StarSystem& sys, int& stationIndex,
 
   ImGui::End();
   return changed;
+}
+
+static double supercruiseMaxSpeedKmS(double minDistToMassKm) {
+  // A simple "gravity well" curve:
+  // - close to masses, allow a minimum high-speed cruise
+  // - far away, asymptotically approach a big cap
+  const double base = 200.0;       // km/s (near masses)
+  const double cap = 100000.0;     // km/s (deep space)
+  const double scale = 20.0e6;     // km
+  const double t = 1.0 - std::exp(-std::max(0.0, minDistToMassKm) / scale);
+  return base + (cap - base) * t;
+}
+
+static double minDistanceToMassKm(const sim::StarSystem& sys, double timeDays, const math::Vec3d& shipPosKm) {
+  // Star at origin.
+  const double starRadKm = sys.star.radiusSol * kSOLAR_RADIUS_KM;
+  double minD = std::max(0.0, shipPosKm.length() - starRadKm);
+
+  // Planets.
+  for (const auto& p : sys.planets) {
+    const math::Vec3d ppos = orbitPosKm(p.orbit, timeDays);
+    const double rad = p.radiusEarth * kEARTH_RADIUS_KM;
+    const double d = std::max(0.0, (ppos - shipPosKm).length() - rad);
+    minD = std::min(minD, d);
+  }
+
+  // Stations.
+  for (const auto& st : sys.stations) {
+    const math::Vec3d spos = orbitPosKm(st.orbit, timeDays);
+    const double d = std::max(0.0, (spos - shipPosKm).length() - st.radiusKm);
+    minD = std::min(minD, d);
+  }
+
+  return minD;
+}
+
+static double stationDropDistanceKm(const sim::Station& st) {
+  // Drop outside comms range so you're not instantly inside the "traffic" bubble.
+  return std::max(80.0, st.docking.commsRangeKm * 4.0);
+}
+
+static double planetDropDistanceKm(const sim::Planet& p) {
+  const double rad = p.radiusEarth * kEARTH_RADIUS_KM;
+  return std::max(1500.0, rad * 6.0);
+}
+
+static bool getTargetState(const sim::StarSystem& sys,
+                           const NavTarget& tgt,
+                           double timeDays,
+                           math::Vec3d& outPosKm,
+                           math::Vec3d& outVelKmS,
+                           std::string& outName) {
+  outPosKm = {0, 0, 0};
+  outVelKmS = {0, 0, 0};
+  outName.clear();
+
+  if (tgt.kind == TargetKind::Station) {
+    if (tgt.index < 0 || tgt.index >= (int)sys.stations.size()) return false;
+    const auto& st = sys.stations[(std::size_t)tgt.index];
+    outPosKm = orbitPosKm(st.orbit, timeDays);
+    outVelKmS = orbitVelKmS(st.orbit, timeDays);
+    outName = st.name;
+    return true;
+  }
+  if (tgt.kind == TargetKind::Planet) {
+    if (tgt.index < 0 || tgt.index >= (int)sys.planets.size()) return false;
+    const auto& p = sys.planets[(std::size_t)tgt.index];
+    outPosKm = orbitPosKm(p.orbit, timeDays);
+    outVelKmS = orbitVelKmS(p.orbit, timeDays);
+    outName = p.name;
+    return true;
+  }
+  return false;
+}
+
+static NavTarget cycleTarget(const sim::StarSystem& sys, const NavTarget& cur) {
+  // Order: stations then planets.
+  const int nStations = (int)sys.stations.size();
+  const int nPlanets = (int)sys.planets.size();
+  const int total = nStations + nPlanets;
+  if (total <= 0) return {};
+
+  int curFlat = -1;
+  if (cur.kind == TargetKind::Station) curFlat = cur.index;
+  if (cur.kind == TargetKind::Planet) curFlat = nStations + cur.index;
+
+  int nextFlat = (curFlat + 1) % total;
+  NavTarget out;
+  if (nextFlat < nStations) {
+    out.kind = TargetKind::Station;
+    out.index = nextFlat;
+  } else {
+    out.kind = TargetKind::Planet;
+    out.index = nextFlat - nStations;
+  }
+  return out;
+}
+
+static void requestDockingClearance(const sim::StarSystem& sys,
+                                   int stationIndex,
+                                   double timeDays,
+                                   const math::Vec3d& shipPosKm,
+                                   const math::Vec3d& shipVelKmS,
+                                   DockingClearance& clearance,
+                                   std::vector<Toast>& toasts) {
+  if (stationIndex < 0 || stationIndex >= (int)sys.stations.size()) {
+    pushToast(toasts, "No station selected.", ImGui::GetTime());
+    return;
+  }
+
+  const auto& st = sys.stations[(std::size_t)stationIndex];
+  const math::Vec3d spos = orbitPosKm(st.orbit, timeDays);
+  const math::Vec3d svel = orbitVelKmS(st.orbit, timeDays);
+  const double dist = (spos - shipPosKm).length();
+
+  // Expire old
+  if (clearance.state != ClearanceState::None && timeDays > clearance.untilTimeDays) {
+    clearance = {};
+  }
+
+  if (dist > st.docking.commsRangeKm) {
+    pushToast(toasts, "Docking request denied: out of range.", ImGui::GetTime());
+    clearance.stationId = st.id;
+    clearance.state = ClearanceState::Denied;
+    clearance.untilTimeDays = timeDays + (st.docking.deniedCooldownSec / 86400.0);
+    return;
+  }
+
+  if (clearance.state == ClearanceState::Denied && clearance.stationId == st.id && timeDays < clearance.untilTimeDays) {
+    pushToast(toasts, "Docking request denied: try again soon.", ImGui::GetTime());
+    return;
+  }
+
+  // Simple traffic model:
+  // - prefer granting when you are slow relative to the station
+  // - some chance of denial to keep it from being automatic
+  const double relSpeed = (shipVelKmS - svel).length();
+
+  double pGrant = 0.85;
+  if (st.type == econ::StationType::Outpost) pGrant = 0.90;
+  if (st.type == econ::StationType::Shipyard) pGrant = 0.80;
+
+  if (relSpeed > st.docking.speedLimitKmS * 3.0) {
+    pGrant = 0.15; // you're screaming in too fast
+  }
+
+  core::SplitMix64 rng(core::hashCombine((core::u64)st.id, (core::u64)std::floor(timeDays * 1440.0)));
+  const double roll = rng.nextDouble();
+
+  if (roll < pGrant) {
+    clearance.stationId = st.id;
+    clearance.state = ClearanceState::Granted;
+    clearance.untilTimeDays = timeDays + (st.docking.clearanceDurationMin / 1440.0);
+    pushToast(toasts, "Docking clearance granted.", ImGui::GetTime());
+  } else {
+    clearance.stationId = st.id;
+    clearance.state = ClearanceState::Denied;
+    clearance.untilTimeDays = timeDays + (st.docking.deniedCooldownSec / 86400.0);
+    pushToast(toasts, "Docking clearance denied: hold position.", ImGui::GetTime());
+  }
+}
+
+static bool undock(sim::Ship& ship,
+                   const sim::StarSystem& sys,
+                   double timeDays,
+                   int dockedStationIndex,
+                   std::vector<Toast>& toasts) {
+  if (sys.stations.empty() || dockedStationIndex < 0 || dockedStationIndex >= (int)sys.stations.size()) return false;
+
+  const auto& st = sys.stations[(std::size_t)dockedStationIndex];
+  math::Vec3d spos, svel, approach;
+  stationDockingGeometry(st, timeDays, spos, svel, approach);
+
+  // Pop out slightly along the approach axis.
+  ship.setPositionKm(spos + approach * (st.docking.corridorLengthKm + 5.0));
+  ship.setVelocityKmS(svel + (-approach) * 0.2);
+  ship.setAngularVelocityRadS({0, 0, 0});
+
+  pushToast(toasts, "Undocked.", ImGui::GetTime());
+  return true;
+}
+
+static bool attemptDock(sim::Ship& ship,
+                        const sim::StarSystem& sys,
+                        double timeDays,
+                        DockingClearance& clearance,
+                        sim::StationId& outDockedStation,
+                        int& outDockedStationIndex,
+                        std::vector<Toast>& toasts) {
+  if (sys.stations.empty()) {
+    pushToast(toasts, "No stations in this system.", ImGui::GetTime());
+    return false;
+  }
+
+  // Find a station you're close to and that passes corridor checks.
+  int best = -1;
+  double bestDist = 1e300;
+
+  for (int i = 0; i < (int)sys.stations.size(); ++i) {
+    const auto& st = sys.stations[(std::size_t)i];
+    math::Vec3d spos, svel, approach;
+    stationDockingGeometry(st, timeDays, spos, svel, approach);
+
+    double distKm = 0.0, relSpeed = 0.0, alignCos = 0.0;
+    bool inCorridor = false;
+    const bool ok = canDockNow(st, spos, svel, approach, ship, clearance, timeDays, distKm, relSpeed, alignCos, inCorridor);
+    if (ok && distKm < bestDist) {
+      bestDist = distKm;
+      best = i;
+    }
+  }
+
+  if (best < 0) {
+    // Provide a more informative message: check the nearest station and report why.
+    auto nearest = findNearestStationIndex(sys, timeDays, ship.positionKm());
+    if (!nearest) {
+      pushToast(toasts, "No station nearby.", ImGui::GetTime());
+      return false;
+    }
+
+    const auto& st = sys.stations[(std::size_t)*nearest];
+    math::Vec3d spos, svel, approach;
+    stationDockingGeometry(st, timeDays, spos, svel, approach);
+
+    double distKm = 0.0, relSpeed = 0.0, alignCos = 0.0;
+    bool inCorridor = false;
+    (void)canDockNow(st, spos, svel, approach, ship, clearance, timeDays, distKm, relSpeed, alignCos, inCorridor);
+
+    if (!(clearance.state == ClearanceState::Granted && clearance.stationId == st.id && timeDays <= clearance.untilTimeDays)) {
+      pushToast(toasts, "Docking failed: no clearance (press L to request).", ImGui::GetTime());
+    } else if (!inCorridor) {
+      pushToast(toasts, "Docking failed: not in approach corridor.", ImGui::GetTime());
+    } else if (distKm > st.docking.dockRangeKm) {
+      pushToast(toasts, "Docking failed: too far.", ImGui::GetTime());
+    } else if (relSpeed > st.docking.speedLimitKmS) {
+      pushToast(toasts, "Docking failed: too fast.", ImGui::GetTime());
+    } else if (alignCos < st.docking.alignCosMin) {
+      pushToast(toasts, "Docking failed: not aligned.", ImGui::GetTime());
+    } else {
+      pushToast(toasts, "Docking failed.", ImGui::GetTime());
+    }
+    return false;
+  }
+
+  const auto& st = sys.stations[(std::size_t)best];
+  math::Vec3d spos, svel, approach;
+  stationDockingGeometry(st, timeDays, spos, svel, approach);
+
+  // Snap to docking position and match station velocity.
+  ship.setPositionKm(spos + approach * st.docking.dockRangeKm);
+  ship.setVelocityKmS(svel);
+  ship.setAngularVelocityRadS({0, 0, 0});
+
+  outDockedStation = st.id;
+  outDockedStationIndex = best;
+
+  pushToast(toasts, "Docked.", ImGui::GetTime());
+  return true;
+}
+
+static sim::ShipInput autopilotStationInput(const sim::Station& st,
+                                           double timeDays,
+                                           const sim::Ship& ship,
+                                           const DockingClearance& clearance,
+                                           bool& outWantsDock) {
+  outWantsDock = false;
+
+  math::Vec3d spos, svel, approach;
+  stationDockingGeometry(st, timeDays, spos, svel, approach);
+
+  const math::Vec3d shipPos = ship.positionKm();
+  const math::Vec3d shipVel = ship.velocityKmS();
+
+  const math::Vec3d rel = shipPos - spos;
+  const math::Vec3d relV = shipVel - svel;
+
+  const double dist = rel.length();
+  const double relSpeed = relV.length();
+
+  // Corridor terms
+  double axial = 0.0, radial = 0.0;
+  const bool inCorridor = isInDockingCorridor(st, spos, approach, shipPos, axial, radial);
+
+  // If we don't have clearance yet, hold outside the corridor.
+  const bool clearanceOk =
+      (clearance.state == ClearanceState::Granted && clearance.stationId == st.id && timeDays <= clearance.untilTimeDays);
+
+  double targetAxial = st.docking.corridorLengthKm;
+  if (clearanceOk) {
+    targetAxial = st.docking.dockRangeKm;
+  } else {
+    // waiting point: just outside corridor
+    targetAxial = st.docking.corridorLengthKm + std::max(5.0, st.docking.corridorRadiusKm * 1.2);
+  }
+
+  const math::Vec3d desiredPos = spos + approach * targetAxial;
+
+  // Desired relative velocity: reduce position error with a time constant.
+  const double tau = clearanceOk ? 2.0 : 4.0;
+  math::Vec3d desiredRelVel = (desiredPos - shipPos) * (1.0 / std::max(0.5, tau));
+
+  // Speed limits
+  double maxRelSpeed = 6.0;
+  if (clearanceOk && inCorridor) maxRelSpeed = st.docking.speedLimitKmS;
+
+  // Smoothly reduce max rel speed as we get close.
+  if (clearanceOk) {
+    const double stopDist = std::max(1e-6, dist);
+    const double a = std::max(0.01, ship.maxLinearAccelKmS2());
+    const double vStop = std::sqrt(2.0 * a * stopDist);
+    maxRelSpeed = std::min(maxRelSpeed, vStop);
+  }
+
+  if (desiredRelVel.length() > maxRelSpeed) {
+    desiredRelVel = desiredRelVel.normalized() * maxRelSpeed;
+  }
+
+  const math::Vec3d desiredVel = svel + desiredRelVel;
+
+  // PD on velocity
+  const double tauV = 0.75;
+  math::Vec3d desiredAcc = (desiredVel - shipVel) * (1.0 / std::max(0.1, tauV));
+
+  // Clamp to ship capabilities (convert to thruster inputs).
+  const double aCap = ship.maxLinearAccelKmS2();
+  if (desiredAcc.length() > aCap) desiredAcc = desiredAcc.normalized() * aCap;
+
+  // Convert world accel -> local thruster demand.
+  const math::Vec3d accLocal = ship.orientation().conjugate().rotate(desiredAcc);
+  sim::ShipInput out{};
+  out.thrustLocal = {accLocal.x / std::max(1e-6, aCap), accLocal.y / std::max(1e-6, aCap), accLocal.z / std::max(1e-6, aCap)};
+
+  // Attitude: align forward with -approachDir when near corridor.
+  const math::Vec3d desiredFwdWorld = safeNorm(spos - shipPos); // point at station
+  const math::Vec3d desiredFwdLocal = safeNorm(ship.orientation().conjugate().rotate(desiredFwdWorld));
+
+  // Error axis between local forward and desired direction.
+  const math::Vec3d fLocal = {0, 0, 1};
+  const math::Vec3d axis = math::cross(fLocal, desiredFwdLocal);
+  const double gain = 3.0;
+  out.torqueLocal = axis * gain;
+
+  // Clamp inputs
+  out.thrustLocal.x = clampd(out.thrustLocal.x, -1.0, 1.0);
+  out.thrustLocal.y = clampd(out.thrustLocal.y, -1.0, 1.0);
+  out.thrustLocal.z = clampd(out.thrustLocal.z, -1.0, 1.0);
+
+  out.torqueLocal.x = clampd(out.torqueLocal.x, -1.0, 1.0);
+  out.torqueLocal.y = clampd(out.torqueLocal.y, -1.0, 1.0);
+  out.torqueLocal.z = clampd(out.torqueLocal.z, -1.0, 1.0);
+
+  out.dampers = true;
+
+  // If we're basically ready, request docking.
+  if (clearanceOk && dist <= st.docking.dockRangeKm * 1.25 && relSpeed <= st.docking.speedLimitKmS * 1.1) {
+    outWantsDock = true;
+  }
+
+  return out;
 }
 
 int main(int argc, char** argv) {
@@ -567,6 +884,7 @@ int main(int argc, char** argv) {
   if (auto s = universe.findClosestSystem({0, 0, 0}, 80.0)) {
     currentStub = *s;
   } else {
+    // Should be rare; fall back
     currentStub = sim::SystemStub{};
     currentStub.id = 0;
     currentStub.seed = seed;
@@ -583,87 +901,94 @@ int main(int argc, char** argv) {
   ship.setMaxAngularAccelRadS2(1.2);
 
   double timeDays = 0.0;
+
+  // Time compression (sim seconds per real second)
+  static const std::array<double, 11> kTimeLevels = {1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 2000.0, 12000.0};
+  int timeLevelIndex = 5; // 60x
+  double requestedTimeScale = kTimeLevels[(std::size_t)timeLevelIndex];
+  double appliedTimeScale = requestedTimeScale;
   bool paused = false;
-
-  int requestedTimeIdx = 2; // 10x default (feels less static)
-  int appliedTimeIdx = requestedTimeIdx;
-
-  // Docking state
-  bool docked = false;
-  sim::StationId dockedStationId = 0;
-  int dockedStationIndex = 0; // also used by market selection
-
-  // Navigation / autopilot
-  NavTarget navTarget{};
-  bool autopilot = false;
-
-  // Supercruise
-  bool supercruise = false;
-  double scThrottle = 0.0;        // 0..1
-  double scSpeedKmS = 0.0;        // actual
-  bool scAutoDrop = true;
 
   // Player economy
   double credits = 2500.0;
   std::array<double, econ::kCommodityCount> cargo{};
 
-  // Save/load
-  const std::string savePath = "savegame.txt";
+  int selectedStationIndex = 0;
+
+  // Nav / flight state
+  FlightMode flightMode = FlightMode::Normal;
+  sim::StationId dockedStationId = 0;
+  int dockedStationIndex = -1;
+
+  NavTarget target{};
+
+  // Approach autopilot (normal flight)
+  bool autopilotEnabled = false;
+
+  // Supercruise state
+  bool scAssistEnabled = false; // 7-second rule throttle hold + auto-drop
+  double scThrottle = 1.0;
+  double scSpeedKmS = 0.0;
+
+  // Docking clearance
+  DockingClearance clearance{};
 
   // UI state
   bool showGalaxy = true;
   bool showShip = true;
   bool showEconomy = true;
   bool showNav = true;
-  bool showHUD = true;
+  bool showHud = true;
+
+  bool cockpitCamera = false;
 
   // Toasts
-  Toast toast;
+  std::vector<Toast> toasts;
 
-  // Starfield (directions)
-  struct StarDir {
-    math::Vec3d dir;
-    float size;
-    float c;
-  };
-  std::vector<StarDir> starDirs;
+  // Save/load
+  const std::string savePath = "savegame.txt";
+
+  // Pre-generate starfield directions
+  std::vector<math::Vec3d> starDirs;
+  std::vector<math::Vec3d> starCols;
+  std::vector<float> starSizes;
   {
-    core::SplitMix64 rng(0xC0FFEEULL);
-    const int n = 2600;
+    core::SplitMix64 rng(0xBADC0FFEEULL);
+    const int n = 2200;
     starDirs.reserve(n);
+    starCols.reserve(n);
+    starSizes.reserve(n);
     for (int i = 0; i < n; ++i) {
-      // Random direction on sphere
+      // random direction
       const double z = rng.range(-1.0, 1.0);
-      const double a = rng.range(0.0, 2.0 * math::kPi);
+      const double t = rng.range(0.0, 2.0 * math::kPi);
       const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
-      const math::Vec3d dir{r * std::cos(a), r * std::sin(a), z};
-      const float size = (float)rng.range(1.0, 2.5);
-      const float c = (float)rng.range(0.75, 1.0);
-      starDirs.push_back({dir, size, c});
+      const double x = r * std::cos(t);
+      const double y = r * std::sin(t);
+      starDirs.push_back(safeNorm({x, y, z}));
+
+      // subtle color variance
+      const double c = rng.range(0.75, 1.0);
+      const double warm = rng.range(0.0, 1.0);
+      const math::Vec3d col = {c * (0.75 + 0.25 * warm), c * (0.78 + 0.18 * warm), c};
+      starCols.push_back(col);
+
+      const float sz = (float)rng.range(1.0, 2.5);
+      starSizes.push_back(sz);
     }
   }
 
-  // Spawn near first station (if present) so it's immediately playable.
-  {
-    if (!currentSystem->stations.empty()) {
-      dockedStationIndex = 0;
-      const auto& st = currentSystem->stations[0];
-      math::Vec3d stPosKm{}, stVelKmS{};
-      orbitStateKm(st.orbit, timeDays, &stPosKm, &stVelKmS);
-      const math::Vec3d axisOut = safeNormalize(stPosKm, {0, 0, 1});
-      const double spawnDist = std::max(1200.0, st.dockingCorridorLengthKm * 0.85);
-      ship.setPositionKm(stPosKm + axisOut * spawnDist);
-      ship.setVelocityKmS(stVelKmS);
-      navTarget.kind = TargetKind::Station;
-      navTarget.index = 0;
-      toast.show("Spawned near " + st.name + " (use T to cycle targets, P for autopilot)", 3.0);
-    } else {
-      ship.setPositionKm({0, 0, -8000.0});
-    }
+  // Initial spawn near first station (if any).
+  if (!currentSystem->stations.empty()) {
+    spawnNearStation(ship, *currentSystem, timeDays, 0);
+  } else {
+    ship.setPositionKm({0, 0, -8000.0});
   }
 
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
+
+  SDL_SetRelativeMouseMode(SDL_FALSE);
 
   while (running) {
     // Timing
@@ -680,18 +1005,17 @@ int main(int argc, char** argv) {
       if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-        const SDL_Keycode key = event.key.keysym.sym;
+        const bool captureKeys = io.WantCaptureKeyboard;
 
-        if (key == SDLK_ESCAPE) running = false;
+        if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
 
-        if (key == SDLK_SPACE) paused = !paused;
-
-        if (key == SDLK_F5) {
+        if (event.key.keysym.sym == SDLK_F5) {
           sim::SaveGame s{};
+          s.version = 1;
           s.seed = universe.seed();
           s.timeDays = timeDays;
           s.currentSystem = currentSystem->stub.id;
-          s.dockedStation = docked ? dockedStationId : 0;
+          s.dockedStation = dockedStationId;
 
           s.shipPosKm = ship.positionKm();
           s.shipVelKmS = ship.velocityKmS();
@@ -703,17 +1027,19 @@ int main(int argc, char** argv) {
           s.stationOverrides = universe.exportStationOverrides();
 
           if (sim::saveToFile(s, savePath)) {
-            toast.show("Saved to " + savePath);
+            core::log(core::LogLevel::Info, "Saved to " + savePath);
+            pushToast(toasts, "Saved.", ImGui::GetTime());
           }
         }
 
-        if (key == SDLK_F9) {
+        if (event.key.keysym.sym == SDLK_F9) {
           sim::SaveGame s{};
           if (sim::loadFromFile(savePath, s)) {
             universe = sim::Universe(s.seed);
             universe.importStationOverrides(s.stationOverrides);
 
             timeDays = s.timeDays;
+
             const sim::StarSystem& sys = universe.getSystem(s.currentSystem);
             currentStub = sys.stub;
             currentSystem = &sys;
@@ -726,396 +1052,343 @@ int main(int argc, char** argv) {
             credits = s.credits;
             cargo = s.cargo;
 
-            docked = (s.dockedStation != 0);
             dockedStationId = s.dockedStation;
-            dockedStationIndex = 0;
-            for (std::size_t i = 0; i < sys.stations.size(); ++i) {
-              if (sys.stations[i].id == dockedStationId) dockedStationIndex = (int)i;
+            flightMode = (dockedStationId != 0) ? FlightMode::Docked : FlightMode::Normal;
+
+            dockedStationIndex = -1;
+            if (dockedStationId != 0) {
+              if (auto idx = findStationIndexById(*currentSystem, dockedStationId)) {
+                dockedStationIndex = *idx;
+                selectedStationIndex = *idx;
+              }
             }
 
-            // Reset transient flight modes
-            autopilot = false;
-            supercruise = false;
-            scThrottle = 0.0;
+            // Reset other transient state
+            target = {};
+            autopilotEnabled = false;
+            scAssistEnabled = false;
+            scThrottle = 1.0;
             scSpeedKmS = 0.0;
+            clearance = {};
 
-            navTarget.clear();
-            if (!sys.stations.empty()) {
-              navTarget.kind = TargetKind::Station;
-              navTarget.index = (std::size_t)dockedStationIndex;
-            }
-
-            toast.show("Loaded " + savePath);
+            core::log(core::LogLevel::Info, "Loaded " + savePath);
+            pushToast(toasts, "Loaded.", ImGui::GetTime());
           }
         }
 
-        if (key == SDLK_TAB) showGalaxy = !showGalaxy;
-        if (key == SDLK_F1) showShip = !showShip;
-        if (key == SDLK_F2) showEconomy = !showEconomy;
-        if (key == SDLK_F3) showNav = !showNav;
-        if (key == SDLK_F4) showHUD = !showHUD;
+        if (event.key.keysym.sym == SDLK_TAB && !captureKeys) showGalaxy = !showGalaxy;
+        if (event.key.keysym.sym == SDLK_F1) showShip = !showShip;
+        if (event.key.keysym.sym == SDLK_F2) showEconomy = !showEconomy;
+        if (event.key.keysym.sym == SDLK_F3) showNav = !showNav;
+        if (event.key.keysym.sym == SDLK_F4) showHud = !showHud;
+        if (event.key.keysym.sym == SDLK_SPACE && !captureKeys) paused = !paused;
 
-        // Time compression hotkeys
-        if (key == SDLK_PAGEUP) requestedTimeIdx = std::min(requestedTimeIdx + 1, maxTimeLevelIndex());
-        if (key == SDLK_PAGEDOWN) requestedTimeIdx = std::max(requestedTimeIdx - 1, 0);
-        if (key == SDLK_HOME) requestedTimeIdx = 0;
-        if (key == SDLK_END) requestedTimeIdx = maxTimeLevelIndex();
+        if (!captureKeys) {
+          if (event.key.keysym.sym == SDLK_v) cockpitCamera = !cockpitCamera;
 
-        // Targeting
-        if (key == SDLK_t) {
-          // Cycle: stations then planets.
-          std::vector<NavTarget> list;
-          list.reserve(currentSystem->stations.size() + currentSystem->planets.size());
-          for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) list.push_back({TargetKind::Station, i});
-          for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) list.push_back({TargetKind::Planet, i});
-
-          if (list.empty()) {
-            navTarget.clear();
-          } else {
-            int idx = 0;
-            for (int i = 0; i < (int)list.size(); ++i) {
-              if (navTarget.kind == list[(std::size_t)i].kind && navTarget.index == list[(std::size_t)i].index) {
-                idx = i;
-                break;
-              }
-            }
-            idx = (idx + 1) % (int)list.size();
-            navTarget = list[(std::size_t)idx];
-
-            BodyState bs{};
-            if (getTargetState(*currentSystem, navTarget, timeDays, &bs)) {
-              toast.show(std::string("Target: ") + bs.kindLabel + " - " + bs.name);
-            }
+          if (event.key.keysym.sym == SDLK_t) {
+            target = cycleTarget(*currentSystem, target);
           }
-        }
 
-        if (key == SDLK_y) {
-          navTarget.clear();
-          toast.show("Target cleared");
-        }
-
-        // Autopilot
-        if (key == SDLK_p) {
-          autopilot = !autopilot;
-          if (autopilot) toast.show("Autopilot ON");
-          else toast.show("Autopilot OFF");
-        }
-
-        // Dock / undock
-        if (key == SDLK_g) {
-          if (docked) {
-            // Undock: keep station velocity, add a small push outward.
-            if (dockedStationIndex >= 0 && (std::size_t)dockedStationIndex < currentSystem->stations.size()) {
-              const auto& st = currentSystem->stations[(std::size_t)dockedStationIndex];
-              math::Vec3d stPosKm{}, stVelKmS{};
-              orbitStateKm(st.orbit, timeDays, &stPosKm, &stVelKmS);
-              const math::Vec3d axisOut = safeNormalize(stPosKm, {0, 0, 1});
-              ship.setPositionKm(stPosKm + axisOut * (st.radiusKm + 5.0));
-              ship.setVelocityKmS(stVelKmS + axisOut * 0.02);
-            }
-            docked = false;
-            dockedStationId = 0;
-            toast.show("Undocked");
-          } else {
-            // Attempt docking at closest station.
-            int best = -1;
-            double bestD = 1.0e30;
-            for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
-              math::Vec3d stPosKm{};
-              orbitStateKm(currentSystem->stations[i].orbit, timeDays, &stPosKm, nullptr);
-              const double d = (ship.positionKm() - stPosKm).length();
-              if (d < bestD) {
-                bestD = d;
-                best = (int)i;
-              }
-            }
-
-            if (best >= 0) {
-              const auto& st = currentSystem->stations[(std::size_t)best];
-              math::Vec3d stPosKm{}, stVelKmS{};
-              orbitStateKm(st.orbit, timeDays, &stPosKm, &stVelKmS);
-              const DockCheck c = canDock(ship, st, stPosKm, stVelKmS);
-              if (c.ok) {
-                docked = true;
-                dockedStationId = st.id;
-                dockedStationIndex = best;
-                ship.setVelocityKmS(stVelKmS);
-                toast.show("Docked at " + st.name);
-              } else {
-                toast.show("Docking conditions not met (align, slow down, be in corridor)");
-              }
-            }
+          if (event.key.keysym.sym == SDLK_y) {
+            target = {};
           }
-        }
 
-        // Supercruise
-        if (key == SDLK_j) {
-          if (supercruise) {
-            supercruise = false;
-            scSpeedKmS = 0.0;
-            scThrottle = 0.0;
-            toast.show("Supercruise OFF");
-          } else {
-            if (docked) {
-              toast.show("Cannot engage supercruise while docked");
+          if (event.key.keysym.sym == SDLK_p) {
+            if (flightMode == FlightMode::Supercruise) {
+              scAssistEnabled = !scAssistEnabled;
+              pushToast(toasts, scAssistEnabled ? "Supercruise assist ON" : "Supercruise assist OFF", ImGui::GetTime());
             } else {
-              std::string reason;
-              if (canEnterSupercruise(*currentSystem, ship.positionKm(), timeDays, &reason)) {
-                supercruise = true;
-                autopilot = false;
-                paused = false;
-                // Start with a modest speed.
-                scSpeedKmS = std::max(20.0, ship.velocityKmS().length());
-                scThrottle = 0.35;
-                toast.show("Supercruise ON");
+              autopilotEnabled = !autopilotEnabled;
+              pushToast(toasts, autopilotEnabled ? "Autopilot ON" : "Autopilot OFF", ImGui::GetTime());
+            }
+          }
+
+          if (event.key.keysym.sym == SDLK_j) {
+            if (flightMode == FlightMode::Docked) {
+              pushToast(toasts, "Cannot enter supercruise while docked.", ImGui::GetTime());
+            } else if (flightMode == FlightMode::Supercruise) {
+              // drop out
+              flightMode = FlightMode::Normal;
+              // set a sane normal-space speed
+              ship.setVelocityKmS(ship.forward() * 4.0);
+              scSpeedKmS = 0.0;
+              pushToast(toasts, "Exited supercruise.", ImGui::GetTime());
+            } else {
+              const double minD = minDistanceToMassKm(*currentSystem, timeDays, ship.positionKm());
+              if (minD < 150.0) {
+                pushToast(toasts, "Mass lock: too close to a body.", ImGui::GetTime());
               } else {
-                toast.show("Supercruise blocked: " + reason);
+                flightMode = FlightMode::Supercruise;
+                scThrottle = 1.0;
+                scSpeedKmS = std::max(400.0, ship.velocityKmS().length());
+                pushToast(toasts, "Entered supercruise.", ImGui::GetTime());
               }
             }
+          }
+
+          if (event.key.keysym.sym == SDLK_l) {
+            int stIdx = -1;
+            if (target.kind == TargetKind::Station) {
+              stIdx = target.index;
+            } else {
+              auto n = findNearestStationIndex(*currentSystem, timeDays, ship.positionKm());
+              if (n) stIdx = *n;
+            }
+
+            if (stIdx >= 0) {
+              requestDockingClearance(*currentSystem,
+                                     stIdx,
+                                     timeDays,
+                                     ship.positionKm(),
+                                     ship.velocityKmS(),
+                                     clearance,
+                                     toasts);
+            } else {
+              pushToast(toasts, "No station to request docking with.", ImGui::GetTime());
+            }
+          }
+
+          if (event.key.keysym.sym == SDLK_g) {
+            if (flightMode == FlightMode::Docked) {
+              if (undock(ship, *currentSystem, timeDays, dockedStationIndex, toasts)) {
+                flightMode = FlightMode::Normal;
+                dockedStationId = 0;
+                dockedStationIndex = -1;
+                // Clear clearance; require re-request next time.
+                clearance = {};
+              }
+            } else {
+              sim::StationId did = 0;
+              int didIdx = -1;
+              if (attemptDock(ship, *currentSystem, timeDays, clearance, did, didIdx, toasts)) {
+                flightMode = FlightMode::Docked;
+                dockedStationId = did;
+                dockedStationIndex = didIdx;
+                selectedStationIndex = didIdx;
+                autopilotEnabled = false;
+                scAssistEnabled = false;
+              }
+            }
+          }
+
+          if (event.key.keysym.sym == SDLK_PAGEUP) {
+            timeLevelIndex = std::min<int>(timeLevelIndex + 1, (int)kTimeLevels.size() - 1);
+          }
+          if (event.key.keysym.sym == SDLK_PAGEDOWN) {
+            timeLevelIndex = std::max<int>(timeLevelIndex - 1, 0);
+          }
+          if (event.key.keysym.sym == SDLK_HOME) {
+            timeLevelIndex = 0;
+          }
+          if (event.key.keysym.sym == SDLK_END) {
+            timeLevelIndex = (int)kTimeLevels.size() - 1;
           }
         }
       }
+    }
+
+    // Compute requested/applied time scale
+    requestedTimeScale = kTimeLevels[(std::size_t)timeLevelIndex];
+    const bool forceTime = (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_LCTRL] != 0) ||
+                           (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_RCTRL] != 0);
+
+    const double maxAllowed = maxAllowedTimeScale(*currentSystem, timeDays, ship, flightMode);
+    appliedTimeScale = forceTime ? requestedTimeScale : std::min(requestedTimeScale, maxAllowed);
+
+    // Expire clearance
+    if (clearance.state != ClearanceState::None && timeDays > clearance.untilTimeDays) {
+      clearance = {};
     }
 
     // Input
+    sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
     const bool captureKeys = io.WantCaptureKeyboard;
 
-    // Manual input intent (used both for direct flight and for canceling autopilot).
-    sim::ShipInput manual{};
-    bool manualActive = false;
-
     if (!captureKeys) {
-      // Rotation always available (except while docked)
-      if (!docked) {
-        manual.torqueLocal.x += (keys[SDL_SCANCODE_UP] ? 1.0 : 0.0);
-        manual.torqueLocal.x -= (keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0);
-        manual.torqueLocal.y += (keys[SDL_SCANCODE_RIGHT] ? 1.0 : 0.0);
-        manual.torqueLocal.y -= (keys[SDL_SCANCODE_LEFT] ? 1.0 : 0.0);
-        manual.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
-        manual.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
+      if (flightMode == FlightMode::Normal) {
+        input.thrustLocal.z += (keys[SDL_SCANCODE_W] ? 1.0 : 0.0);
+        input.thrustLocal.z -= (keys[SDL_SCANCODE_S] ? 1.0 : 0.0);
+
+        input.thrustLocal.x += (keys[SDL_SCANCODE_D] ? 1.0 : 0.0);
+        input.thrustLocal.x -= (keys[SDL_SCANCODE_A] ? 1.0 : 0.0);
+
+        input.thrustLocal.y += (keys[SDL_SCANCODE_R] ? 1.0 : 0.0);
+        input.thrustLocal.y -= (keys[SDL_SCANCODE_F] ? 1.0 : 0.0);
+
+        input.torqueLocal.x += (keys[SDL_SCANCODE_UP] ? 1.0 : 0.0);
+        input.torqueLocal.x -= (keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0);
+
+        input.torqueLocal.y += (keys[SDL_SCANCODE_RIGHT] ? 1.0 : 0.0);
+        input.torqueLocal.y -= (keys[SDL_SCANCODE_LEFT] ? 1.0 : 0.0);
+
+        input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
+        input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
+
+        input.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
+        input.brake = keys[SDL_SCANCODE_X] != 0;
+
+        static bool dampers = true;
+        if (keys[SDL_SCANCODE_Z]) dampers = true;
+        if (keys[SDL_SCANCODE_C]) dampers = false;
+        input.dampers = dampers;
+      } else if (flightMode == FlightMode::Supercruise) {
+        // Rotation still works.
+        input.torqueLocal.x += (keys[SDL_SCANCODE_UP] ? 1.0 : 0.0);
+        input.torqueLocal.x -= (keys[SDL_SCANCODE_DOWN] ? 1.0 : 0.0);
+
+        input.torqueLocal.y += (keys[SDL_SCANCODE_RIGHT] ? 1.0 : 0.0);
+        input.torqueLocal.y -= (keys[SDL_SCANCODE_LEFT] ? 1.0 : 0.0);
+
+        input.torqueLocal.z += (keys[SDL_SCANCODE_E] ? 1.0 : 0.0);
+        input.torqueLocal.z -= (keys[SDL_SCANCODE_Q] ? 1.0 : 0.0);
+
+        input.dampers = true;
+
+        // Manual throttle when not using SC assist
+        if (!scAssistEnabled) {
+          const double d = 0.6 * dtReal;
+          if (keys[SDL_SCANCODE_W]) scThrottle = clampd(scThrottle + d, 0.0, 1.0);
+          if (keys[SDL_SCANCODE_S]) scThrottle = clampd(scThrottle - d, 0.0, 1.0);
+          if (keys[SDL_SCANCODE_X]) scThrottle = 0.0;
+        }
       }
-
-      manual.boost = keys[SDL_SCANCODE_LSHIFT] != 0;
-      manual.brake = keys[SDL_SCANCODE_X] != 0;
-
-      static bool dampers = true;
-      if (keys[SDL_SCANCODE_Z]) dampers = true;
-      if (keys[SDL_SCANCODE_C]) dampers = false;
-      manual.dampers = dampers;
-
-      if (!supercruise && !docked) {
-        manual.thrustLocal.z += (keys[SDL_SCANCODE_W] ? 1.0 : 0.0);
-        manual.thrustLocal.z -= (keys[SDL_SCANCODE_S] ? 1.0 : 0.0);
-        manual.thrustLocal.x += (keys[SDL_SCANCODE_D] ? 1.0 : 0.0);
-        manual.thrustLocal.x -= (keys[SDL_SCANCODE_A] ? 1.0 : 0.0);
-        manual.thrustLocal.y += (keys[SDL_SCANCODE_R] ? 1.0 : 0.0);
-        manual.thrustLocal.y -= (keys[SDL_SCANCODE_F] ? 1.0 : 0.0);
-      }
-
-      if (supercruise && !docked) {
-        const double rate = 0.5; // per second
-        if (keys[SDL_SCANCODE_W]) scThrottle = clampd(scThrottle + rate * dtReal, 0.0, 1.0);
-        if (keys[SDL_SCANCODE_S]) scThrottle = clampd(scThrottle - rate * dtReal, 0.0, 1.0);
-        if (keys[SDL_SCANCODE_X]) scThrottle = 0.0;
-      }
-
-      manualActive = (manual.thrustLocal.lengthSq() > 1e-6) || (manual.torqueLocal.lengthSq() > 1e-6);
     }
 
-    // Cancel autopilot on manual input.
-    if (autopilot && manualActive && !captureKeys) {
-      autopilot = false;
-      toast.show("Autopilot canceled (manual input)");
+    // Autopilot override (normal flight)
+    bool wantsAutoDock = false;
+    if (!paused && flightMode == FlightMode::Normal && autopilotEnabled && target.kind == TargetKind::Station &&
+        target.index >= 0 && target.index < (int)currentSystem->stations.size()) {
+      const auto& st = currentSystem->stations[(std::size_t)target.index];
+
+      // Auto-request docking when in comms range
+      const math::Vec3d spos = orbitPosKm(st.orbit, timeDays);
+      const double dist = (spos - ship.positionKm()).length();
+      if (dist <= st.docking.commsRangeKm &&
+          !(clearance.state == ClearanceState::Granted && clearance.stationId == st.id && timeDays <= clearance.untilTimeDays)) {
+        requestDockingClearance(*currentSystem,
+                               target.index,
+                               timeDays,
+                               ship.positionKm(),
+                               ship.velocityKmS(),
+                               clearance,
+                               toasts);
+      }
+
+      input = autopilotStationInput(st, timeDays, ship, clearance, wantsAutoDock);
     }
 
-    // Time compression clamp / application
-    const bool forceTime = (!captureKeys) && (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]);
-    const int allowedIdx = allowedTimeLevelIndex(*currentSystem, ship, timeDays, docked, supercruise, autopilot, manualActive);
-    appliedTimeIdx = forceTime ? requestedTimeIdx : std::min(requestedTimeIdx, allowedIdx);
-    const double timeScale = paused ? 0.0 : timeScaleForIndex(appliedTimeIdx);
-    const double dtSim = dtReal * timeScale;
+    // Simulation step
+    if (!paused) {
+      const double dtSim = dtReal * appliedTimeScale;
 
-    // --- Simulation update ---
-    if (toast.timer > 0.0) toast.timer = std::max(0.0, toast.timer - dtReal);
+      if (flightMode == FlightMode::Normal) {
+        stepShipSubdiv(ship, dtSim, input);
+        timeDays += dtSim / 86400.0;
 
-    if (!paused && dtSim > 0.0) {
-      // Advance "world time"
-      timeDays += dtSim / 86400.0;
+        if (wantsAutoDock) {
+          sim::StationId did = 0;
+          int didIdx = -1;
+          if (attemptDock(ship, *currentSystem, timeDays, clearance, did, didIdx, toasts)) {
+            flightMode = FlightMode::Docked;
+            dockedStationId = did;
+            dockedStationIndex = didIdx;
+            selectedStationIndex = didIdx;
+            autopilotEnabled = false;
+            scAssistEnabled = false;
+          }
+        }
+      } else if (flightMode == FlightMode::Docked) {
+        // Advance time, keep ship attached.
+        timeDays += (dtSim / 86400.0);
 
-      if (docked) {
-        // Snap ship to docked station's orbit state
-        if (dockedStationIndex >= 0 && (std::size_t)dockedStationIndex < currentSystem->stations.size()) {
+        if (dockedStationIndex >= 0 && dockedStationIndex < (int)currentSystem->stations.size()) {
           const auto& st = currentSystem->stations[(std::size_t)dockedStationIndex];
-          math::Vec3d stPosKm{}, stVelKmS{};
-          orbitStateKm(st.orbit, timeDays, &stPosKm, &stVelKmS);
-          const math::Vec3d axisOut = safeNormalize(stPosKm, {0, 0, 1});
-          ship.setPositionKm(stPosKm + axisOut * (st.radiusKm + 3.0));
-          ship.setVelocityKmS(stVelKmS);
+          math::Vec3d spos, svel, approach;
+          stationDockingGeometry(st, timeDays, spos, svel, approach);
+          ship.setPositionKm(spos + approach * st.docking.dockRangeKm);
+          ship.setVelocityKmS(svel);
         }
-      } else if (supercruise) {
-        // Supercruise: simplified translation, keep rotation thrusters.
-        const double maxKmS = supercruiseMaxSpeedKmS(*currentSystem, ship.positionKm(), timeDays);
-        const double desired = scThrottle * maxKmS;
-        const double accel = 0.8; // 1/s smoothing
-        scSpeedKmS += (desired - scSpeedKmS) * (1.0 - std::exp(-accel * dtSim));
+      } else if (flightMode == FlightMode::Supercruise) {
+        // In supercruise, we do NOT apply time acceleration (to avoid insane stacking).
+        timeDays += dtReal / 86400.0;
 
-        // Angular integration using ship physics (but freeze linear).
-        sim::ShipInput ang = manual;
-        ang.thrustLocal = {0, 0, 0};
-        // Don't let dampers kill our (synthetic) supercruise speed.
+        // Rotate ship (no linear motion through ship.step)
         ship.setVelocityKmS({0, 0, 0});
-        ship.step(dtSim, ang);
+        ship.setPositionKm(ship.positionKm());
+        stepShipSubdiv(ship, dtReal, input);
 
-        const math::Vec3d newPos = ship.positionKm() + ship.forward() * (scSpeedKmS * dtSim);
-        ship.setPositionKm(newPos);
+        // Steering assist: keep nose pointed at target when SC assist is enabled.
+        math::Vec3d targetPos{}, targetVel{};
+        std::string targetName;
+        const bool hasTarget = getTargetState(*currentSystem, target, timeDays, targetPos, targetVel, targetName);
+
+        if (scAssistEnabled && hasTarget) {
+          const math::Vec3d dir = safeNorm(targetPos - ship.positionKm());
+          const math::Vec3d dirLocal = safeNorm(ship.orientation().conjugate().rotate(dir));
+          const math::Vec3d fLocal = {0, 0, 1};
+          const math::Vec3d axis = math::cross(fLocal, dirLocal);
+          sim::ShipInput steer{};
+          steer.dampers = true;
+          steer.torqueLocal = axis * 2.5;
+          steer.torqueLocal.x = clampd(steer.torqueLocal.x, -1.0, 1.0);
+          steer.torqueLocal.y = clampd(steer.torqueLocal.y, -1.0, 1.0);
+          steer.torqueLocal.z = clampd(steer.torqueLocal.z, -1.0, 1.0);
+          stepShipSubdiv(ship, dtReal, steer);
+
+          // 7-second-rule throttle hold (aim to keep time-to-target ~ 7s)
+          const double distKm = (targetPos - ship.positionKm()).length();
+          const double etaTarget = 7.0;
+
+          const double minD = minDistanceToMassKm(*currentSystem, timeDays, ship.positionKm());
+          const double maxV = supercruiseMaxSpeedKmS(minD);
+
+          const double desiredSpeed = clampd(distKm / std::max(etaTarget, 0.5), 0.0, maxV);
+          scThrottle = clampd(desiredSpeed / std::max(1.0, maxV), 0.0, 1.0);
+        }
+
+        // Speed update
+        const double minD = minDistanceToMassKm(*currentSystem, timeDays, ship.positionKm());
+        const double maxV = supercruiseMaxSpeedKmS(minD);
+        const double desired = scThrottle * maxV;
+        const double k = 1.5; // response
+        const double a = 1.0 - std::exp(-dtReal * k);
+        scSpeedKmS = scSpeedKmS + (desired - scSpeedKmS) * a;
+
+        // Move forward at scSpeed
         ship.setVelocityKmS(ship.forward() * scSpeedKmS);
+        ship.setPositionKm(ship.positionKm() + ship.velocityKmS() * dtReal);
 
-        // Auto-drop near target.
-        if (scAutoDrop && navTarget.isValid(*currentSystem)) {
-          BodyState bs{};
-          if (getTargetState(*currentSystem, navTarget, timeDays, &bs)) {
-            const double dist = (bs.posKm - ship.positionKm()).length();
-            double dropDist = 0.0;
-            if (navTarget.kind == TargetKind::Station) {
-              const auto& st = currentSystem->stations[navTarget.index];
-              dropDist = std::max(5000.0, st.dockingCorridorLengthKm * 0.8);
-            } else {
-              dropDist = std::max(20000.0, bs.radiusKm * 3.0);
-            }
+        // Auto-drop near target
+        if (scAssistEnabled && hasTarget) {
+          const math::Vec3d toT = targetPos - ship.positionKm();
+          const double distKm = toT.length();
+          const double alignCos = math::dot(safeNorm(ship.forward()), safeNorm(toT));
 
-            if (dist <= dropDist) {
-              supercruise = false;
-              scSpeedKmS = 0.0;
-              scThrottle = 0.0;
-              // Drop with the target's orbital velocity to avoid ridiculous relative speeds.
-              ship.setVelocityKmS(bs.velKmS);
-              toast.show("Auto-drop near " + bs.name);
-            }
+          double dropDist = 1500.0;
+          if (target.kind == TargetKind::Station && target.index >= 0 && target.index < (int)currentSystem->stations.size()) {
+            dropDist = stationDropDistanceKm(currentSystem->stations[(std::size_t)target.index]);
           }
-        }
-      } else {
-        // Normal flight: manual or autopilot input.
-        sim::ShipInput in = manual;
-
-        bool autoDockNow = false;
-
-        if (autopilot && navTarget.isValid(*currentSystem)) {
-          BodyState bs{};
-          if (getTargetState(*currentSystem, navTarget, timeDays, &bs)) {
-            // Autopilot behavior depends on target.
-            if (navTarget.kind == TargetKind::Station) {
-              const auto& st = currentSystem->stations[navTarget.index];
-              const math::Vec3d stPos = bs.posKm;
-              const math::Vec3d stVel = bs.velKmS;
-
-              const math::Vec3d shipPos = ship.positionKm();
-              const math::Vec3d shipVel = ship.velocityKmS();
-
-              const CorridorInfo corridor = stationCorridorInfo(st, shipPos, stPos);
-              const math::Vec3d axisOut = corridor.axisOut;
-
-              const math::Vec3d rel = shipPos - stPos;
-              const double dist = rel.length();
-              const double axial = corridor.axialKm;
-              const math::Vec3d relPerp = rel - axisOut * axial;
-              const double lateral = relPerp.length();
-
-              // Waypoint: corridor entry point (outward end)
-              const math::Vec3d entryPoint = stPos + axisOut * st.dockingCorridorLengthKm;
-              const math::Vec3d toEntry = entryPoint - shipPos;
-
-              // Desired relative speed profile (stop at dockingRange)
-              const double maxA = std::max(0.01, ship.maxLinearAccelKmS2());
-              const double stopDist = std::max(0.0, dist - st.dockingRangeKm);
-              const double vStop = std::sqrt(2.0 * maxA * stopDist);
-
-              const double farCap = std::max(2.0, st.dockingSpeedLimitKmS * 12.0);
-              const double speedCap = corridor.inside ? st.dockingSpeedLimitKmS : farCap;
-              const double desiredSpeed = std::min(speedCap, vStop);
-
-              math::Vec3d desiredRelVel{0, 0, 0};
-              if (!corridor.inside || axial < 0.0) {
-                // Get to corridor entry point.
-                const math::Vec3d dir = safeNormalize(toEntry, -axisOut);
-                const double s = std::min(farCap, toEntry.length() * 0.02); // ~2% of distance per second
-                desiredRelVel = dir * s;
-              } else {
-                // In corridor: go inward and correct lateral offset.
-                desiredRelVel = (-axisOut) * desiredSpeed;
-                if (lateral > 1e-3) {
-                  const math::Vec3d latDir = (-relPerp) * (1.0 / lateral);
-                  const double latSpeed = std::min(desiredSpeed * 0.6 + 0.02, lateral * 0.02);
-                  desiredRelVel += latDir * latSpeed;
-                }
-              }
-
-              const math::Vec3d desiredVelWorld = stVel + desiredRelVel;
-
-              // Velocity controller -> acceleration -> thrusters.
-              const math::Vec3d velErr = desiredVelWorld - shipVel;
-              const math::Vec3d desiredAccelWorld = clampLen(velErr * 0.7, maxA);
-              const math::Vec3d accelLocal = ship.orientation().conjugate().rotate(desiredAccelWorld);
-              in.thrustLocal = clampLen(accelLocal * (1.0 / maxA), 1.0);
-              in.dampers = true;
-
-              // Orientation controller: point toward station.
-              const math::Vec3d desiredFwd = safeNormalize(stPos - shipPos, ship.forward());
-              const math::Vec3d errAxisWorld = math::cross(ship.forward(), desiredFwd);
-              const math::Vec3d errAxisLocal = ship.orientation().conjugate().rotate(errAxisWorld);
-              in.torqueLocal = clampLen(errAxisLocal * 4.0, 1.0);
-
-              // Auto-dock when conditions met.
-              const DockCheck dc = canDock(ship, st, stPos, stVel);
-              autoDockNow = dc.ok;
-            } else {
-              // Planet target: just match its orbital velocity and point at it.
-              const math::Vec3d shipPos = ship.positionKm();
-              const math::Vec3d shipVel = ship.velocityKmS();
-              const math::Vec3d to = bs.posKm - shipPos;
-              const double dist = to.length();
-              const double safeDist = std::max(5000.0, bs.radiusKm * 2.0);
-
-              const double maxA = std::max(0.01, ship.maxLinearAccelKmS2());
-              const double stopDist = std::max(0.0, dist - safeDist);
-              const double vStop = std::sqrt(2.0 * maxA * stopDist);
-              const double desiredSpeed = std::min(5.0, vStop);
-              const math::Vec3d desiredVelWorld = bs.velKmS + safeNormalize(to, ship.forward()) * desiredSpeed;
-
-              const math::Vec3d velErr = desiredVelWorld - shipVel;
-              const math::Vec3d desiredAccelWorld = clampLen(velErr * 0.5, maxA);
-              const math::Vec3d accelLocal = ship.orientation().conjugate().rotate(desiredAccelWorld);
-              in.thrustLocal = clampLen(accelLocal * (1.0 / maxA), 1.0);
-              in.dampers = true;
-
-              const math::Vec3d desiredFwd = safeNormalize(to, ship.forward());
-              const math::Vec3d errAxisWorld = math::cross(ship.forward(), desiredFwd);
-              const math::Vec3d errAxisLocal = ship.orientation().conjugate().rotate(errAxisWorld);
-              in.torqueLocal = clampLen(errAxisLocal * 3.5, 1.0);
-            }
+          if (target.kind == TargetKind::Planet && target.index >= 0 && target.index < (int)currentSystem->planets.size()) {
+            dropDist = planetDropDistanceKm(currentSystem->planets[(std::size_t)target.index]);
           }
-        }
 
-        // Integrate ship simulation. Cap per-step to avoid huge dt when time compression is high.
-        const double maxStep = 1.0; // seconds
-        double remain = dtSim;
-        while (remain > 0.0) {
-          const double step = std::min(remain, maxStep);
-          ship.step(step, in);
-          remain -= step;
-        }
+          if (distKm <= dropDist && alignCos >= 0.985) {
+            flightMode = FlightMode::Normal;
+            // Give a manageable starting velocity in normal space.
+            ship.setVelocityKmS(ship.forward() * 6.0);
+            scSpeedKmS = 0.0;
+            pushToast(toasts, "Auto-drop complete.", ImGui::GetTime());
 
-        if (autoDockNow && navTarget.kind == TargetKind::Station && navTarget.index < currentSystem->stations.size()) {
-          const auto& st = currentSystem->stations[navTarget.index];
-          docked = true;
-          dockedStationId = st.id;
-          dockedStationIndex = (int)navTarget.index;
-          toast.show("Auto-docked at " + st.name);
+            // Optional: continue into normal-space autopilot for station approaches.
+            if (target.kind == TargetKind::Station) autopilotEnabled = true;
+          }
         }
       }
     }
 
-    // ---- Camera (third-person follow) ----
+    // ---- Camera follow ----
     render::Camera cam;
     int w = 1280, h = 720;
     SDL_GetWindowSize(window, &w, &h);
@@ -1124,11 +1397,16 @@ int main(int argc, char** argv) {
     cam.setPerspective(math::degToRad(60.0), aspect, 0.01, 20000.0);
 
     const math::Vec3d shipPosU = ship.positionKm() * (1.0 / kRENDER_UNIT_KM);
-    const math::Vec3d back = ship.forward() * (-6.0);
-    const math::Vec3d up = ship.up() * (2.0);
 
-    cam.setPosition(shipPosU + back + up);
-    cam.setOrientation(ship.orientation());
+    if (!cockpitCamera) {
+      const math::Vec3d back = ship.forward() * (-8.0);
+      const math::Vec3d up = ship.up() * (3.0);
+      cam.setPosition(shipPosU + back + up);
+      cam.setOrientation(ship.orientation());
+    } else {
+      cam.setPosition(shipPosU + ship.up() * 0.2);
+      cam.setOrientation(ship.orientation());
+    }
 
     const math::Mat4d view = cam.viewMatrix();
     const math::Mat4d proj = cam.projectionMatrix();
@@ -1141,7 +1419,18 @@ int main(int argc, char** argv) {
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
 
-    // ---- Build instances (star + planets) ----
+    // ---- Starfield (camera-anchored) ----
+    std::vector<render::PointVertex> stars;
+    stars.reserve(starDirs.size());
+
+    const double starRadiusU = 16000.0; // within far plane
+    for (std::size_t i = 0; i < starDirs.size(); ++i) {
+      const math::Vec3d pU = cam.position() + starDirs[i] * starRadiusU;
+      const auto& c = starCols[i];
+      stars.push_back({(float)pU.x, (float)pU.y, (float)pU.z, (float)c.x, (float)c.y, (float)c.z, starSizes[i]});
+    }
+
+    // ---- Build instances (star + planets + stations + ship) ----
     std::vector<render::InstanceData> spheres;
     spheres.reserve(1 + currentSystem->planets.size());
 
@@ -1155,13 +1444,13 @@ int main(int argc, char** argv) {
     // Planets
     for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
       const auto& p = currentSystem->planets[i];
-      math::Vec3d posKm{};
-      orbitStateKm(p.orbit, timeDays, &posKm, nullptr);
+      const math::Vec3d posKm = orbitPosKm(p.orbit, timeDays);
       const math::Vec3d posU = posKm * (1.0 / kRENDER_UNIT_KM);
 
       const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
       const float scale = (float)std::max(0.25, (radiusKm / kRENDER_UNIT_KM) * 200.0);
 
+      // Simple color palette by type
       float cr = 0.6f, cg = 0.6f, cb = 0.6f;
       switch (p.type) {
         case sim::PlanetType::Rocky: cr = 0.6f; cg = 0.55f; cb = 0.5f; break;
@@ -1185,104 +1474,108 @@ int main(int argc, char** argv) {
                          cb});
     }
 
-    // ---- Orbit lines (planets + stations) ----
-    std::vector<render::LineVertex> orbitLines;
-    orbitLines.reserve((currentSystem->planets.size() + currentSystem->stations.size()) * 128);
+    // Station cubes
+    std::vector<render::InstanceData> cubes;
+    cubes.reserve(currentSystem->stations.size() + 1);
 
-    auto appendOrbit = [&](const sim::OrbitElements& el, float r, float g, float b) {
+    for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+      const auto& st = currentSystem->stations[i];
+      const math::Vec3d posKm = orbitPosKm(st.orbit, timeDays);
+      const math::Vec3d posU = posKm * (1.0 / kRENDER_UNIT_KM);
+
+      float cr = 0.7f, cg = 0.8f, cb = 0.9f;
+      if ((int)i == selectedStationIndex) {
+        cr = 1.0f;
+        cg = 0.75f;
+        cb = 0.35f;
+      }
+      if (target.kind == TargetKind::Station && target.index == (int)i) {
+        cr = 1.0f;
+        cg = 0.35f;
+        cb = 0.35f;
+      }
+      if (dockedStationId != 0 && st.id == dockedStationId) {
+        cr = 0.3f;
+        cg = 0.95f;
+        cb = 0.4f;
+      }
+
+      // Use a visual scale factor so stations are visible even though radiusKm is small.
+      const float scale = (float)std::max(0.008, (st.radiusKm / kRENDER_UNIT_KM) * 6000.0);
+
+      cubes.push_back({(float)posU.x,
+                       (float)posU.y,
+                       (float)posU.z,
+                       scale,
+                       1,
+                       0,
+                       0,
+                       0,
+                       cr,
+                       cg,
+                       cb});
+    }
+
+    // Ship cube (oriented)
+    {
+      render::InstanceData shipInst{};
+      shipInst.px = (float)shipPosU.x;
+      shipInst.py = (float)shipPosU.y;
+      shipInst.pz = (float)shipPosU.z;
+      shipInst.scale = 0.0065f;
+      shipInst.qw = (float)ship.orientation().w;
+      shipInst.qx = (float)ship.orientation().x;
+      shipInst.qy = (float)ship.orientation().y;
+      shipInst.qz = (float)ship.orientation().z;
+
+      shipInst.cr = 0.9f;
+      shipInst.cg = 0.9f;
+      shipInst.cb = 1.0f;
+      cubes.push_back(shipInst);
+    }
+
+    // Orbit lines
+    std::vector<render::LineVertex> orbitLines;
+    orbitLines.reserve(currentSystem->planets.size() * 128);
+
+    for (const auto& p : currentSystem->planets) {
       const int seg = 96;
       math::Vec3d prev{};
       for (int s = 0; s <= seg; ++s) {
-        const double t = (double)s / (double)seg * el.periodDays;
-        const math::Vec3d posU = (sim::orbitPosition3DAU(el, t) * kAU_KM) * (1.0 / kRENDER_UNIT_KM);
+        const double t = (double)s / (double)seg * p.orbit.periodDays;
+        const math::Vec3d posKm = orbitPosKm(p.orbit, t);
+        const math::Vec3d posU = posKm * (1.0 / kRENDER_UNIT_KM);
+
         if (s > 0) {
-          orbitLines.push_back({(float)prev.x, (float)prev.y, (float)prev.z, r, g, b});
-          orbitLines.push_back({(float)posU.x, (float)posU.y, (float)posU.z, r, g, b});
+          orbitLines.push_back({(float)prev.x, (float)prev.y, (float)prev.z, 0.25f, 0.25f, 0.25f});
+          orbitLines.push_back({(float)posU.x, (float)posU.y, (float)posU.z, 0.25f, 0.25f, 0.25f});
         }
         prev = posU;
       }
-    };
-
-    for (const auto& p : currentSystem->planets) appendOrbit(p.orbit, 0.25f, 0.25f, 0.25f);
-    for (const auto& st : currentSystem->stations) appendOrbit(st.orbit, 0.22f, 0.32f, 0.42f);
-
-    // ---- Cubes: stations + ship ----
-    std::vector<render::InstanceData> cubes;
-    cubes.reserve(1 + currentSystem->stations.size());
-
-    // Stations
-    for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
-      const auto& st = currentSystem->stations[i];
-      math::Vec3d stPosKm{};
-      orbitStateKm(st.orbit, timeDays, &stPosKm, nullptr);
-      const math::Vec3d stPosU = stPosKm * (1.0 / kRENDER_UNIT_KM);
-      const float scale = (float)std::max(0.12, (st.radiusKm / kRENDER_UNIT_KM) * 20000.0);
-
-      float cr = 0.75f, cg = 0.75f, cb = 0.85f;
-      if (navTarget.kind == TargetKind::Station && navTarget.index == i) {
-        cr = 1.0f;
-        cg = 0.55f;
-        cb = 0.55f;
-      }
-      if (docked && (int)i == dockedStationIndex) {
-        cr = 0.55f;
-        cg = 1.0f;
-        cb = 0.55f;
-      }
-
-      // Identity rotation (cube is symmetric anyway)
-      cubes.push_back({(float)stPosU.x, (float)stPosU.y, (float)stPosU.z, scale, 1, 0, 0, 0, cr, cg, cb});
-
-      // Corridor visualization for targeted station
-      if (navTarget.kind == TargetKind::Station && navTarget.index == i) {
-        const math::Vec3d axisOut = safeNormalize(stPosKm, {0, 0, 1});
-        const math::Vec3d aU = axisOut * (1.0 / kRENDER_UNIT_KM);
-        const math::Vec3d startU = stPosU;
-        const math::Vec3d endU = stPosU + aU * st.dockingCorridorLengthKm;
-
-        orbitLines.push_back({(float)startU.x, (float)startU.y, (float)startU.z, 0.9f, 0.35f, 0.2f});
-        orbitLines.push_back({(float)endU.x, (float)endU.y, (float)endU.z, 0.9f, 0.35f, 0.2f});
-      }
     }
 
-    // Ship
-    {
-      const auto q = ship.orientation();
-      cubes.push_back({(float)shipPosU.x,
-                       (float)shipPosU.y,
-                       (float)shipPosU.z,
-                       0.35f,
-                       (float)q.w,
-                       (float)q.x,
-                       (float)q.y,
-                       (float)q.z,
-                       0.9f,
-                       0.9f,
-                       1.0f});
+    // Station corridor line for selected station
+    std::vector<render::LineVertex> corridorLines;
+    if (!currentSystem->stations.empty() && selectedStationIndex >= 0 && selectedStationIndex < (int)currentSystem->stations.size()) {
+      const auto& st = currentSystem->stations[(std::size_t)selectedStationIndex];
+      math::Vec3d spos, svel, approach;
+      stationDockingGeometry(st, timeDays, spos, svel, approach);
+      const math::Vec3d a = (spos)* (1.0 / kRENDER_UNIT_KM);
+      const math::Vec3d b = (spos + approach * st.docking.corridorLengthKm) * (1.0 / kRENDER_UNIT_KM);
+
+      corridorLines.push_back({(float)a.x, (float)a.y, (float)a.z, 0.8f, 0.7f, 0.2f});
+      corridorLines.push_back({(float)b.x, (float)b.y, (float)b.z, 0.8f, 0.7f, 0.2f});
     }
 
-    // ---- Starfield points (attached to camera) ----
-    std::vector<render::PointVertex> stars;
-    stars.reserve(starDirs.size());
-    {
-      const math::Vec3d camPosU = cam.position();
-      const double r = 12000.0;
-      for (const auto& sdir : starDirs) {
-        const math::Vec3d p = camPosU + sdir.dir * r;
-        stars.push_back({(float)p.x, (float)p.y, (float)p.z, sdir.c, sdir.c, sdir.c, sdir.size});
-      }
-    }
-
-    // ---- Render ---
+    // ---- Render ----
     glViewport(0, 0, w, h);
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // Stars (points)
     pointRenderer.drawPoints(stars);
 
-    // Orbits + corridor line (lines)
     lineRenderer.drawLines(orbitLines);
+    lineRenderer.drawLines(corridorLines);
 
     // Star + planets
     meshRenderer.setMesh(&sphere);
@@ -1299,6 +1592,67 @@ int main(int argc, char** argv) {
 
     ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
 
+    // HUD overlay
+    if (showHud) {
+      ImGuiViewport* vp = ImGui::GetMainViewport();
+      ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
+
+      const ImVec2 center = ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f);
+      dl->AddLine(ImVec2(center.x - 10, center.y), ImVec2(center.x + 10, center.y), IM_COL32(220, 220, 235, 160), 1.0f);
+      dl->AddLine(ImVec2(center.x, center.y - 10), ImVec2(center.x, center.y + 10), IM_COL32(220, 220, 235, 160), 1.0f);
+
+      // Target marker
+      math::Vec3d tposKm{}, tvelKmS{};
+      std::string tname;
+      if (getTargetState(*currentSystem, target, timeDays, tposKm, tvelKmS, tname)) {
+        const math::Vec3d tposU = tposKm * (1.0 / kRENDER_UNIT_KM);
+        ImVec2 p2;
+        bool behind = false;
+        projectToScreen(tposU, view, proj, (int)vp->Size.x, (int)vp->Size.y, p2, behind);
+
+        // clamp to viewport
+        ImVec2 marker = ImVec2(vp->Pos.x + p2.x, vp->Pos.y + p2.y);
+        if (behind) {
+          // flip to edge
+          marker.x = vp->Pos.x + vp->Size.x - 30.0f;
+          marker.y = vp->Pos.y + 30.0f;
+        }
+
+        dl->AddCircle(marker, 10.0f, IM_COL32(255, 120, 120, 220), 0, 2.0f);
+        const double distKm = (tposKm - ship.positionKm()).length();
+
+        char buf[256];
+        if (flightMode == FlightMode::Supercruise) {
+          const double eta = distKm / std::max(1.0, std::max(scSpeedKmS, 1.0));
+          std::snprintf(buf, sizeof(buf), "%s  %.0f km  ETA %.1fs", tname.c_str(), distKm, eta);
+        } else {
+          std::snprintf(buf, sizeof(buf), "%s  %.0f km", tname.c_str(), distKm);
+        }
+
+        dl->AddText(ImVec2(marker.x + 14.0f, marker.y - 8.0f), IM_COL32(235, 235, 245, 220), buf);
+      }
+
+      // Mode line
+      const char* modeStr = (flightMode == FlightMode::Normal) ? "NORMAL" : (flightMode == FlightMode::Supercruise ? "SUPERCRUISE" : "DOCKED");
+      char mline[256];
+      std::snprintf(mline,
+                    sizeof(mline),
+                    "%s  |v| %.2f km/s  Time x%.0f%s",
+                    modeStr,
+                    ship.velocityKmS().length(),
+                    appliedTimeScale,
+                    paused ? " [PAUSED]" : "");
+      dl->AddText(ImVec2(vp->Pos.x + 12.0f, vp->Pos.y + vp->Size.y - 26.0f), IM_COL32(235, 235, 245, 220), mline);
+
+      // Clearance line
+      if (clearance.state == ClearanceState::Granted) {
+        dl->AddText(ImVec2(vp->Pos.x + 12.0f, vp->Pos.y + vp->Size.y - 46.0f), IM_COL32(120, 255, 150, 220), "Docking clearance: GRANTED");
+      } else if (clearance.state == ClearanceState::Denied) {
+        dl->AddText(ImVec2(vp->Pos.x + 12.0f, vp->Pos.y + vp->Size.y - 46.0f), IM_COL32(255, 120, 120, 220), "Docking clearance: DENIED");
+      }
+    }
+
+    // Flight window
     if (showShip) {
       ImGui::Begin("Ship / Flight");
 
@@ -1306,123 +1660,96 @@ int main(int argc, char** argv) {
       const auto vel = ship.velocityKmS();
       const auto wv = ship.angularVelocityRadS();
 
-      ImGui::Text("Time: %.2f days  %s", timeDays, paused ? "[PAUSED]" : "");
-      ImGui::Text("Time compression: requested x%.0f | applied x%.0f | allowed max x%.0f %s",
-                  timeScaleForIndex(requestedTimeIdx),
-                  timeScaleForIndex(appliedTimeIdx),
-                  timeScaleForIndex(allowedIdx),
-                  forceTime ? "[FORCED]" : "");
-
-      ImGui::Text("Flight mode: %s%s", docked ? "DOCKED" : (supercruise ? "SUPERCRUISE" : "NORMAL"),
-                  autopilot ? " + AUTOPILOT" : "");
+      ImGui::Text("Time: %.4f days", timeDays);
+      ImGui::Text("Time compression: requested x%.0f, applied x%.0f%s", requestedTimeScale, appliedTimeScale, (appliedTimeScale < requestedTimeScale ? " (clamped)" : ""));
+      if ((SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_LCTRL] != 0) || (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_RCTRL] != 0)) {
+        ImGui::TextDisabled("CTRL held: force time compression (unsafe)");
+      }
 
       ImGui::Separator();
       ImGui::Text("Pos (km):   [%.1f %.1f %.1f]", pos.x, pos.y, pos.z);
       ImGui::Text("Vel (km/s): [%.3f %.3f %.3f] |v|=%.3f", vel.x, vel.y, vel.z, vel.length());
       ImGui::Text("AngVel (rad/s): [%.3f %.3f %.3f]", wv.x, wv.y, wv.z);
 
-      if (supercruise) {
+      if (flightMode == FlightMode::Supercruise) {
+        const double minD = minDistanceToMassKm(*currentSystem, timeDays, ship.positionKm());
+        const double maxV = supercruiseMaxSpeedKmS(minD);
         ImGui::Separator();
-        ImGui::Text("Supercruise speed: %.0f km/s  throttle: %.2f", scSpeedKmS, scThrottle);
-        ImGui::Checkbox("Auto-drop", &scAutoDrop);
+        ImGui::Text("Supercruise speed: %.0f km/s  (max %.0f km/s)", scSpeedKmS, maxV);
+        ImGui::Text("Throttle: %.0f%%", scThrottle * 100.0);
+        ImGui::Text("SC assist: %s (P toggles)", scAssistEnabled ? "ON" : "OFF");
       }
 
       ImGui::Separator();
       ImGui::TextDisabled("Controls:");
-      ImGui::BulletText("Translate: WASD + R/F (up/down)");
+      ImGui::BulletText("Translate: WASD + R/F (normal)");
       ImGui::BulletText("Rotate: Arrow keys + Q/E roll");
       ImGui::BulletText("Boost: LShift   Brake: X");
       ImGui::BulletText("Dampers: Z (on) / C (off)");
-      ImGui::BulletText("Target cycle: T  Clear: Y");
-      ImGui::BulletText("Autopilot: P   Dock/Undock: G");
-      ImGui::BulletText("Supercruise toggle: J (W/S throttle while active)");
-      ImGui::BulletText("Time compression: PgUp/PgDn, Home=1x, End=max (hold Ctrl to force)");
+      ImGui::BulletText("Target: T cycle, Y clear");
+      ImGui::BulletText("Autopilot/SC assist: P");
+      ImGui::BulletText("Request docking: L");
+      ImGui::BulletText("Dock/Undock: G");
+      ImGui::BulletText("Supercruise: J");
+      ImGui::BulletText("Time compression: PgUp/PgDn, Home=1x, End=max (hold CTRL to force)");
+      ImGui::BulletText("Camera: V");
       ImGui::BulletText("Pause: Space   Save: F5   Load: F9");
-      ImGui::BulletText("Windows: TAB Galaxy, F1 Flight, F2 Economy, F3 Nav, F4 HUD");
 
       ImGui::End();
     }
 
+    // Nav window
     if (showNav) {
-      ImGui::Begin("System / Nav");
+      ImGui::Begin("Nav / Targets");
 
-      if (navTarget.kind == TargetKind::None) {
-        ImGui::Text("Target: (none)");
-      } else {
-        BodyState bs{};
-        if (getTargetState(*currentSystem, navTarget, timeDays, &bs)) {
-          const double dist = (bs.posKm - ship.positionKm()).length();
-          const double relSpeed = (ship.velocityKmS() - bs.velKmS).length();
-          ImGui::Text("Target: %s - %s", bs.kindLabel, bs.name.c_str());
-          ImGui::Text("Distance: %.0f km", dist);
-          ImGui::Text("Relative speed: %.3f km/s", relSpeed);
+      if (ImGui::CollapsingHeader("Stations", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < (int)currentSystem->stations.size(); ++i) {
+          const auto& st = currentSystem->stations[(std::size_t)i];
+          const bool isSel = (target.kind == TargetKind::Station && target.index == i);
+          if (ImGui::Selectable(st.name.c_str(), isSel)) {
+            target.kind = TargetKind::Station;
+            target.index = i;
+            selectedStationIndex = i;
+          }
+        }
+      }
 
-          if (navTarget.kind == TargetKind::Station) {
-            const auto& st = currentSystem->stations[navTarget.index];
-            const DockCheck dc = canDock(ship, st, bs.posKm, bs.velKmS);
-            ImGui::Text("Docking: %s | corridor=%s | vRel=%.3f (limit %.3f)",
-                        dc.ok ? "OK" : "NO",
-                        dc.inCorridor ? "IN" : "OUT",
-                        dc.relSpeedKmS,
-                        st.dockingSpeedLimitKmS);
+      if (ImGui::CollapsingHeader("Planets", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < (int)currentSystem->planets.size(); ++i) {
+          const auto& p = currentSystem->planets[(std::size_t)i];
+          const bool isSel = (target.kind == TargetKind::Planet && target.index == i);
+          if (ImGui::Selectable(p.name.c_str(), isSel)) {
+            target.kind = TargetKind::Planet;
+            target.index = i;
           }
         }
       }
 
       ImGui::Separator();
-      ImGui::Checkbox("Autopilot", &autopilot);
-      ImGui::SameLine();
-      ImGui::Checkbox("Supercruise", &supercruise);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use J hotkey for safety checks");
-
-      ImGui::Separator();
-      ImGui::Text("Stations:");
-      for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
-        const auto& st = currentSystem->stations[i];
-        bool selected = (navTarget.kind == TargetKind::Station && navTarget.index == i);
-        if (ImGui::Selectable(st.name.c_str(), selected)) {
-          navTarget.kind = TargetKind::Station;
-          navTarget.index = i;
-        }
-      }
-
-      ImGui::Separator();
-      ImGui::Text("Planets:");
-      for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
-        const auto& p = currentSystem->planets[i];
-        bool selected = (navTarget.kind == TargetKind::Planet && navTarget.index == i);
-        if (ImGui::Selectable(p.name.c_str(), selected)) {
-          navTarget.kind = TargetKind::Planet;
-          navTarget.index = i;
-        }
-      }
+      ImGui::TextDisabled("Tip: target a station and hit P for approach autopilot.");
 
       ImGui::End();
     }
 
+    // Economy window
     if (showEconomy) {
-      beginStationSelectHUD(*currentSystem, dockedStationIndex, "Dock / Market");
-
-      ImGui::Begin("Dock / Status");
-      if (docked) {
-        const auto& st = currentSystem->stations[(std::size_t)dockedStationIndex];
-        ImGui::Text("Docked at: %s", st.name.c_str());
-      } else {
-        ImGui::TextDisabled("Not docked. Fly to a station, align in corridor, slow down, press G.");
+      std::string_view dockedName = "";
+      if (flightMode == FlightMode::Docked && dockedStationIndex >= 0 && dockedStationIndex < (int)currentSystem->stations.size()) {
+        dockedName = currentSystem->stations[(std::size_t)dockedStationIndex].name;
       }
-      ImGui::End();
+
+      beginStationSelectionUI(*currentSystem, selectedStationIndex, flightMode == FlightMode::Docked, dockedName);
 
       if (!currentSystem->stations.empty()) {
-        const auto& station = currentSystem->stations[(std::size_t)dockedStationIndex];
+        selectedStationIndex = std::clamp(selectedStationIndex, 0, (int)currentSystem->stations.size() - 1);
+        const auto& station = currentSystem->stations[(std::size_t)selectedStationIndex];
         auto& stEcon = universe.stationEconomy(station, timeDays);
+
+        const bool dockedHere = (flightMode == FlightMode::Docked && dockedStationId == station.id);
 
         ImGui::Begin("Market Details");
         ImGui::Text("Credits: %.2f", credits);
-
-        const bool atThisStation = docked && (station.id == dockedStationId);
-        if (!atThisStation) {
-          ImGui::TextDisabled("Trade is disabled unless you are docked at the selected station.");
-        }
+        ImGui::Text("Trading: %s", dockedHere ? "ENABLED (docked)" : "DISABLED (dock to trade)");
 
         static int selectedCommodity = 0;
         ImGui::SliderInt("Plot commodity", &selectedCommodity, 0, (int)econ::kCommodityCount - 1);
@@ -1465,15 +1792,16 @@ int main(int argc, char** argv) {
             ImGui::SetNextItemWidth(70);
             ImGui::InputFloat("##qty", &qty[i], 1.0f, 10.0f, "%.0f");
 
-            if (!atThisStation) ImGui::BeginDisabled(true);
-
             ImGui::SameLine();
+            if (!dockedHere) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Buy")) {
               auto tr = econ::buy(stEcon, station.economyModel, cid, qty[i], credits, 0.10, station.feeRate);
               if (tr.ok) cargo[i] += qty[i];
             }
+            if (!dockedHere) ImGui::EndDisabled();
 
             ImGui::SameLine();
+            if (!dockedHere) ImGui::BeginDisabled();
             if (ImGui::SmallButton("Sell")) {
               const double sellUnits = std::min<double>(qty[i], cargo[i]);
               if (sellUnits > 0.0) {
@@ -1481,8 +1809,7 @@ int main(int argc, char** argv) {
                 if (tr.ok) cargo[i] -= sellUnits;
               }
             }
-
-            if (!atThisStation) ImGui::EndDisabled();
+            if (!dockedHere) ImGui::EndDisabled();
 
             ImGui::PopID();
           }
@@ -1500,13 +1827,14 @@ int main(int argc, char** argv) {
 
           ImGui::PlotLines("Price history", vals.data(), (int)vals.size(), 0, nullptr, 0.0f, 0.0f, ImVec2(0, 120));
         } else {
-          ImGui::TextDisabled("No history yet (time needs to advance). Use PgUp/PgDn time compression.");
+          ImGui::TextDisabled("No history yet (time needs to advance).");
         }
 
         ImGui::End();
       }
     }
 
+    // Galaxy window
     if (showGalaxy) {
       ImGui::Begin("Galaxy / Streaming");
 
@@ -1515,9 +1843,9 @@ int main(int argc, char** argv) {
       ImGui::SliderFloat("Query radius (ly)", &radius, 20.0f, 1200.0f);
 
       auto nearby = universe.queryNearby(center, radius, 128);
+
       ImGui::Text("Nearby systems: %d", (int)nearby.size());
 
-      // Mini-map canvas
       const ImVec2 canvasSize = ImVec2(420, 420);
       ImGui::BeginChild("map", canvasSize, true, ImGuiWindowFlags_NoScrollbar);
 
@@ -1592,33 +1920,26 @@ int main(int argc, char** argv) {
             const auto& sys = universe.getSystem(currentStub.id, &currentStub);
             currentSystem = &sys;
 
-            // Reset transient state
-            docked = false;
-            dockedStationId = 0;
-            dockedStationIndex = 0;
-            autopilot = false;
-            supercruise = false;
-            scThrottle = 0.0;
-            scSpeedKmS = 0.0;
-
-            navTarget.clear();
-
-            // Spawn near first station if available.
-            if (!sys.stations.empty()) {
-              const auto& st = sys.stations[0];
-              math::Vec3d stPosKm{}, stVelKmS{};
-              orbitStateKm(st.orbit, timeDays, &stPosKm, &stVelKmS);
-              const math::Vec3d axisOut = safeNormalize(stPosKm, {0, 0, 1});
-              ship.setPositionKm(stPosKm + axisOut * std::max(1200.0, st.dockingCorridorLengthKm * 0.85));
-              ship.setVelocityKmS(stVelKmS);
-              navTarget.kind = TargetKind::Station;
-              navTarget.index = 0;
+            // spawn near a station for immediate gameplay
+            if (!currentSystem->stations.empty()) {
+              spawnNearStation(ship, *currentSystem, timeDays, 0);
+              selectedStationIndex = 0;
             } else {
               ship.setPositionKm({0, 0, -8000.0});
               ship.setVelocityKmS({0, 0, 0});
+              ship.setAngularVelocityRadS({0, 0, 0});
             }
 
-            toast.show("Jumped to " + sys.stub.name);
+            flightMode = FlightMode::Normal;
+            dockedStationId = 0;
+            dockedStationIndex = -1;
+
+            target = {};
+            autopilotEnabled = false;
+            scAssistEnabled = false;
+            clearance = {};
+
+            pushToast(toasts, "Arrived in new system.", ImGui::GetTime());
           }
         }
       }
@@ -1628,76 +1949,8 @@ int main(int argc, char** argv) {
       ImGui::End();
     }
 
-    // HUD overlay (target marker + crosshair)
-    if (showHUD) {
-      ImDrawList* fg = ImGui::GetForegroundDrawList();
-      const ImGuiViewport* vp = ImGui::GetMainViewport();
-      const ImVec2 vpPos = vp->Pos;
-      const ImVec2 vpSize = vp->Size;
-      const ImVec2 center = ImVec2(vpPos.x + vpSize.x * 0.5f, vpPos.y + vpSize.y * 0.5f);
-
-      // Crosshair
-      const float s = 6.0f;
-      fg->AddLine(ImVec2(center.x - s, center.y), ImVec2(center.x + s, center.y), IM_COL32(220, 220, 240, 170), 1.0f);
-      fg->AddLine(ImVec2(center.x, center.y - s), ImVec2(center.x, center.y + s), IM_COL32(220, 220, 240, 170), 1.0f);
-
-      // Target marker
-      if (navTarget.isValid(*currentSystem)) {
-        BodyState bs{};
-        if (getTargetState(*currentSystem, navTarget, timeDays, &bs)) {
-          const math::Vec3d targetU = bs.posKm * (1.0 / kRENDER_UNIT_KM);
-          ImVec2 px{}, ndc{};
-          bool onScreen = false;
-          if (projectToScreen(targetU, view, proj, vpPos, vpSize, &px, &onScreen, &ndc)) {
-            ImVec2 drawPos = px;
-            if (!onScreen) {
-              // Clamp to edge.
-              const float ax = ndc.x;
-              const float ay = ndc.y;
-              const float m = std::max(std::abs(ax), std::abs(ay));
-              const float kEdge = 0.92f;
-              const float sx = (m > 1e-5f) ? (ax / m) * kEdge : 0.0f;
-              const float sy = (m > 1e-5f) ? (ay / m) * kEdge : 0.0f;
-              const float px2 = vpPos.x + (sx * 0.5f + 0.5f) * vpSize.x;
-              const float py2 = vpPos.y + (1.0f - (sy * 0.5f + 0.5f)) * vpSize.y;
-              drawPos = ImVec2(px2, py2);
-            }
-
-            fg->AddCircle(drawPos, 10.0f, IM_COL32(255, 140, 80, 220), 0, 1.5f);
-            const double dist = (bs.posKm - ship.positionKm()).length();
-            const std::string label = bs.name + "  " + std::to_string((long long)dist) + " km";
-            fg->AddText(ImVec2(drawPos.x + 12.0f, drawPos.y - 6.0f), IM_COL32(255, 200, 160, 220), label.c_str());
-          }
-        }
-      }
-
-      // Mini status top-left
-      ImGui::SetNextWindowPos(ImVec2(vpPos.x + 10.0f, vpPos.y + 10.0f));
-      ImGui::SetNextWindowBgAlpha(0.35f);
-      ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                               ImGuiWindowFlags_NoNav;
-      ImGui::Begin("##hud", nullptr, flags);
-      ImGui::Text("%s", currentSystem->stub.name.c_str());
-      ImGui::Text("x%.0f %s", timeScale, paused ? "PAUSED" : "");
-      if (autopilot) ImGui::Text("AUTOPILOT");
-      if (supercruise) ImGui::Text("SUPERCRUISE %.0f km/s", scSpeedKmS);
-      if (docked) ImGui::Text("DOCKED");
-      ImGui::End();
-    }
-
-    // Toast overlay
-    if (toast.timer > 0.0 && !toast.msg.empty()) {
-      const ImGuiViewport* vp = ImGui::GetMainViewport();
-      ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + 10.0f, vp->Pos.y + vp->Size.y - 60.0f));
-      ImGui::SetNextWindowBgAlpha(0.55f);
-      ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                               ImGuiWindowFlags_NoNav;
-      ImGui::Begin("##toast", nullptr, flags);
-      ImGui::TextUnformatted(toast.msg.c_str());
-      ImGui::End();
-    }
+    // Toasts
+    drawToasts(toasts, ImGui::GetTime());
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

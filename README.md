@@ -22,14 +22,26 @@ New in this build:
 
 - **Streaming universe**: systems are generated **on-demand** (infinite indices) with an **LRU cache**
 - **Renderer layer**: a minimal OpenGL point renderer (GL function loading via SDL's `SDL_GL_GetProcAddress`)
-- **Player ship**: simple input + physics integration (AU/day units)
-- **Targeting + nav HUD**: select a planet/station as a nav target, with an on-screen marker
-- **Docking corridor**: stations have an approach corridor, speed limit, and alignment requirement
-- **Autopilot**: a basic approach assist that keeps you on the station corridor and respects the speed limit
-- **Supercruise**: high-speed in-system travel with simplified physics + auto-drop near the target
-- **Time compression UX**: discrete in-system time acceleration levels with safety clamping
+- **Player ship**: flight model + navigation modes (**normal flight / supercruise / docked**)
+- **Targeting / nav**: select a **station or planet** as a navigation target (HUD marker)
+- **Supercruise**: high-speed travel mode with simplified physics
+- **Supercruise assist**: optional **"7-second" approach throttle hold** + **auto-drop** near target
+- **Docking**: station approach corridor + speed limit + alignment requirement
+- **Docking clearance**: **request docking** (not always granted; must be within range)
+- **Approach autopilot**: station approach autopilot that lines you up with the corridor and respects limits
+- **Time compression UX**: PageUp/PageDown time acceleration with safety clamps (CTRL to force)
 - **Factions + markets**: deterministic faction generation + per-system market generation
 - **Persistence**: lightweight save file (`savegame.txt`) for player/system/time/cargo
+
+Gameplay / UX additions (Elite/Pioneer-style progression):
+
+- **Targeting system**: select a **station or planet** as your nav target (HUD marker)
+- **Supercruise**: a high-speed travel mode with simplified physics
+  - Optional **Supercruise Assist**: **7-second-rule** style auto-throttle + auto-drop
+- **Docking approach corridor**: visual corridor line + corridor constraints
+- **Approach autopilot**: holds corridor + respects speed limit (when a station is targeted)
+- **Request docking clearance**: docking is not always allowed; you must request permission
+- **Time compression hotkeys** with safety clamps (hold CTRL to force)
 
 ## Build
 
@@ -105,39 +117,49 @@ Then:
 ./build/apps/stellar_game/stellar_game
 ```
 
-The game will auto-load `savegame.txt` if present; press **F5** to save.
+### Controls (prototype)
 
-### Prototype controls
+UI / windows:
+
+- **TAB**: toggle Galaxy window
+- **F1**: toggle Flight window
+- **F2**: toggle Economy window
+- **F3**: toggle Nav window
+- **F4**: toggle HUD overlay
 
 Flight:
 
-- Translate: **WASD** + **R/F** (up/down)
-- Rotate: **Arrow keys** + **Q/E** (roll)
-- Boost: **LShift**
-- Brake: **X**
-- Dampers: **Z** (on) / **C** (off)
+- **WASD + R/F**: translate (normal flight)
+- **Arrow keys**: pitch/yaw
+- **Q/E**: roll
+- **LShift**: boost
+- **X**: brake (normal) / throttle cut (supercruise)
+- **Z/C**: dampers on/off
+- **V**: camera toggle (chase/cockpit)
 
 Navigation:
 
-- Cycle targets: **T**
-- Clear target: **Y**
-- Autopilot toggle: **P**
-- Dock / Undock: **G**
+- **T**: cycle target (stations + planets)
+- **Y**: clear target
+- **P**: toggle **Approach Autopilot** (normal) / **Supercruise Assist** (supercruise)
+- **J**: toggle supercruise
 
-Supercruise:
+Docking:
 
-- Toggle: **J**
-- Throttle while in supercruise: **W/S** (and **X** to cut throttle)
+- **L**: request docking clearance (must be within range)
+- **G**: dock / undock
 
-Time:
+Time / sim:
 
-- Time compression: **PgUp/PgDn** (Home = 1x, End = max)
-- Hold **Ctrl** to force the requested time compression (bypasses the safety clamp)
-- Pause: **Space**
+- **PageUp / PageDown**: time compression
+- **Home**: 1x time
+- **End**: max time
+- Hold **CTRL** to force time compression beyond safety clamps
+- **Space**: pause
+- **F5**: save
+- **F9**: load
 
-UI:
-
-- Toggle windows: **TAB** (Galaxy), **F1** (Flight), **F2** (Economy), **F3** (Nav), **F4** (HUD)
+The game will auto-load `savegame.txt` if present; press **F5** to save.
 
 ## Next steps you can add easily
 

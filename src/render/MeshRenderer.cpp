@@ -20,7 +20,7 @@ layout(location=1) in vec3 aNrm;
 layout(location=2) in vec2 aUv;
 
 layout(location=3) in vec4 iPosScale; // xyz + scale
-layout(location=4) in vec4 iQuat;     // wxyz
+layout(location=4) in vec4 iQuat;     // wxyz (unit quaternion)
 layout(location=5) in vec3 iColor;
 
 uniform mat4 uView;
@@ -31,20 +31,19 @@ out vec3 vColor;
 out vec3 vNrm;
 
 vec3 quatRotate(vec4 q, vec3 v) {
-  // q assumed normalized. Uses an optimized form of q*v*q^-1.
+  // q assumed normalized. (x,y,z) is q.yzw? Here we store wxyz.
   vec3 u = q.yzw;
   float s = q.x;
-  return 2.0 * dot(u, v) * u
-       + (s*s - dot(u,u)) * v
-       + 2.0 * s * cross(u, v);
+  return v + 2.0 * cross(u, cross(u, v) + s * v);
 }
 
 void main() {
-  vec3 pos = quatRotate(iQuat, aPos * iPosScale.w) + iPosScale.xyz;
+  vec3 lp = quatRotate(iQuat, aPos);
+  vec3 pos = lp * iPosScale.w + iPosScale.xyz;
   gl_Position = uProj * uView * vec4(pos, 1.0);
   vUv = aUv;
   vColor = iColor;
-  vNrm = quatRotate(iQuat, aNrm);
+  vNrm = normalize(quatRotate(iQuat, aNrm));
 }
 )GLSL";
 
@@ -106,12 +105,12 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
                  instances.data(),
                  GL_DYNAMIC_DRAW);
 
-  // location 3: vec4
+  // location 3: vec4 (pos + scale)
   gl::EnableVertexAttribArray(3);
   gl::VertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, px));
   gl::VertexAttribDivisor(3, 1);
 
-  // location 4: vec3 color
+  // location 4: vec4 (quat)
   gl::EnableVertexAttribArray(4);
   gl::VertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, qw));
   gl::VertexAttribDivisor(4, 1);

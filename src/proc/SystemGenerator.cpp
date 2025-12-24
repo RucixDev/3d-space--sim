@@ -184,80 +184,58 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
     st.type = pickStationType(rng, bias);
     st.economyModel = econ::makeEconomyModel(st.type, bias);
 
-    // ----------------------
-    // Physical placement
-    // ----------------------
-    // For now stations are placed on simple heliocentric orbits, biased toward
-    // existing planet semi-major axes so they feel "in-system".
-    double aAU = 0.0;
+    // Place stations on simple low-eccentricity star orbits.
+    // Prefer parking them near an existing planet orbit so the system feels "lived in".
+    double aAU = 1.0;
     if (!sys.planets.empty()) {
-      const auto& p = sys.planets[(std::size_t)i % sys.planets.size()];
-      const double jitter = rng.range(0.01, 0.08) * (rng.nextDouble() < 0.5 ? -1.0 : 1.0);
-      aAU = std::max(0.15, p.orbit.semiMajorAxisAU + jitter);
+      const int pidx = (int)rng.range(0.0, (double)sys.planets.size());
+      aAU = sys.planets[(std::size_t)std::min(pidx, (int)sys.planets.size() - 1)].orbit.semiMajorAxisAU;
+      aAU *= rng.range(0.98, 1.03);
     } else {
-      aAU = rng.range(0.35, 4.0);
+      aAU = rng.range(0.6, 4.0);
     }
 
     st.orbit.semiMajorAxisAU = aAU;
-    st.orbit.eccentricity = rng.range(0.0, 0.03);
-    st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(2.5));
-    st.orbit.ascendingNodeRad = rng.range(0.0, 2.0 * stellar::math::kPi);
-    st.orbit.argPeriapsisRad = rng.range(0.0, 2.0 * stellar::math::kPi);
-    st.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0 * stellar::math::kPi);
+    st.orbit.eccentricity = rng.range(0.0, 0.02);
+    st.orbit.inclinationRad = rng.range(0.0, stellar::math::degToRad(2.0));
+    st.orbit.ascendingNodeRad = rng.range(0.0, 2.0*stellar::math::kPi);
+    st.orbit.argPeriapsisRad = rng.range(0.0, 2.0*stellar::math::kPi);
+    st.orbit.meanAnomalyAtEpochRad = rng.range(0.0, 2.0*stellar::math::kPi);
     st.orbit.epochDays = 0.0;
-    {
-      const double years = std::sqrt((aAU * aAU * aAU) / std::max(0.08, sys.star.massSol));
-      st.orbit.periodDays = years * 365.25;
-    }
 
-    // ----------------------
-    // Docking parameters
-    // ----------------------
-    // Keep this lightweight and tunable. Values are chosen so that docking is
-    // achievable with early-game thruster settings.
-    double radiusKm = 12.0;
-    double speedLimitKmS = 0.10;
-    double corridorLenKm = 3000.0;
-    double halfAngleRad = stellar::math::degToRad(14.0);
+    // Kepler-ish: P(years)^2 = a(AU)^3 / M(star)
+    const double years = std::sqrt((aAU*aAU*aAU) / std::max(0.08, sys.star.massSol));
+    st.orbit.periodDays = years * 365.25;
 
+    // Docking parameters by station type (tuned for "early playable" feel).
+    // Values are intentionally generous compared to real scales.
     switch (st.type) {
       case econ::StationType::Outpost:
-        radiusKm = 8.0;
-        speedLimitKmS = 0.15;
-        corridorLenKm = 2000.0;
-        halfAngleRad = stellar::math::degToRad(16.0);
+        st.radiusKm = 3.0;
+        st.docking.commsRangeKm = 22.0;
+        st.docking.corridorLengthKm = 45.0;
+        st.docking.corridorRadiusKm = 6.0;
+        st.docking.dockRangeKm = 1.2;
+        st.docking.speedLimitKmS = 0.22;
         break;
-      case econ::StationType::Agricultural:
-      case econ::StationType::Mining:
-      case econ::StationType::Refinery:
-      case econ::StationType::Research:
-        radiusKm = 12.0;
-        speedLimitKmS = 0.12;
-        corridorLenKm = 2800.0;
-        halfAngleRad = stellar::math::degToRad(14.0);
-        break;
-      case econ::StationType::Industrial:
       case econ::StationType::TradeHub:
-        radiusKm = 18.0;
-        speedLimitKmS = 0.10;
-        corridorLenKm = 3500.0;
-        halfAngleRad = stellar::math::degToRad(13.0);
-        break;
       case econ::StationType::Shipyard:
-        radiusKm = 26.0;
-        speedLimitKmS = 0.08;
-        corridorLenKm = 4200.0;
-        halfAngleRad = stellar::math::degToRad(12.0);
+        st.radiusKm = 8.0;
+        st.docking.commsRangeKm = 35.0;
+        st.docking.corridorLengthKm = 70.0;
+        st.docking.corridorRadiusKm = 10.0;
+        st.docking.dockRangeKm = 2.0;
+        st.docking.speedLimitKmS = 0.28;
         break;
       default:
+        st.radiusKm = 5.0;
+        st.docking.commsRangeKm = 28.0;
+        st.docking.corridorLengthKm = 55.0;
+        st.docking.corridorRadiusKm = 8.0;
+        st.docking.dockRangeKm = 1.5;
+        st.docking.speedLimitKmS = 0.25;
         break;
     }
-
-    st.radiusKm = radiusKm;
-    st.dockingSpeedLimitKmS = speedLimitKmS;
-    st.dockingCorridorLengthKm = corridorLenKm;
-    st.dockingCorridorHalfAngleRad = halfAngleRad;
-    st.dockingRangeKm = std::max(60.0, radiusKm * 4.0);
 
     sys.stations.push_back(std::move(st));
   }

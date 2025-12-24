@@ -57,6 +57,9 @@ public:
   void setDampingLinear(double d) { dampingLinear_ = d; }     // per-second
   void setDampingAngular(double d) { dampingAngular_ = d; }   // per-second
 
+  double dampingLinear() const { return dampingLinear_; }
+  double dampingAngular() const { return dampingAngular_; }
+
   // Update physics
   void step(double dtSeconds, const ShipInput& input);
 
