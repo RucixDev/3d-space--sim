@@ -84,7 +84,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{5};
+  int version{6};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -115,6 +115,15 @@ struct SaveGame {
   double heat{0.0}; // gameplay heat (0..~120)
   double cargoCapacityKg{420.0};
   double fsdReadyDay{0.0}; // timeDays when the next hyperspace jump is allowed
+
+  // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).
+  // These are *not* physics-critical; they tune HUD/combat feel and basic progression loops.
+  core::u8 shipHull{0};        // 0 = Scout (starter), 1 = Hauler, 2 = Fighter
+  core::u8 thrusterMk{1};      // 1..3
+  core::u8 shieldMk{1};        // 1..3
+  core::u8 distributorMk{1};   // 1..3
+  core::u8 weaponPrimary{0};   // enum in gameplay (0=beam, 1=pulse, 2=cannon, 3=rail)
+  core::u8 weaponSecondary{2}; // default cannon
 
   // Missions
   core::u64 nextMissionId{1};

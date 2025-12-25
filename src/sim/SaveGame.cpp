@@ -41,6 +41,14 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
 
+  // Loadout / progression
+  f << "shipHull " << (int)s.shipHull << "\n";
+  f << "thrusterMk " << (int)s.thrusterMk << "\n";
+  f << "shieldMk " << (int)s.shieldMk << "\n";
+  f << "distributorMk " << (int)s.distributorMk << "\n";
+  f << "weaponPrimary " << (int)s.weaponPrimary << "\n";
+  f << "weaponSecondary " << (int)s.weaponSecondary << "\n";
+
   f << "cargo";
   for (double u : s.cargo) f << " " << u;
   f << "\n";
@@ -174,6 +182,30 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.cargoCapacityKg;
     } else if (key == "fsdReadyDay") {
       f >> out.fsdReadyDay;
+    } else if (key == "shipHull") {
+      int v = 0;
+      f >> v;
+      out.shipHull = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "thrusterMk") {
+      int v = 0;
+      f >> v;
+      out.thrusterMk = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "shieldMk") {
+      int v = 0;
+      f >> v;
+      out.shieldMk = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "distributorMk") {
+      int v = 0;
+      f >> v;
+      out.distributorMk = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "weaponPrimary") {
+      int v = 0;
+      f >> v;
+      out.weaponPrimary = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "weaponSecondary") {
+      int v = 0;
+      f >> v;
+      out.weaponSecondary = (core::u8)std::clamp(v, 0, 255);
     } else if (key == "cargo") {
       for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
 } else if (key == "explorationDataCr") {
