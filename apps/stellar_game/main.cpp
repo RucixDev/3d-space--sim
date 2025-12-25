@@ -142,12 +142,9 @@ static math::Vec3d stationPosKm(const sim::Station& st, double timeDays) {
 }
 
 static math::Vec3d stationVelKmS(const sim::Station& st, double timeDays) {
-  // Numeric derivative over a short window.
-  const double epsDays = 0.001; // 86.4s
-  const math::Vec3d a = stationPosKm(st, timeDays - epsDays);
-  const math::Vec3d b = stationPosKm(st, timeDays + epsDays);
-  const double dt = epsDays * 2.0 * 86400.0;
-  return (b - a) * (1.0 / dt);
+  // Analytic Keplerian velocity (avoids numerical jitter in local-frame velocity matching).
+  const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(st.orbit, timeDays);
+  return velAUPerDay * (kAU_KM / 86400.0);
 }
 
 static math::Vec3d planetPosKm(const sim::Planet& p, double timeDays) {
@@ -156,12 +153,9 @@ static math::Vec3d planetPosKm(const sim::Planet& p, double timeDays) {
 }
 
 static math::Vec3d planetVelKmS(const sim::Planet& p, double timeDays) {
-  // Numeric derivative over a short window.
-  const double epsDays = 0.001; // 86.4s
-  const math::Vec3d a = planetPosKm(p, timeDays - epsDays);
-  const math::Vec3d b = planetPosKm(p, timeDays + epsDays);
-  const double dt = epsDays * 2.0 * 86400.0;
-  return (b - a) * (1.0 / dt);
+  // Analytic Keplerian velocity.
+  const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(p.orbit, timeDays);
+  return velAUPerDay * (kAU_KM / 86400.0);
 }
 
 static math::Quatd stationOrient(const sim::Station& st, const math::Vec3d& posKm, double timeDays) {
@@ -1120,6 +1114,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.fuelMax = fuelMax;
           s.fsdRangeLy = fsdRangeLy;
           s.hull = std::clamp(playerHull / 100.0, 0.0, 1.0);
+          s.shield = std::clamp(playerShield / 100.0, 0.0, 1.0);
+          s.heat = std::clamp(heat, 0.0, 200.0);
           s.fsdReadyDay = fsdReadyDay;
 
           s.nextMissionId = nextMissionId;
@@ -1174,6 +1170,8 @@ for (const auto& [fid, b] : bountyByFaction) {
             fsdRangeLy = s.fsdRangeLy;
             fsdReadyDay = s.fsdReadyDay;
             playerHull = std::clamp(s.hull, 0.0, 1.0) * 100.0;
+            playerShield = std::clamp(s.shield, 0.0, 1.0) * 100.0;
+            heat = std::clamp(s.heat, 0.0, 200.0);
 
             nextMissionId = s.nextMissionId;
             missions = s.missions;
@@ -2556,8 +2554,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       scanLockedId = 0;
       scanLabel.clear();
       scanLockedTarget = Target{};
-      scanLockedId = 0;
-      scanLabel.clear();
       toast(toasts, msg, toastSec);
     };
 
@@ -4075,6 +4071,23 @@ if (canTrade) {
                       toast(toasts, "Cargo too full to accept this mission.", 2.0);
                     } else {
                       cargo[(std::size_t)cid] += (double)m.units;
+
+                      // Mission cargo is issued from the station's stock to keep the market "alive".
+                      // (If the station runs out, we still provide the cargo - but the shortage will
+                      // propagate into prices / route planning.)
+                      if (currentSystem) {
+                        const sim::Station* fromSt = nullptr;
+                        for (const auto& st : currentSystem->stations) {
+                          if (st.id == m.fromStation) { fromSt = &st; break; }
+                        }
+                        if (fromSt) {
+                          auto& stEco = universe.stationEconomy(*fromSt, timeDays);
+                          auto& inv = stEco.inventory[(std::size_t)cid];
+                          inv = std::max(0.0, inv - (double)m.units);
+                          stEco.clampToCapacity(fromSt->economyModel);
+                        }
+                      }
+
                       toast(toasts, "Mission accepted (cargo provided).", 2.0);
                       missions.push_back(m);
                       missionOffers.erase(missionOffers.begin() + (std::ptrdiff_t)i);

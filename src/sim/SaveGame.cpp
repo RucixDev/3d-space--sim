@@ -36,6 +36,8 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "fuelMax " << s.fuelMax << "\n";
   f << "fsdRangeLy " << s.fsdRangeLy << "\n";
   f << "hull " << s.hull << "\n";
+  f << "shield " << s.shield << "\n";
+  f << "heat " << s.heat << "\n";
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
 
@@ -164,6 +166,10 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.fsdRangeLy;
     } else if (key == "hull") {
       f >> out.hull;
+    } else if (key == "shield") {
+      f >> out.shield;
+    } else if (key == "heat") {
+      f >> out.heat;
     } else if (key == "cargoCapacityKg") {
       f >> out.cargoCapacityKg;
     } else if (key == "fsdReadyDay") {

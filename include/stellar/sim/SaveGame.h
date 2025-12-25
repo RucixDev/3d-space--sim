@@ -84,7 +84,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{4};
+  int version{5};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -111,6 +111,8 @@ struct SaveGame {
   double fuelMax{45.0};
   double fsdRangeLy{18.0};
   double hull{1.0}; // 0..1
+  double shield{1.0}; // 0..1
+  double heat{0.0}; // gameplay heat (0..~120)
   double cargoCapacityKg{420.0};
   double fsdReadyDay{0.0}; // timeDays when the next hyperspace jump is allowed
 
