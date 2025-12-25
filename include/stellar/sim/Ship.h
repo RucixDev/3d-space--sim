@@ -60,6 +60,11 @@ public:
   void setDampingLinear(double d) { dampingLinear_ = d; }     // per-second
   void setDampingAngular(double d) { dampingAngular_ = d; }   // per-second
 
+  // Dampers act on velocity relative to this reference frame (km/s).
+  // Set this each frame from gameplay code to get an Elite/Pioneer-style local space feel.
+  void setDampingFrameVelocityKmS(const math::Vec3d& v) { dampingFrameVelKmS_ = v; }
+  math::Vec3d dampingFrameVelocityKmS() const { return dampingFrameVelKmS_; }
+
   // Update physics
   void step(double dtSeconds, const ShipInput& input);
 
@@ -81,6 +86,10 @@ private:
   // Dampers (simple exponential decay)
   double dampingLinear_{0.15};       // 1/s
   double dampingAngular_{0.25};      // 1/s
+
+  // Velocity of the local reference frame that dampers try to match (km/s).
+  // For example: a station's orbital velocity when flying near it.
+  math::Vec3d dampingFrameVelKmS_{0,0,0};
 
   // State
   math::Vec3d posKm_{0,0,0};

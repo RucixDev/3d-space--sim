@@ -10,34 +10,32 @@
 // incomplete (notably Windows' legacy gl.h).
 #include <SDL_opengl_glext.h>
 
-// Some header combinations (notably on Windows) can still miss PFN typedefs for
-// core OpenGL 1.1 functions (e.g. glGenTextures). The missing typedefs cause
-// MSVC to fall back to the old C "default-int" assumption, which then produces
-// a huge cascade of confusing syntax errors.
+// -----------------------------------------------------------------------------
+// Fallback PFN typedefs
 //
-// SDL_opengl_glext.h typically provides these, but we add small, guarded
-// fallbacks so the project builds reliably across toolchains.
-
+// Some platform/header combinations (notably Windows + legacy OpenGL headers)
+// may not provide PFNGL*PROC typedefs for core 1.1 texture entry points.
+// We only need a tiny subset for this project, so define minimal fallbacks.
+// -----------------------------------------------------------------------------
 #ifndef PFNGLGENTEXTURESPROC
 typedef void (APIENTRYP PFNGLGENTEXTURESPROC)(GLsizei n, GLuint* textures);
 #endif
-
 #ifndef PFNGLBINDTEXTUREPROC
 typedef void (APIENTRYP PFNGLBINDTEXTUREPROC)(GLenum target, GLuint texture);
 #endif
-
 #ifndef PFNGLTEXIMAGE2DPROC
 typedef void (APIENTRYP PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint internalformat,
                                             GLsizei width, GLsizei height, GLint border,
                                             GLenum format, GLenum type, const void* pixels);
 #endif
-
 #ifndef PFNGLTEXPARAMETERIPROC
 typedef void (APIENTRYP PFNGLTEXPARAMETERIPROC)(GLenum target, GLenum pname, GLint param);
 #endif
-
 #ifndef PFNGLDELETETEXTURESPROC
 typedef void (APIENTRYP PFNGLDELETETEXTURESPROC)(GLsizei n, const GLuint* textures);
+#endif
+#ifndef PFNGLGENERATEMIPMAPPROC
+typedef void (APIENTRYP PFNGLGENERATEMIPMAPPROC)(GLenum target);
 #endif
 
 namespace stellar::render::gl {

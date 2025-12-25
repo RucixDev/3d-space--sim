@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -223,6 +224,21 @@ static bool projectToScreen(const math::Vec3d& worldU,
   outPx.x = (float)((ndcX * 0.5 + 0.5) * (double)w);
   outPx.y = (float)((-ndcY * 0.5 + 0.5) * (double)h);
   return true;
+}
+
+static bool segmentHitsSphere(const math::Vec3d& aKm,
+                             const math::Vec3d& bKm,
+                             const math::Vec3d& centerKm,
+                             double radiusKm) {
+  const math::Vec3d ab = bKm - aKm;
+  const double abLenSq = ab.lengthSq();
+  if (abLenSq < 1e-12) {
+    return (aKm - centerKm).lengthSq() <= radiusKm * radiusKm;
+  }
+
+  const double t = std::clamp(math::dot(centerKm - aKm, ab) / abLenSq, 0.0, 1.0);
+  const math::Vec3d closest = aKm + ab * t;
+  return (closest - centerKm).lengthSq() <= radiusKm * radiusKm;
 }
 
 static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationIndex, bool docked, sim::StationId dockedId) {
@@ -637,14 +653,11 @@ int main(int argc, char** argv) {
   double playerShield = 100.0;
   double playerHull = 100.0;
   double playerLaserCooldown = 0.0; // seconds
+  double playerCannonCooldown = 0.0; // seconds
 
   // Time
   double timeDays = 0.0;
   double timeScale = 60.0; // simulated seconds per real second
-  // Discrete time-acceleration steps (sim seconds / real second).
-  // Kept fairly conservative so ship physics stays stable.
-  const std::array<double, 5> timeScalePresets{1.0, 10.0, 60.0, 600.0, 3600.0};
-  std::size_t timeScalePresetIdx = 2; // 60x
   bool paused = false;
 
   // Economy
@@ -696,6 +709,20 @@ int main(int argc, char** argv) {
   struct Beam { math::Vec3d aU, bU; float r,g,b; double ttl; };
   std::vector<Beam> beams;
 
+  // Projectiles (kinetic cannons / slugs)
+  struct Projectile {
+    math::Vec3d prevKm;
+    math::Vec3d posKm;
+    math::Vec3d velKmS;
+    float r{1}, g{1}, b{1};
+    double ttlSim{0.0};      // simulated seconds remaining
+    double radiusKm{450.0};  // collision radius
+    double dmg{0.0};
+    bool fromPlayer{false};
+    core::u64 shooterId{0};
+  };
+  std::vector<Projectile> projectiles;
+
   // Save/load
   const std::string savePath = "savegame.txt";
 
@@ -709,21 +736,31 @@ int main(int argc, char** argv) {
 
   // Flight assistance
   bool autopilot = false;
+  int autopilotPhase = 0; // 0=staging, 1=corridor
 
-  // Mouse steering (for rotation). Designed so you can still use ImGui/UI.
-  // Default: hold Right Mouse Button to steer.
-  bool mouseSteerEnabled = true;
-  bool mouseSteerHoldRmb = true;
-  bool mouseSteerToggleActive = false; // used when hold-RMB mode is disabled
-  bool mouseSteerInvertX = false;
-  bool mouseSteerInvertY = false;
-  float mouseSteerSensitivity = 0.0045f; // torque per pixel (tuned by feel)
-  bool mouseSteerEngaged = false;        // runtime, for UI/status
+  // Local reference frame ("space is local" feel near moving bodies)
+  bool localFrameEnabled = true;
+  math::Vec3d localFrameVelKmS{0,0,0};
+  double localFrameBlendTauSec = 1.0; // seconds (real time)
 
-  // Supercruise-lite
-  bool supercruise = false;
-  bool supercruiseAssist = true;
+  // "Blue zone" turn assist (max turn rate near ~mid-speed when flight assist is on)
+  bool blueZoneTurnAssist = true;
+
+  // Supercruise (Elite-style in-system travel)
+  enum class SupercruiseState { Idle, Charging, Active, Cooldown };
+  SupercruiseState supercruiseState = SupercruiseState::Idle;
+
+  bool supercruiseAssist = true; // "Nav assist" keeps a safe drop profile
   double supercruiseMaxSpeedKmS = 18000.0;
+
+  double supercruiseChargeRemainingSec = 0.0;   // real seconds
+  double supercruiseCooldownRemainingSec = 0.0; // real seconds
+  double supercruiseCooldownTotalSec = 0.0;     // real seconds (for UI)
+  bool supercruiseDropRequested = false;
+  bool supercruiseSafeDropReady = false;
+  double supercruiseTtaSec = 0.0;
+  double supercruiseDistKm = 0.0;
+  double supercruiseClosingKmS = 0.0;
 
   // FSD / hyperspace (system-to-system)
   enum class FsdState { Idle, Charging, Jumping };
@@ -853,6 +890,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   const double kFsdChargeSec = 4.0;
   const double kFsdCooldownSec = 25.0;
 
+  // Supercruise parameters (in-system travel mode)
+  const double kSupercruiseChargeSec = 3.0;
+  const double kSupercruiseCooldownSec = 6.0;
+  const double kSupercruiseEmergencyCooldownSec = 14.0;
+  const double kSupercruiseSafeTtaSec = 7.0; // the classic "7-second rule"
+
   auto fsdBaseRangeLy = [&]() -> double {
     const double cap = std::max(1.0, cargoCapacityKg);
     const double load = std::clamp(cargoMassKg(cargo) / cap, 0.0, 1.0);
@@ -906,7 +949,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       toast(toasts, "Can't jump while docked.", 2.0);
       return;
     }
-    if (supercruise) {
+    if (supercruiseState != SupercruiseState::Idle) {
       toast(toasts, "Disengage supercruise before jumping.", 2.0);
       return;
     }
@@ -959,14 +1002,73 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   auto last = std::chrono::high_resolution_clock::now();
 
   SDL_SetRelativeMouseMode(SDL_FALSE);
-  SDL_GetRelativeMouseState(nullptr, nullptr); // flush any initial delta
-  bool mouseCaptured = false;
 
   while (running) {
     // Timing
     auto now = std::chrono::high_resolution_clock::now();
     const double dtReal = std::chrono::duration<double>(now - last).count();
     last = now;
+
+
+    // Per-frame helper: apply damage from the player to a contact (laser / cannon / projectiles).
+    auto playerDamageContact = [&](int idx, double dmg) {
+      if (idx < 0 || idx >= (int)contacts.size()) return;
+      auto& hit = contacts[(std::size_t)idx];
+      if (!hit.alive) return;
+
+      // Apply damage
+      applyDamage(dmg, hit.shield, hit.hull);
+
+      // Crimes / reactions (on hit)
+      if (hit.alive && hit.role == ContactRole::Trader) {
+        hit.fleeUntilDays = timeDays + (180.0 / 86400.0); // flee ~3 minutes
+        commitCrime(hit.factionId, 250.0, -5.0, "Assault on trader");
+      }
+      if (hit.alive && hit.role == ContactRole::Police) {
+        hit.hostileToPlayer = true;
+        commitCrime(hit.factionId, 600.0, -10.0, "Assault on security");
+      }
+
+      // If destroyed
+      if (hit.hull <= 0.0) {
+        const core::u64 deadId = hit.id;
+        const ContactRole deadRole = hit.role;
+        const core::u32 deadFaction = hit.factionId;
+        const double lootCr = hit.cargoValueCr;
+
+        hit.alive = false;
+
+        if (deadRole == ContactRole::Pirate) {
+          const double bountyCr = 450.0;
+          credits += bountyCr;
+          toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
+
+          const core::u32 lf = currentSystem ? currentSystem->stub.factionId : 0;
+          if (lf != 0) addRep(lf, +0.5);
+        } else if (deadRole == ContactRole::Trader) {
+          // Piracy payout (simplified as immediate credits)
+          const double payout = std::max(0.0, lootCr);
+          credits += payout;
+          toast(toasts, "Trader destroyed. Loot +" + std::to_string((int)payout) + " cr (WANTED!)", 3.0);
+
+          commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+        } else if (deadRole == ContactRole::Police) {
+          toast(toasts, "Security destroyed. (WANTED!)", 3.0);
+          commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+        }
+
+        // Bounty kill missions (pirate targets)
+        for (auto& m : missions) {
+          if (m.completed || m.failed) continue;
+          if (m.type == sim::MissionType::BountyKill && m.targetNpcId == deadId && m.toSystem == currentSystem->stub.id) {
+            m.completed = true;
+            credits += m.reward;
+            addRep(m.factionId, +2.0);
+            toast(toasts, "Mission complete: bounty target eliminated. +" + std::to_string((int)m.reward) + " cr", 3.0);
+          }
+        }
+      }
+    };
 
     // Events
     SDL_Event event;
@@ -1084,7 +1186,15 @@ policeAlertUntilDays = 0.0;
           nextTraderSpawnDays = timeDays + (rng.range(15.0, 35.0) / 86400.0);
           nextPoliceSpawnDays = timeDays + (rng.range(10.0, 25.0) / 86400.0);
             autopilot = false;
-            supercruise = false;
+            supercruiseState = SupercruiseState::Idle;
+            supercruiseChargeRemainingSec = 0.0;
+            supercruiseCooldownRemainingSec = 0.0;
+      supercruiseCooldownTotalSec = 0.0;
+            supercruiseDropRequested = false;
+            supercruiseSafeDropReady = false;
+            supercruiseTtaSec = 0.0;
+            supercruiseDistKm = 0.0;
+            supercruiseClosingKmS = 0.0;
             fsdState = FsdState::Idle;
             fsdTargetSystem = 0;
             navRoute.clear();
@@ -1113,57 +1223,46 @@ policeAlertUntilDays = 0.0;
 
         if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
 
-        // Time scale (simulation speed): [ / ]
-        if (!io.WantCaptureKeyboard) {
-          if (event.key.keysym.sym == SDLK_LEFTBRACKET) {
-            if (timeScalePresetIdx > 0) {
-              timeScalePresetIdx--;
-              timeScale = timeScalePresets[timeScalePresetIdx];
-              toast(toasts, "Time scale: " + std::to_string((int)timeScale) + "x", 1.5);
-            }
-          }
-          if (event.key.keysym.sym == SDLK_RIGHTBRACKET) {
-            if (timeScalePresetIdx + 1 < timeScalePresets.size()) {
-              timeScalePresetIdx++;
-              timeScale = timeScalePresets[timeScalePresetIdx];
-              toast(toasts, "Time scale: " + std::to_string((int)timeScale) + "x", 1.5);
-            }
-          }
-        }
-
-        if (event.key.keysym.sym == SDLK_p) autopilot = !autopilot;
-
-        // Mouse steering toggle (only meaningful when hold-RMB is disabled).
-        if (!io.WantCaptureKeyboard && event.key.keysym.sym == SDLK_m) {
-          if (mouseSteerHoldRmb) {
-            mouseSteerEnabled = !mouseSteerEnabled;
-            if (!mouseSteerEnabled && mouseCaptured) {
-              SDL_SetRelativeMouseMode(SDL_FALSE);
-              SDL_GetRelativeMouseState(nullptr, nullptr);
-              mouseCaptured = false;
-            }
-            toast(toasts, std::string("Mouse steering: ") + (mouseSteerEnabled ? "enabled" : "disabled"), 1.6);
-          } else {
-            mouseSteerToggleActive = !mouseSteerToggleActive;
-            toast(toasts, std::string("Mouse steering: ") + (mouseSteerToggleActive ? "ON" : "OFF"), 1.6);
-          }
+        if (event.key.keysym.sym == SDLK_p) {
+          autopilot = !autopilot;
+          autopilotPhase = 0;
         }
 
         if (event.key.keysym.sym == SDLK_h) {
-          // Supercruise-lite toggle (in-system travel assist).
-          if (docked) {
-            toast(toasts, "Can't engage supercruise while docked.", 2.0);
-          } else if (supercruise) {
-            supercruise = false;
-            toast(toasts, "Supercruise disengaged.", 1.5);
-          } else {
-            if (target.kind == TargetKind::None) {
-              toast(toasts, "Set a target (T station / B planet) to use supercruise.", 2.5);
-            } else {
-              supercruise = true;
-              autopilot = false;
-              beams.clear();
-              toast(toasts, "Supercruise engaged.", 1.5);
+          if (!captureKeys && !docked && fsdState == FsdState::Idle) {
+            // Interdiction-lite: if pirates are nearby, block *engage* and force emergency drops while active.
+            double nearestPirateKm = 1e99;
+            for (const auto& c : contacts) {
+              if (!c.alive || c.role != ContactRole::Pirate) continue;
+              nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
+            }
+            const bool pirateNearby = (nearestPirateKm < 120000.0);
+
+            if (supercruiseState == SupercruiseState::Idle) {
+              if (target.kind == TargetKind::None) {
+                toast(toasts, "No nav target set.", 1.8);
+              } else if (pirateNearby) {
+                toast(toasts, "Interdiction risk: can't engage supercruise with pirates nearby.", 2.3);
+              } else {
+                supercruiseState = SupercruiseState::Charging;
+                supercruiseChargeRemainingSec = kSupercruiseChargeSec;
+                supercruiseDropRequested = false;
+                autopilot = false;
+                autopilotPhase = 0;
+                scanning = false;
+                scanProgressSec = 0.0;
+                navAutoRun = false;
+                toast(toasts, "Supercruise charging...", 1.6);
+              }
+            } else if (supercruiseState == SupercruiseState::Charging) {
+              supercruiseState = SupercruiseState::Idle;
+              supercruiseChargeRemainingSec = 0.0;
+              toast(toasts, "Supercruise canceled.", 1.4);
+            } else if (supercruiseState == SupercruiseState::Active) {
+              supercruiseDropRequested = true;
+              toast(toasts, "Drop requested.", 1.2);
+            } else if (supercruiseState == SupercruiseState::Cooldown) {
+              toast(toasts, "Supercruise cooling down...", 1.6);
             }
           }
         }
@@ -1179,7 +1278,7 @@ policeAlertUntilDays = 0.0;
             } else {
               if (docked) {
                 toast(toasts, "Undock to scan.", 1.8);
-              } else if (supercruise || fsdState != FsdState::Idle) {
+              } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
                 toast(toasts, "Scanning unavailable in supercruise / hyperspace.", 2.0);
               } else if (target.kind == TargetKind::None) {
                 toast(toasts, "No scan target selected. (Use T/B/N/U or System Scanner)", 2.5);
@@ -1331,7 +1430,9 @@ if (event.key.keysym.sym == SDLK_y) {
         }
 
         if (event.key.keysym.sym == SDLK_g) {
-          if (docked) {
+          if (supercruiseState != SupercruiseState::Idle) {
+            toast(toasts, "Cannot dock while in supercruise.", 2.0);
+          } else if (docked) {
             // Undock: place ship just outside the slot
             const auto it = std::find_if(currentSystem->stations.begin(), currentSystem->stations.end(),
                                          [&](const sim::Station& s){ return s.id == dockedStationId; });
@@ -1396,7 +1497,7 @@ if (event.key.keysym.sym == SDLK_y) {
       if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
         if (!io.WantCaptureMouse) {
           // Fire laser
-          if (playerLaserCooldown <= 0.0 && !docked && fsdState == FsdState::Idle && !supercruise) {
+          if (playerLaserCooldown <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
             playerLaserCooldown = 0.18; // rate of fire
             heat = std::min(120.0, heat + 2.5);
             const double rangeKm = 120000.0;
@@ -1490,6 +1591,41 @@ if (bestIdx >= 0) {
       }
     }
 
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_RIGHT) {
+        if (!io.WantCaptureMouse) {
+          // Fire cannon projectile (kinetic)
+          if (playerCannonCooldown <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
+            // NOTE: cooldown is in *sim* seconds, so it naturally scales with timeScale.
+            playerCannonCooldown = 0.9;
+            heat = std::min(120.0, heat + 4.5);
+
+            const double muzzleSpeedKmS = 250.0;
+            const double rangeKm = 130000.0;
+            const double dmg = 38.0;
+
+            const double ttlSim = rangeKm / muzzleSpeedKmS;
+
+            const math::Vec3d fwd = ship.forward().normalized();
+            const math::Vec3d spawnKm = ship.positionKm() + fwd * 400.0; // start slightly ahead of the ship
+
+            Projectile p{};
+            p.prevKm = spawnKm;
+            p.posKm = spawnKm;
+            p.velKmS = ship.velocityKmS() + fwd * muzzleSpeedKmS;
+            p.r = 1.0f; p.g = 0.95f; p.b = 0.65f;
+            p.ttlSim = ttlSim;
+            p.radiusKm = 700.0;
+            p.dmg = dmg;
+            p.fromPlayer = true;
+            p.shooterId = 0;
+            projectiles.push_back(p);
+
+            // Tiny recoil impulse
+            ship.setVelocityKmS(ship.velocityKmS() - fwd * 0.002);
+          }
+        }
+      }
+
     // Input (6DOF)
     sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
@@ -1523,183 +1659,283 @@ if (bestIdx >= 0) {
       input.dampers = dampers;
     }
 
-    // Mouse steering (rotation) - uses SDL relative mouse mode while active.
-    // Default: hold RMB to steer.
-    bool wantMouseSteer = false;
-    if (mouseSteerEnabled && !docked && !captureKeys && fsdState == FsdState::Idle && !supercruise && !autopilot) {
-      if (mouseSteerHoldRmb) {
-        const Uint32 m = SDL_GetMouseState(nullptr, nullptr);
-        wantMouseSteer = (m & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
-      } else {
-        wantMouseSteer = mouseSteerToggleActive;
-      }
-      // If ImGui is actively using the mouse, don't steal it.
-      if (io.WantCaptureMouse) wantMouseSteer = false;
-    }
-
-    if (wantMouseSteer && !mouseCaptured) {
-      SDL_SetRelativeMouseMode(SDL_TRUE);
-      SDL_GetRelativeMouseState(nullptr, nullptr); // flush
-      mouseCaptured = true;
-    } else if (!wantMouseSteer && mouseCaptured) {
-      SDL_SetRelativeMouseMode(SDL_FALSE);
-      SDL_GetRelativeMouseState(nullptr, nullptr);
-      mouseCaptured = false;
-    }
-
-    mouseSteerEngaged = mouseCaptured;
-
-    if (mouseCaptured) {
-      int dx = 0, dy = 0;
-      SDL_GetRelativeMouseState(&dx, &dy);
-
-      float yaw = (float)dx * mouseSteerSensitivity;
-      float pitch = (float)(-dy) * mouseSteerSensitivity;
-      if (mouseSteerInvertX) yaw = -yaw;
-      if (mouseSteerInvertY) pitch = -pitch;
-
-      input.torqueLocal.y += (double)yaw;
-      input.torqueLocal.x += (double)pitch;
-    }
-
-    // Autopilot: station approach assist (keeps you aligned to slot and under approach speed).
-    if (autopilot && !docked && target.kind == TargetKind::Station && target.index < currentSystem->stations.size() && !captureKeys) {
+    // Autopilot: station approach assist (staging + docking corridor guidance).
+    if (autopilot && !docked && currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size() && !captureKeys) {
       const auto& st = currentSystem->stations[target.index];
 
       const math::Vec3d stPos = stationPosKm(st, timeDays);
       const math::Quatd stQ = stationOrient(st, stPos, timeDays);
       const math::Vec3d stV = stationVelKmS(st, timeDays);
 
-      const math::Vec3d axisOut = stQ.rotate({0,0,1});
-      const math::Vec3d desiredPoint = stPos + axisOut * (st.radiusKm * 2.2); // just outside slot
+      const double zEntrance = st.radiusKm * 1.10;
+      const double zCorridorEnd = zEntrance + st.approachLengthKm;
+      const double zStage = zCorridorEnd + st.radiusKm * 0.8;
 
+      const math::Vec3d relLocal = stQ.conjugate().rotate(ship.positionKm() - stPos);
+      const double lateralDist = math::Vec3d{relLocal.x, relLocal.y, 0.0}.length();
+
+      // Phase switching: start by staging at the corridor end, then commit through the corridor.
+      if (autopilotPhase == 0) {
+        if (relLocal.z < zCorridorEnd * 1.05 && lateralDist < st.approachRadiusKm * 0.65) autopilotPhase = 1;
+      } else {
+        // If we drift far off-axis, go back to staging.
+        if (relLocal.z > zStage || lateralDist > st.approachRadiusKm * 1.25) autopilotPhase = 0;
+      }
+
+      math::Vec3d desiredLocal{0,0,0};
+      if (autopilotPhase == 0) desiredLocal = {0,0, zStage};
+      else desiredLocal = {0,0, zEntrance + st.radiusKm * 0.7};
+
+      const math::Vec3d desiredPoint = stPos + stQ.rotate(desiredLocal);
       const math::Vec3d rel = desiredPoint - ship.positionKm();
       const double dist = rel.length();
+      const math::Vec3d dir = (dist > 1e-6) ? (rel / dist) : math::Vec3d{0,0,0};
 
-      // Desired velocity: approach slowly as we get closer.
-      const double maxV = st.maxApproachSpeedKmS * 0.9;
-      const double vMag = std::min(maxV, 0.004 * dist); // km/s
-      const math::Vec3d desiredVel = stV + (dist > 1e-6 ? rel.normalized() * vMag : math::Vec3d{0,0,0});
+      const double maxV = (autopilotPhase == 0) ? std::max(st.maxApproachSpeedKmS * 2.5, 0.45)
+                                                : (st.maxApproachSpeedKmS * 0.85);
+      double vMag = std::min(maxV, 0.004 * dist);
 
+      // Slow down more if we're not centered when committing.
+      if (autopilotPhase == 1) {
+        const double frac = std::clamp(lateralDist / std::max(1.0, st.approachRadiusKm), 0.0, 1.0);
+        vMag *= (1.0 - 0.55 * frac);
+      }
+
+      const math::Vec3d desiredVel = stV + dir * vMag;
       const math::Vec3d dv = desiredVel - ship.velocityKmS();
 
-      // Convert desired acceleration direction to local thrust.
-      const math::Vec3d accelWorldDir = dv.normalized();
-      const math::Vec3d accelLocal = ship.orientation().conjugate().rotate(accelWorldDir);
+      if (dv.lengthSq() > 1e-12) input.thrustLocal = ship.orientation().conjugate().rotate(dv.normalized());
+      else input.thrustLocal = {0,0,0};
 
-      input.thrustLocal = accelLocal;
-      input.brake = false;
-      input.boost = false;
       input.dampers = true;
 
-      // Orientation control: face into the slot (-axisOut)
-      const math::Vec3d desiredFwdWorld = (-axisOut).normalized();
-      const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(desiredFwdWorld);
+      // Align forward into station (towards -axisOut).
+      const math::Vec3d axisOut = stQ.rotate({0,0,1});
+      const math::Vec3d desiredFwdWorld = -axisOut;
 
-      // Yaw/pitch to bring +Z toward desired direction.
+      const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(desiredFwdWorld);
       const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
       const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
 
-      input.torqueLocal.x = std::clamp(pitchErr * 2.0, -1.0, 1.0);
-      input.torqueLocal.y = std::clamp(yawErr * 2.0, -1.0, 1.0);
-      input.torqueLocal.z = 0.0;
+      // Roll: keep ship "up" aligned to station +Y so you fly the slot level.
+      const math::Vec3d desiredUpWorld = stQ.rotate({0,1,0});
+      const math::Vec3d desiredUpLocal = ship.orientation().conjugate().rotate(desiredUpWorld);
+      const double rollErr = std::atan2(desiredUpLocal.x, desiredUpLocal.y);
 
-      // Auto-request clearance when close enough.
-      auto& cs = clearances[st.id];
-      const double shipDist = (ship.positionKm() - stPos).length();
-      if (shipDist < st.commsRangeKm && !(cs.granted && timeDays <= cs.expiresDays) && timeDays >= cs.cooldownUntilDays) {
-        cs.granted = true;
-        cs.expiresDays = timeDays + (12.0 * 60.0) / 86400.0;
-        toast(toasts, "Autopilot: requested clearance (auto-granted).", 2.0);
+      input.torqueLocal.x = (float)std::clamp(pitchErr * 1.8, -1.0, 1.0);
+      input.torqueLocal.y = (float)std::clamp(yawErr * 1.8, -1.0, 1.0);
+      input.torqueLocal.z = (float)std::clamp(rollErr * 1.6, -1.0, 1.0);
+    }
+
+    // Supercruise: fast in-system travel assist to current target.
+    // Also: update the "local reference frame" velocity that Flight Assist uses for dampers.
+    if (localFrameEnabled && currentSystem) {
+      math::Vec3d desiredVel{0,0,0};
+      double best = 1e99;
+
+      // Prefer stations when nearby (keeps you "riding along" with their orbital motion).
+      for (const auto& st : currentSystem->stations) {
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const double d = (stPos - ship.positionKm()).length();
+        const double influence = std::max(st.commsRangeKm * 1.5, st.approachLengthKm * 2.0 + st.radiusKm * 12.0);
+        if (d < influence && d < best) {
+          best = d;
+          desiredVel = stationVelKmS(st, timeDays);
+        }
+      }
+
+      // Fall back to planets if no station "wins".
+      for (const auto& p : currentSystem->planets) {
+        const math::Vec3d pPos = planetPosKm(p, timeDays);
+        const double d = (pPos - ship.positionKm()).length();
+        const double rKm = p.radiusEarth * 6371.0;
+        const double influence = std::max(250000.0, rKm * 80.0);
+        if (d < influence && d < best) {
+          best = d;
+          desiredVel = planetVelKmS(p, timeDays);
+        }
+      }
+
+      const double tau = std::max(0.05, localFrameBlendTauSec);
+      const double alpha = 1.0 - std::exp(-dtReal / tau);
+      localFrameVelKmS = localFrameVelKmS + (desiredVel - localFrameVelKmS) * alpha;
+    } else {
+      localFrameVelKmS = {0,0,0};
+    }
+    ship.setDampingFrameVelocityKmS(localFrameVelKmS);
+
+    // Supercruise state timers (real time)
+    if (supercruiseState == SupercruiseState::Charging) {
+      supercruiseChargeRemainingSec = std::max(0.0, supercruiseChargeRemainingSec - dtReal);
+      if (supercruiseChargeRemainingSec <= 0.0) {
+        supercruiseState = SupercruiseState::Active;
+        supercruiseDropRequested = false;
+        toast(toasts, "Supercruise engaged.", 1.6);
+      }
+    } else if (supercruiseState == SupercruiseState::Cooldown) {
+      supercruiseCooldownRemainingSec = std::max(0.0, supercruiseCooldownRemainingSec - dtReal);
+      if (supercruiseCooldownRemainingSec <= 0.0) {
+        supercruiseState = SupercruiseState::Idle;
       }
     }
 
-    // Supercruise-lite: fast in-system travel assist to current target.
-    // Inspired by the "supercruise" style travel in games like Elite Dangerous.
-    if (supercruise && !docked && !captureKeys && fsdState == FsdState::Idle) {
-      // Simple interdiction: don't allow supercruise if a pirate is nearby.
-      bool interdicted = false;
-      for (const auto& c : contacts) {
-        if (!c.alive || c.role != ContactRole::Pirate) continue;
-        const double d = (c.ship.positionKm() - ship.positionKm()).length();
-        if (d < 120000.0) { interdicted = true; break; }
+    // Reset per-frame HUD values
+    supercruiseSafeDropReady = false;
+    supercruiseTtaSec = 0.0;
+    supercruiseDistKm = 0.0;
+    supercruiseClosingKmS = 0.0;
+
+    auto endSupercruise = [&](bool emergency, const math::Vec3d& destVelKmS, const math::Vec3d& dirToDest, const char* msg) {
+      supercruiseState = SupercruiseState::Cooldown;
+      supercruiseCooldownRemainingSec = emergency ? kSupercruiseEmergencyCooldownSec : kSupercruiseCooldownSec;
+      supercruiseCooldownTotalSec = supercruiseCooldownRemainingSec;
+      supercruiseDropRequested = false;
+
+      const double approachSpeed = emergency ? 0.45 : 0.16;
+      ship.setVelocityKmS(destVelKmS + dirToDest * approachSpeed);
+
+      if (emergency) {
+        heat = std::min(120.0, heat + 25.0);
+        playerShield = std::max(0.0, playerShield - 12.0);
+        playerHull = std::max(0.0, playerHull - 4.0);
+        ship.setAngularVelocityRadS({rng.range(-0.6, 0.6), rng.range(-0.6, 0.6), rng.range(-0.4, 0.4)});
+      } else {
+        ship.setAngularVelocityRadS({0,0,0});
       }
 
-      if (interdicted) {
-        supercruise = false;
-        toast(toasts, "Supercruise blocked: hostile contact nearby.", 2.0);
+      toast(toasts, msg, 2.2);
+    };
+
+    if (supercruiseState == SupercruiseState::Active && !docked && !captureKeys && fsdState == FsdState::Idle) {
+      // Determine destination (station or planet)
+      bool hasDest = false;
+      math::Vec3d destPosKm{0,0,0};
+      math::Vec3d destVelKmS{0,0,0};
+      double dropKm = 0.0;
+
+      if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+        const auto& st = currentSystem->stations[target.index];
+        destPosKm = stationPosKm(st, timeDays);
+        destVelKmS = stationVelKmS(st, timeDays);
+        dropKm = std::max(15000.0, st.radiusKm * 3.0);
+        hasDest = true;
+      } else if (currentSystem && target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+        const auto& p = currentSystem->planets[target.index];
+        destPosKm = planetPosKm(p, timeDays);
+        destVelKmS = planetVelKmS(p, timeDays);
+        const double rKm = p.radiusEarth * 6371.0;
+        dropKm = std::max(60000.0, rKm * 12.0);
+        hasDest = true;
+      }
+
+      math::Vec3d dirToDest = ship.forward().normalized();
+      if (hasDest) {
+        const math::Vec3d rel = destPosKm - ship.positionKm();
+        const double dist = rel.length();
+        if (dist > 1e-6) dirToDest = rel / dist;
+      }
+
+      // Interdiction-lite: pirates nearby can force an emergency drop
+      double nearestPirateKm = 1e99;
+      for (const auto& c : contacts) {
+        if (!c.alive || c.role != ContactRole::Pirate) continue;
+        nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
+      }
+      if (nearestPirateKm < 120000.0) {
+        endSupercruise(true, destVelKmS, dirToDest, "Interdicted! Emergency drop.");
+      } else if (!hasDest) {
+        endSupercruise(true, localFrameVelKmS, dirToDest, "Supercruise lost target. Emergency drop.");
       } else {
-        std::optional<math::Vec3d> destPosKm;
-        math::Vec3d destVelKmS{0,0,0};
-        double dropKm = 60000.0;
+        // Compute safe-drop window ("7-second rule")
+        const math::Vec3d rel = destPosKm - ship.positionKm();
+        const double dist = rel.length();
+        supercruiseDistKm = dist;
 
-        if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
-          const auto& st = currentSystem->stations[target.index];
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
-          const math::Quatd stQ = stationOrient(st, stPos, timeDays);
-          const math::Vec3d axisOut = stQ.rotate({0,0,1});
-          destPosKm = stPos + axisOut * (st.radiusKm * 2.2);
-          destVelKmS = stationVelKmS(st, timeDays);
-          dropKm = std::max(45000.0, st.commsRangeKm * 0.35);
-        } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
-          const auto& p = currentSystem->planets[target.index];
-          const math::Vec3d pPos = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
-          destPosKm = pPos;
-          const double rKm = p.radiusEarth * kEARTH_RADIUS_KM;
-          dropKm = std::max(80000.0, rKm * 30.0);
-        }
-
-        if (!destPosKm) {
-          supercruise = false;
-          toast(toasts, "Supercruise requires a station/planet target.", 2.0);
+        if (dist < 1e-6) {
+          endSupercruise(false, destVelKmS, dirToDest, "Supercruise drop.");
         } else {
-          const math::Vec3d rel = *destPosKm - ship.positionKm();
-          const double dist = rel.length();
-          const math::Vec3d dir = (dist > 1e-6) ? (rel / dist) : math::Vec3d{0,0,1};
+          const math::Vec3d dir = rel / dist;
+          const math::Vec3d vRel = ship.velocityKmS() - destVelKmS;
+          const double closing = math::dot(vRel, dir);
+          supercruiseClosingKmS = closing;
 
-          if (dist < dropKm) {
-            supercruise = false;
-            // Drop to a safe approach speed relative to destination.
-            ship.setVelocityKmS(destVelKmS + dir * 0.12);
-            ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
-            ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
-            toast(toasts, "Dropped from supercruise.", 1.6);
+          const double tta = (closing > 1e-3) ? (dist / closing) : 1e9;
+          supercruiseTtaSec = tta;
+
+          const double safeMin = kSupercruiseSafeTtaSec - 2.0;
+          const double safeMax = kSupercruiseSafeTtaSec + 2.0;
+          const bool safeWindow = (dist < dropKm) && (tta > safeMin) && (tta < safeMax) && (closing > 0.05);
+          supercruiseSafeDropReady = safeWindow;
+
+          // Manual drop request (H while in supercruise)
+          if (supercruiseDropRequested) {
+            if (safeWindow) endSupercruise(false, destVelKmS, dir, "Supercruise drop.");
+            else endSupercruise(true, destVelKmS, dir, "EMERGENCY DROP!");
+          } else if (supercruiseAssist && safeWindow) {
+            // Nav assist auto-drop when safe
+            endSupercruise(false, destVelKmS, dir, "Supercruise drop.");
           } else {
-            // Crank the ship up for supercruise, but keep controls simple.
-            ship.setMaxLinearAccelKmS2(6.0);
-            ship.setMaxAngularAccelRadS2(1.0);
+            // Follow a speed profile toward the target
+            const double desiredSpeed =
+              supercruiseAssist ? std::clamp(dist / kSupercruiseSafeTtaSec, 60.0, supercruiseMaxSpeedKmS)
+                               : std::clamp(dist * 0.0008, 90.0, supercruiseMaxSpeedKmS);
 
-            // Supercruise speed law:
-            // - Assist ON: classic "7-second rule" (keep time-to-arrival ~7s, capped by max)
-            // - Assist OFF: gentler proportional controller (slower, hard to overshoot)
-            const double desiredSpeed = supercruiseAssist
-                ? std::clamp(dist / 7.0, 40.0, supercruiseMaxSpeedKmS)
-                : std::clamp(dist * 0.0008, 40.0, supercruiseMaxSpeedKmS);
             const math::Vec3d desiredVel = destVelKmS + dir * desiredSpeed;
             const math::Vec3d dv = desiredVel - ship.velocityKmS();
-            const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
-            input.thrustLocal = ship.orientation().conjugate().rotate(accelWorldDir);
-            input.dampers = true;
-            input.brake = false;
-            input.boost = true;
 
-            // Face the destination direction.
-            const math::Vec3d desiredFwdWorld = dir;
-            const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(desiredFwdWorld);
+            if (dv.lengthSq() > 1e-12) {
+              const math::Vec3d accelDir = dv.normalized();
+              input.thrustLocal = ship.orientation().conjugate().rotate(accelDir);
+            } else {
+              input.thrustLocal = {0,0,0};
+            }
+
+            // Always face the direction of travel while in supercruise
+            const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(dir);
             const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
             const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
 
-            input.torqueLocal.x = std::clamp(pitchErr * 2.0, -1.0, 1.0);
-            input.torqueLocal.y = std::clamp(yawErr * 2.0, -1.0, 1.0);
-            input.torqueLocal.z = 0.0;
+            input.torqueLocal.x = (float)std::clamp(pitchErr * 1.6, -1.0, 1.0);
+            input.torqueLocal.y = (float)std::clamp(yawErr * 1.6, -1.0, 1.0);
+            input.torqueLocal.z = 0.0f;
+
+            input.dampers = true;
+            input.brake = false;
+            input.boost = false;
+
+            ship.setMaxLinearAccelKmS2(6.0);
+            ship.setMaxAngularAccelRadS2(1.2);
           }
         }
       }
-    } else {
-      // Restore normal handling when not in supercruise.
-      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
-      ship.setMaxAngularAccelRadS2(kPlayerBaseAngAccelRadS2);
     }
+
+    if (supercruiseState == SupercruiseState::Active) {
+      ship.setMaxLinearAccelKmS2(6.0);
+      ship.setMaxAngularAccelRadS2(1.2);
+    }
+
+    // Restore handling caps when not in active supercruise (also applies "blue zone" turn assist).
+    if (supercruiseState != SupercruiseState::Active) {
+      ship.setMaxLinearAccelKmS2(kPlayerBaseLinAccelKmS2);
+
+      double ang = kPlayerBaseAngAccelRadS2;
+      if (blueZoneTurnAssist && input.dampers && !docked && fsdState == FsdState::Idle) {
+        const double v = (ship.velocityKmS() - localFrameVelKmS).length();
+        const double vTerm = std::max(0.001, ship.maxLinearAccelKmS2() / std::max(0.05, ship.dampingLinear()));
+        const double x = std::clamp(v / vTerm, 0.0, 1.0);
+
+        // Gaussian-ish bump centered around mid-speed.
+        const double center = 0.55;
+        const double sigma = 0.25;
+        const double bump = std::exp(-std::pow((x - center) / sigma, 2.0));
+        const double factor = 0.65 + 0.35 * bump;
+        ang *= factor;
+      }
+
+      ship.setMaxAngularAccelRadS2(ang);
+    }
+
 
     // Sim step
     const double dtSim = dtReal * timeScale;
@@ -1772,7 +2008,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       }
 
       // Auto-run route (hands-free multi-jump). We only auto-trigger when safe.
-      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && !docked && !supercruise) {
+      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && !docked && supercruiseState == SupercruiseState::Idle) {
         if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && !isMassLocked()) {
           startFsdJumpTo(navRoute[navRouteHop + 1]);
         }
@@ -1812,7 +2048,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
         if (input.boost) {
           fuel -= dtSim * 0.0025;
         }
-        if (supercruise) {
+        if (supercruiseState == SupercruiseState::Active) {
           const double v = ship.velocityKmS().length();
           fuel -= dtSim * (0.0020 + v * 0.00000015);
         }
@@ -1820,13 +2056,23 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
         if (fuel < 0.0) fuel = 0.0;
         if (fuel > fuelMax) fuel = fuelMax;
 
-        if (fuel <= 0.0 && supercruise) {
-          supercruise = false;
-          toast(toasts, "Fuel depleted: supercruise disengaged.", 2.0);
+        if (fuel <= 0.0 && supercruiseState == SupercruiseState::Active) {
+          supercruiseState = SupercruiseState::Cooldown;
+          supercruiseCooldownRemainingSec = kSupercruiseEmergencyCooldownSec;
+          supercruiseCooldownTotalSec = supercruiseCooldownRemainingSec;
+          supercruiseDropRequested = false;
+
+          heat = std::min(120.0, heat + 25.0);
+          playerShield = std::max(0.0, playerShield - 10.0);
+          playerHull = std::max(0.0, playerHull - 3.0);
+          ship.setVelocityKmS(localFrameVelKmS + ship.forward().normalized() * 0.45);
+          ship.setAngularVelocityRadS({rng.range(-0.6, 0.6), rng.range(-0.6, 0.6), rng.range(-0.4, 0.4)});
+
+          toast(toasts, "Fuel depleted: EMERGENCY DROP!", 2.4);
         }
       }
 
-const bool combatSimEnabled = (fsdState == FsdState::Idle && !supercruise);
+const bool combatSimEnabled = (fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
 if (combatSimEnabled) {
   // ---- Spawns / combat / traffic ----
 
@@ -2062,6 +2308,9 @@ for (const auto& c : contacts) {
   for (auto& c : contacts) {
     if (!c.alive) continue;
 
+    // Keep contact dampers in the same local reference frame as the player.
+    c.ship.setDampingFrameVelocityKmS(localFrameVelKmS);
+
     // cooldowns
     c.fireCooldown = std::max(0.0, c.fireCooldown - dtSim);
 
@@ -2251,7 +2500,7 @@ for (const auto& c : contacts) {
       }
 
 // --- Scanner progress (missions + exploration) ---
-if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
+if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
   bool valid = false;
 
   // If the player changes target while scanning, cancel.
@@ -2437,7 +2686,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         double heatIn = 0.0;
         if (!docked) {
           if (input.boost) heatIn += 18.0;
-          if (supercruise) heatIn += 6.0;
+          if (supercruiseState == SupercruiseState::Active) heatIn += 6.0;
           if (fsdState == FsdState::Charging) heatIn += 12.0;
           if (fsdState == FsdState::Jumping) heatIn += 16.0;
         }
@@ -2504,7 +2753,49 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         }
       }
 
+      // Projectiles update (simple ballistic slugs)
+      for (auto& p : projectiles) {
+        if (p.ttlSim <= 0.0) continue;
+
+        const math::Vec3d a = p.posKm;
+        const math::Vec3d b = p.posKm + p.velKmS * dtSim;
+
+        p.prevKm = a;
+        p.posKm = b;
+        p.ttlSim -= dtSim;
+
+        // Collisions
+        if (p.fromPlayer) {
+          for (int i = 0; i < (int)contacts.size(); ++i) {
+            const auto& c = contacts[(std::size_t)i];
+            if (!c.alive) continue;
+            if (p.shooterId != 0 && c.id == p.shooterId) continue;
+
+            const double hitRadiusKm = 900.0 + p.radiusKm;
+            if (segmentHitsSphere(a, b, c.ship.positionKm(), hitRadiusKm)) {
+              playerDamageContact(i, p.dmg);
+              p.ttlSim = 0.0;
+              break;
+            }
+          }
+        } else {
+          if (!docked) {
+            const double playerHitRadiusKm = 900.0 + p.radiusKm;
+            if (segmentHitsSphere(a, b, ship.positionKm(), playerHitRadiusKm)) {
+              applyDamage(p.dmg, playerShield, playerHull);
+              p.ttlSim = 0.0;
+            }
+          }
+        }
+      }
+
+      projectiles.erase(
+        std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.ttlSim <= 0.0; }),
+        projectiles.end());
+
+
       playerLaserCooldown = std::max(0.0, playerLaserCooldown - dtSim);
+      playerCannonCooldown = std::max(0.0, playerCannonCooldown - dtSim);
 
       // Shield regen (slow)
       if (!paused && playerHull > 0.0 && playerShield < 100.0) {
@@ -2520,7 +2811,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
       credits *= 0.90;
       cargo.fill(0.0);
       fuel = fuelMax;
-      supercruise = false;
+      supercruiseState = SupercruiseState::Idle;
+      supercruiseChargeRemainingSec = 0.0;
+      supercruiseCooldownRemainingSec = 0.0;
+      supercruiseDropRequested = false;
       scanning = false;
       scanProgressSec = 0.0;
       fsdState = FsdState::Idle;
@@ -2645,15 +2939,80 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         prev = posU;
       }
 
-      // approach corridor axis for targeted station
+      // docking corridor guidance for targeted station
       if (target.kind == TargetKind::Station && target.index == i) {
         const math::Vec3d stPos = stationPosKm(st, timeDays);
         const math::Quatd stQ = stationOrient(st, stPos, timeDays);
         const math::Vec3d axis = stQ.rotate({0,0,1});
-        const math::Vec3d aU = toRenderU(stPos + axis * (st.radiusKm * 1.1));
-        const math::Vec3d bU = toRenderU(stPos + axis * (st.radiusKm * 1.1 + st.approachLengthKm));
-        lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, 0.35f,0.85f,0.45f});
-        lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, 0.35f,0.85f,0.45f});
+        const math::Vec3d right = stQ.rotate({1,0,0});
+        const math::Vec3d up = stQ.rotate({0,1,0});
+
+        const double zEntrance = st.radiusKm * 1.10;
+        const double zEnd = zEntrance + st.approachLengthKm;
+
+        const math::Vec3d startKm = stPos + axis * zEntrance;
+        const math::Vec3d endKm = stPos + axis * zEnd;
+
+        bool clearanceGranted = false;
+        if (auto it = clearances.find(st.id); it != clearances.end()) {
+          clearanceGranted = it->second.granted && (timeDays <= it->second.expiresDays);
+        }
+
+        const float cr = clearanceGranted ? 0.35f : 0.85f;
+        const float cg = clearanceGranted ? 0.85f : 0.55f;
+        const float cb = clearanceGranted ? 0.45f : 0.25f;
+
+        auto addLineKm = [&](const math::Vec3d& aKm, const math::Vec3d& bKm, float r, float g, float b) {
+          const math::Vec3d aU = toRenderU(aKm);
+          const math::Vec3d bU = toRenderU(bKm);
+          lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, r,g,b});
+          lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, r,g,b});
+        };
+
+        // Centerline
+        addLineKm(startKm, endKm, cr,cg,cb);
+
+        // Corridor wireframe box
+        const double hx = st.approachRadiusKm;
+        const double hy = st.approachRadiusKm;
+
+        math::Vec3d c0[4] = {
+          startKm + right*hx + up*hy,
+          startKm + right*hx - up*hy,
+          startKm - right*hx - up*hy,
+          startKm - right*hx + up*hy,
+        };
+        math::Vec3d c1[4] = {
+          endKm + right*hx + up*hy,
+          endKm + right*hx - up*hy,
+          endKm - right*hx - up*hy,
+          endKm - right*hx + up*hy,
+        };
+
+        for (int k = 0; k < 4; ++k) {
+          const int k2 = (k + 1) % 4;
+          addLineKm(c0[k], c0[k2], cr,cg,cb);
+          addLineKm(c1[k], c1[k2], cr,cg,cb);
+          addLineKm(c0[k], c1[k], cr,cg,cb);
+        }
+
+        // Slot frame at the corridor entrance (yellow)
+        const double sw = st.slotWidthKm * 0.5;
+        const double sh = st.slotHeightKm * 0.5;
+        math::Vec3d s[4] = {
+          startKm + right*sw + up*sh,
+          startKm + right*sw - up*sh,
+          startKm - right*sw - up*sh,
+          startKm - right*sw + up*sh,
+        };
+        for (int k = 0; k < 4; ++k) {
+          addLineKm(s[k], s[(k + 1) % 4], 0.95f,0.9f,0.15f);
+        }
+
+        // Small staging cross at the corridor end (cyan)
+        const double cross = std::max(250.0, st.approachRadiusKm * 0.15);
+        addLineKm(endKm - right*cross, endKm + right*cross, 0.25f,0.7f,1.0f);
+        addLineKm(endKm - up*cross, endKm + up*cross, 0.25f,0.7f,1.0f);
       }
     }
 
@@ -2661,6 +3020,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
     for (const auto& b : beams) {
       lines.push_back({(float)b.aU.x,(float)b.aU.y,(float)b.aU.z, b.r,b.g,b.b});
       lines.push_back({(float)b.bU.x,(float)b.bU.y,(float)b.bU.z, b.r,b.g,b.b});
+    }
+
+    // Projectile tracers (draw a fixed-length tail so they're visible at astronomical scales)
+    for (const auto& p : projectiles) {
+      math::Vec3d tailKm = p.prevKm;
+      if (p.velKmS.lengthSq() > 1e-12) {
+        const double tracerLenKm = 15000.0;
+        tailKm = p.posKm - p.velKmS.normalized() * tracerLenKm;
+      }
+      const math::Vec3d aU = toRenderU(tailKm);
+      const math::Vec3d bU = toRenderU(p.posKm);
+      lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, p.r,p.g,p.b});
+      lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, p.r,p.g,p.b});
     }
 
     // Station geometry (cubes)
@@ -2756,6 +3128,60 @@ if (scanning && !docked && fsdState == FsdState::Idle && !supercruise) {
         }
       }
 
+      // Docking corridor HUD for targeted station
+      if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+        const auto& st = currentSystem->stations[target.index];
+
+        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+        const math::Vec3d stV = stationVelKmS(st, timeDays);
+
+        const math::Vec3d relLocal = stQ.conjugate().rotate(ship.positionKm() - stPos);
+        const math::Vec3d vRelLocal = stQ.conjugate().rotate(ship.velocityKmS() - stV);
+
+        const double zEntrance = st.radiusKm * 1.10;
+        const double zEnd = zEntrance + st.approachLengthKm;
+
+        const double hx = st.approachRadiusKm;
+        const double hy = st.approachRadiusKm;
+
+        const bool inZ = (relLocal.z >= zEntrance && relLocal.z <= zEnd);
+        const bool inXY = (std::abs(relLocal.x) <= hx && std::abs(relLocal.y) <= hy);
+        const bool inCorridor = inZ && inXY;
+
+        bool clearanceGranted = false;
+        if (auto it = clearances.find(st.id); it != clearances.end()) {
+          clearanceGranted = it->second.granted && (timeDays <= it->second.expiresDays);
+        }
+
+        const math::Vec3d axisOut = stQ.rotate({0,0,1});
+        const math::Vec3d slotFwd = (-axisOut).normalized();
+        const math::Vec3d slotUp = stQ.rotate({0,1,0}).normalized();
+
+        const double fwdAlign = math::dot(ship.forward().normalized(), slotFwd);
+        const double upAlign = math::dot(ship.up().normalized(), slotUp);
+
+        const double relSpeed = (ship.velocityKmS() - stV).length();
+
+        ImVec2 ds = io.DisplaySize;
+        float y0 = ds.y - 78.0f;
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "Corridor: %s | offX %.0f km offY %.0f km | z %.0f km | vrel %.2f km/s",
+                      inCorridor ? "IN" : "OUT",
+                      relLocal.x, relLocal.y, relLocal.z, relSpeed);
+
+        const ImU32 col = clearanceGranted ? IM_COL32(160,255,180,220) : IM_COL32(255,220,140,220);
+        draw->AddText({18.0f, y0}, col, buf);
+
+        std::snprintf(buf, sizeof(buf),
+                      "Align: fwd %.2f up %.2f | speed limit %.2f km/s | %s",
+                      fwdAlign, upAlign, st.maxApproachSpeedKmS,
+                      clearanceGranted ? "CLEARANCE GRANTED" : "NO CLEARANCE (press L to request)");
+        draw->AddText({18.0f, y0 + 18.0f}, col, buf);
+      }
+
       // Toasts
       float y = 18.0f;
       for (const auto& t : toasts) {
@@ -2768,8 +3194,6 @@ if (showShip) {
   ImGui::Begin("Ship / Status");
 
   ImGui::Text("System: %s", currentSystem->stub.name.c_str());
-  ImGui::Text("Time scale: %.0fx%s", timeScale, paused ? " (PAUSED)" : "");
-  ImGui::TextDisabled("SPACE pause/resume | [ / ] change time scale");
 
   const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
   if (localFaction != 0) {
@@ -2830,9 +3254,34 @@ if (showShip) {
     }
   }
 
-  if (supercruise) {
+  if (supercruiseState != SupercruiseState::Idle) {
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "Supercruise: ACTIVE");
+
+    if (supercruiseState == SupercruiseState::Charging) {
+      ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "Supercruise: CHARGING");
+      const float t = (float)std::clamp(1.0 - (supercruiseChargeRemainingSec / std::max(0.001, kSupercruiseChargeSec)), 0.0, 1.0);
+      ImGui::ProgressBar(t, ImVec2(-1, 0));
+    } else if (supercruiseState == SupercruiseState::Active) {
+      ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "Supercruise: ACTIVE");
+      if (supercruiseDistKm > 0.0) ImGui::Text("Range: %.0f km", supercruiseDistKm);
+      if (supercruiseTtaSec > 0.0 && supercruiseTtaSec < 1e8) ImGui::Text("ETA: %.1f s", supercruiseTtaSec);
+
+      if (supercruiseSafeDropReady) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "SAFE DROP");
+      } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.2f, 1.0f), "Keep ~7s ETA for safe drop");
+      }
+
+      if (!supercruiseAssist) {
+        ImGui::Text("Manual drop: press H");
+      } else {
+        ImGui::Text("Nav assist: auto-drop when safe");
+      }
+    } else if (supercruiseState == SupercruiseState::Cooldown) {
+      ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "Supercruise: COOLDOWN");
+      const float t = (float)std::clamp(1.0 - (supercruiseCooldownRemainingSec / std::max(0.001, supercruiseCooldownTotalSec)), 0.0, 1.0);
+      ImGui::ProgressBar(t, ImVec2(-1, 0));
+    }
   }
 
   // Navigation / route status
@@ -2861,74 +3310,29 @@ if (showShip) {
 
   // Target summary
   ImGui::Separator();
-  std::optional<math::Vec3d> tgtPosKm;
-  math::Vec3d tgtVelKmS{0,0,0};
-  std::string tgtLabel;
-
   if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
     const auto& st = currentSystem->stations[target.index];
-    tgtPosKm = stationPosKm(st, timeDays);
-    tgtVelKmS = stationVelKmS(st, timeDays);
-    tgtLabel = st.name;
+    ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), (stationPosKm(st, timeDays) - ship.positionKm()).length());
   } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
     const auto& p = currentSystem->planets[target.index];
-    tgtPosKm = planetPosKm(p, timeDays);
-    tgtVelKmS = planetVelKmS(p, timeDays);
-    tgtLabel = p.name;
+    const math::Vec3d pPos = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
+    ImGui::Text("Target: %s (%.0f km)", p.name.c_str(), (pPos - ship.positionKm()).length());
   } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
     const auto& c = contacts[target.index];
-    if (c.alive) {
-      tgtPosKm = c.ship.positionKm();
-      tgtVelKmS = c.ship.velocityKmS();
-      tgtLabel = c.name + std::string(" [") + contactRoleName(c.role) + "]";
-    }
+    ImGui::Text("Target: %s [%s] (%.0f km)", c.name.c_str(), contactRoleName(c.role), (c.ship.positionKm() - ship.positionKm()).length());
   } else if (target.kind == TargetKind::Star) {
-    tgtPosKm = math::Vec3d{0,0,0};
-    tgtVelKmS = math::Vec3d{0,0,0};
-    tgtLabel = std::string("Star (") + starClassName(currentSystem->star.cls) + ")";
-  }
-
-  if (tgtPosKm) {
-    const math::Vec3d relPos = *tgtPosKm - ship.positionKm();
-    const double distKm = relPos.length();
-
-    ImGui::Text("Target: %s (%.0f km)", tgtLabel.c_str(), distKm);
-
-    const math::Vec3d dir = (distKm > 1e-6) ? (relPos / distKm) : math::Vec3d{0,0,1};
-    const math::Vec3d relVel = ship.velocityKmS() - tgtVelKmS;
-    const double relSpeed = relVel.length();
-    const double rangeRate = math::dot(relVel, dir); // + opening, - closing
-    const double closing = -rangeRate;
-
-    auto fmtEta = [](double sec) -> std::string {
-      if (!std::isfinite(sec) || sec < 0.0) return "n/a";
-      if (sec < 60.0) return std::to_string((int)std::round(sec)) + "s";
-      if (sec < 3600.0) return std::to_string((int)std::round(sec / 60.0)) + "m";
-      const int h = (int)std::floor(sec / 3600.0);
-      const int m = (int)std::floor((sec - h * 3600.0) / 60.0);
-      return std::to_string(h) + "h" + std::to_string(m) + "m";
-    };
-
-    std::string eta = "n/a";
-    if (closing > 1e-6) {
-      eta = fmtEta(distKm / closing);
-    } else if (closing < -1e-6) {
-      eta = "opening";
-    }
-
-    ImGui::TextDisabled("Rel v: %.3f km/s | Closing: %.3f km/s | ETA: %s", relSpeed, closing, eta.c_str());
+    ImGui::Text("Target: Star (%s)", starClassName(currentSystem->star.cls));
   } else {
     ImGui::Text("Target: (none)  [T station / B planet / N contact / U star]");
   }
 
   ImGui::Separator();
   ImGui::TextDisabled("Controls:");
-  ImGui::BulletText("WASD / RF translate, QE roll");
-  ImGui::BulletText("Arrows rotate | Hold RMB + Mouse to pitch/yaw");
-  ImGui::BulletText("[ / ] change time scale (sim speed)");
-  ImGui::BulletText("H toggle supercruise (target station/planet)");
+  ImGui::BulletText("WASD / Space/Ctrl: translate | Arrows: pitch/yaw | Q/E: roll");
+  ImGui::BulletText("Shift: boost | X: brake | Left click: laser | Right click: cannon");
+  ImGui::BulletText("H: supercruise (charge/engage). While active: H requests drop (~7s safe)");
   ImGui::BulletText("J engage FSD jump (uses plotted route if present)");
-  ImGui::BulletText("P autopilot to station (needs docking clearance)");
+  ImGui::BulletText("P: autopilot to station (staging + corridor guidance)");
   ImGui::BulletText("T/B/N/U cycle targets, Y clear target");
   ImGui::BulletText("K scan target (missions + exploration scans)");
   ImGui::BulletText("L request docking clearance");
@@ -2936,41 +3340,20 @@ if (showShip) {
   ImGui::BulletText("F5 quicksave, F9 quickload");
 
   ImGui::Separator();
-  ImGui::TextDisabled("Time / Mouse:");
-
-  // Time scale preset dropdown (matches [ / ] hotkeys)
-  {
-    static const char* kTimeItems[] = {"1x", "10x", "60x", "600x", "3600x"};
-    int idx = (int)timeScalePresetIdx;
-    if (ImGui::Combo("Time scale", &idx, kTimeItems, IM_ARRAYSIZE(kTimeItems))) {
-      idx = std::clamp(idx, 0, (int)timeScalePresets.size() - 1);
-      timeScalePresetIdx = (std::size_t)idx;
-      timeScale = timeScalePresets[timeScalePresetIdx];
-    }
-  }
-
-  // Mouse steering settings
-  ImGui::Checkbox("Enable mouse steering", &mouseSteerEnabled);
-  ImGui::Checkbox("Hold RMB to steer", &mouseSteerHoldRmb);
-  if (!mouseSteerHoldRmb) {
-    ImGui::SameLine();
-    ImGui::TextDisabled("(press M to toggle)");
-    if (ImGui::Button(mouseSteerToggleActive ? "Steering: ON" : "Steering: OFF")) {
-      mouseSteerToggleActive = !mouseSteerToggleActive;
-    }
-  }
-
-  ImGui::SliderFloat("Mouse sensitivity", &mouseSteerSensitivity, 0.001f, 0.02f, "%.4f");
-  ImGui::Checkbox("Invert mouse X", &mouseSteerInvertX);
-  ImGui::Checkbox("Invert mouse Y", &mouseSteerInvertY);
-  ImGui::TextDisabled("Mouse steering status: %s", mouseSteerEngaged ? "ENGAGED" : "idle");
-
-  ImGui::Separator();
   float scMax = (float)supercruiseMaxSpeedKmS;
   if (ImGui::SliderFloat("Supercruise max speed (km/s)", &scMax, 4000.0f, 60000.0f, "%.0f")) {
     supercruiseMaxSpeedKmS = (double)scMax;
   }
   ImGui::Checkbox("Supercruise assist", &supercruiseAssist);
+
+  ImGui::Separator();
+  ImGui::TextDisabled("Flight Assist:");
+  ImGui::Checkbox("Local reference frame", &localFrameEnabled);
+  float lfTau = (float)localFrameBlendTauSec;
+  if (ImGui::SliderFloat("Local frame blend (s)", &lfTau, 0.05f, 6.0f, "%.2f")) {
+    localFrameBlendTauSec = (double)lfTau;
+  }
+  ImGui::Checkbox("Blue-zone turn assist", &blueZoneTurnAssist);
 
   ImGui::End();
 }
@@ -2997,7 +3380,7 @@ if (showScanner) {
       toast(toasts, "Undock to scan.", 1.8);
       return;
     }
-    if (supercruise || fsdState != FsdState::Idle) {
+    if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
       toast(toasts, "Scanning unavailable in supercruise / hyperspace.", 2.0);
       return;
     }

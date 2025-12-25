@@ -49,13 +49,15 @@ void Ship::step(double dtSeconds, const ShipInput& input) {
 
     if (in.dampers) {
       // Dampers attempt to kill velocity (uses thrusters, so cap it).
-      const stellar::math::Vec3d damp = clampMagnitude(velKmS_ * (-dampingLinear_), linCap);
+      const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
+      const stellar::math::Vec3d damp = clampMagnitude(relVel * (-dampingLinear_), linCap);
       accelWorld += damp;
     }
 
     if (in.brake) {
       const double brakeCap = linCap * 2.0;
-      const stellar::math::Vec3d brake = clampMagnitude(velKmS_ * (-dampingLinear_ * 6.0), brakeCap);
+      const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
+      const stellar::math::Vec3d brake = clampMagnitude(relVel * (-dampingLinear_ * 6.0), brakeCap);
       accelWorld += brake;
     }
 
