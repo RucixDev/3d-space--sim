@@ -10,6 +10,49 @@
 // incomplete (notably Windows' legacy gl.h).
 #include <SDL_opengl_glext.h>
 
+// ---- Compatibility typedefs (OpenGL 1.1 core) ----
+//
+// Some OpenGL headers (notably Windows' legacy gl.h and some platform SDKs)
+// do not provide PFNGL*PROC typedefs for *core* OpenGL 1.1 functions like
+// glGenTextures / glBindTexture / glTexImage2D.
+//
+// We intentionally keep a tiny SDL_GL_GetProcAddress-based loader (instead of
+// bundling a full loader like GLAD), so we provide the minimal missing PFN*
+// typedefs here when they're absent.
+//
+// This fixes MSVC errors like:
+//   "missing type specifier - int assumed" / "missing ';' before identifier 'GenTextures'"
+//
+#ifndef APIENTRY
+#  define APIENTRY
+#endif
+
+#ifndef APIENTRYP
+#  define APIENTRYP APIENTRY *
+#endif
+
+#ifndef PFNGLGENTEXTURESPROC
+typedef void (APIENTRYP PFNGLGENTEXTURESPROC)(GLsizei n, GLuint* textures);
+#endif
+
+#ifndef PFNGLBINDTEXTUREPROC
+typedef void (APIENTRYP PFNGLBINDTEXTUREPROC)(GLenum target, GLuint texture);
+#endif
+
+#ifndef PFNGLTEXIMAGE2DPROC
+typedef void (APIENTRYP PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint internalformat,
+                                            GLsizei width, GLsizei height, GLint border,
+                                            GLenum format, GLenum type, const void* pixels);
+#endif
+
+#ifndef PFNGLTEXPARAMETERIPROC
+typedef void (APIENTRYP PFNGLTEXPARAMETERIPROC)(GLenum target, GLenum pname, GLint param);
+#endif
+
+#ifndef PFNGLDELETETEXTURESPROC
+typedef void (APIENTRYP PFNGLDELETETEXTURESPROC)(GLsizei n, const GLuint* textures);
+#endif
+
 namespace stellar::render::gl {
 
 bool load();
