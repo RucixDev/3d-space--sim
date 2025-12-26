@@ -1,7 +1,6 @@
-// SDL on Windows may redefine main() to SDL_main() unless SDL_MAIN_HANDLED is set.
-// This project links SDL2 but not SDL2main, so we keep a normal C-runtime main()
-// entry point and call SDL_SetMainReady() manually.
-#if defined(_WIN32)
+// On Windows, SDL may redefine main() to SDL_main unless SDL2main is linked.
+// We provide our own entry point, so prevent SDL from overriding it.
+#ifdef _WIN32
 #define SDL_MAIN_HANDLED
 #endif
 
@@ -24,8 +23,7 @@
 #include <SDL.h>
 #include <SDL_opengl.h>
 
-// Some SDL2 distributions (or build flags) may still define `main` as a macro.
-// Ensure we declare the real C runtime entry point symbol.
+// Some SDL configurations still define main -> SDL_main; ensure our main symbol remains intact.
 #ifdef main
 #undef main
 #endif
@@ -557,9 +555,7 @@ int main(int argc, char** argv) {
 
   core::setLogLevel(core::LogLevel::Info);
 
-#if defined(_WIN32)
-  // When SDL_MAIN_HANDLED is used, SDL expects the app to call SDL_SetMainReady()
-  // before SDL_Init().
+#ifdef _WIN32
   SDL_SetMainReady();
 #endif
 
@@ -1861,6 +1857,8 @@ if (event.key.keysym.sym == SDLK_y) {
           }
         }
       }
+
+    } // while (SDL_PollEvent)
 
     // Input (6DOF)
     sim::ShipInput input{};
@@ -4514,7 +4512,8 @@ if (canTrade) {
                   ImGui::TextDisabled("%.0f ly (~%d jumps)", t.distanceLy, (int)std::ceil(t.distanceLy / jr));
 
                   ImGui::TableNextColumn();
-                  ImGui::Text("%s", econ::commodityDef(t.commodity).name.c_str());
+                  // CommodityDef::name is a const char* (not std::string)
+                  ImGui::Text("%s", econ::commodityDef(t.commodity).name);
                   ImGui::TextDisabled("%.0f kg/u", econ::commodityDef(t.commodity).massKg);
 
                   ImGui::TableNextColumn();
