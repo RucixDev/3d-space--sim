@@ -539,151 +539,6 @@ static std::vector<sim::SystemId> plotRouteAStarHops(const std::vector<sim::Syst
   return {};
 }
 
-// Fuel-aware multi-hop route planner.
-//
-// Compared to the simple hop-count A* above, this variant:
-// - Precomputes "reachable hops" adjacency (edges within maxJumpLy)
-// - Tracks remaining fuel across hops (discretized), optionally assuming you can refuel to full
-//   in systems that have at least one station.
-// - Optionally avoids "low-fuel dead-ends" by preventing hops into stationless systems
-//   where you wouldn't have enough fuel left to make *any* further hop.
-struct RouteFuelPlanOptions {
-  double startFuel{0.0};      // fuel available at the start (units)
-  double fuelMax{0.0};        // full tank (units)
-  double fuelBaseCost{2.0};   // base cost per jump (units)
-  double fuelPerLy{0.5};      // linear cost per ly (units/ly)
-  double fuelQuantStep{0.1};  // discretization step (units)
-  bool allowRefuelAtStations{true};
-  bool avoidLowFuelDeadEnds{false};
-};
-
-static std::vector<sim::SystemId> plotRouteFuelAware(
-    const std::vector<sim::SystemStub>& nodes,
-    sim::SystemId startId,
-    sim::SystemId goalId,
-    double maxJumpLy,
-    const RouteFuelPlanOptions& opt) {
-  if (startId == 0 || goalId == 0 || nodes.empty() || maxJumpLy <= 0.0) return {};
-
-  const std::size_t N = nodes.size();
-  std::unordered_map<sim::SystemId, int> idToIndex;
-  idToIndex.reserve(N);
-  for (std::size_t i = 0; i < N; ++i) idToIndex[nodes[i].id] = (int)i;
-
-  auto itS = idToIndex.find(startId);
-  auto itG = idToIndex.find(goalId);
-  if (itS == idToIndex.end() || itG == idToIndex.end()) return {};
-
-  const int start = itS->second;
-  const int goal = itG->second;
-
-  struct Edge { int to; float distLy; };
-  std::vector<std::vector<Edge>> adj(N);
-
-  // Precompute reachable hops adjacency.
-  for (std::size_t i = 0; i < N; ++i) {
-    for (std::size_t j = i + 1; j < N; ++j) {
-      const double d = systemDistanceLy(nodes[i], nodes[j]);
-      if (d <= maxJumpLy + 1e-9) {
-        adj[i].push_back({(int)j, (float)d});
-        adj[j].push_back({(int)i, (float)d});
-      }
-    }
-  }
-
-  const double step = std::max(0.01, opt.fuelQuantStep);
-  const int B = (int)std::ceil(std::max(0.0, opt.fuelMax) / step) + 1;
-  if (B <= 1) return {};
-
-  auto toBucket = [&](double fuel) -> int {
-    const double f = std::clamp(fuel, 0.0, opt.fuelMax);
-    const int b = (int)std::floor(f / step + 1e-9);
-    return std::clamp(b, 0, B - 1);
-  };
-  auto bucketToFuel = [&](int b) -> double {
-    return (double)b * step;
-  };
-
-  const int fullBucket = toBucket(opt.fuelMax);
-  const int startBucket = toBucket(opt.startFuel);
-
-  // Precompute minimum fuel required to leave each node (used for dead-end avoidance).
-  std::vector<double> minExitFuel(N, std::numeric_limits<double>::infinity());
-  if (opt.avoidLowFuelDeadEnds) {
-    for (std::size_t i = 0; i < N; ++i) {
-      if (nodes[i].stationCount > 0) continue; // refuel-capable, not a dead-end concern
-      double best = std::numeric_limits<double>::infinity();
-      for (const auto& e : adj[i]) {
-        const double need = opt.fuelBaseCost + (double)e.distLy * opt.fuelPerLy;
-        best = std::min(best, need);
-      }
-      minExitFuel[i] = best;
-    }
-  }
-
-  const int startState = start * B + startBucket;
-  std::vector<int> dist(N * (std::size_t)B, -1);
-  std::vector<int> prev(N * (std::size_t)B, -1);
-  std::queue<int> q;
-
-  dist[startState] = 0;
-  q.push(startState);
-
-  int goalState = -1;
-
-  while (!q.empty()) {
-    const int s = q.front();
-    q.pop();
-
-    const int i = s / B;
-    const int b = s % B;
-
-    if (i == goal) { goalState = s; break; }
-
-    const double fuelAvail = bucketToFuel(b);
-
-    for (const auto& e : adj[i]) {
-      const int j = e.to;
-
-      const double need = opt.fuelBaseCost + (double)e.distLy * opt.fuelPerLy;
-      if (fuelAvail + 1e-9 < need) continue;
-
-      const double fuelAfter = fuelAvail - need;
-      int b2 = toBucket(fuelAfter);
-
-      // Dead-end avoidance: don't jump into an empty system if we can't jump out again.
-      if (opt.avoidLowFuelDeadEnds && j != goal && nodes[j].stationCount == 0) {
-        if (!(fuelAfter + 1e-9 >= minExitFuel[j])) {
-          continue;
-        }
-      }
-
-      // Auto-refuel at any system with a station (assumes you can dock/refuel there).
-      if (opt.allowRefuelAtStations && nodes[j].stationCount > 0 && j != goal) {
-        b2 = fullBucket;
-      }
-
-      const int s2 = j * B + b2;
-      if (dist[s2] != -1) continue;
-
-      dist[s2] = dist[s] + 1;
-      prev[s2] = s;
-      q.push(s2);
-    }
-  }
-
-  if (goalState < 0) return {};
-
-  std::vector<sim::SystemId> path;
-  for (int s = goalState; s >= 0; s = prev[s]) {
-    const int i = s / B;
-    path.push_back(nodes[(std::size_t)i].id);
-  }
-  std::reverse(path.begin(), path.end());
-
-  return path;
-}
-
 int main(int argc, char** argv) {
   (void)argc; (void)argv;
 
@@ -944,9 +799,6 @@ int main(int argc, char** argv) {
   // Missions + reputation
   core::u64 nextMissionId = 1;
   std::vector<sim::Mission> missions;
-  core::u64 trackedMissionId = 0;
-  sim::SystemId trackedObjectiveSystemId = 0;
-  sim::StationId trackedObjectiveStationId = 0;
   std::unordered_map<core::u32, double> repByFaction;
 
   // Law / crime (per-faction bounties)
@@ -972,11 +824,6 @@ int main(int argc, char** argv) {
     double profitPerKg{0.0};
     double estTripProfit{0.0};
     double distanceLy{0.0};
-
-    // Route estimate (computed on refresh; used for jumps/fuel QoL in the Trade Helper UI)
-    bool routeFound{false};
-    int estJumps{0};
-    double estFuel{0.0};
   };
 
   std::vector<TradeIdea> tradeIdeas;
@@ -1087,10 +934,6 @@ int main(int argc, char** argv) {
   std::vector<sim::SystemId> navRoute;
   std::size_t navRouteHop = 0;
   bool navAutoRun = false;
-
-  // Route plotting: safety preference. When enabled, the plotter avoids hops that would
-  // strand you in a stationless system with too little fuel to jump out again.
-  bool navAvoidLowFuelDeadEnds = true;
 
   // Optional helper: when arriving in a system, auto-target a specific station (e.g. from a mission/trade suggestion).
   sim::StationId pendingArrivalTargetStationId = 0;
@@ -1247,40 +1090,11 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     return false;
   };
 
-  auto computeRouteToSystem = [&](sim::SystemId destSystemId, double searchRadiusLy) -> std::vector<sim::SystemId> {
-    if (!currentSystem || destSystemId == 0) return {};
-    if (destSystemId == currentSystem->stub.id) return {currentSystem->stub.id};
-
-    const double jrMaxLy = std::max(1e-6, fsdBaseRangeLy());
-
-    // If there are stations in this system, assume you can dock/refuel to full before departing.
-    const double startFuelPlan = (!currentSystem->stations.empty()) ? fuelMax : fuel;
-
-    RouteFuelPlanOptions opt{};
-    opt.startFuel = startFuelPlan;
-    opt.fuelMax = fuelMax;
-    opt.fuelBaseCost = kFsdFuelBase;
-    opt.fuelPerLy = kFsdFuelPerLy;
-    opt.fuelQuantStep = 0.1;
-    opt.allowRefuelAtStations = true;
-    opt.avoidLowFuelDeadEnds = navAvoidLowFuelDeadEnds;
-
-    const auto nearby = universe.queryNearby(currentSystem->stub.posLy, searchRadiusLy);
-    if (nearby.empty()) return {};
-
-    auto route = plotRouteFuelAware(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, opt);
-    if (route.empty()) {
-      // Fallback: hop-count-only route (still useful as a hint).
-      route = plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy);
-    }
-    return route;
-  };
-
   auto plotRouteToSystem = [&](sim::SystemId destSystemId, bool showToast = true) -> bool {
     if (!currentSystem || destSystemId == 0) return false;
 
     if (destSystemId == currentSystem->stub.id) {
-      navRoute = {currentSystem->stub.id};
+      navRoute.clear();
       navRouteHop = 0;
       navAutoRun = false;
       galaxySelectedSystemId = destSystemId;
@@ -1290,41 +1104,25 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     const auto& destStub = universe.getSystem(destSystemId).stub;
     const double distLy = (destStub.posLy - currentSystem->stub.posLy).length();
 
+    const double jrMaxLy = fsdCurrentRangeLy();
     double radius = std::clamp(distLy * 1.20 + 60.0, 180.0, 1400.0);
 
-    std::vector<sim::SystemId> best;
     for (int attempt = 0; attempt < 6; ++attempt) {
-      best = computeRouteToSystem(destSystemId, radius);
-      if (!best.empty()) break;
+      auto nearby = universe.queryNearby(currentSystem->stub.posLy, radius);
+      auto route = plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy);
+      if (!route.empty()) {
+        navRoute = std::move(route);
+        navRouteHop = 0;
+        navAutoRun = false;
+        galaxySelectedSystemId = destSystemId;
+        if (showToast) toast(toasts, "Route plotted (" + std::to_string(navRoute.size() - 1) + " jumps).", 2.2);
+        return true;
+      }
       radius *= 1.35;
     }
 
-    if (best.empty()) {
-      if (showToast) toast(toasts, "No route found (try expanding the search radius).", 2.6);
-      return false;
-    }
-
-    navRoute = std::move(best);
-    navRouteHop = 0;
-    navAutoRun = false;
-    galaxySelectedSystemId = destSystemId;
-
-    if (showToast) {
-      toast(toasts, "Route plotted (" + std::to_string((int)navRoute.size() - 1) + " jumps).", 2.2);
-
-      // If you're starting from a stationless system, warn if the first hop needs more fuel than you currently have.
-      if (currentSystem->stations.empty() && navRoute.size() >= 2) {
-        const sim::StarSystem& s0 = universe.getSystem(navRoute[0]);
-        const sim::StarSystem& s1 = universe.getSystem(navRoute[1]);
-        const double hopLy = (s1.stub.posLy - s0.stub.posLy).length();
-        const double need = fsdFuelCostFor(hopLy);
-        if (fuel + 1e-9 < need) {
-          toast(toasts, "First hop needs more fuel than you have.", 3.0);
-        }
-      }
-    }
-
-    return true;
+    if (showToast) toast(toasts, "No route found (try refueling or upgrading your FSD).", 2.6);
+    return false;
   };
 
   auto isMassLocked = [&]() -> bool {
@@ -2039,13 +1837,18 @@ if (event.key.keysym.sym == SDLK_y) {
               projectiles.push_back(p);
 
               // Tiny recoil impulse
-              ship.setVelocityKmS(ship.velocityKmS() - fwd * (wType == WeaponType::Railgun ? 0.003 : 0.002));
-            }
-          }
-        }
-      }
+	              ship.setVelocityKmS(ship.velocityKmS() - fwd * (wType == WeaponType::Railgun ? 0.003 : 0.002));
+	            }
+	          }
+	        }
+	      }
 
-    // Input (6DOF)
+	    // NOTE: this brace ends the per-frame SDL event pump.
+	    // The remainder of the frame (continuous input, sim update, render) must run once per frame,
+	    // not once per SDL event.
+	    }
+
+	    // Input (6DOF)
     sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
@@ -3269,18 +3072,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               if (m.type == sim::MissionType::MultiDelivery && m.viaSystem != 0 && m.leg == 0 && atVia) {
                 m.leg = 1;
                 toast(toasts, "Multi-hop delivery: leg 1/2 complete.", 2.5);
-
-                // Mission completion UX: if you just delivered at the via-stop, auto-switch the nav
-                // route to the final leg (so you immediately see where to go next).
-                const bool routeWasToVia = (!navRoute.empty() && navRoute.back() == m.viaSystem);
-                const bool isTracked = (trackedMissionId == m.id);
-                if (routeWasToVia || isTracked) {
-                  if (plotRouteToSystem(m.toSystem, false)) {
-                    pendingArrivalTargetStationId = m.toStation;
-                    if (m.toSystem == currentSystem->stub.id) tryTargetStationById(m.toStation);
-                    toast(toasts, "Route updated to final destination.", 2.0);
-                  }
-                }
               } else if (atFinal && (m.viaSystem == 0 || m.leg >= 1)) {
                 const econ::CommodityId cid = m.commodity;
                 const double have = cargo[(std::size_t)cid];
@@ -3296,42 +3087,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               }
             }
           }
-        }
-      }
-
-
-      // --- Mission tracking objective (clear "current leg" marker) ---
-      {
-        auto findMissionById = [&](core::u64 id) -> sim::Mission* {
-          for (auto& m : missions) {
-            if (m.id == id) return &m;
-          }
-          return nullptr;
-        };
-
-        // Keep the tracked mission id pointing at an active mission. If the tracked mission ends
-        // (completed/failed), clear it so the marker disappears until you track another.
-        sim::Mission* tracked = (trackedMissionId != 0) ? findMissionById(trackedMissionId) : nullptr;
-        if (trackedMissionId != 0 && !tracked) {
-          trackedMissionId = 0;
-        }
-        if (tracked && (tracked->completed || tracked->failed)) {
-          trackedMissionId = 0;
-          tracked = nullptr;
-        }
-
-        trackedObjectiveSystemId = 0;
-        trackedObjectiveStationId = 0;
-
-        if (tracked) {
-          sim::SystemId legSystem = tracked->toSystem;
-          sim::StationId legStation = tracked->toStation;
-          if (tracked->type == sim::MissionType::MultiDelivery && tracked->viaSystem != 0 && tracked->leg == 0) {
-            legSystem = tracked->viaSystem;
-            legStation = tracked->viaStation;
-          }
-          trackedObjectiveSystemId = legSystem;
-          trackedObjectiveStationId = legStation;
         }
       }
 
@@ -4707,76 +4462,6 @@ if (canTrade) {
                 return a.estTripProfit > b.estTripProfit;
               });
               if (tradeIdeas.size() > 12) tradeIdeas.resize(12);
-
-
-        // Precompute route estimates (jumps + fuel) for the short-list.
-        // We keep this lightweight by using the same nearby-set used to generate the ideas.
-        {
-          std::vector<sim::SystemStub> routeNodes = nearby;
-          bool haveStart = false;
-          for (const auto& s : routeNodes) {
-            if (s.id == currentSystem->stub.id) {
-              haveStart = true;
-              break;
-            }
-          }
-          if (!haveStart) routeNodes.push_back(currentSystem->stub);
-
-          std::unordered_map<sim::SystemId, math::Vec3d> posById;
-          posById.reserve(routeNodes.size());
-          for (const auto& s : routeNodes) posById[s.id] = s.posLy;
-
-          auto hopDistLy = [&](sim::SystemId a, sim::SystemId b) -> double {
-            auto ita = posById.find(a);
-            auto itb = posById.find(b);
-            if (ita != posById.end() && itb != posById.end()) {
-              return (itb->second - ita->second).length();
-            }
-            const auto& sa = universe.getSystem(a).stub;
-            const auto& sb = universe.getSystem(b).stub;
-            return (sb.posLy - sa.posLy).length();
-          };
-
-          const double jrMaxLy = std::max(1e-6, fsdBaseRangeLy());
-
-          RouteFuelPlanOptions ropt{};
-          ropt.startFuel = fuelMax; // from a station, assume you can refuel before departure
-          ropt.fuelMax = fuelMax;
-          ropt.fuelBaseCost = kFsdFuelBase;
-          ropt.fuelPerLy = kFsdFuelPerLy;
-          ropt.fuelQuantStep = 0.1;
-          ropt.allowRefuelAtStations = true;
-          ropt.avoidLowFuelDeadEnds = navAvoidLowFuelDeadEnds;
-
-          for (auto& t : tradeIdeas) {
-            t.routeFound = false;
-            t.estJumps = std::max(1, (int)std::ceil(t.distanceLy / jrMaxLy));
-            t.estFuel = kFsdFuelBase * (double)t.estJumps + kFsdFuelPerLy * t.distanceLy;
-
-            if (t.toSystem == 0 || t.toSystem == currentSystem->stub.id) {
-              t.routeFound = true;
-              t.estJumps = 0;
-              t.estFuel = 0.0;
-              continue;
-            }
-
-            auto route = plotRouteFuelAware(routeNodes, currentSystem->stub.id, t.toSystem, jrMaxLy, ropt);
-            if (route.empty()) {
-              // Fallback to hop-count-only route.
-              route = plotRouteAStarHops(routeNodes, currentSystem->stub.id, t.toSystem, jrMaxLy);
-            }
-
-            if (route.size() >= 2) {
-              t.routeFound = true;
-              t.estJumps = (int)route.size() - 1;
-              double totalFuel = 0.0;
-              for (std::size_t i = 1; i < route.size(); ++i) {
-                totalFuel += fsdFuelCostFor(hopDistLy(route[i - 1], route[i]));
-              }
-              t.estFuel = totalFuel;
-            }
-          }
-        }
             }
 
             if (tradeIdeas.empty()) {
@@ -4791,6 +4476,7 @@ if (canTrade) {
                 return "Station #" + std::to_string((std::uint64_t)stId);
               };
 
+              const double jr = std::max(1e-6, fsdCurrentRangeLy());
 
               ImGui::TextDisabled("Top routes (estimated with a full hold):");
               if (ImGui::BeginTable("trade_table", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame)) {
@@ -4811,12 +4497,11 @@ if (canTrade) {
                   ImGui::TableNextRow();
                   ImGui::TableNextColumn();
                   ImGui::Text("%s", toLabel.c_str());
-                  ImGui::TextDisabled("%.0f ly", t.distanceLy);
-                  const char* approx = t.routeFound ? "" : "~";
-                  ImGui::TextDisabled("%s%d jumps, %sfuel %.1f", approx, t.estJumps, approx, t.estFuel);
+                  ImGui::TextDisabled("%.0f ly (~%d jumps)", t.distanceLy, (int)std::ceil(t.distanceLy / jr));
 
                   ImGui::TableNextColumn();
-                  ImGui::Text("%s", econ::commodityDef(t.commodity).name.c_str());
+	                  // CommodityDef::name is a const char* (not std::string).
+	                  ImGui::Text("%s", econ::commodityDef(t.commodity).name);
                   ImGui::TextDisabled("%.0f kg/u", econ::commodityDef(t.commodity).massKg);
 
                   ImGui::TableNextColumn();
@@ -4858,9 +4543,7 @@ if (canTrade) {
                         auto tr = econ::buy(fromEcon, fromSt->economyModel, t.commodity, maxUnits, credits, 0.10, feeEff);
                         if (tr.ok) {
                           cargo[(int)t.commodity] += maxUnits;
-                          toast(toasts, "Bought " + std::to_string((int)maxUnits) + "u of " + econ::commodityDef(t.commodity).name, 2.2);
-                        } else {
-                          toast(toasts, tr.reason ? tr.reason : "Purchase failed.", 3.0);
+                          toast(toasts, ("Bought " + std::to_string((int)maxUnits) + "u of " + econ::commodityDef(t.commodity).name).c_str(), 2.2);
                         }
                       }
                     }
@@ -4951,44 +4634,17 @@ if (canTrade) {
             }
 
             if (active) {
-              sim::SystemId legSys = m.toSystem;
-              sim::StationId legStation = m.toStation;
-              if (m.type == sim::MissionType::MultiDelivery && m.viaSystem != 0 && m.leg == 0) {
-                legSys = m.viaSystem;
-                legStation = m.viaStation;
-              }
-
-              const bool isTracked = (trackedMissionId == m.id);
-              if (!isTracked) {
-                if (ImGui::SmallButton("Track")) {
-                  trackedMissionId = m.id;
-                  toast(toasts, "Mission tracked (objective marker updated).", 1.6);
+              if (ImGui::SmallButton("Set destination")) {
+                sim::SystemId destSys = m.toSystem;
+                if (m.type == sim::MissionType::MultiDelivery && m.viaSystem != 0 && m.leg == 0) {
+                  destSys = m.viaSystem;
                 }
-              } else {
-                ImGui::TextDisabled("Tracked");
-              }
-              ImGui::SameLine();
-              if (ImGui::SmallButton("Plot leg")) {
-                trackedMissionId = m.id;
-                if (plotRouteToSystem(legSys, false)) {
-                  pendingArrivalTargetStationId = legStation;
-                  if (currentSystem && legSys == currentSystem->stub.id && legStation != 0) {
-                    tryTargetStationById(legStation);
-                  }
-                  toast(toasts, "Route plotted for current mission leg.", 2.0);
-                } else {
-                  toast(toasts, "Couldn't plot route for this mission leg.", 2.5);
-                }
-              }
-              ImGui::SameLine();
-              if (ImGui::SmallButton("Show")) {
-                galaxySelectedSystemId = legSys;
+                galaxySelectedSystemId = destSys;
                 showGalaxy = true;
-                toast(toasts, "Galaxy: mission objective selected.", 2.0);
+                toast(toasts, "Galaxy: mission destination selected.", 2.0);
               }
               ImGui::SameLine();
               if (ImGui::SmallButton("Abandon")) {
-                if (trackedMissionId == m.id) trackedMissionId = 0;
                 m.failed = true;
                 addRep(m.factionId, -2.0);
                 toast(toasts, "Mission abandoned.", 2.0);
@@ -5165,7 +4821,6 @@ if (canTrade) {
                 }
 
                 missions.push_back(m);
-                trackedMissionId = m.id;
                 missionOffers.erase(missionOffers.begin() + (std::ptrdiff_t)offerIdx);
                 toast(toasts, "Mission accepted.", 2.0);
 
@@ -5456,13 +5111,6 @@ if (showContacts) {
           draw->AddCircle(p, 6.5f, IM_COL32(80, 140, 220, 140), 24, 1.0f);
         }
 
-        // Tracked mission objective (current leg)
-        if (trackedObjectiveSystemId != 0 && s.id == trackedObjectiveSystemId) {
-          draw->AddCircle(p, 9.5f, IM_COL32(255, 215, 120, 230), 32, 2.0f);
-          draw->AddLine(ImVec2(p.x - 6.0f, p.y), ImVec2(p.x + 6.0f, p.y), IM_COL32(255, 215, 120, 220), 2.0f);
-          draw->AddLine(ImVec2(p.x, p.y - 6.0f), ImVec2(p.x, p.y + 6.0f), IM_COL32(255, 215, 120, 220), 2.0f);
-        }
-
         // Click detection
         const float rClick = 6.0f;
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -5481,26 +5129,6 @@ if (showContacts) {
       if (galaxySelectedSystemId == 0) {
         ImGui::Text("Select a system on the map.");
       } else {
-        if (trackedObjectiveSystemId != 0) {
-          const auto& objSys = universe.getSystem(trackedObjectiveSystemId);
-          ImGui::TextDisabled("Objective: %s", objSys.stub.name.c_str());
-          if (trackedObjectiveStationId != 0) {
-            // Best-effort station name lookup for the tracked mission leg.
-            for (const auto& st : objSys.stations) {
-              if (st.id == trackedObjectiveStationId) {
-                ImGui::TextDisabled("Station: %s", st.name.c_str());
-                break;
-              }
-            }
-          }
-          if (trackedObjectiveSystemId != galaxySelectedSystemId) {
-            if (ImGui::SmallButton("Select objective")) {
-              galaxySelectedSystemId = trackedObjectiveSystemId;
-            }
-          }
-          ImGui::Separator();
-        }
-
         const auto& selSys = universe.getSystem(galaxySelectedSystemId);
         const double distLy = (selSys.stub.posLy - currentSystem->stub.posLy).length();
         const double jrMaxLy = fsdBaseRangeLy();
@@ -5516,24 +5144,8 @@ if (showContacts) {
           const double fuelCost = fsdFuelCostFor(distLy);
           ImGui::Text("Direct jump: %s (fuel cost %.1f)", (distLy <= jrMaxLy + 1e-6) ? "IN RANGE" : "OUT OF RANGE", fuelCost);
 
-          ImGui::Checkbox("Avoid low-fuel dead-ends", &navAvoidLowFuelDeadEnds);
-
           if (ImGui::Button("Plot route")) {
-            RouteFuelPlanOptions opt{};
-            opt.startFuel = (!currentSystem->stations.empty()) ? fuelMax : fuel;
-            opt.fuelMax = fuelMax;
-            opt.fuelBaseCost = kFsdFuelBase;
-            opt.fuelPerLy = kFsdFuelPerLy;
-            opt.fuelQuantStep = 0.1;
-            opt.allowRefuelAtStations = true;
-            opt.avoidLowFuelDeadEnds = navAvoidLowFuelDeadEnds;
-
-            navRoute = plotRouteFuelAware(nearby, currentSystem->stub.id, galaxySelectedSystemId, jrMaxLy, opt);
-            if (navRoute.empty()) {
-              // Fallback to hop-count-only route.
-              navRoute = plotRouteAStarHops(nearby, currentSystem->stub.id, galaxySelectedSystemId, jrMaxLy);
-            }
-
+            navRoute = plotRouteAStarHops(nearby, currentSystem->stub.id, galaxySelectedSystemId, jrMaxLy);
             navRouteHop = 0;
             navAutoRun = false;
             if (navRoute.empty()) {
