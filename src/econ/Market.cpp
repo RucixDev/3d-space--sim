@@ -9,6 +9,37 @@ namespace stellar::econ {
 
 static constexpr std::size_t idx(CommodityId id) { return static_cast<std::size_t>(id); }
 
+double takeInventory(StationEconomyState& state,
+                     const StationEconomyModel& model,
+                     CommodityId id,
+                     double units) {
+  (void)model;
+  if (units <= 0.0) return 0.0;
+
+  double& inv = state.inventory[idx(id)];
+  inv = std::max(0.0, inv);
+
+  const double taken = std::min(inv, units);
+  inv = std::max(0.0, inv - taken);
+  return taken;
+}
+
+double addInventory(StationEconomyState& state,
+                    const StationEconomyModel& model,
+                    CommodityId id,
+                    double units) {
+  if (units <= 0.0) return 0.0;
+
+  const double cap = std::max(0.0, model.capacity[idx(id)]);
+  double& inv = state.inventory[idx(id)];
+  inv = std::max(0.0, inv);
+
+  const double space = std::max(0.0, cap - inv);
+  const double added = std::min(space, units);
+  inv = std::min(cap, inv + added);
+  return added;
+}
+
 MarketQuote quote(const StationEconomyState& state,
                   const StationEconomyModel& model,
                   CommodityId id,

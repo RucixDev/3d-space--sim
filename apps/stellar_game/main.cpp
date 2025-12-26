@@ -338,6 +338,15 @@ struct Contact {
   // Traders can have an approximate loot value (paid on destruction for now).
   double cargoValueCr{0.0};
 
+  // --- Trader economy simulation (local-system hauling) ---
+  // Traders move a small amount of real station inventory between stations.
+  // This makes markets feel "alive" and creates/relieves shortages.
+  std::size_t tradeDestStationIndex{0};
+  econ::CommodityId tradeCommodity{econ::CommodityId::Food};
+  double tradeUnits{0.0};        // units currently carried
+  double tradeCapacityKg{180.0}; // cargo capacity (kg)
+  double tradeCooldownUntilDays{0.0};
+
   double fireCooldown{0.0}; // seconds
   bool alive{true};
 };
@@ -2477,6 +2486,97 @@ for (const auto& c : contacts) {
     outShip.setOrientation(quatFromTo({0,0,1}, (stPos - p).normalized()));
   };
 
+  // Pick a different station index in the current system (best-effort).
+  auto chooseOtherStation = [&](std::size_t avoidIdx) -> std::size_t {
+    if (!currentSystem || currentSystem->stations.empty()) return 0;
+    const std::size_t n = currentSystem->stations.size();
+    if (n == 1) return 0;
+
+    avoidIdx = std::min(avoidIdx, n - 1);
+    // Choose an offset in [1, n-1] and wrap.
+    const std::size_t off = 1u + (std::size_t)(rng.nextU32() % (core::u32)(n - 1));
+    return (avoidIdx + off) % n;
+  };
+
+  // Give a trader a simple local hauling job:
+  // - choose a destination station (different from source)
+  // - choose a commodity and load units by reducing station inventory
+  // This makes NPC traffic actually influence station inventories/prices.
+  auto planTraderHaul = [&](Contact& t, std::size_t fromIdx) -> bool {
+    if (!currentSystem || currentSystem->stations.size() < 2) return false;
+
+    const std::size_t n = currentSystem->stations.size();
+    fromIdx = std::min(fromIdx, n - 1);
+    const std::size_t toIdx = chooseOtherStation(fromIdx);
+
+    const auto& fromSt = currentSystem->stations[fromIdx];
+    const auto& toSt   = currentSystem->stations[toIdx];
+
+    auto& fromE = universe.stationEconomy(fromSt, timeDays);
+    auto& toE   = universe.stationEconomy(toSt, timeDays);
+
+    // Prefer profitable routes (creates believable trade lanes).
+    econ::CommodityId cid = econ::CommodityId::Food;
+    {
+      const auto routes = econ::bestRoutes(fromE, fromSt.economyModel, toE, toSt.economyModel, 0.10, 3);
+      if (!routes.empty()) {
+        cid = routes.front().commodity;
+      } else {
+        // If no clear arbitrage, move whichever good is most "surplus" at the source.
+        double bestSurplus = -1e99;
+        std::size_t bestI = 0;
+        for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+          const double surplus = fromE.inventory[i] - fromSt.economyModel.desiredStock[i];
+          if (surplus > bestSurplus) {
+            bestSurplus = surplus;
+            bestI = i;
+          }
+        }
+        cid = (econ::CommodityId)bestI;
+      }
+    }
+
+    // Compute how many units we can carry.
+    const double capKg = std::max(40.0, t.tradeCapacityKg);
+    const double massKg = std::max(1e-6, econ::commodityDef(cid).massKg);
+    const double wantUnits = std::max(1.0, std::floor(capKg / massKg));
+
+    // Load from source inventory (clamped).
+    const double loaded = econ::takeInventory(fromE, fromSt.economyModel, cid, wantUnits);
+    if (loaded <= 0.0) {
+      // Fallback: try a couple of random commodities to avoid "empty" traders.
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto rcid = (econ::CommodityId)(rng.nextU32() % (core::u32)econ::kCommodityCount);
+        const double m2 = std::max(1e-6, econ::commodityDef(rcid).massKg);
+        const double w2 = std::max(1.0, std::floor(capKg / m2));
+        const double l2 = econ::takeInventory(fromE, fromSt.economyModel, rcid, w2);
+        if (l2 > 0.0) {
+          cid = rcid;
+          t.tradeUnits = l2;
+          t.tradeCommodity = rcid;
+          t.tradeDestStationIndex = toIdx;
+          const auto q = econ::quote(fromE, fromSt.economyModel, rcid, 0.10);
+          t.cargoValueCr = std::max(0.0, l2 * q.mid);
+          return true;
+        }
+      }
+      t.tradeUnits = 0.0;
+      t.tradeCommodity = cid;
+      t.tradeDestStationIndex = toIdx;
+      t.cargoValueCr = 0.0;
+      return false;
+    }
+
+    t.tradeCommodity = cid;
+    t.tradeUnits = loaded;
+    t.tradeDestStationIndex = toIdx;
+
+    // Approximate cargo value for piracy/loot purposes.
+    const auto q = econ::quote(fromE, fromSt.economyModel, cid, 0.10);
+    t.cargoValueCr = std::max(0.0, loaded * q.mid);
+    return true;
+  };
+
   auto spawnPirate = [&]() {
     Contact p{};
     p.id = std::max<core::u64>(1, rng.nextU64());
@@ -2505,7 +2605,12 @@ for (const auto& c : contacts) {
     t.name = "Trader " + std::to_string((int)contacts.size() + 1);
     t.shield = 35.0;
     t.hull = 55.0;
-    t.cargoValueCr = rng.range(350.0, 900.0);
+
+    // Cargo capacity (kg) varies per trader.
+    t.tradeCapacityKg = rng.range(120.0, 420.0);
+
+    // Assign an initial hauling job (if possible) and load from source inventory.
+    planTraderHaul(t, t.homeStationIndex);
 
     t.ship.setMaxLinearAccelKmS2(0.05);
     t.ship.setMaxAngularAccelRadS2(0.6);
@@ -2701,13 +2806,59 @@ for (const auto& c : contacts) {
         const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
         chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 200000.0, ship.velocityKmS(), 0.0, 0.25, 1.4);
       } else if (currentSystem && !currentSystem->stations.empty()) {
-        // Lazy orbit/patrol around their home station.
-        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
-        const double baseR = st.radiusKm * 26.0;
-        const double ang = std::fmod((double)(c.id % 1000) * 0.01 + timeDays * 0.75, 2.0 * math::kPi);
-        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.15*std::sin(ang*0.7), std::sin(ang)} * baseR;
-        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.18, 1.2);
+        // Hauling between stations in the current system (if possible).
+        if (currentSystem->stations.size() >= 2) {
+          std::size_t destIdx = std::min(c.tradeDestStationIndex, currentSystem->stations.size() - 1);
+          const auto& st = currentSystem->stations[destIdx];
+          const math::Vec3d stPos = stationPosKm(st, timeDays);
+
+          // Approach to comms-range and "trade" (we simulate docking by adjusting inventories).
+          const double desiredDist = std::clamp(st.commsRangeKm * 0.55, st.radiusKm * 6.0, st.radiusKm * 14.0);
+          chaseTarget(c.ship, ai, stPos, stationVelKmS(st, timeDays), desiredDist, 1.20, 1.0);
+
+          const double distKm = (c.ship.positionKm() - stPos).length();
+          const bool arrived = distKm < st.commsRangeKm * 0.65;
+
+          if (arrived && timeDays >= c.tradeCooldownUntilDays) {
+            // Deliver current cargo (if any).
+            auto& stEcon = universe.stationEconomy(st, timeDays);
+            if (c.tradeUnits > 0.0) {
+              const double before = c.tradeUnits;
+              const double delivered = econ::addInventory(stEcon, st.economyModel, c.tradeCommodity, c.tradeUnits);
+              c.tradeUnits = std::max(0.0, c.tradeUnits - delivered);
+              if (c.tradeUnits < 1e-6) c.tradeUnits = 0.0;
+
+              // If storage was full and we couldn't unload everything, pick a different buyer.
+              if (c.tradeUnits > 0.0 && delivered + 1e-6 < before) {
+                c.tradeDestStationIndex = chooseOtherStation(destIdx);
+              }
+            }
+
+            // If empty, load a new haul from this station for the next leg.
+            if (c.tradeUnits <= 0.0) {
+              planTraderHaul(c, destIdx);
+            }
+
+            // Update loot value for piracy / UI.
+            if (c.tradeUnits > 0.0) {
+              const auto q = econ::quote(stEcon, st.economyModel, c.tradeCommodity, 0.10);
+              c.cargoValueCr = std::max(0.0, c.tradeUnits * q.mid);
+            } else {
+              c.cargoValueCr = 0.0;
+            }
+
+            // Cooldown to prevent multiple trades in one arrival.
+            c.tradeCooldownUntilDays = timeDays + (20.0 / 86400.0);
+          }
+        } else {
+          // Single-station systems: lazy orbit/patrol around their home station.
+          const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
+          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const double baseR = st.radiusKm * 26.0;
+          const double ang = std::fmod((double)(c.id % 1000) * 0.01 + timeDays * 0.75, 2.0 * math::kPi);
+          const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.15*std::sin(ang*0.7), std::sin(ang)} * baseR;
+          chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.18, 1.2);
+        }
       }
 
       c.ship.step(dtSim, ai);
@@ -3090,6 +3241,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 if (have + 1e-6 >= m.units) {
                   cargo[(std::size_t)cid] -= m.units;
                   if (cargo[(std::size_t)cid] < 1e-6) cargo[(std::size_t)cid] = 0.0;
+
+                  // Feed delivered cargo back into the destination market (best-effort).
+                  // This helps keep the economy "conservative" when missions move real commodities around.
+                  for (const auto& stHere : currentSystem->stations) {
+                    if (stHere.id == here) {
+                      auto& econHere = universe.stationEconomy(stHere, timeDays);
+                      econ::addInventory(econHere, stHere.economyModel, cid, m.units);
+                      break;
+                    }
+                  }
 
                   m.completed = true;
                   credits += m.reward;
@@ -4017,11 +4178,17 @@ if (showScanner) {
             } else if (fuelBuy <= 0.01) {
               toast(toasts, "Station is out of fuel.", 2.0);
             } else if (credits >= fuelCost) {
-              credits -= fuelCost;
-              fuel += fuelBuy;
-              // Reduce station inventory (best-effort).
-              stEcon.inventory[(std::size_t)econ::CommodityId::Fuel] = std::max(0.0, fuelAvail - fuelBuy);
-              toast(toasts, "Refueled.", 2.0);
+              // Take fuel from the station's commodity inventory (clamped). We charge for the
+              // amount actually transferred (useful if inventories are changing due to NPC traffic).
+              const double taken = econ::takeInventory(stEcon, station.economyModel, econ::CommodityId::Fuel, fuelBuy);
+              if (taken <= 0.01) {
+                toast(toasts, "Station is out of fuel.", 2.0);
+              } else {
+                const double cost = taken * fuelQuote.ask * (1.0 + feeEff);
+                credits -= cost;
+                fuel += taken;
+                toast(toasts, "Refueled.", 2.0);
+              }
             } else {
               toast(toasts, "Not enough credits to refuel.", 2.0);
             }
@@ -4799,8 +4966,8 @@ if (canTrade) {
                 if (offerIdx >= missionOffers.size()) return false;
 
                 sim::Mission m = missionOffers[offerIdx];
-                // If it's a delivery, ensure we can fit the cargo and (if required) auto-buy it.
-                if (m.type == sim::MissionType::Delivery && m.units > 0.0) {
+                // If it's a delivery, ensure we can fit the cargo and (if required) auto-buy/provide it.
+                if ((m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery) && m.units > 0.0) {
                   const double massKg = econ::commodityDef(m.commodity).massKg;
                   const double needKg = massKg * (double)m.units;
                   if (cargoMassKg(cargo) + needKg > cargoCapacityKg + 1e-6) {
@@ -4809,8 +4976,15 @@ if (canTrade) {
                   }
 
                   if (m.cargoProvided) {
-                    cargo[(int)m.commodity] += m.units;
-                    stEcon.inventory[(int)m.commodity] = std::max(0.0, stEcon.inventory[(int)m.commodity] - (double)m.units);
+                    // Provided cargo should come from real station inventory (no free duplication).
+                    const double taken = econ::takeInventory(stEcon, st.economyModel, m.commodity, (double)m.units);
+                    if (taken + 1e-6 < (double)m.units) {
+                      // Restore any partial transfer and fail.
+                      econ::addInventory(stEcon, st.economyModel, m.commodity, taken);
+                      toast(toasts, "Station can't provide that much cargo right now.", 2.8);
+                      return false;
+                    }
+                    cargo[(int)m.commodity] += taken;
                   } else {
                     const auto q = econ::quote(stEcon, st.economyModel, m.commodity, 0.10);
                     const double totalCost = q.ask * (double)m.units * (1.0 + feeEff);
@@ -4868,7 +5042,9 @@ if (canTrade) {
                   const double needKg = massKg * (double)o.units;
                   if (needKg > cargoCapacityKg + 1e-6) continue;
 
-                  if (!o.cargoProvided) {
+                  if (o.cargoProvided) {
+                    if (stEcon.inventory[(int)o.commodity] + 1e-6 < (double)o.units) continue;
+                  } else {
                     const auto q = econ::quote(stEcon, st.economyModel, o.commodity, 0.10);
                     const double totalCost = q.ask * (double)o.units * (1.0 + feeEff);
                     if (q.inventory + 1e-6 < (double)o.units) continue;
@@ -4914,10 +5090,23 @@ if (canTrade) {
                 }
 
                 bool canAccept = (missions.size() < 16);
-                if (offer.cargoProvided) {
+
+                // Basic pre-flight validation for cargo missions (so the "Accept" button behaviour matches the toast checks).
+                const bool isDelivery = (offer.type == sim::MissionType::Delivery || offer.type == sim::MissionType::MultiDelivery);
+                if (isDelivery && offer.units > 0.0) {
                   const econ::CommodityId cid = offer.commodity;
-                  const double addKg = (double)offer.units * econ::commodityDef(cid).massKg;
+                  const double massKg = econ::commodityDef(cid).massKg;
+                  const double addKg = (double)offer.units * massKg;
                   canAccept = canAccept && (cargoMassKg(cargo) + addKg <= cargoCapacityKg + 1e-6);
+
+                  if (offer.cargoProvided) {
+                    // Cargo-provided offers must be backed by real station inventory.
+                    canAccept = canAccept && (stEcon.inventory[(int)cid] + 1e-6 >= (double)offer.units);
+                  } else {
+                    const auto q = econ::quote(stEcon, st.economyModel, cid, 0.10);
+                    const double totalCost = q.ask * (double)offer.units * (1.0 + feeEff);
+                    canAccept = canAccept && (q.inventory + 1e-6 >= (double)offer.units) && (credits + 1e-6 >= totalCost);
+                  }
                 }
 
                 const bool acceptDisabled = (!dockedHere) || (!canAccept);
@@ -5014,7 +5203,21 @@ if (showContacts) {
     ImGui::TextDisabled("Dist %.0f km | Hull %.0f | Shield %.0f", distKm, c.hull, c.shield);
 
     if (c.role == ContactRole::Trader) {
-      ImGui::TextDisabled("Cargo value ~%.0f cr (piracy is illegal).", c.cargoValueCr);
+      std::string destName = "?";
+      if (currentSystem && c.tradeDestStationIndex < currentSystem->stations.size()) {
+        destName = currentSystem->stations[c.tradeDestStationIndex].name;
+      }
+
+      const char* cName = econ::commodityDef(c.tradeCommodity).name;
+      if (c.tradeUnits > 0.0) {
+        ImGui::TextDisabled("Hauling %.0fu %s -> %s | Cargo value ~%.0f cr (piracy is illegal).",
+                            c.tradeUnits,
+                            cName,
+                            destName.c_str(),
+                            c.cargoValueCr);
+      } else {
+        ImGui::TextDisabled("En route -> %s | Empty hold (piracy is illegal).", destName.c_str());
+      }
     }
 
     ImGui::Separator();

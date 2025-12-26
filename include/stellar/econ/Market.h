@@ -18,6 +18,20 @@ struct TradeResult {
   const char* reason{nullptr};
 };
 
+// Inventory helpers (no credit handling)
+//
+// These are useful for NPC traffic, mission cargo provisioning, refueling, etc.
+// They clamp to [0, capacity] and return the number of units actually moved.
+double takeInventory(StationEconomyState& state,
+                     const StationEconomyModel& model,
+                     CommodityId id,
+                     double units);
+
+double addInventory(StationEconomyState& state,
+                    const StationEconomyModel& model,
+                    CommodityId id,
+                    double units);
+
 MarketQuote quote(const StationEconomyState& state,
                   const StationEconomyModel& model,
                   CommodityId id,

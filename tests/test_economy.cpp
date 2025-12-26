@@ -79,6 +79,36 @@ int test_economy() {
     }
   }
 
+  // Inventory helper clamps
+  {
+    using stellar::econ::CommodityId;
+    const std::size_t iFood = static_cast<std::size_t>(CommodityId::Food);
+    const double before = econ10.inventory[iFood];
+
+    const double take = stellar::econ::takeInventory(econ10, station.economyModel, CommodityId::Food, before + 9999.0);
+    if (std::abs(take - before) > 1e-9) {
+      std::cerr << "[test_economy] takeInventory didn't clamp to available inventory\n";
+      ++fails;
+    }
+    if (econ10.inventory[iFood] < -1e-9) {
+      std::cerr << "[test_economy] takeInventory produced negative inventory\n";
+      ++fails;
+    }
+
+    // Fill to capacity and ensure addInventory clamps.
+    econ10.inventory[iFood] = 0.0;
+    const double cap = station.economyModel.capacity[iFood];
+    const double add = stellar::econ::addInventory(econ10, station.economyModel, CommodityId::Food, cap + 9999.0);
+    if (std::abs(add - cap) > 1e-9) {
+      std::cerr << "[test_economy] addInventory didn't clamp to capacity\n";
+      ++fails;
+    }
+    if (econ10.inventory[iFood] > cap + 1e-9) {
+      std::cerr << "[test_economy] addInventory exceeded capacity\n";
+      ++fails;
+    }
+  }
+
   (void)q0; (void)q10;
 
   if (fails == 0) std::cout << "[test_economy] pass\n";
