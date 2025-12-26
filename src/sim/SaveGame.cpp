@@ -53,12 +53,12 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   for (double u : s.cargo) f << " " << u;
   f << "\n";
 
-// Exploration
-f << "explorationDataCr " << s.explorationDataCr << "\n";
-f << "scannedKeys " << s.scannedKeys.size() << "\n";
-for (core::u64 k : s.scannedKeys) {
-  f << "scan " << k << "\n";
-}
+  // Exploration
+  f << "explorationDataCr " << s.explorationDataCr << "\n";
+  f << "scannedKeys " << s.scannedKeys.size() << "\n";
+  for (core::u64 k : s.scannedKeys) {
+    f << "scan " << k << "\n";
+  }
 
   // Missions
   f << "nextMissionId " << s.nextMissionId << "\n";
@@ -91,11 +91,11 @@ for (core::u64 k : s.scannedKeys) {
     f << "rep " << r.factionId << " " << r.rep << "\n";
   }
 
-// Bounties
-f << "bounties " << s.bounties.size() << "\n";
-for (const auto& b : s.bounties) {
-  f << "bounty " << b.factionId << " " << b.bountyCr << "\n";
-}
+  // Bounties
+  f << "bounties " << s.bounties.size() << "\n";
+  for (const auto& b : s.bounties) {
+    f << "bounty " << b.factionId << " " << b.bountyCr << "\n";
+  }
 
   f << "station_overrides " << s.stationOverrides.size() << "\n";
   for (const auto& ov : s.stationOverrides) {
@@ -208,21 +208,30 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       out.weaponSecondary = (core::u8)std::clamp(v, 0, 255);
     } else if (key == "cargo") {
       for (std::size_t i = 0; i < econ::kCommodityCount; ++i) f >> out.cargo[i];
-} else if (key == "explorationDataCr") {
-  f >> out.explorationDataCr;
-} else if (key == "scannedKeys") {
-  std::size_t n = 0;
-  f >> n;
-  out.scannedKeys.clear();
-  out.scannedKeys.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    std::string tag;
-    f >> tag;
-    if (tag != "scan") break;
-    core::u64 k = 0;
-    f >> k;
-    out.scannedKeys.push_back(k);
-  }
+    } else if (key == "explorationDataCr") {
+      f >> out.explorationDataCr;
+    } else if (key == "scannedKeys") {
+      std::size_t n = 0;
+      f >> n;
+      out.scannedKeys.clear();
+      out.scannedKeys.reserve(n);
+
+      // Read scan entries robustly.
+      // If the count is stale/corrupt, fall back to stopping when we no longer
+      // see a "scan" tag, *without* consuming the next top-level key.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "scan") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        core::u64 k = 0;
+        if (!(f >> k)) break;
+        out.scannedKeys.push_back(k);
+      }
     } else if (key == "nextMissionId") {
       f >> out.nextMissionId;
     } else if (key == "missions") {
@@ -288,19 +297,26 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         f >> r.factionId >> r.rep;
         out.reputation.push_back(std::move(r));
       }
-} else if (key == "bounties") {
-  std::size_t n = 0;
-  f >> n;
-  out.bounties.clear();
-  out.bounties.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    std::string tag;
-    f >> tag;
-    if (tag != "bounty") break;
-    FactionBounty b;
-    f >> b.factionId >> b.bountyCr;
-    out.bounties.push_back(std::move(b));
-  }
+    } else if (key == "bounties") {
+      std::size_t n = 0;
+      f >> n;
+      out.bounties.clear();
+      out.bounties.reserve(n);
+
+      // Same robustness strategy as scannedKeys.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "bounty") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        FactionBounty b{};
+        if (!(f >> b.factionId >> b.bountyCr)) break;
+        out.bounties.push_back(std::move(b));
+      }
     } else if (key == "station_overrides") {
       std::size_t n = 0;
       f >> n;

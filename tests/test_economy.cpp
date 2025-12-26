@@ -21,6 +21,34 @@ int test_economy() {
 
   const auto& station = sys.stations.front();
 
+  // Determinism check: two fresh universes with the same seed should
+  // produce identical station economy states at the same timestamp.
+  {
+    stellar::sim::Universe uA(123);
+    stellar::sim::Universe uB(123);
+
+    auto stubsA = uA.queryNearby({0,0,0}, 60.0, 8);
+    auto stubsB = uB.queryNearby({0,0,0}, 60.0, 8);
+
+    const auto& sysA = uA.getSystem(stubsA.front().id, &stubsA.front());
+    const auto& sysB = uB.getSystem(stubsB.front().id, &stubsB.front());
+
+    const auto& stA = sysA.stations.front();
+    const auto& stB = sysB.stations.front();
+
+    auto& econA = uA.stationEconomy(stA, 10.0);
+    auto& econB = uB.stationEconomy(stB, 10.0);
+
+    const auto cid = static_cast<std::size_t>(stellar::econ::CommodityId::Food);
+    const double invA = econA.inventory[cid];
+    const double invB = econB.inventory[cid];
+    if (std::abs(invA - invB) > 1e-8) {
+      std::cerr << "[test_economy] determinism mismatch (Food inventory) "
+                << invA << " vs " << invB << "\n";
+      ++fails;
+    }
+  }
+
   auto& econ0 = u.stationEconomy(station, 0.0);
   const auto q0 = stellar::econ::quote(econ0, station.economyModel, stellar::econ::CommodityId::Food);
 

@@ -38,7 +38,7 @@ void Universe::setCacheCaps(std::size_t sectorCap, std::size_t systemCap, std::s
   stationEconomyCache_.setCapacity(stationCap);
 }
 
-proc::Sector Universe::sector(const proc::SectorCoord& coord) {
+const proc::Sector& Universe::sector(const proc::SectorCoord& coord) {
   if (auto* cached = sectorCache_.get(coord)) return *cached;
   auto sec = galaxyGen_.generateSector(coord, factions_);
   return sectorCache_.put(coord, std::move(sec));
@@ -71,7 +71,7 @@ std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
     for (core::i32 y = minC.y; y <= maxC.y; ++y) {
       for (core::i32 z = minC.z; z <= maxC.z; ++z) {
         const proc::SectorCoord c{x,y,z};
-        const proc::Sector sec = sector(c);
+        const proc::Sector& sec = sector(c);
 
         for (const auto& stub : sec.systems) {
           const math::Vec3d d = stub.posLy - posLy;
@@ -116,7 +116,7 @@ const StarSystem& Universe::getSystem(SystemId id, const SystemStub* hintStub) {
     core::u32 localIndex = 0;
     const proc::SectorCoord c = decodeSector(id, localIndex);
 
-    const proc::Sector sec = sector(c);
+    const proc::Sector& sec = sector(c);
 
     auto it = std::lower_bound(sec.systems.begin(), sec.systems.end(), id,
                                [](const SystemStub& s, SystemId idv) { return s.id < idv; });

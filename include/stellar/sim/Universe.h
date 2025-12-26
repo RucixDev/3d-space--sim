@@ -123,7 +123,9 @@ private:
     std::unordered_map<Key, Entry, Hash> map_{};
   };
 
-  proc::Sector sector(const proc::SectorCoord& coord);
+  // Return a cached sector (generated on-demand). Returning by reference avoids
+  // copying potentially large stub vectors during frequent queries.
+  const proc::Sector& sector(const proc::SectorCoord& coord);
 
   core::u64 seed_{0};
   proc::GalaxyParams galaxyParams_{};

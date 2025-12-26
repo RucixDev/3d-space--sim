@@ -180,22 +180,52 @@ double midPrice(const StationEconomyState& state, const StationEconomyModel& mod
 void updateEconomyTo(StationEconomyState& state,
                      const StationEconomyModel& model,
                      double timeDays,
-                     core::SplitMix64& /*rng*/,
+                     core::SplitMix64& rng,
                      double sampleIntervalDays) {
   if (timeDays <= state.lastUpdateDay) return;
 
+  // Defensive clamp: avoid weird sampling behavior / infinite loops.
+  sampleIntervalDays = std::max(1e-6, sampleIntervalDays);
+
+  // Economy shocks need to be deterministic and *independent of update cadence*.
+  // We do this by deriving a stable per-station base seed, then using an integer
+  // day index to generate a fixed shock value for each commodity.
+  //
+  // NOTE: Universe::stationEconomy() currently re-seeds the RNG each call, so we
+  // must not rely on RNG state continuity across calls.
+  const core::u64 baseSeed = rng.nextU64();
+  const double shockVol = std::max(0.0, model.shockVolatility);
+
   double t = state.lastUpdateDay;
 
-  // Step in chunks so we can sample prices on a reasonable cadence.
+  // Step at most one day at a time so our day-indexed shocks remain stable.
   while (t < timeDays) {
-    const double step = std::min(1.0, timeDays - t); // 1 day max step
+    const double day = std::floor(t);
+    const double nextDay = day + 1.0;
+    const double tNext = std::min(timeDays, nextDay);
+    const double step = std::max(0.0, tNext - t);
+
+    // Pre-mix a day seed once per loop.
+    const core::u64 daySeed = core::hashCombine(baseSeed, static_cast<core::u64>(day));
+
     for (std::size_t i = 0; i < kCommodityCount; ++i) {
-      const double net = model.productionPerDay[i] - model.consumptionPerDay[i];
+      double net = model.productionPerDay[i] - model.consumptionPerDay[i];
+
+      if (shockVol > 0.0) {
+        // Deterministic daily shock in [-1, 1].
+        // Scaled by desired stock so all commodities get comparable *relative* drift.
+        core::SplitMix64 srng(core::hashCombine(daySeed, static_cast<core::u64>(i)));
+        const double noise = srng.nextDouble() * 2.0 - 1.0;
+        const double desired = std::max(1e-9, model.desiredStock[i]);
+        const double shockUnitsPerDay = noise * shockVol * desired;
+        net += shockUnitsPerDay;
+      }
+
       state.inventory[i] += net * step;
       state.inventory[i] = std::max(0.0, std::min(state.inventory[i], model.capacity[i]));
     }
 
-    t += step;
+    t = tNext;
 
     if (t - state.lastSampleDay >= sampleIntervalDays) {
       for (std::size_t i = 0; i < kCommodityCount; ++i) {
