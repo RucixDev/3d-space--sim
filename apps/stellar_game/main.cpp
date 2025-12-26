@@ -340,9 +340,13 @@ struct Contact {
   bool hostileToPlayer{false}; // police become hostile when you're wanted / shoot them
   double fleeUntilDays{0.0};   // traders flee after being attacked
 
-  // Combat stats
+  // Combat stats (very lightweight for now, but enough for early combat/mining loops)
   double shield{60.0};
+  double shieldMax{60.0};
+  double shieldRegenPerSec{0.0}; // points per simulated second
+
   double hull{70.0};
+  double hullMax{70.0};
 
   // Traders can have an approximate loot value (paid on destruction for now).
   double cargoValueCr{0.0};
@@ -383,8 +387,15 @@ struct AsteroidNode {
   core::u64 id{0};
   math::Vec3d posKm{0,0,0};
   double radiusKm{2500.0};
-  econ::CommodityId yieldCommodity{econ::CommodityId::Ore};
-  double remainingUnits{120.0}; // units of yieldCommodity remaining
+
+  // What this asteroid yields when mined / prospected.
+  econ::CommodityId yield{econ::CommodityId::Ore};
+
+  // Units remaining inside the rock.
+  double remainingUnits{120.0};
+
+  // Mining can generate fractional chunks; accumulate and emit whole units over time.
+  double chunkAccumulator{0.0};
 };
 
 enum class SignalType : int {
@@ -407,7 +418,12 @@ struct SignalSource {
   SignalType type{SignalType::Distress};
   math::Vec3d posKm{0,0,0};
   double expireDay{0.0};
-  bool resolved{false}; // whether it has "spawned" its content
+
+  // Whether the player has "resolved" this site (i.e., we have fired its one-shot content).
+  bool resolved{false};
+
+  // Some sites (resource fields) need a second one-shot flag even after 'resolved' for clarity / future expansion.
+  bool fieldSpawned{false};
 };
 
 static void applyDamage(double dmg, double& shield, double& hull) {
@@ -827,6 +843,11 @@ int main(int argc, char** argv) {
   double playerHull = 100.0;
   double weaponPrimaryCooldown = 0.0;   // simulated seconds
   double weaponSecondaryCooldown = 0.0; // simulated seconds
+
+  // Baseline NPC combat tuning (used for random encounters / ambushes)
+  const double npcShieldMax = 80.0;
+  const double npcHullMax = 90.0;
+  const double npcShieldRegenPerSec = 0.035; // points per simulated second (~2.1 per sim minute)
 
   auto recalcPlayerStats = [&]() {
     const auto& hull = kHullDefs[(int)shipHullClass];
@@ -1478,7 +1499,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   // --- Gameplay helpers ---
   auto cargoValueEstimateCr = [&]() -> double {
     double v = 0.0;
-    for (int i = 0; i < (int)econ::CommodityId::COUNT; ++i) {
+    for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
       const auto cid = (econ::CommodityId)i;
       const double units = cargo[i];
       if (units <= 0.0) continue;
@@ -1488,14 +1509,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   };
 
   auto spawnCargoPod = [&](econ::CommodityId cid, double units, const math::Vec3d& posKm,
-                          const math::Vec3d& inheritVelKmS) {
+                          const math::Vec3d& inheritVelKmS, double scatterMaxKmS) {
     if (units <= 0.0) return;
     FloatingCargo pod{};
     pod.id = allocWorldId();
     pod.commodity = cid;
     pod.units = units;
     pod.posKm = posKm;
-    pod.velKmS = inheritVelKmS + randUnit() * rng.range(0.0, 1.2);
+    pod.velKmS = inheritVelKmS + randUnit() * rng.range(0.0, std::max(0.0, scatterMaxKmS));
     pod.expireDay = timeDays + (rng.range(8.0 * 60.0, 18.0 * 60.0) / 86400.0); // 8–18 min
     floatingCargo.push_back(pod);
   };
@@ -1509,7 +1530,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     for (int i = 0; i < pods; ++i) {
       // Small random split so the last pod isn't always tiny.
       const double u = (i == pods - 1) ? (totalUnits - per * (pods - 1)) : (per * rng.range(0.75, 1.25));
-      spawnCargoPod(cid, std::max(0.0, u), posKm, inheritVelKmS);
+      spawnCargoPod(cid, std::max(0.0, u), posKm, inheritVelKmS, 1.2);
     }
   };
 
@@ -1597,7 +1618,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	          for (int i = 0; i < pods; ++i) {
 	            const auto cid = kPirateLoot[rng.range<int>(0, (int)std::size(kPirateLoot) - 1)];
 	            const double units = (double)rng.range<int>(4, 14);
-	            spawnCargoPod(cid, units, deadPos, deadVel);
+	            spawnCargoPod(cid, units, deadPos, deadVel, 1.0);
 	          }
 	        } else if (deadRole == ContactRole::Trader) {
 	          // Traders drop their carried commodity as pods (ties piracy -> scooping loop).
@@ -3180,6 +3201,9 @@ for (const auto& c : contacts) {
     p.id = std::max<core::u64>(1, rng.nextU64());
     p.role = ContactRole::Pirate;
     p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
+    p.shieldMax = p.shield;
+    p.hullMax = p.hull;
+    p.shieldRegenPerSec = npcShieldRegenPerSec * 0.8;
     p.ship.setMaxLinearAccelKmS2(0.06);
     p.ship.setMaxAngularAccelRadS2(0.9);
 
@@ -3202,7 +3226,9 @@ for (const auto& c : contacts) {
     t.homeStationIndex = chooseHomeStation();
     t.name = "Trader " + std::to_string((int)contacts.size() + 1);
     t.shield = 35.0;
+    t.shieldMax = t.shield;
     t.hull = 55.0;
+    t.hullMax = t.hull;
 
     // Cargo capacity (kg) varies per trader.
     t.tradeCapacityKg = rng.range(120.0, 420.0);
@@ -3229,7 +3255,10 @@ for (const auto& c : contacts) {
     p.homeStationIndex = chooseHomeStation();
     p.name = "Security " + std::to_string((int)contacts.size() + 1);
     p.shield = 90.0;
+    p.shieldMax = p.shield;
+    p.shieldRegenPerSec = npcShieldRegenPerSec;
     p.hull = 90.0;
+    p.hullMax = p.hull;
 
     p.ship.setMaxLinearAccelKmS2(0.075);
     p.ship.setMaxAngularAccelRadS2(1.05);
@@ -3300,7 +3329,10 @@ for (const auto& c : contacts) {
       tgt.missionTarget = true;
       tgt.name = "Bounty Target";
       tgt.shield = 80.0;
+      tgt.shieldMax = tgt.shield;
+      tgt.shieldRegenPerSec = npcShieldRegenPerSec * 0.9;
       tgt.hull = 90.0;
+      tgt.hullMax = tgt.hull;
       tgt.ship.setMaxLinearAccelKmS2(0.07);
       tgt.ship.setMaxAngularAccelRadS2(1.0);
 
@@ -4235,7 +4267,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	            if (takeUnits >= 1e-4) {
 	              cargo[(int)pod.commodity] += takeUnits;
 	              pod.units -= takeUnits;
-	              toast(toasts, "Scooped " + def.name + " x" + std::to_string((int)takeUnits), 2.0);
+	              toast(toasts, std::string("Scooped ") + def.name + " x" + std::to_string((int)takeUnits), 2.0);
 	            } else {
 	              if (timeDays > cargoFullToastCooldownUntilDays) {
 	                cargoFullToastCooldownUntilDays = timeDays + (4.0 / 86400.0);
@@ -4376,6 +4408,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       // Shield regen (slow)
       if (!paused && playerHull > 0.0 && playerShield < playerShieldMax) {
         playerShield = std::min(playerShieldMax, playerShield + playerShieldRegenPerSimMin * (dtSim / 60.0));
+      }
+
+      // NPC shield regen (simple; gives fights a bit of pacing without heavy AI)
+      for (auto& c : contacts) {
+        if (!c.alive) continue;
+        if (c.hull <= 0.0) continue;
+        if (c.shieldRegenPerSec <= 0.0) continue;
+        if (c.shieldMax <= 0.0) continue;
+        if (c.shield >= c.shieldMax) continue;
+        c.shield = std::min(c.shieldMax, c.shield + c.shieldRegenPerSec * dtSim);
       }
     }
 
@@ -5303,7 +5345,7 @@ if (showScanner) {
 	      if (a.remainingUnits <= 1e-3) continue;
 	      const double distKm = (a.posKm - ship.positionKm()).length();
 	      ImGui::PushID((int)i + 12000);
-	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name.c_str(),
+	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name,
 	                  std::round(std::max(0.0, a.remainingUnits)), distKm);
 	      ImGui::SameLine();
 	      if (ImGui::SmallButton("Target##ast")) {
@@ -5328,7 +5370,7 @@ if (showScanner) {
 	      const double distKm = (pod.posKm - ship.positionKm()).length();
 	      const double minsLeft = (pod.expireDay > 0.0) ? (pod.expireDay - timeDays) * 1440.0 : 0.0;
 	      ImGui::PushID((int)i + 15000);
-	      ImGui::Text("%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name.c_str(),
+	      ImGui::Text("%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name,
 	                  std::round(std::max(0.0, pod.units)), distKm, (int)std::round(std::max(0.0, minsLeft)));
 	      ImGui::SameLine();
 	      if (ImGui::SmallButton("Target##pod")) {
