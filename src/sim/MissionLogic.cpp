@@ -8,6 +8,7 @@
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -62,41 +63,83 @@ void refreshMissionOffers(Universe& universe,
 
   const double repScale = 1.0 + std::clamp(playerRep, 0.0, 100.0) / 100.0 * params.repRewardBonus;
 
-  for (int i = 0; i < offerCount && !dests.empty(); ++i) {
-    const int pick = (int)(mrng.nextU32() % (core::u32)dests.size());
-    const auto destStub = dests[(std::size_t)pick];
-    const auto& destSys = universe.getSystem(destStub.id, &destStub);
-    const auto& destSt = destSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)destSys.stations.size())];
+    // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
+  const double tCourier = params.wCourier;
+  const double tDelivery = tCourier + params.wDelivery;
+  const double tMulti = tDelivery + params.wMultiDelivery;
+  const double tSalvage = tMulti + params.wSalvage;
+  const double tPassenger = tSalvage + params.wPassenger;
+  const double tSmuggle = tPassenger + params.wSmuggle;
+  const double tBountyScan = tSmuggle + params.wBountyScan;
 
-    const double distLy = (destStub.posLy - currentSystem.stub.posLy).length();
+  for (int i = 0; i < offerCount; ++i) {
+    const double r = mrng.nextUnit();
+
+    MissionType type = MissionType::BountyKill;
+    if (r < tCourier) type = MissionType::Courier;
+    else if (r < tDelivery) type = MissionType::Delivery;
+    else if (r < tMulti) type = MissionType::MultiDelivery;
+    else if (r < tSalvage) type = MissionType::Salvage;
+    else if (r < tPassenger) type = MissionType::Passenger;
+    else if (r < tSmuggle) type = MissionType::Smuggle;
+    else if (r < tBountyScan) type = MissionType::BountyScan;
+    else type = MissionType::BountyKill;
+
+    // Multi-hop deliveries need at least two distinct candidate systems.
+    if (type == MissionType::MultiDelivery && dests.size() < 2) {
+      type = MissionType::Delivery;
+    }
+
+    // If we don't have any destination candidates, we can still offer local Salvage jobs.
+    if (type != MissionType::Salvage && dests.empty()) {
+      type = MissionType::Salvage;
+    }
 
     Mission m{};
     m.id = 0; // offers are not persisted as "accepted" missions
     m.factionId = dockedStation.factionId;
     m.fromSystem = currentSystem.stub.id;
     m.fromStation = dockedStation.id;
-    m.toSystem = destStub.id;
-    m.toStation = destSt.id;
-    m.deadlineDay = timeDays + 1.0 + distLy / 20.0;
 
-    const double r = mrng.nextUnit();
-    const double tCourier = params.wCourier;
-    const double tDelivery = tCourier + params.wDelivery;
-    const double tMulti = tDelivery + params.wMultiDelivery;
-    const double tPassenger = tMulti + params.wPassenger;
-    const double tSmuggle = tPassenger + params.wSmuggle;
-    const double tBountyScan = tSmuggle + params.wBountyScan;
+    // Default to a local job that returns to the issuing station.
+    m.toSystem = currentSystem.stub.id;
+    m.toStation = dockedStation.id;
 
-    if (r < tCourier) {
+    // Default deadline (overridden per type)
+    m.deadlineDay = timeDays + 1.0;
+
+    double distLy = 0.0;
+    const Station* destSt = nullptr;
+    sim::SystemStub destStub{};
+
+    if (type != MissionType::Salvage) {
+      // Pick a random destination system/station from nearby candidates.
+      const int pick = (int)(mrng.nextU32() % (core::u32)dests.size());
+      destStub = dests[(std::size_t)pick];
+      const auto& destSys = universe.getSystem(destStub.id, &destStub);
+      if (destSys.stations.empty()) continue;
+      destSt = &destSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)destSys.stations.size())];
+
+      m.toSystem = destStub.id;
+      m.toStation = destSt->id;
+
+      distLy = (destStub.posLy - currentSystem.stub.posLy).length();
+      m.deadlineDay = timeDays + 1.0 + distLy / 20.0;
+    } else {
+      // Salvage is a local in-system job: make it snappy.
+      m.deadlineDay = timeDays + 0.35 + mrng.range(0.05, 0.20);
+    }
+
+    if (type == MissionType::Courier) {
       m.type = MissionType::Courier;
       m.reward = 350.0 + distLy * 110.0;
-    } else if (r < tDelivery) {
+    } else if (type == MissionType::Delivery) {
       m.type = MissionType::Delivery;
       m.commodity = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
       m.units = 25 + (mrng.nextU32() % 120);
       m.reward = 250.0 + distLy * 120.0 + (double)m.units * 6.0;
       m.cargoProvided = (mrng.nextUnit() < 0.25);
-    } else if (r < tMulti && dests.size() >= 2) {
+    } else if (type == MissionType::MultiDelivery) {
       m.type = MissionType::MultiDelivery;
       m.commodity = (econ::CommodityId)(mrng.nextU32() % (core::u32)econ::kCommodityCount);
       m.units = 20 + (mrng.nextU32() % 100);
@@ -116,7 +159,27 @@ void refreshMissionOffers(Universe& universe,
       }
       // Slightly longer default deadline for multi-hop.
       m.deadlineDay = timeDays + 2.0 + distLy / 18.0;
-    } else if (r < tPassenger) {
+    } else if (type == MissionType::Salvage) {
+      m.type = MissionType::Salvage;
+
+      // Salvage jobs are local: recover loose goods from a mission derelict signal and return here.
+      static const std::array<econ::CommodityId, 4> kSalvage = {
+        econ::CommodityId::Machinery,
+        econ::CommodityId::Electronics,
+        econ::CommodityId::Metals,
+        econ::CommodityId::Luxury,
+      };
+
+      m.commodity = kSalvage[(std::size_t)(mrng.nextU32() % (core::u32)kSalvage.size())];
+      m.units = 3 + (mrng.nextU32() % 12);
+
+      const double base = econ::commodityDef(m.commodity).basePrice;
+      m.reward = 520.0 + (double)m.units * base * 1.05 + mrng.range(0.0, 180.0);
+
+      // Reuse targetNpcId as a stable "signal id" so the game can spawn/track the mission site.
+      m.targetNpcId = (mrng.nextU64() | 0x8000000000000000ull);
+      m.cargoProvided = false;
+    } else if (type == MissionType::Passenger) {
       m.type = MissionType::Passenger;
       // units is interpreted as "passenger count" for Passenger missions.
       m.units = 1 + (mrng.nextU32() % 8);
@@ -125,12 +188,12 @@ void refreshMissionOffers(Universe& universe,
       // Slightly tighter deadline than courier to encourage routing decisions.
       m.deadlineDay = timeDays + 0.9 + distLy / 24.0;
       m.cargoProvided = false;
-    } else if (r < tSmuggle) {
+    } else if (type == MissionType::Smuggle) {
       m.type = MissionType::Smuggle;
 
       // Pick a commodity that is illegal in the destination's jurisdiction.
       // Smuggling jobs are treated as "cargo provided" by the contact (not drawn from open-market inventory).
-      const core::u32 destFaction = destSt.factionId;
+      const core::u32 destFaction = destSt ? destSt->factionId : 0;
       const core::u32 mask = illegalCommodityMask(universe.seed(), destFaction);
 
       std::vector<econ::CommodityId> illegal;
@@ -151,7 +214,7 @@ void refreshMissionOffers(Universe& universe,
       m.reward = 650.0 + distLy * 155.0 + (double)m.units * 18.0;
       m.deadlineDay = timeDays + 1.2 + distLy / 19.0;
       m.cargoProvided = true;
-    } else if (r < tBountyScan) {
+    } else if (type == MissionType::BountyScan) {
       m.type = MissionType::BountyScan;
       m.targetNpcId = std::max<core::u64>(1, mrng.nextU64());
       m.reward = 900.0 + distLy * 80.0;
@@ -229,6 +292,18 @@ bool acceptMissionOffer(Universe& universe,
     }
   }
 
+  // Salvage missions don't grant cargo up-front, but we should still ensure the requested salvage will
+  // fit in the player's hold (otherwise the job is impossible to complete).
+  if (m.type == MissionType::Salvage && m.units > 0.0) {
+    const econ::CommodityId cid = m.commodity;
+    const double massKg = std::max(1e-6, econ::commodityDef(cid).massKg);
+    const double needKg = massKg * (double)m.units;
+    if (needKg > ioSave.cargoCapacityKg + 1e-6) {
+      if (outError) *outError = "This salvage won't fit in your cargo hold.";
+      return false;
+    }
+  }
+
   // Passenger missions require cabin capacity.
   if (m.type == MissionType::Passenger) {
     const int party = std::max(0, (int)std::llround(m.units));
@@ -293,6 +368,26 @@ MissionDockResult tryCompleteMissionsAtDock(Universe& universe,
         addReputation(ioSave, m.factionId, repRewardOnComplete);
         ++r.completed;
       }
+    } else if (m.type == MissionType::Salvage) {
+      // Salvage jobs require that the player has actually visited the mission site (m.scanned),
+      // then returned with the requested goods.
+      if (atFinal && m.scanned) {
+        const econ::CommodityId cid = m.commodity;
+        const double have = ioSave.cargo[(std::size_t)cid];
+        if (have + 1e-6 >= m.units) {
+          ioSave.cargo[(std::size_t)cid] -= m.units;
+          if (ioSave.cargo[(std::size_t)cid] < 1e-6) ioSave.cargo[(std::size_t)cid] = 0.0;
+
+          // Feed recovered salvage into the local market (best-effort).
+          auto& econHere = universe.stationEconomy(dockedStation, timeDays);
+          econ::addInventory(econHere, dockedStation.economyModel, cid, m.units);
+
+          m.completed = true;
+          ioSave.credits += m.reward;
+          addReputation(ioSave, m.factionId, repRewardOnComplete);
+          ++r.completed;
+        }
+      }
     } else if (m.type == MissionType::Delivery || m.type == MissionType::MultiDelivery || m.type == MissionType::Smuggle) {
       if (m.type == MissionType::MultiDelivery && m.viaSystem != 0 && m.leg == 0 && atVia) {
         m.leg = 1;
@@ -317,6 +412,54 @@ MissionDockResult tryCompleteMissionsAtDock(Universe& universe,
         }
       }
     }
+  }
+
+  return r;
+}
+
+
+MissionEventResult tryCompleteBountyScan(SaveGame& ioSave,
+                                         SystemId currentSystemId,
+                                         core::u64 targetNpcId,
+                                         double repRewardOnComplete) {
+  MissionEventResult r{};
+  if (currentSystemId == 0 || targetNpcId == 0) return r;
+
+  for (auto& m : ioSave.missions) {
+    if (m.completed || m.failed) continue;
+    if (m.type != MissionType::BountyScan) continue;
+    if (m.toSystem != currentSystemId) continue;
+    if (m.targetNpcId != targetNpcId) continue;
+
+    m.scanned = true;
+    m.completed = true;
+    ioSave.credits += m.reward;
+    addReputation(ioSave, m.factionId, repRewardOnComplete);
+    ++r.completed;
+    r.rewardCr += m.reward;
+  }
+
+  return r;
+}
+
+MissionEventResult tryCompleteBountyKill(SaveGame& ioSave,
+                                         SystemId currentSystemId,
+                                         core::u64 targetNpcId,
+                                         double repRewardOnComplete) {
+  MissionEventResult r{};
+  if (currentSystemId == 0 || targetNpcId == 0) return r;
+
+  for (auto& m : ioSave.missions) {
+    if (m.completed || m.failed) continue;
+    if (m.type != MissionType::BountyKill) continue;
+    if (m.toSystem != currentSystemId) continue;
+    if (m.targetNpcId != targetNpcId) continue;
+
+    m.completed = true;
+    ioSave.credits += m.reward;
+    addReputation(ioSave, m.factionId, repRewardOnComplete);
+    ++r.completed;
+    r.rewardCr += m.reward;
   }
 
   return r;

@@ -24,12 +24,13 @@ struct MissionBoardParams {
   double repThreshold2{50.0};
 
   // Mission type weights (must sum <= 1.0; remainder goes to BountyKill).
-  double wCourier{0.31};
-  double wDelivery{0.31};
-  double wMultiDelivery{0.13};
-  double wPassenger{0.11};
+  double wCourier{0.29};
+  double wDelivery{0.29};
+  double wMultiDelivery{0.12};
+  double wSalvage{0.08};
+  double wPassenger{0.10};
   double wSmuggle{0.04};
-  double wBountyScan{0.06};
+  double wBountyScan{0.05};
 
   // Reward scaling (positive rep only): reward *= 1 + (rep/100)*repRewardBonus
   double repRewardBonus{0.10};
@@ -42,6 +43,11 @@ struct MissionTickResult {
 struct MissionDockResult {
   int completed{0};
   int progressedMultiLeg{0};
+};
+
+struct MissionEventResult {
+  int completed{0};
+  double rewardCr{0.0};
 };
 
 // Ensure SaveGame::missionOffers is populated for the given docked station and day.
@@ -80,5 +86,17 @@ MissionDockResult tryCompleteMissionsAtDock(Universe& universe,
                                             double timeDays,
                                             SaveGame& ioSave,
                                             double repRewardOnComplete = +2.0);
+
+// When you scan a bounty target in-system (prototype scanner), complete matching BountyScan missions.
+MissionEventResult tryCompleteBountyScan(SaveGame& ioSave,
+                                         SystemId currentSystemId,
+                                         core::u64 targetNpcId,
+                                         double repRewardOnComplete = +2.0);
+
+// When you destroy a bounty target in-system, complete matching BountyKill missions.
+MissionEventResult tryCompleteBountyKill(SaveGame& ioSave,
+                                         SystemId currentSystemId,
+                                         core::u64 targetNpcId,
+                                         double repRewardOnComplete = +2.0);
 
 } // namespace stellar::sim

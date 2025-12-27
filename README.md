@@ -8,6 +8,7 @@ This repo contains:
 - A real-time **flight prototype** with ship physics, docking, markets, and combat-lite threats
 - "Ambient" **NPC trade traffic** that nudges station inventories (and therefore prices) over time
 - **Squad encounters**: pirate packs + police wingmen, with basic morale/pursuit escalation
+  - Pirates may demand **tribute** (jettison cargo pods) before they open fire.
 
 ## What’s playable right now (prototype “feel” pass)
 
@@ -31,20 +32,25 @@ This repo contains:
 - Autopilot can fly to the current target.
 - Planet/star collision + low-altitude heating (simple danger close to gravity wells).
 - Projectile lead indicator for kinetic weapons (HUD).
+- Pirates may demand **tribute**: jettison cargo pods to satisfy them (Threat HUD). Tribute pods are removed once paid.
 
 ### Galaxy streaming
 - A simple galaxy map that streams nearby systems from a procedural seed.
+- Galaxy map jump overlay shows both **max jump range** (cargo-limited) and **current-fuel range**.
+- Route plotting supports **Min jumps**, **Min distance**, or **Min fuel** (A*), with an optional "constrain to current-fuel range" toggle.
 - System IDs encode their sector so `Universe::getSystem(id)` works without extra context (useful for saves + nav routes).
 
 ### FSD jump (early hyperspace loop)
 - Select a destination system in the **Galaxy** window and press **J** (or click the button).
 - Requires being undocked, not mass-locked near a station, and having enough fuel.
 - Has a short **charge** and **cooldown** (balance tuning is placeholder).
+- Auto-run routing will stop cleanly if the next hop is out of range or you don't have enough fuel.
 
 ### Missions (early)
 - Dock at a station and open the **Missions** window (**F4**).
-- Accept **Courier**, **Delivery**, **Multi-hop Delivery**, **Smuggle**, and **Passenger** jobs.
+- Accept **Courier**, **Delivery**, **Multi-hop Delivery**, **Salvage**, **Smuggle**, and **Passenger** jobs.
 - Some deliveries require you to source the cargo; others provide it up-front (requires cargo space).
+- **Salvage** jobs spawn a mission derelict signal; recover loose cargo in-system and return for payout.
 - **Smuggle** jobs carry contraband (illegal cargo) and may attract police attention.
 - Passenger jobs require enough **Passenger Seats** (buy cabin upgrades at Shipyards).
 - Accept early **Bounty Scan** / **Bounty Kill** jobs (scan targets with the scanner, or destroy marked criminals).
@@ -59,6 +65,8 @@ This repo contains:
 - Request clearance: **L**
 - Dock/Undock: **G**
 - Autopilot approach: **P**
+- Cargo scoop: **O** deploy/retract (scoop floating cargo pods)
+- Cargo jettison: **Ship / Status → Cargo management** (spawns floating pods)
 - Fire primary/secondary: **Left Mouse / Right Mouse**
 - Supercruise: **H** engage/drop (assist auto-drops in SAFE window)
 - Interdiction: align to escape vector (HUD) | **H** submit
@@ -104,7 +112,7 @@ ctest --test-dir build --output-on-failure
 
 # Plan a jump route (A* hops) inside the queried node set.
 # Tip: increase --radius/--limit if a route cannot be found.
-./build/apps/stellar_sandbox/stellar_sandbox --seed 1337 --radius 200 --route --fromSys 0 --toSys 12 --jr 18
+./build/apps/stellar_sandbox/stellar_sandbox --seed 1337 --radius 200 --route --fromSys 0 --toSys 12 --jr 18 --routeCost fuel
 
 # Emit JSON for scripting / balancing spreadsheets.
 ./build/apps/stellar_sandbox/stellar_sandbox --seed 1337 --radius 120 --trade --cargoKg 240 --json --out trade_scan.json

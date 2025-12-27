@@ -1,3 +1,54 @@
+## 2025-12-27 (Patch) - Salvage recovery missions + mission derelict sites
+- **Missions:** added a new **Salvage** mission type.
+  - Salvage jobs spawn a **mission derelict** signal in-system; recover the requested goods and return to the station for payout.
+  - Completion requires that you have **visited the site** (tracked via `m.scanned`) so you can't instantly complete from dock.
+- **Signals + Scanner:** mission salvage signals and cargo pods are tagged **[MISSION]** in the scanner UI.
+- **Objective + Tracker:** Objective HUD and the Ship/Status mission tracker can now point you at the **mission site** (`Target site`).
+- **Core (MissionLogic):** Mission Board can generate Salvage offers and dock completion now supports Salvage.
+
+## 2025-12-27 (Patch) - Pirate extortion / tribute (combat + cargo loop)
+- **Pirates:** pirate packs may now try **extortion** before opening fire.
+  - A **Threat HUD** appears showing the demanded cargo **value** and **time remaining**.
+  - Use **Ship/Status → Cargo management → Jettison** to drop cargo pods; jettisoned cargo counts toward the demand by **base value**.
+  - If you satisfy the demand, pirates **disengage and flee** (tribute pods are removed to simulate them scooping it).
+  - If you ignore the demand or **attack** the pirates, they immediately **turn hostile**.
+- **Contacts UI:** pirates involved in an active demand are tagged **[DEMAND]**.
+
+## 2025-12-27 (Patch) - Cargo jettison + contraband dump (smuggling QoL)
+- **Ship / Status:** added a **Cargo management** panel to **jettison cargo** (spawns floating pods behind your ship).
+- **Smuggling QoL:** added a one-click **Dump contraband** "panic button" to jettison all illegal goods in the current jurisdiction.
+- **Law:** dumping cargo near authorities (station comms range, during a scan, or near police) is treated as a **crime** and will generate a **bounty** + reputation hit.
+- **Safety:** mission cargo is reserved by default to prevent accidental mission sabotage (toggle: **Allow dumping mission cargo**).
+
+## 2025-12-27 (Patch) - Objective HUD overlay + Mission Board route previews
+- **stellar_game:** added an in-flight **Objective HUD overlay** (top-right) that shows your **tracked mission**, next stop hint, and (if present) a quick **route remaining** summary.
+- **Ship/Status:** added a toggle for the Objective HUD overlay.
+- **Missions (Active):** added a **Plot route** button to quickly plot to the current mission leg and open the Galaxy map.
+- **Mission Board:** optional **route preview** line per offer (A*), showing estimated **jumps / distance / fuel** to the *next stop* under your current route-planner settings.
+
+## 2025-12-27 (Patch) - Mission tracker HUD + auto-plot next leg + save persistence
+- **stellar_game:** added a **Mission tracker** section to **Ship / Status** showing the tracked mission with quick actions: **Select**, **Plot Route**, **Target** (if in-system), and **Untrack**.
+- **stellar_game:** optional **Auto-plot next leg**: when a *tracked* **Multi-delivery** completes leg 1/2, the nav route is automatically re-plotted to the final destination.
+- **Missions UI:** Active missions list now supports **Track/Untrack** and shows a **[TRACKED]** tag.
+- **SaveGame:** persisted `trackedMissionId` (version bumped to **13**) so the tracker survives save/load.
+
+
+## 2025-12-27 (Patch) - Shared mission completion + bounty event helpers + Galaxy system list (QoL)
+- **Core (MissionLogic):** added `tryCompleteBountyScan(...)` and `tryCompleteBountyKill(...)` so bounty missions can be completed via shared, testable logic.
+- **stellar_game:** mission deadline ticking + docked completion now delegate to `sim::MissionLogic` (so prototype behavior matches tooling/tests and avoids duplicated rules).
+- **Tests:** expanded `test_missions` to cover deadline expiry, multi-hop delivery leg progression, and bounty scan/kill completions.
+- **Galaxy UI:** added a searchable/sortable **System list** under the map with an **IN/OUT of jump range** indicator for faster selection.
+
+## 2025-12-27 (Patch) - In-game route planner modes + safer auto-run (stellar_game)
+- **Galaxy UI:** route plotting now supports **Min jumps**, **Min distance**, or **Min fuel** (A*).
+- **Galaxy UI:** added an option to constrain route edges to **current-fuel jump range** (vs max range) for "what can I do right now?" planning.
+- **Galaxy UI:** jump range overlay now shows both **max range** and **current-fuel range** rings.
+- **QoL:** auto-run route now **stops cleanly** (with a single toast) if the next hop is out of range or fuel is insufficient.
+
+## 2025-12-27 (Patch) - Cost-aware route planning (core + stellar_sandbox)
+- **Core:** added `sim::plotRouteAStarCost(...)` to plan routes using a weighted cost model (per jump + per ly).
+- **Tooling:** `stellar_sandbox --route` now supports `--routeCost hops|dist|fuel` (plus `--fuelBase` / `--fuelPerLy`) and reports total cost + fuel estimate.
+
 
 ## 2025-12-27 (Patch) - Alert decay + Lay Low station option
 - **Bugfix/behavior:** local security `policeHeat` now decays over time (exponential decay), so "Alert" cools down naturally as time passes.

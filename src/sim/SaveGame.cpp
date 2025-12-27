@@ -87,6 +87,8 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  f << "trackedMissionId " << s.trackedMissionId << "\n";
+
   // Mission board (cached offers)
   f << "mission_offers_station " << s.missionOffersStationId << "\n";
   f << "mission_offers_day " << s.missionOffersDayStamp << "\n";
@@ -287,6 +289,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (!(f >> k)) break;
         out.scannedKeys.push_back(k);
       }
+    } else if (key == "trackedMissionId") {
+      f >> out.trackedMissionId;
     } else if (key == "nextMissionId") {
       f >> out.nextMissionId;
     } else if (key == "missions") {

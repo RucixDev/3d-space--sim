@@ -99,6 +99,7 @@ std::vector<SystemId> plotRouteAStarHops(const std::vector<SystemStub>& nodes,
     stats.reached = true;
     stats.hops = 0;
     stats.distanceLy = 0.0;
+    stats.cost = 0.0;
     setStats(outStats, stats);
     return {startId};
   }
@@ -124,13 +125,18 @@ std::vector<SystemId> plotRouteAStarHops(const std::vector<SystemStub>& nodes,
   };
 
   struct QN {
-    int f;
-    int g;
-    std::size_t i;
+    int f{0};
+    int g{0};
+    std::size_t i{0};
   };
 
+  // Prefer lower f, then lower g, then lower index (stable/deterministic tie-break).
   struct Cmp {
-    bool operator()(const QN& a, const QN& b) const { return a.f > b.f; }
+    bool operator()(const QN& a, const QN& b) const {
+      if (a.f != b.f) return a.f > b.f;
+      if (a.g != b.g) return a.g > b.g;
+      return a.i > b.i;
+    }
   };
 
   std::priority_queue<QN, std::vector<QN>, Cmp> open;
@@ -160,6 +166,7 @@ std::vector<SystemId> plotRouteAStarHops(const std::vector<SystemStub>& nodes,
       stats.reached = true;
       stats.hops = path.size() > 0 ? (int)path.size() - 1 : 0;
       stats.distanceLy = routeDistanceLy(nodes, path);
+      stats.cost = (double)stats.hops;
 
       setStats(outStats, stats);
       return path;
@@ -200,6 +207,160 @@ std::vector<SystemId> plotRouteAStarHops(const std::vector<SystemStub>& nodes,
   return {};
 }
 
+std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
+                                        SystemId startId,
+                                        SystemId goalId,
+                                        double maxJumpLy,
+                                        double costPerJump,
+                                        double costPerLy,
+                                        RoutePlanStats* outStats,
+                                        std::size_t maxExpansions) {
+  RoutePlanStats stats{};
+
+  if (startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (nodes.empty()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+
+  // Degenerate: no optimization signal. Fall back to the classic hop planner.
+  if (costPerJump <= 0.0 && costPerLy <= 0.0) {
+    return plotRouteAStarHops(nodes, startId, goalId, maxJumpLy, outStats, maxExpansions);
+  }
+
+  const auto idx = buildIndex(nodes);
+  auto itS = idx.find(startId);
+  auto itG = idx.find(goalId);
+  if (itS == idx.end() || itG == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  const std::size_t start = itS->second;
+  const std::size_t goal  = itG->second;
+  const std::size_t N = nodes.size();
+
+  if (start == goal) {
+    stats.reached = true;
+    stats.hops = 0;
+    stats.distanceLy = 0.0;
+    stats.cost = 0.0;
+    setStats(outStats, stats);
+    return {startId};
+  }
+
+  // Spatial hash grid for neighbor queries.
+  const double cellSize = maxJumpLy;
+  std::unordered_map<CellCoord, std::vector<std::size_t>, CellHash> grid;
+  grid.reserve(nodes.size());
+
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    grid[cellFor(nodes[i].posLy, cellSize)].push_back(i);
+  }
+
+  std::vector<int> cameFrom(N, -1);
+  std::vector<double> gScore(N, std::numeric_limits<double>::infinity());
+  std::vector<char> closed(N, 0);
+
+  auto heuristic = [&](std::size_t i) -> double {
+    if (i == goal) return 0.0;
+    const double d = systemDistanceLy(nodes[i], nodes[goal]);
+    const double minHops = std::ceil(d / maxJumpLy);
+    return minHops * costPerJump + d * costPerLy;
+  };
+
+  struct QN {
+    double f{0.0};
+    double g{0.0};
+    std::size_t i{0};
+  };
+
+  struct Cmp {
+    bool operator()(const QN& a, const QN& b) const {
+      if (a.f != b.f) return a.f > b.f;
+      if (a.g != b.g) return a.g > b.g;
+      return a.i > b.i;
+    }
+  };
+
+  std::priority_queue<QN, std::vector<QN>, Cmp> open;
+  gScore[start] = 0.0;
+  open.push(QN{heuristic(start), 0.0, start});
+
+  std::size_t expansions = 0;
+
+  while (!open.empty() && expansions < maxExpansions) {
+    const QN cur = open.top();
+    open.pop();
+
+    if (closed[cur.i]) continue;
+    closed[cur.i] = 1;
+
+    ++expansions;
+    ++stats.visited;
+    stats.expansions = (int)expansions;
+
+    if (cur.i == goal) {
+      std::vector<SystemId> path;
+      for (int at = (int)goal; at != -1; at = cameFrom[(std::size_t)at]) {
+        path.push_back(nodes[(std::size_t)at].id);
+      }
+      std::reverse(path.begin(), path.end());
+
+      stats.reached = true;
+      stats.hops = path.size() > 0 ? (int)path.size() - 1 : 0;
+      stats.distanceLy = routeDistanceLy(nodes, path);
+      stats.cost = gScore[goal];
+
+      setStats(outStats, stats);
+      return path;
+    }
+
+    const CellCoord c = cellFor(nodes[cur.i].posLy, cellSize);
+
+    for (long long dx = -1; dx <= 1; ++dx) {
+      for (long long dy = -1; dy <= 1; ++dy) {
+        for (long long dz = -1; dz <= 1; ++dz) {
+          const CellCoord cc{c.x + dx, c.y + dy, c.z + dz};
+          auto it = grid.find(cc);
+          if (it == grid.end()) continue;
+
+          for (const std::size_t j : it->second) {
+            if (j == cur.i) continue;
+            if (closed[j]) continue;
+
+            const double d = systemDistanceLy(nodes[cur.i], nodes[j]);
+            if (d > maxJumpLy + 1e-9) continue;
+
+            const double legCost = costPerJump + costPerLy * d;
+            const double tentative = gScore[cur.i] + legCost;
+
+            if (tentative + 1e-12 < gScore[j]) {
+              gScore[j] = tentative;
+              cameFrom[j] = (int)cur.i;
+              const double f = tentative + heuristic(j);
+              open.push(QN{f, tentative, j});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  setStats(outStats, stats);
+  return {};
+}
+
 double routeDistanceLy(const std::vector<SystemStub>& nodes,
                        const std::vector<SystemId>& route) {
   if (route.size() < 2) return 0.0;
@@ -212,6 +373,28 @@ double routeDistanceLy(const std::vector<SystemStub>& nodes,
     const auto itB = idx.find(route[i + 1]);
     if (itA == idx.end() || itB == idx.end()) break;
     sum += systemDistanceLy(nodes[itA->second], nodes[itB->second]);
+  }
+  return sum;
+}
+
+double routeCost(const std::vector<SystemStub>& nodes,
+                 const std::vector<SystemId>& route,
+                 double costPerJump,
+                 double costPerLy) {
+  if (route.size() < 2) return 0.0;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+
+  const auto idx = buildIndex(nodes);
+
+  double sum = 0.0;
+  for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+    const auto itA = idx.find(route[i]);
+    const auto itB = idx.find(route[i + 1]);
+    if (itA == idx.end() || itB == idx.end()) break;
+    const double d = systemDistanceLy(nodes[itA->second], nodes[itB->second]);
+    sum += costPerJump + costPerLy * d;
   }
   return sum;
 }

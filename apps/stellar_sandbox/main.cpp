@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -45,6 +46,7 @@ static const char* missionTypeName(sim::MissionType t) {
     case MissionType::MultiDelivery: return "MultiDelivery";
     case MissionType::Passenger: return "Passenger";
     case MissionType::Smuggle: return "Smuggle";
+    case MissionType::Salvage: return "Salvage";
     default: return "Unknown";
   }
 }
@@ -52,15 +54,18 @@ static const char* missionTypeName(sim::MissionType t) {
 static void printMission(const sim::Mission& m) {
   std::cout << "  [" << missionTypeName(m.type) << "] "
             << "toSystem=" << m.toSystem << " toStation=" << m.toStation;
-  if (m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Smuggle) {
+  if (m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Smuggle || m.type == sim::MissionType::Salvage) {
     std::cout << " cargo=" << econ::commodityCode(m.commodity) << " units=" << std::fixed << std::setprecision(0)
               << m.units;
   }
   if (m.type == sim::MissionType::Passenger) {
     std::cout << " party=" << std::fixed << std::setprecision(0) << m.units << " seats";
   }
-  if (m.type == sim::MissionType::BountyScan || m.type == sim::MissionType::BountyKill) {
+  if (m.type == sim::MissionType::BountyScan || m.type == sim::MissionType::BountyKill || m.type == sim::MissionType::Salvage) {
     std::cout << " targetNpcId=" << m.targetNpcId;
+  }
+  if (m.type == sim::MissionType::Salvage) {
+    std::cout << " siteVisited=" << (m.scanned ? "yes" : "no");
   }
   if (m.type == sim::MissionType::MultiDelivery && m.viaStation != 0) {
     std::cout << " via=" << m.viaSystem << "/" << m.viaStation << " leg=" << (int)m.leg;
@@ -116,6 +121,9 @@ static void printHelp() {
             << "  --route                Plot a jump route between two systems in the printed list\n"
             << "  --toSys <idx>          Destination system index in the printed list (default: 0)\n"
             << "  --jr <ly>              Jump range in ly (default: 18)\n"
+            << "  --routeCost <mode>     Route cost: hops | dist | fuel (default: hops)\n"
+            << "  --fuelBase <u>         Base cost per jump for --routeCost fuel (default: 2.0)\n"
+            << "  --fuelPerLy <u>        Cost per ly for --routeCost fuel (default: 0.5)\n"
             << "\n"
             << "Mission board (headless):\n"
             << "  --missions             Print mission offers for the chosen station\n"
@@ -200,6 +208,13 @@ int main(int argc, char** argv) {
   }
   double jumpRangeLy = 18.0;
   (void)args.getDouble("jr", jumpRangeLy);
+
+  std::string routeCost = "hops";
+  (void)args.getString("routeCost", routeCost);
+  double fuelBase = 2.0;
+  double fuelPerLy = 0.5;
+  (void)args.getDouble("fuelBase", fuelBase);
+  (void)args.getDouble("fuelPerLy", fuelPerLy);
 
   const bool doMissions = args.hasFlag("missions");
   double rep = 0.0;
@@ -438,7 +453,23 @@ int main(int argc, char** argv) {
     const auto& toStub = systems[toSysIdx];
 
     sim::RoutePlanStats stats{};
-    const auto route = sim::plotRouteAStarHops(systems, fromStub.id, toStub.id, jumpRangeLy, &stats);
+    std::vector<sim::SystemId> route;
+    std::string costModel = "hops";
+    {
+      std::string rc = routeCost;
+      std::transform(rc.begin(), rc.end(), rc.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+      if (rc == "dist" || rc == "distance") {
+        costModel = "dist";
+        route = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, 0.0, 1.0, &stats);
+      } else if (rc == "fuel") {
+        costModel = "fuel";
+        route = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, fuelBase, fuelPerLy, &stats);
+      } else {
+        costModel = "hops";
+        route = sim::plotRouteAStarHops(systems, fromStub.id, toStub.id, jumpRangeLy, &stats);
+      }
+    }
+    const double fuelEstimate = route.empty() ? 0.0 : (stats.hops * fuelBase + stats.distanceLy * fuelPerLy);
 
     if (json) {
       j.key("route");
@@ -448,6 +479,11 @@ int main(int argc, char** argv) {
       j.key("fromSystemId"); j.value((unsigned long long)fromStub.id);
       j.key("toSystemId"); j.value((unsigned long long)toStub.id);
       j.key("jumpRangeLy"); j.value(jumpRangeLy);
+      j.key("costModel"); j.value(costModel);
+      j.key("cost"); j.value(stats.cost);
+      j.key("fuelBase"); j.value(fuelBase);
+      j.key("fuelPerLy"); j.value(fuelPerLy);
+      j.key("fuelEstimate"); j.value(fuelEstimate);
       j.key("found"); j.value(!route.empty());
       j.key("hops"); j.value((unsigned long long)(route.size() > 1 ? route.size() - 1 : 0));
       j.key("distanceLy"); j.value(stats.distanceLy);
@@ -459,7 +495,7 @@ int main(int argc, char** argv) {
       j.endArray();
       j.endObject();
     } else {
-      std::cout << "\n--- Route plan (A* hops, jr=" << std::fixed << std::setprecision(1) << jumpRangeLy << " ly) ---\n";
+      std::cout << "\n--- Route plan (A*, cost=" << costModel << ", jr=" << std::fixed << std::setprecision(1) << jumpRangeLy << " ly) ---\n";
       std::cout << "From: [" << fromSysIdx << "] " << fromStub.name << " (" << fromStub.id << ")\n";
       std::cout << "To:   [" << toSysIdx << "] " << toStub.name << " (" << toStub.id << ")\n";
 
@@ -471,9 +507,12 @@ int main(int argc, char** argv) {
         stubById.reserve(systems.size());
         for (const auto& s : systems) stubById[s.id] = &s;
 
-        std::cout << "Hops: " << (route.size() - 1)
+        std::cout << "Hops: " << stats.hops
                   << "  Dist: " << std::fixed << std::setprecision(2) << stats.distanceLy
-                  << " ly  (visited=" << stats.visited << ")\n";
+                  << " ly"
+                  << "  Cost(" << costModel << "): " << std::fixed << std::setprecision(2) << stats.cost
+                  << "  FuelEst: " << std::fixed << std::setprecision(2) << fuelEstimate
+                  << "  (visited=" << stats.visited << ")\n";
 
         for (std::size_t i = 0; i < route.size(); ++i) {
           const auto id = route[i];

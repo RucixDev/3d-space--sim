@@ -48,6 +48,10 @@ enum class MissionType : core::u8 {
   MultiDelivery,
   Passenger,
   Smuggle,
+
+
+  // Recover goods from a mission derelict signal and return to a station.
+  Salvage,
 };
 
 struct Mission {
@@ -93,7 +97,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{12};
+  int version{14};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -144,6 +148,9 @@ struct SaveGame {
   // Missions
   core::u64 nextMissionId{1};
   std::vector<Mission> missions{};
+
+  // Mission tracker UI (quality-of-life): remember which active mission is "tracked".
+  core::u64 trackedMissionId{0};
 
   // Mission board (cached offers) - persisted so boards don't reroll on UI refresh / reload.
   StationId missionOffersStationId{0};
