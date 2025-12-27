@@ -50,6 +50,49 @@ void Universe::setCacheCaps(std::size_t sectorCap, std::size_t systemCap, std::s
   stationEconomyCache_.setCapacity(stationCap);
 }
 
+Universe::CacheStats Universe::cacheStats() const {
+  CacheStats s;
+
+  {
+    const auto st = sectorCache_.stats();
+    s.sectors.capacity = st.capacity;
+    s.sectors.size = st.size;
+    s.sectors.hits = st.hits;
+    s.sectors.misses = st.misses;
+    s.sectors.puts = st.puts;
+    s.sectors.evictions = st.evictions;
+  }
+
+  {
+    const auto st = systemCache_.stats();
+    s.systems.capacity = st.capacity;
+    s.systems.size = st.size;
+    s.systems.hits = st.hits;
+    s.systems.misses = st.misses;
+    s.systems.puts = st.puts;
+    s.systems.evictions = st.evictions;
+  }
+
+  {
+    const auto st = stationEconomyCache_.stats();
+    s.stationEconomies.capacity = st.capacity;
+    s.stationEconomies.size = st.size;
+    s.stationEconomies.hits = st.hits;
+    s.stationEconomies.misses = st.misses;
+    s.stationEconomies.puts = st.puts;
+    s.stationEconomies.evictions = st.evictions;
+  }
+
+  return s;
+}
+
+void Universe::resetCacheStats() {
+  sectorCache_.resetStats();
+  systemCache_.resetStats();
+  stationEconomyCache_.resetStats();
+}
+
+
 const proc::Sector& Universe::sector(const proc::SectorCoord& coord) {
   if (auto* cached = sectorCache_.get(coord)) return *cached;
   auto sec = galaxyGen_.generateSector(coord, factions_);

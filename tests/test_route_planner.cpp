@@ -9,6 +9,32 @@ int test_route_planner() {
 
   using namespace stellar::econ;
 
+  // Tooling helpers: commodity code/name parsing should be robust and
+  // case-insensitive.
+  {
+    CommodityId id{};
+    if (!tryParseCommodityCode("FOOD", id) || id != CommodityId::Food) {
+      std::cerr << "[test_route_planner] tryParseCommodityCode(FOOD) failed\n";
+      ++fails;
+    }
+    if (!tryParseCommodityCode("food", id) || id != CommodityId::Food) {
+      std::cerr << "[test_route_planner] tryParseCommodityCode(food) failed\n";
+      ++fails;
+    }
+    if (!tryParseCommodity("H2O", id) || id != CommodityId::Water) {
+      std::cerr << "[test_route_planner] tryParseCommodity(H2O) failed\n";
+      ++fails;
+    }
+    if (!tryParseCommodity("water", id) || id != CommodityId::Water) {
+      std::cerr << "[test_route_planner] tryParseCommodity(water) failed\n";
+      ++fails;
+    }
+    if (tryParseCommodityCode("NOPE", id)) {
+      std::cerr << "[test_route_planner] tryParseCommodityCode(NOPE) should fail\n";
+      ++fails;
+    }
+  }
+
   StationEconomyModel fromM{};
   StationEconomyModel toM{};
 

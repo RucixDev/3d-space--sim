@@ -297,10 +297,16 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       std::size_t n = 0;
       f >> n;
       out.missions.clear();
-      out.missions.reserve(n);
+      out.missions.reserve(std::min<std::size_t>(n, 4096));
       for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
         std::string tok;
-        if (!(f >> tok) || tok != "mission") return false;
+        if (!(f >> tok)) break;
+        if (tok != "mission") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
 
         // Parse the rest of the mission line so we can be backward compatible
         // with older saves that did not include newer fields.
@@ -352,10 +358,16 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       std::size_t n = 0;
       f >> n;
       out.missionOffers.clear();
-      out.missionOffers.reserve(n);
+      out.missionOffers.reserve(std::min<std::size_t>(n, 4096));
       for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
         std::string tok;
-        if (!(f >> tok) || tok != "offer") return false;
+        if (!(f >> tok)) break;
+        if (tok != "offer") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
 
         std::string line;
         std::getline(f, line);
@@ -396,7 +408,7 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
 
         out.missionOffers.push_back(std::move(m));
       }
-} else if (key == "reputation") {
+    } else if (key == "reputation") {
       std::size_t n = 0;
       f >> n;
       out.reputation.clear();
@@ -470,12 +482,20 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       std::size_t n = 0;
       f >> n;
       out.stationOverrides.clear();
-      out.stationOverrides.reserve(n);
+      out.stationOverrides.reserve(std::min<std::size_t>(n, 2048));
 
       for (std::size_t si = 0; si < n; ++si) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "station") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
         StationEconomyOverride ov{};
-        if (!expectToken(f, "station")) return false;
-        f >> ov.stationId;
+        if (!(f >> ov.stationId)) break;
 
         // Parse station block until endstation
         std::string sk;

@@ -2,12 +2,16 @@ add_executable(stellar_tests
   main.cpp
   test_orbit.cpp
   test_streaming.cpp
+  test_universe_cache.cpp
   test_proc.cpp
   test_economy.cpp
+  test_traffic.cpp
   test_route_planner.cpp
   test_savegame.cpp
   test_missions.cpp
   test_nav.cpp
+  test_args.cpp
+  test_signature.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)

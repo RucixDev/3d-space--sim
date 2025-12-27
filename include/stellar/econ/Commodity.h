@@ -40,4 +40,16 @@ const CommodityDef& commodityDef(CommodityId id);
 std::string_view commodityName(CommodityId id);
 std::string_view commodityCode(CommodityId id);
 
+// Parse helpers (case-insensitive).
+//
+// These are primarily intended for headless tooling / CLI inputs.
+//
+// Examples:
+//  - tryParseCommodityCode("FOOD") => Food
+//  - tryParseCommodity("water")    => Water
+//
+// Returns true on success and writes the parsed id to `out`.
+bool tryParseCommodityCode(std::string_view code, CommodityId& out);
+bool tryParseCommodity(std::string_view codeOrName, CommodityId& out);
+
 } // namespace stellar::econ

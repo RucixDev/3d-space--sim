@@ -7,6 +7,7 @@
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/Signature.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -107,8 +108,10 @@ static void printHelp() {
             << "  --radius <ly>          Query radius in ly (default: 50)\n"
             << "  --limit <n>            Max systems (default: 32)\n"
             << "  --day <days>           Economy time (days) for trade quotes (default: 0)\n"
+            << "  --sig                  Include a stable signature per system stub (determinism)\n"
+            << "  --sysSig               Include a deep signature of full generated systems (slower)\n"
             << "  --json                 Emit machine-readable JSON to stdout (also works with --out)\n"
-            << "  --out <path>           Write JSON output to a file instead of stdout\n"
+            << "  --out <path>           Write JSON output to a file instead of stdout ('-' means stdout)\n"
             << "\n"
             << "Trade scanning (headless route planner):\n"
             << "  --trade                Print best trade opportunities from a chosen station\n"
@@ -116,6 +119,8 @@ static void printHelp() {
             << "  --fromStation <idx>    Origin station index inside that system (default: 0)\n"
             << "  --cargoKg <kg>         Cargo capacity (kg) used for trip profit (default: 420)\n"
             << "  --tradeLimit <n>       Max trade opportunities to print (default: 12)\n"
+            << "  --commodity <c>        Optional filter (code or name), e.g. FOOD | H2O | water\n"
+            << "  --minProfit <cr>       Min net trip profit filter (default: 0)\n"
             << "\n"
             << "Jump route planning (A*):\n"
             << "  --route                Plot a jump route between two systems in the printed list\n"
@@ -184,6 +189,9 @@ int main(int argc, char** argv) {
   std::string outPath;
   (void)args.getString("out", outPath);
 
+  const bool emitStubSig = args.hasFlag("sig");
+  const bool emitSysSig = args.hasFlag("sysSig");
+
   const bool doTrade = args.hasFlag("trade");
   std::size_t fromSysIdx = 0;
   std::size_t fromStationIdx = 0;
@@ -198,6 +206,30 @@ int main(int argc, char** argv) {
   {
     unsigned long long v = 0;
     if (args.getU64("tradeLimit", v)) tradeLimit = (std::size_t)v;
+  }
+
+  // Optional trade-scan filters.
+  std::string commodityFilter;
+  (void)args.getString("commodity", commodityFilter);
+
+  double minProfit = 0.0;
+  (void)args.getDouble("minProfit", minProfit);
+  if (!std::isfinite(minProfit)) minProfit = 0.0;
+  minProfit = std::max(0.0, minProfit);
+
+  bool hasCommodityFilter = false;
+  econ::CommodityId commodityFilterId = econ::CommodityId::Food;
+  if (!commodityFilter.empty()) {
+    hasCommodityFilter = econ::tryParseCommodity(commodityFilter, commodityFilterId);
+    if (!hasCommodityFilter) {
+      std::cerr << "Invalid --commodity: '" << commodityFilter << "'\n";
+      std::cerr << "Valid codes:";
+      for (const auto& def : econ::commodityTable()) {
+        std::cerr << " " << def.code;
+      }
+      std::cerr << "\n";
+      return 1;
+    }
   }
 
   const bool doRoute = args.hasFlag("route");
@@ -241,7 +273,7 @@ int main(int argc, char** argv) {
   // Otherwise, we keep the original human-readable console output.
   std::unique_ptr<std::ofstream> jsonFile;
   std::ostream* jsonStream = &std::cout;
-  if (json && !outPath.empty()) {
+  if (json && !outPath.empty() && outPath != "-") {
     jsonFile = std::make_unique<std::ofstream>(outPath, std::ios::out | std::ios::trunc);
     if (!*jsonFile) {
       std::cerr << "Failed to open --out file: " << outPath << "\n";
@@ -276,6 +308,15 @@ int main(int argc, char** argv) {
       j.key("planetCount"); j.value((unsigned long long)s.planetCount);
       j.key("stationCount"); j.value((unsigned long long)s.stationCount);
       j.key("factionId"); j.value((unsigned long long)s.factionId);
+      if (emitStubSig) {
+        j.key("stubSig");
+        j.value((unsigned long long)sim::signatureSystemStub(s));
+      }
+      if (emitSysSig) {
+        const auto& sys = u.getSystem(s.id, &s);
+        j.key("sysSig");
+        j.value((unsigned long long)sim::signatureStarSystem(sys));
+      }
       j.endObject();
     }
     j.endArray();
@@ -294,8 +335,18 @@ int main(int argc, char** argv) {
                 << "  dist=" << std::fixed << std::setprecision(2) << dist << " ly"
                 << "  planets=" << s.planetCount
                 << "  stations=" << s.stationCount
-                << "  faction=" << s.factionId
-                << "\n";
+                << "  faction=" << s.factionId;
+
+      if (emitStubSig) {
+        const auto sig = sim::signatureSystemStub(s);
+        std::cout << "  stubSig=" << (unsigned long long)sig;
+      }
+      if (emitSysSig) {
+        const auto& sys = u.getSystem(s.id, &s);
+        const auto sig = sim::signatureStarSystem(sys);
+        std::cout << "  sysSig=" << (unsigned long long)sig;
+      }
+      std::cout << "\n";
     }
   }
 
@@ -356,6 +407,7 @@ int main(int argc, char** argv) {
         if (stub.id == fromStub.id && toSt.id == fromSt.id) continue;
 
         auto& toEcon = u.stationEconomy(toSt, timeDays);
+        const std::size_t perStationLimit = hasCommodityFilter ? econ::kCommodityCount : 1;
         const auto routes = econ::bestRoutesForCargo(fromEcon,
                                                      fromSt.economyModel,
                                                      toEcon,
@@ -364,22 +416,35 @@ int main(int argc, char** argv) {
                                                      fromSt.feeRate,
                                                      toSt.feeRate,
                                                      0.10,
-                                                     1);
+                                                     perStationLimit);
 
         if (routes.empty()) continue;
-        const auto& r = routes.front();
+
+        const econ::RouteOpportunity* pick = &routes.front();
+        if (hasCommodityFilter) {
+          pick = nullptr;
+          for (const auto& r : routes) {
+            if (r.commodity == commodityFilterId) {
+              pick = &r;
+              break;
+            }
+          }
+          if (!pick) continue;
+        }
+
+        if (pick->netProfitTotal + 1e-9 < minProfit) continue;
 
         Idea it;
         it.sysId = stub.id;
         it.stationId = toSt.id;
         it.sysName = stub.name;
         it.stationName = toSt.name;
-        it.commodity = r.commodity;
-        it.buyAsk = r.buyPrice;
-        it.sellBid = r.sellPrice;
-        it.units = r.unitsPossible;
-        it.netProfitPerUnit = r.netProfitPerUnit;
-        it.netTripProfit = r.netProfitTotal;
+        it.commodity = pick->commodity;
+        it.buyAsk = pick->buyPrice;
+        it.sellBid = pick->sellPrice;
+        it.units = pick->unitsPossible;
+        it.netProfitPerUnit = pick->netProfitPerUnit;
+        it.netTripProfit = pick->netProfitTotal;
         it.distanceLy = distLy;
         ideas.push_back(std::move(it));
       }
@@ -397,6 +462,13 @@ int main(int argc, char** argv) {
       j.beginObject();
       j.key("day"); j.value(timeDays);
       j.key("cargoKg"); j.value(cargoCapacityKg);
+      j.key("commodityFilter");
+      if (hasCommodityFilter) {
+        j.value(econ::commodityCode(commodityFilterId));
+      } else {
+        j.nullValue();
+      }
+      j.key("minProfit"); j.value(minProfit);
       j.key("from");
       j.beginObject();
       j.key("systemId"); j.value((unsigned long long)fromStub.id);
@@ -427,6 +499,14 @@ int main(int argc, char** argv) {
     } else {
       std::cout << "\n--- Trade scan (day=" << timeDays << ", cargoKg=" << cargoCapacityKg << ") ---\n";
       std::cout << "From: " << fromStub.name << " / " << fromSt.name << "  (fee=" << fromSt.feeRate * 100.0 << "%)\n";
+      if (hasCommodityFilter) {
+        std::cout << "Filter: " << econ::commodityCode(commodityFilterId)
+                  << " (" << econ::commodityName(commodityFilterId) << ")";
+        if (minProfit > 0.0) std::cout << "  minProfit=" << std::fixed << std::setprecision(0) << minProfit;
+        std::cout << "\n";
+      } else if (minProfit > 0.0) {
+        std::cout << "Min profit: " << std::fixed << std::setprecision(0) << minProfit << "\n";
+      }
       if (ideas.empty()) {
         std::cout << "No profitable routes found inside the query set.\n";
       } else {

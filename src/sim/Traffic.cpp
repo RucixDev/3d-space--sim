@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace stellar::sim {
@@ -100,29 +101,17 @@ BestCommodity pickCommodity(const Station& src,
   return top[0];
 }
 
-} // namespace
-
-void simulateNpcTradeTraffic(Universe& universe,
-                             const StarSystem& system,
-                             double timeDays,
-                             std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
-                             int kMaxBackfillDays) {
+static void simulateNpcTradeTrafficImpl(Universe& universe,
+                                        const StarSystem& system,
+                                        double timeDays,
+                                        int& lastDay,
+                                        int kMaxBackfillDays) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
   const SystemId sysId = system.stub.id;
   const int currentDay = (int)std::floor(timeDays);
 
-  auto it = lastTrafficDayBySystem.find(sysId);
-  if (it == lastTrafficDayBySystem.end()) {
-    // First time we see this system: don't backfill the whole universe.
-    // If we're already far into the timeline, do a tiny "warm start" (simulate one day)
-    // so markets aren't always perfectly "fresh" on first arrival.
-    lastTrafficDayBySystem.emplace(sysId, std::max(-1, currentDay - 1));
-    it = lastTrafficDayBySystem.find(sysId);
-  }
-
-  int lastDay = it->second;
   if (currentDay <= lastDay) {
     // Still advance station economies to the current time so callers see up-to-date state.
     for (const auto& st : system.stations) (void)universe.stationEconomy(st, timeDays);
@@ -204,7 +193,79 @@ void simulateNpcTradeTraffic(Universe& universe,
   // Advance all affected stations to the actual current time.
   for (const auto& st : system.stations) (void)universe.stationEconomy(st, timeDays);
 
-  it->second = currentDay;
+  lastDay = currentDay;
+}
+
+} // namespace
+
+void simulateNpcTradeTraffic(Universe& universe,
+                             const StarSystem& system,
+                             double timeDays,
+                             std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
+                             int kMaxBackfillDays) {
+  if (system.stations.size() < 2) return;
+  if (timeDays < 0.0) return;
+
+  const SystemId sysId = system.stub.id;
+  const int currentDay = (int)std::floor(timeDays);
+
+  auto it = lastTrafficDayBySystem.find(sysId);
+  if (it == lastTrafficDayBySystem.end()) {
+    // First time we see this system: don't backfill the whole universe.
+    // If we're already far into the timeline, do a tiny "warm start" (simulate one day)
+    // so markets aren't always perfectly "fresh" on first arrival.
+    lastTrafficDayBySystem.emplace(sysId, std::max(-1, currentDay - 1));
+    it = lastTrafficDayBySystem.find(sysId);
+  }
+
+  simulateNpcTradeTrafficImpl(universe, system, timeDays, it->second, kMaxBackfillDays);
+}
+
+void simulateNpcTradeTraffic(Universe& universe,
+                             const StarSystem& system,
+                             double timeDays,
+                             std::vector<SystemTrafficStamp>& trafficStamps,
+                             int kMaxBackfillDays) {
+  if (system.stations.size() < 2) return;
+  if (timeDays < 0.0) return;
+
+  const SystemId sysId = system.stub.id;
+  const int currentDay = (int)std::floor(timeDays);
+
+  // Find the first stamp entry for this system (keeping order stable) and also
+  // compute the max day across duplicates (if any).
+  SystemTrafficStamp* first = nullptr;
+  int maxDay = std::numeric_limits<int>::min();
+  for (auto& t : trafficStamps) {
+    if (t.systemId != sysId) continue;
+    if (!first) first = &t;
+    maxDay = std::max(maxDay, t.dayStamp);
+  }
+
+  if (!first) {
+    // Warm start (matches unordered_map overload behavior).
+    trafficStamps.push_back(SystemTrafficStamp{sysId, std::max(-1, currentDay - 1)});
+    first = &trafficStamps.back();
+  } else {
+    first->dayStamp = maxDay;
+  }
+
+  simulateNpcTradeTrafficImpl(universe, system, timeDays, first->dayStamp, kMaxBackfillDays);
+
+  // Remove any duplicate entries for this system (keep the first occurrence).
+  bool kept = false;
+  for (auto it = trafficStamps.begin(); it != trafficStamps.end();) {
+    if (it->systemId == sysId) {
+      if (!kept) {
+        kept = true;
+        ++it;
+      } else {
+        it = trafficStamps.erase(it);
+      }
+    } else {
+      ++it;
+    }
+  }
 }
 
 } // namespace stellar::sim

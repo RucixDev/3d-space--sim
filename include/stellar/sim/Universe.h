@@ -47,31 +47,84 @@ public:
 
   void setCacheCaps(std::size_t sectorCap, std::size_t systemCap, std::size_t stationCap);
 
+  // Lightweight cache diagnostics (useful for tests/tools and for tuning cache caps).
+  struct CacheStats {
+    struct One {
+      std::size_t capacity{0};
+      std::size_t size{0};
+      std::size_t hits{0};
+      std::size_t misses{0};
+      std::size_t puts{0};
+      std::size_t evictions{0};
+    };
+
+    One sectors{};
+    One systems{};
+    One stationEconomies{};
+  };
+
+  CacheStats cacheStats() const;
+  void resetCacheStats();
+
 private:
   template <class Key, class Value, class Hash = std::hash<Key>>
   class LruCache {
   public:
-    explicit LruCache(std::size_t cap = 128) : cap_(cap) {}
+    explicit LruCache(std::size_t cap = 128) : cap_(cap ? cap : 1) {}
 
-    void setCapacity(std::size_t cap) { cap_ = cap; evictIfNeeded(); }
+    void setCapacity(std::size_t cap) {
+      cap_ = cap ? cap : 1;
+      evictIfNeeded();
+    }
     std::size_t capacity() const { return cap_; }
     std::size_t size() const { return map_.size(); }
 
+    struct Stats {
+      std::size_t capacity{0};
+      std::size_t size{0};
+      std::size_t hits{0};
+      std::size_t misses{0};
+      std::size_t puts{0};
+      std::size_t evictions{0};
+    };
+
+    Stats stats() const {
+      Stats s;
+      s.capacity = cap_;
+      s.size = map_.size();
+      s.hits = hits_;
+      s.misses = misses_;
+      s.puts = puts_;
+      s.evictions = evictions_;
+      return s;
+    }
+
+    void resetStats() { hits_ = misses_ = puts_ = evictions_ = 0; }
+
     Value* get(const Key& key) {
       auto it = map_.find(key);
-      if (it == map_.end()) return nullptr;
+      if (it == map_.end()) {
+        ++misses_;
+        return nullptr;
+      }
+      ++hits_;
       touch(it);
       return &it->second.value;
     }
 
     const Value* get(const Key& key) const {
       auto it = map_.find(key);
-      if (it == map_.end()) return nullptr;
+      if (it == map_.end()) {
+        ++misses_;
+        return nullptr;
+      }
+      ++hits_;
       // const cache doesn't update LRU; ok for now
       return &it->second.value;
     }
 
     Value& put(const Key& key, Value value) {
+      ++puts_;
       auto it = map_.find(key);
       if (it != map_.end()) {
         it->second.value = std::move(value);
@@ -83,10 +136,10 @@ private:
       Entry e;
       e.value = std::move(value);
       e.it = order_.begin();
-      map_.emplace(key, std::move(e));
+      auto itIns = map_.emplace(key, std::move(e)).first;
 
       evictIfNeeded();
-      return map_.find(key)->second.value;
+      return itIns->second.value;
     }
 
     std::unordered_map<Key, Value, Hash> snapshot() const {
@@ -115,12 +168,20 @@ private:
         const Key& key = order_.back();
         map_.erase(key);
         order_.pop_back();
+        ++evictions_;
       }
     }
 
     std::size_t cap_{128};
     std::list<Key> order_{};
     std::unordered_map<Key, Entry, Hash> map_{};
+
+    // These are intentionally mutable so callers can query cache stats on const caches
+    // (e.g. via const Universe) without changing functional behavior.
+    mutable std::size_t hits_{0};
+    mutable std::size_t misses_{0};
+    mutable std::size_t puts_{0};
+    mutable std::size_t evictions_{0};
   };
 
   // Return a cached sector (generated on-demand). Returning by reference avoids

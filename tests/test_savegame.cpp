@@ -4,10 +4,49 @@
 
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
+#include <string>
 
 static bool nearly(double a, double b, double eps = 1e-9) {
   return std::abs(a - b) <= eps;
+}
+
+static std::string readAllText(const std::string& path) {
+  std::ifstream f(path, std::ios::in);
+  if (!f) return {};
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+static bool writeAllText(const std::string& path, const std::string& content) {
+  std::ofstream f(path, std::ios::out | std::ios::trunc);
+  if (!f) return false;
+  f << content;
+  return static_cast<bool>(f);
+}
+
+static std::string replaceCountLine(const std::string& content,
+                                   const std::string& key,
+                                   std::size_t newCount,
+                                   bool& replaced) {
+  replaced = false;
+  std::istringstream iss(content);
+  std::ostringstream oss;
+  std::string line;
+  const std::string prefix = key + " ";
+
+  while (std::getline(iss, line)) {
+    if (!replaced && line.rfind(prefix, 0) == 0) {
+      oss << key << " " << newCount << "\n";
+      replaced = true;
+    } else {
+      oss << line << "\n";
+    }
+  }
+  return oss.str();
 }
 
 int test_savegame() {
@@ -35,6 +74,7 @@ int test_savegame() {
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Metals)] = 5.5;
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Food)] = 12.0;
   s.scannedKeys = {111, 222, 333};
+  s.trackedMissionId = 1;
 
   // One accepted mission.
   {
@@ -162,6 +202,11 @@ int test_savegame() {
     }
   }
 
+  if (l.trackedMissionId != s.trackedMissionId) {
+    std::cerr << "[test_savegame] trackedMissionId mismatch\n";
+    ++fails;
+  }
+
   // Mission board persistence.
   if (l.missionOffersStationId != s.missionOffersStationId || l.missionOffersDayStamp != s.missionOffersDayStamp) {
     std::cerr << "[test_savegame] mission offers header mismatch\n";
@@ -202,6 +247,98 @@ int test_savegame() {
     if (a.state.history[0].empty() || b.state.history[0].empty()) {
       std::cerr << "[test_savegame] override history missing\n";
       ++fails;
+    }
+  }
+
+  // Robustness: tolerate stale/corrupt section counts without breaking subsequent key parsing.
+  {
+    const std::string original = readAllText(path);
+    if (original.empty()) {
+      std::cerr << "[test_savegame] failed to read back saved file for robustness tests\n";
+      ++fails;
+    } else {
+      // If the missions count is wrong, the loader should stop when it no longer sees "mission"
+      // and continue parsing top-level keys like trackedMissionId.
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "missions", s.missions.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_missions.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt missions save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale missions count\n";
+            ++fails;
+          } else {
+            if (x.missions.size() != s.missions.size()) {
+              std::cerr << "[test_savegame] stale missions count changed parsed mission count\n";
+              ++fails;
+            }
+            if (x.trackedMissionId != s.trackedMissionId) {
+              std::cerr << "[test_savegame] stale missions count broke trackedMissionId parsing\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If the mission_offers count is wrong, the loader should stop when it no longer sees "offer"
+      // and continue parsing keys that follow (e.g. reputation).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "mission_offers", s.missionOffers.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_offers.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt mission_offers save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale mission_offers count\n";
+            ++fails;
+          } else {
+            if (x.missionOffers.size() != s.missionOffers.size()) {
+              std::cerr << "[test_savegame] stale mission_offers count changed parsed offers count\n";
+              ++fails;
+            }
+            if (x.reputation.size() != s.reputation.size()) {
+              std::cerr << "[test_savegame] stale mission_offers count broke parsing of later keys (reputation)\n";
+              ++fails;
+            } else if (!x.reputation.empty()) {
+              if (!nearly(x.reputation.front().rep, s.reputation.front().rep)) {
+                std::cerr << "[test_savegame] reputation value mismatch after stale mission_offers count\n";
+                ++fails;
+              }
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If station_overrides count is wrong (e.g., EOF before reaching the claimed count),
+      // the loader should still succeed.
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "station_overrides", s.stationOverrides.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_overrides.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt station_overrides save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale station_overrides count\n";
+            ++fails;
+          } else if (x.stationOverrides.size() != s.stationOverrides.size()) {
+            std::cerr << "[test_savegame] stale station_overrides count changed parsed overrides count\n";
+            ++fails;
+          }
+          std::filesystem::remove(p);
+        }
+      }
     }
   }
 

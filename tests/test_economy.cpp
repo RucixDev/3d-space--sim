@@ -109,6 +109,64 @@ int test_economy() {
     }
   }
 
+  // Robustness: clamp fee/spread so pathological inputs cannot produce
+  // negative payouts or NaNs.
+  {
+    using namespace stellar::econ;
+
+    StationEconomyModel m{};
+    StationEconomyState s{};
+    for (std::size_t i = 0; i < kCommodityCount; ++i) {
+      m.capacity[i] = 100.0;
+      m.desiredStock[i] = 50.0;
+      s.inventory[i] = 10.0;
+    }
+
+    CommodityId cid = CommodityId::Food;
+    const std::size_t iFood2 = static_cast<std::size_t>(cid);
+
+    // Out-of-range spread should not produce negative bids.
+    {
+      const auto q = quote(s, m, cid, /*bidAskSpread=*/10.0);
+      if (q.bid < -1e-9) {
+        std::cerr << "[test_economy] quote() produced negative bid with huge spread\n";
+        ++fails;
+      }
+      if (!(q.bid <= q.mid + 1e-9 && q.mid <= q.ask + 1e-9)) {
+        std::cerr << "[test_economy] quote() invariant bid<=mid<=ask violated\n";
+        ++fails;
+      }
+    }
+
+    // Fee > 1 should be clamped so selling never *reduces* player credits.
+    {
+      double credits2 = 0.0;
+      const double before = credits2;
+      const auto tr = sell(s, m, cid, 1.0, credits2, 0.10, /*fee=*/2.0);
+      if (!tr.ok) {
+        std::cerr << "[test_economy] sell() failed under fee clamp\n";
+        ++fails;
+      } else if (credits2 + 1e-9 < before) {
+        std::cerr << "[test_economy] sell() decreased credits with fee>1 (should clamp)\n";
+        ++fails;
+      } else if (tr.creditsDelta < -1e-9) {
+        std::cerr << "[test_economy] sell() returned negative creditsDelta with fee>1\n";
+        ++fails;
+      }
+    }
+
+    // Corrupted station inventory (>capacity) should be handled safely by helpers.
+    {
+      s.inventory[iFood2] = 1e9; // corrupted
+      const double taken = takeInventory(s, m, cid, 1.0);
+      (void)taken;
+      if (s.inventory[iFood2] > m.capacity[iFood2] + 1e-6) {
+        std::cerr << "[test_economy] takeInventory() did not clamp oversized inventory\n";
+        ++fails;
+      }
+    }
+  }
+
   (void)q0; (void)q10;
 
   if (fails == 0) std::cout << "[test_economy] pass\n";
