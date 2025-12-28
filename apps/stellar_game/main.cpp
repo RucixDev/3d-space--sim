@@ -12,9 +12,14 @@
 #include "stellar/render/Camera.h"
 #include "stellar/render/Gl.h"
 #include "stellar/render/LineRenderer.h"
+#include "stellar/render/PointRenderer.h"
 #include "stellar/render/Mesh.h"
 #include "stellar/render/MeshRenderer.h"
 #include "stellar/render/Texture.h"
+#include "stellar/render/ProceduralSprite.h"
+#include "stellar/render/Starfield.h"
+#include "stellar/render/ParticleSystem.h"
+#include "stellar/render/PostFX.h"
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
@@ -44,6 +49,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cctype>
+#include <cstdint>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -609,6 +615,8 @@ int main(int argc, char** argv) {
 
   glEnable(GL_DEPTH_TEST);
 
+  { // Scope GL objects so they are destroyed before SDL_GL_DeleteContext
+
   // --- ImGui setup ---
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -630,6 +638,10 @@ int main(int argc, char** argv) {
   render::Texture2D checker;
   checker.createChecker(256, 256, 16);
 
+  // UI icon sprites (procedural, cached as GL textures)
+  render::SpriteCache spriteCache;
+  spriteCache.setMaxEntries(2048);
+
   render::MeshRenderer meshRenderer;
   std::string err;
   if (!meshRenderer.init(&err)) {
@@ -644,8 +656,45 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  render::PointRenderer pointRenderer;
+  if (!pointRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+
+  // --- Post-processing (HDR + bloom + tonemap) ---
+  render::PostFX postFx;
+  if (!postFx.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+  render::PostFXSettings postFxSettings{};
+  bool postFxAutoWarpFromSpeed = true;
+
   // --- Universe / sim state ---
   core::u64 seed = 1337;
+
+  // --- Visual effects (background stars + particles) ---
+  bool vfxStarfieldEnabled = true;
+  int vfxStarCount = 5200;
+  double vfxStarRadiusU = 18000.0;
+
+  bool vfxParticlesEnabled = true;
+  bool vfxThrustersEnabled = true;
+  bool vfxImpactsEnabled = true;
+  bool vfxExplosionsEnabled = true;
+  float vfxParticleIntensity = 1.0f; // global scaler
+
+  render::Starfield starfield;
+  starfield.setRadius(vfxStarRadiusU);
+  starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+
+  render::ParticleSystem particles;
+  particles.reseed(seed ^ 0xBADC0FFEu);
+  particles.setMaxParticles(14000);
+
+  std::vector<render::PointVertex> particleVerts;
+
   sim::Universe universe(seed);
 
   sim::SystemStub currentStub{};
@@ -995,6 +1044,9 @@ int main(int argc, char** argv) {
   bool showScanner = true;
   bool showTrade = true;
   bool showGuide = true;
+  bool showSprites = false;
+  bool showVfx = false;
+  bool showPostFx = false;
 
   // Optional mouse steering (relative mouse mode). Toggle with M.
   bool mouseSteer = false;
@@ -1749,6 +1801,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
 
+  double timeRealSec = 0.0; // for purely visual effects
+
   SDL_SetRelativeMouseMode(SDL_FALSE);
 
   while (running) {
@@ -1756,6 +1810,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     auto now = std::chrono::high_resolution_clock::now();
     const double dtReal = std::chrono::duration<double>(now - last).count();
     last = now;
+
+    timeRealSec += dtReal;
 
     // Police heat decays in real time (stays stable even if you change timeScale).
     policeHeat = std::max(0.0, policeHeat - dtReal * 0.015);
@@ -1793,6 +1849,17 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       // Apply damage
       applyDamage(dmg, hit.shield, hit.hull);
 
+      // VFX: impact sparks at the target.
+      if (vfxParticlesEnabled && vfxImpactsEnabled) {
+        const math::Vec3d posU = toRenderU(hit.ship.positionKm());
+        math::Vec3d n = hit.ship.positionKm() - ship.positionKm();
+        if (n.lengthSq() < 1e-12) n = math::Vec3d{0,1,0};
+        n = n.normalized();
+
+        const double energy = std::clamp((dmg / 18.0) * (double)vfxParticleIntensity, 0.15, 2.5);
+        particles.spawnSparks(posU, n, toRenderU(hit.ship.velocityKmS()), energy);
+      }
+
       // Crimes / reactions (on hit)
       if (hit.alive && hit.role == ContactRole::Trader) {
         hit.fleeUntilDays = timeDays + (180.0 / 86400.0); // flee ~3 minutes
@@ -1822,6 +1889,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
 	        const math::Vec3d deadPos = hit.ship.positionKm();
 	        const math::Vec3d deadVel = hit.ship.velocityKmS();
+
+          // VFX: explosion burst on destruction.
+          if (vfxParticlesEnabled && vfxExplosionsEnabled) {
+            const double eBase = std::clamp((hit.hullMax / 140.0) * (double)vfxParticleIntensity, 0.45, 2.25);
+            particles.spawnExplosion(toRenderU(deadPos), toRenderU(deadVel), eBase);
+          }
 
 	        if (deadRole == ContactRole::Pirate) {
 	          // Bounty vouchers: redeemed at stations (ties combat -> station loop).
@@ -2072,6 +2145,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             beams.clear();
             projectiles.clear();
 
+            // VFX
+            particles.clear();
+
             floatingCargo.clear();
             asteroids.clear();
             signals.clear();
@@ -2121,6 +2197,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         if (event.key.keysym.sym == SDLK_F6) showScanner = !showScanner;
         if (event.key.keysym.sym == SDLK_F7) showTrade = !showTrade;
         if (event.key.keysym.sym == SDLK_F8) showGuide = !showGuide;
+        if (event.key.keysym.sym == SDLK_F10) showSprites = !showSprites;
+        if (event.key.keysym.sym == SDLK_F11) showVfx = !showVfx;
+        if (event.key.keysym.sym == SDLK_F12) showPostFx = !showPostFx;
 
         if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
 
@@ -3217,6 +3296,12 @@ if (event.key.keysym.sym == SDLK_y) {
     }
 
 
+    // VFX step uses real time (not sim time). When paused, freeze particles.
+    const double dtVfx = paused ? 0.0 : dtReal;
+    if (vfxParticlesEnabled) {
+      particles.update(dtVfx);
+    }
+
     // Sim step
     const double dtSim = dtReal * timeScale;
     if (!paused) {
@@ -3246,6 +3331,9 @@ if (event.key.keysym.sym == SDLK_y) {
           clearances.clear();
           contacts.clear();
           beams.clear();
+
+          // VFX
+          particles.clear();
 	          floatingCargo.clear();
 	          signals.clear();
 	          asteroids.clear();
@@ -3357,6 +3445,47 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           ship.setPositionKm(stPos + stQ.rotate(dockLocal));
           ship.setVelocityKmS(stV);
           ship.setOrientation(stQ * math::Quatd::fromAxisAngle({0,1,0}, math::kPi)); // face outward-ish
+        }
+      }
+
+      // VFX: thruster plume.
+      if (vfxParticlesEnabled && vfxThrustersEnabled && !docked && fsdState == FsdState::Idle) {
+        math::Vec3d accelLocal = input.thrustLocal;
+        double intensity = std::clamp(accelLocal.length(), 0.0, 1.0);
+
+        // Braking with no explicit thrust still feels like "something" should fire.
+        if (input.brake && intensity < 0.12) {
+          intensity = 0.35;
+        }
+
+        if (input.boost) {
+          intensity = std::clamp(intensity + 0.35, 0.0, 1.0);
+        }
+
+        intensity *= (double)vfxParticleIntensity;
+
+        if (intensity > 1e-4) {
+          math::Vec3d accelWorld{0,0,1};
+          if (accelLocal.lengthSq() > 1e-8) {
+            accelWorld = ship.orientation().rotate(accelLocal).normalized();
+          } else if (input.brake) {
+            const math::Vec3d v = ship.velocityKmS() - localFrameVelKmS;
+            if (v.lengthSq() > 1e-10) {
+              accelWorld = (-v).normalized();
+            } else {
+              accelWorld = ship.forward().normalized();
+            }
+          } else {
+            accelWorld = ship.forward().normalized();
+          }
+
+          const math::Vec3d exhaustDir = (-accelWorld).normalized();
+          const math::Vec3d shipPosU = toRenderU(ship.positionKm());
+
+          // Push the emitter slightly toward the exhaust direction so the plume starts behind the ship.
+          const math::Vec3d emitterPosU = shipPosU + exhaustDir * 0.75;
+
+          particles.emitThruster(emitterPosU, exhaustDir, std::clamp(intensity, 0.0, 1.0), dtVfx, input.boost);
         }
       }
 
@@ -5138,6 +5267,17 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const double playerHitRadiusKm = 900.0 + p.radiusKm;
             if (segmentHitsSphere(a, b, ship.positionKm(), playerHitRadiusKm)) {
               applyDamage(p.dmg, playerShield, playerHull);
+
+              if (vfxParticlesEnabled && vfxImpactsEnabled) {
+                // Approximate impact normal by projectile travel direction.
+                math::Vec3d n = -p.velKmS;
+                if (n.lengthSq() < 1e-12) n = ship.forward();
+                n = n.normalized();
+
+                const double energy = std::clamp((p.dmg / 16.0) * (double)vfxParticleIntensity, 0.12, 2.2);
+                particles.spawnSparks(toRenderU(ship.positionKm()), n, toRenderU(ship.velocityKmS()), energy);
+              }
+
               p.ttlSim = 0.0;
             }
           }
@@ -5171,6 +5311,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Death / respawn
     if (playerHull <= 0.0) {
       toast(toasts, "Ship destroyed! Respawning (lost cargo, -10% credits).", 4.0);
+
+      if (vfxParticlesEnabled && vfxExplosionsEnabled) {
+        const double eBase = 2.2 * (double)vfxParticleIntensity;
+        particles.spawnExplosion(toRenderU(ship.positionKm()), toRenderU(ship.velocityKmS()), eBase);
+      }
+
       playerHull = playerHullMax;
       playerShield = playerShieldMax * 0.60;
       credits *= 0.90;
@@ -5239,6 +5385,24 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     meshRenderer.setViewProj(viewF, projF);
     lineRenderer.setViewProj(viewF, projF);
+    pointRenderer.setViewProj(viewF, projF);
+
+    // Update VFX render buffers.
+    if (vfxStarfieldEnabled) {
+      if ((int)starfield.starCount() != vfxStarCount) {
+        starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+      }
+      if (std::abs(starfield.radius() - vfxStarRadiusU) > 1e-3) {
+        starfield.setRadius(vfxStarRadiusU);
+      }
+      starfield.update(cam.position(), timeRealSec);
+    }
+
+    if (vfxParticlesEnabled) {
+      particles.buildPoints(particleVerts);
+    } else {
+      particleVerts.clear();
+    }
 
     // ---- Build instances (star + planets) ----
     std::vector<render::InstanceData> spheres;
@@ -5469,9 +5633,27 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	    }
 
     // ---- Render ---
+    // World pass
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+
+    if (postFxSettings.enabled) {
+      postFx.ensureSize(w, h);
+      postFx.beginScene(w, h);
+    } else {
+      render::gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
     glViewport(0, 0, w, h);
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Background stars (point sprites, additive blend). Don't write depth.
+    if (vfxStarfieldEnabled) {
+      glDepthMask(GL_FALSE);
+      pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
+      glDepthMask(GL_TRUE);
+    }
 
     // Lines (orbits, corridor, beams)
     lineRenderer.drawLines(lines);
@@ -5483,6 +5665,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Cubes (stations, ship, contacts)
     meshRenderer.setMesh(&cube);
     meshRenderer.drawInstances(cubes);
+
+    // Particles (thrusters, impacts, explosions). Depth-tested but no depth writes.
+    if (vfxParticlesEnabled) {
+      glDepthMask(GL_FALSE);
+      pointRenderer.drawPoints(particleVerts, render::PointBlendMode::Additive);
+      glDepthMask(GL_TRUE);
+    }
+
+    // PostFX pass (HDR tonemap / bloom) - draw scene to the backbuffer, then render ImGui on top.
+    if (postFxSettings.enabled) {
+      // Auto-warp from ship speed gives a subtle "speed lines" vibe in supercruise without touching gameplay.
+      render::PostFXSettings s = postFxSettings;
+      if (postFxAutoWarpFromSpeed) {
+        const double spdKmS = ship.velocityKmS().length();
+        const float a = (float)std::clamp((spdKmS - 25.0) / 450.0, 0.0, 1.0);
+        s.warp = std::max(s.warp, a * 0.030f);
+      }
+      postFx.present(w, h, s, (float)timeRealSec);
+    } else {
+      // Ensure UI draws to the backbuffer even if PostFX was previously enabled.
+      render::gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
 
     // ---- UI ----
     ImGui_ImplOpenGL3_NewFrame();
@@ -5830,6 +6034,105 @@ if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0
 }
 
 
+if (showVfx) {
+  ImGui::Begin("VFX Lab");
+
+  ImGui::TextDisabled("F11 toggles this panel. Background stars + particles are rendered as point sprites.");
+
+  if (ImGui::CollapsingHeader("Starfield", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enabled##stars", &vfxStarfieldEnabled);
+
+    if (vfxStarfieldEnabled) {
+      ImGui::SliderInt("Star count", &vfxStarCount, 0, 20000);
+      float radiusF = (float)vfxStarRadiusU;
+      if (ImGui::SliderFloat("Star radius (U)", &radiusF, 2000.0f, 20000.0f, "%.0f")) {
+        vfxStarRadiusU = (double)radiusF;
+      }
+
+      ImGui::Text("Generated stars: %zu", starfield.starCount());
+    } else {
+      ImGui::TextDisabled("(starfield disabled)");
+    }
+  }
+
+  if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enabled##particles", &vfxParticlesEnabled);
+
+    if (vfxParticlesEnabled) {
+      ImGui::Text("Alive: %zu / %zu", particles.aliveCount(), particles.maxParticles());
+
+      float inten = vfxParticleIntensity;
+      if (ImGui::SliderFloat("Intensity", &inten, 0.0f, 2.0f, "%.2f")) {
+        vfxParticleIntensity = inten;
+      }
+
+      ImGui::Checkbox("Thrusters", &vfxThrustersEnabled);
+      ImGui::Checkbox("Impacts", &vfxImpactsEnabled);
+      ImGui::Checkbox("Explosions", &vfxExplosionsEnabled);
+
+      static int maxP = 14000;
+      if (maxP < 256) maxP = 256;
+      if (ImGui::SliderInt("Max particles", &maxP, 256, 30000)) {
+        particles.setMaxParticles((std::size_t)maxP);
+      }
+
+      if (ImGui::Button("Clear particles")) {
+        particles.clear();
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Test explosion")) {
+        const double eBase = 1.75 * (double)vfxParticleIntensity;
+        particles.spawnExplosion(toRenderU(ship.positionKm()), toRenderU(ship.velocityKmS()), eBase);
+      }
+    } else {
+      ImGui::TextDisabled("(particles disabled)");
+    }
+  }
+
+  ImGui::End();
+}
+
+
+if (showPostFx) {
+  ImGui::Begin("Post FX");
+
+  ImGui::TextDisabled("F12 toggles this panel. Scene renders to an HDR target and is post-processed before UI.");
+
+  ImGui::Checkbox("Enabled", &postFxSettings.enabled);
+
+  if (postFxSettings.enabled) {
+    if (ImGui::CollapsingHeader("Bloom", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Checkbox("Bloom enabled", &postFxSettings.bloomEnabled);
+      ImGui::SliderFloat("Threshold", &postFxSettings.bloomThreshold, 0.10f, 3.50f, "%.2f");
+      ImGui::SliderFloat("Soft knee", &postFxSettings.bloomKnee, 0.00f, 2.50f, "%.2f");
+      ImGui::SliderFloat("Boost", &postFxSettings.bloomBoost, 0.00f, 3.00f, "%.2f");
+      ImGui::SliderFloat("Intensity", &postFxSettings.bloomIntensity, 0.00f, 2.50f, "%.2f");
+      ImGui::SliderInt("Blur passes", &postFxSettings.bloomPasses, 0, 16);
+      ImGui::TextDisabled("Bloom is extracted at half resolution, then ping-pong blurred.");
+    }
+
+    if (ImGui::CollapsingHeader("Tonemap / Output", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::SliderFloat("Exposure", &postFxSettings.exposure, 0.10f, 3.50f, "%.2f");
+      ImGui::SliderFloat("Gamma", &postFxSettings.gamma, 1.20f, 2.80f, "%.2f");
+    }
+
+    if (ImGui::CollapsingHeader("Extras", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::SliderFloat("Vignette", &postFxSettings.vignette, 0.00f, 0.75f, "%.2f");
+      ImGui::SliderFloat("Film grain", &postFxSettings.grain, 0.00f, 0.20f, "%.3f");
+      ImGui::SliderFloat("Chromatic aberration", &postFxSettings.chromaticAberration, 0.0f, 0.01f, "%.4f");
+      ImGui::Separator();
+      ImGui::Checkbox("Auto warp from speed", &postFxAutoWarpFromSpeed);
+      ImGui::SliderFloat("Warp (manual)", &postFxSettings.warp, 0.0f, 0.08f, "%.4f");
+    }
+  } else {
+    ImGui::TextDisabled("(PostFX disabled)");
+  }
+
+  ImGui::End();
+}
+
+
 
 if (showShip) {
   ImGui::Begin("Ship / Status");
@@ -5838,6 +6141,16 @@ if (showShip) {
 
   const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
   if (localFaction != 0) {
+    const core::u64 fSeed = core::hashCombine(core::fnv1a64("faction"), (core::u64)localFaction);
+    const auto& fIcon = spriteCache.get(render::SpriteKind::Faction, fSeed, 32);
+    ImGui::Image((ImTextureID)(intptr_t)fIcon.handle(), ImVec2(18, 18));
+    if (ImGui::IsItemHovered()) {
+      const auto& big = spriteCache.get(render::SpriteKind::Faction, fSeed, 96);
+      ImGui::BeginTooltip();
+      ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+      ImGui::EndTooltip();
+    }
+    ImGui::SameLine();
     ImGui::Text("Local faction: %s | Rep %.1f | Bounty %.0f | Alert %.1f",
                 factionName(localFaction).c_str(),
                 getRep(localFaction),
@@ -6359,6 +6672,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
   ImGui::BulletText("L request docking clearance | G dock / undock");
   ImGui::BulletText("TAB Galaxy map, F1 Ship, F2 Market, F3 Contacts, F4 Missions, F6 Scanner, F7 Trade, F8 Guide");
   ImGui::BulletText("F5 quicksave, F9 quickload");
+  ImGui::BulletText("F10 Sprite Lab, F11 VFX Lab");
 
   ImGui::Separator();
   float scMax = (float)supercruiseMaxSpeedKmS;
@@ -6389,6 +6703,8 @@ if (showGuide) {
   ImGui::BulletText("Supercruise: H engage, H drop near ~7s ETA. Interdiction: align to escape vector; H submits");
   ImGui::BulletText("Trade helper: F7 (best local routes)");
   ImGui::BulletText("Scan: K (stars/planets/contacts). Sell exploration data at stations");
+  ImGui::BulletText("Sprite Lab: F10 (procedural UI icons preview + cache)");
+  ImGui::BulletText("VFX Lab: F11 (starfield + particles)");
 
   ImGui::Separator();
   ImGui::Text("Quick actions");
@@ -6432,15 +6748,112 @@ if (showGuide) {
   ImGui::End();
 }
 
+
+if (showSprites) {
+  ImGui::Begin("Sprite Lab");
+
+  ImGui::TextDisabled("F10 toggles this panel. Procedural icons are generated deterministically from (kind, seed).");
+  ImGui::Text("Sprite cache: %zu / %zu", spriteCache.size(), spriteCache.maxEntries());
+  if (ImGui::Button("Clear sprite cache")) spriteCache.clear();
+
+  ImGui::Separator();
+
+  static int kindIdx = 0;
+  static int texSize = 64;
+  static core::u64 seed = 0xC0FFEEULL;
+
+  const char* kindNames[] = {"Commodity", "Faction", "Mission", "Ship", "Station", "Planet", "Star"};
+  ImGui::Combo("Kind", &kindIdx, kindNames, IM_ARRAYSIZE(kindNames));
+  ImGui::SliderInt("Texture size", &texSize, 16, 128);
+  ImGui::InputScalar("Seed (u64)", ImGuiDataType_U64, &seed);
+  ImGui::SameLine();
+  if (ImGui::Button("Randomize")) {
+    seed = core::hashCombine((core::u64)SDL_GetPerformanceCounter(), core::fnv1a64("sprite_rand"));
+  }
+
+  const auto kind = (render::SpriteKind)std::clamp(kindIdx, 0, (int)IM_ARRAYSIZE(kindNames) - 1);
+  const auto& tex = spriteCache.get(kind, seed, texSize);
+
+  const float preview = std::max(128.0f, (float)texSize * 3.0f);
+  ImGui::Image((ImTextureID)(intptr_t)tex.handle(), ImVec2(preview, preview));
+
+  ImGui::Separator();
+
+  if (ImGui::CollapsingHeader("Commodity icon atlas", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::BeginTable("commod_atlas", 6, ImGuiTableFlags_SizingFixedFit)) {
+      for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+        const auto cid = (econ::CommodityId)i;
+        const core::u64 cSeed = core::hashCombine(core::fnv1a64("commodity"), (core::u64)i);
+        const auto& cTex = spriteCache.get(render::SpriteKind::Commodity, cSeed, 32);
+
+        ImGui::TableNextColumn();
+        ImGui::PushID((int)i);
+
+        ImGui::Image((ImTextureID)(intptr_t)cTex.handle(), ImVec2(26, 26));
+        if (ImGui::IsItemHovered()) {
+          const auto& big = spriteCache.get(render::SpriteKind::Commodity, cSeed, 96);
+          ImGui::BeginTooltip();
+          ImGui::Text("%s (%s)", std::string(econ::commodityName(cid)).c_str(), econ::commodityCode(cid));
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+          ImGui::EndTooltip();
+        }
+
+        ImGui::TextUnformatted(econ::commodityCode(cid));
+
+        ImGui::PopID();
+      }
+      ImGui::EndTable();
+    }
+  }
+
+  if (ImGui::CollapsingHeader("System icon samples", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (currentSystem) {
+      const core::u64 sSeed = core::hashCombine(core::fnv1a64("star"), (core::u64)currentSystem->stub.seed);
+      const auto& sTex = spriteCache.get(render::SpriteKind::Star, sSeed, 64);
+      ImGui::Image((ImTextureID)(intptr_t)sTex.handle(), ImVec2(64, 64));
+      ImGui::SameLine();
+      ImGui::Text("Star: %s", starClassName(currentSystem->star.cls));
+
+      ImGui::Separator();
+
+      for (std::size_t i = 0; i < std::min<std::size_t>(currentSystem->planets.size(), 8); ++i) {
+        const auto& p = currentSystem->planets[i];
+        const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)i);
+        const auto& pTex = spriteCache.get(render::SpriteKind::Planet, pSeed, 64);
+        ImGui::Image((ImTextureID)(intptr_t)pTex.handle(), ImVec2(48, 48));
+        ImGui::SameLine();
+        ImGui::Text("%s (%s)", p.name.c_str(), planetTypeName(p.type));
+      }
+    } else {
+      ImGui::TextDisabled("No current system loaded.");
+    }
+  }
+
+  ImGui::End();
+}
+
+
 if (showScanner) {
   ImGui::Begin("System Scanner");
 
   ImGui::Text("System: %s", currentSystem->stub.name.c_str());
-  ImGui::Text("Star: %s | Mass %.2f | Radius %.2f | Temp %.0fK",
-              starClassName(currentSystem->star.cls),
-              currentSystem->star.massSol,
-              currentSystem->star.radiusSol,
-              currentSystem->star.temperatureK);
+  {
+    const core::u64 sSeed = core::hashCombine(core::fnv1a64("star"), (core::u64)currentSystem->stub.seed);
+    const auto& sIcon = spriteCache.get(render::SpriteKind::Star, sSeed, 48);
+    ImGui::Image((ImTextureID)(intptr_t)sIcon.handle(), ImVec2(22, 22));
+    if (ImGui::IsItemHovered()) {
+      const auto& big = spriteCache.get(render::SpriteKind::Star, sSeed, 96);
+      ImGui::BeginTooltip();
+      ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+      ImGui::EndTooltip();
+    }
+    ImGui::SameLine();
+    ImGui::Text("Star: %s | Mass %.2f | Radius %.2f | Temp %.0fK",
+                starClassName(currentSystem->star.cls),
+                currentSystem->star.massSol,
+                currentSystem->star.radiusSol,
+                currentSystem->star.temperatureK);
+  }
 
   const bool starScanned = (scannedKeys.find(scanKeyStar(currentSystem->stub.id)) != scannedKeys.end());
 
@@ -6560,7 +6973,20 @@ if (showScanner) {
 
     ImGui::PushID((int)i);
 
-    ImGui::Text("%s %s", p.name.c_str(), scanned ? "" : "(unscanned)");
+    {
+      const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)i);
+      const auto& pIcon = spriteCache.get(render::SpriteKind::Planet, pSeed, 48);
+      ImGui::Image((ImTextureID)(intptr_t)pIcon.handle(), ImVec2(18, 18));
+      if (ImGui::IsItemHovered()) {
+        const auto& big = spriteCache.get(render::SpriteKind::Planet, pSeed, 96);
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(p.name.c_str());
+        ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+        ImGui::EndTooltip();
+      }
+      ImGui::SameLine();
+      ImGui::Text("%s %s", p.name.c_str(), scanned ? "" : "(unscanned)");
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("Target##p")) {
       target.kind = TargetKind::Planet;
@@ -6592,7 +7018,20 @@ if (showScanner) {
 
     ImGui::PushID((int)(1000 + i));
 
-    ImGui::Text("%s %s", st.name.c_str(), scanned ? "" : "(unscanned)");
+    {
+      const core::u64 stSeed = core::hashCombine(core::fnv1a64("station"), (core::u64)st.id);
+      const auto& stIcon = spriteCache.get(render::SpriteKind::Station, stSeed, 32);
+      ImGui::Image((ImTextureID)(intptr_t)stIcon.handle(), ImVec2(18, 18));
+      if (ImGui::IsItemHovered()) {
+        const auto& big = spriteCache.get(render::SpriteKind::Station, stSeed, 96);
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(st.name.c_str());
+        ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+        ImGui::EndTooltip();
+      }
+      ImGui::SameLine();
+      ImGui::Text("%s %s", st.name.c_str(), scanned ? "" : "(unscanned)");
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("Target##s")) {
       target.kind = TargetKind::Station;
@@ -7221,7 +7660,19 @@ if (canTrade) {
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%s%s", std::string(econ::commodityName(cid)).c_str(), illegalHere ? " (ILLEGAL)" : "");
+            {
+              const core::u64 iconSeed = core::hashCombine(core::fnv1a64("commodity"), (core::u64)i);
+              const auto& iconTex = spriteCache.get(render::SpriteKind::Commodity, iconSeed, 32);
+              ImGui::Image((ImTextureID)(intptr_t)iconTex.handle(), ImVec2(18, 18));
+              if (ImGui::IsItemHovered()) {
+                const auto& big = spriteCache.get(render::SpriteKind::Commodity, iconSeed, 96);
+                ImGui::BeginTooltip();
+                ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+                ImGui::EndTooltip();
+              }
+              ImGui::SameLine();
+              ImGui::Text("%s%s", std::string(econ::commodityName(cid)).c_str(), illegalHere ? " (ILLEGAL)" : "");
+            }
 
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%.0f", q.inventory);
@@ -7598,7 +8049,37 @@ if (canTrade) {
             ImGui::PushID((int)m.id);
             const bool active = !(m.completed || m.failed);
             const char* status = m.completed ? "COMPLETED" : (m.failed ? "FAILED" : "ACTIVE");
-            ImGui::Text("[%s]%s %s", status, (trackedMissionId == m.id ? " [TRACKED]" : ""), describeMission(m).c_str());
+            // Procedural mission icon(s)
+            {
+              core::u64 mSeed = core::hashCombine(core::fnv1a64("mission"), (core::u64)m.id);
+              mSeed = core::hashCombine(mSeed, (core::u64)(core::i64)m.type);
+              mSeed = core::hashCombine(mSeed, (core::u64)m.factionId);
+              const auto& mIcon = spriteCache.get(render::SpriteKind::Mission, mSeed, 32);
+              ImGui::Image((ImTextureID)(intptr_t)mIcon.handle(), ImVec2(18, 18));
+              if (ImGui::IsItemHovered()) {
+                const auto& big = spriteCache.get(render::SpriteKind::Mission, mSeed, 96);
+                ImGui::BeginTooltip();
+                ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+                ImGui::EndTooltip();
+              }
+
+              if (m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery ||
+                  m.type == sim::MissionType::Smuggle || m.type == sim::MissionType::Salvage) {
+                const core::u64 cSeed = core::hashCombine(core::fnv1a64("commodity"), (core::u64)(core::i64)m.commodity);
+                const auto& cIcon = spriteCache.get(render::SpriteKind::Commodity, cSeed, 32);
+                ImGui::SameLine();
+                ImGui::Image((ImTextureID)(intptr_t)cIcon.handle(), ImVec2(18, 18));
+                if (ImGui::IsItemHovered()) {
+                  const auto& cBig = spriteCache.get(render::SpriteKind::Commodity, cSeed, 96);
+                  ImGui::BeginTooltip();
+                  ImGui::Image((ImTextureID)(intptr_t)cBig.handle(), ImVec2(96, 96));
+                  ImGui::EndTooltip();
+                }
+              }
+
+              ImGui::SameLine();
+              ImGui::Text("[%s]%s %s", status, (trackedMissionId == m.id ? " [TRACKED]" : ""), describeMission(m).c_str());
+            }
             ImGui::TextDisabled("Reward %.0f cr | Faction: %s (rep %.1f)", m.reward, factionName(m.factionId).c_str(), getRep(m.factionId));
 
             if (m.deadlineDay > 0.0) {
@@ -8022,6 +8503,16 @@ if (showContacts) {
 
   const core::u32 localFaction = currentSystem ? currentSystem->stub.factionId : 0;
   if (localFaction != 0) {
+    const core::u64 fSeed = core::hashCombine(core::fnv1a64("faction"), (core::u64)localFaction);
+    const auto& fIcon = spriteCache.get(render::SpriteKind::Faction, fSeed, 32);
+    ImGui::Image((ImTextureID)(intptr_t)fIcon.handle(), ImVec2(18, 18));
+    if (ImGui::IsItemHovered()) {
+      const auto& big = spriteCache.get(render::SpriteKind::Faction, fSeed, 96);
+      ImGui::BeginTooltip();
+      ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+      ImGui::EndTooltip();
+    }
+    ImGui::SameLine();
     ImGui::Text("Local faction: %s | Rep %.1f | Bounty %.0f | Alert %.1f",
                 factionName(localFaction).c_str(),
                 getRep(localFaction),
@@ -8457,7 +8948,7 @@ if (showContacts) {
         }
       }
 
-      ImGui::TextDisabled("TAB toggles this window, F1 Flight, F2 Market, F3 Contacts");
+      ImGui::TextDisabled("TAB toggles this window, F1 Flight, F2 Market, F3 Contacts, F12 PostFX");
 
       ImGui::End();
     }
@@ -8469,9 +8960,11 @@ if (showContacts) {
   }
 
   // Cleanup
+  spriteCache.clear();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();
+  }
 
   SDL_GL_DeleteContext(glContext);
   SDL_DestroyWindow(window);

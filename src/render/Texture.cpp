@@ -175,6 +175,34 @@ void Texture2D::createChecker(int w, int h, int checkSize) {
   gl::GenerateMipmap(GL_TEXTURE_2D);
 }
 
+void Texture2D::createRGBA(int w, int h, const void* rgbaPixels,
+                           bool generateMips, bool nearestFilter, bool clampToEdge) {
+  destroy();
+  if (w <= 0 || h <= 0 || !rgbaPixels) return;
+  w_ = w;
+  h_ = h;
+
+  gl::GenTextures(1, &tex_);
+  gl::BindTexture(GL_TEXTURE_2D, tex_);
+
+  const GLint minFilter = generateMips
+    ? (nearestFilter ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR)
+    : (nearestFilter ? GL_NEAREST : GL_LINEAR);
+  const GLint magFilter = nearestFilter ? GL_NEAREST : GL_LINEAR;
+
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
+
+  const GLint wrap = clampToEdge ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+
+  gl::TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgbaPixels);
+  if (generateMips) {
+    gl::GenerateMipmap(GL_TEXTURE_2D);
+  }
+}
+
 void Texture2D::bind(int unit) const {
   gl::ActiveTexture(GL_TEXTURE0 + unit);
   gl::BindTexture(GL_TEXTURE_2D, tex_);

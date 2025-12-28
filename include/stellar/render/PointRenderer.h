@@ -6,9 +6,15 @@
 
 namespace stellar::render {
 
+enum class PointBlendMode {
+  Alpha = 0,
+  Additive,
+};
+
 struct PointVertex {
   float px, py, pz;
   float cr, cg, cb;
+  float a;
   float size;
 };
 
@@ -23,7 +29,7 @@ public:
   bool init(std::string* outError = nullptr);
 
   void setViewProj(const float* view, const float* proj);
-  void drawPoints(const std::vector<PointVertex>& points);
+  void drawPoints(const std::vector<PointVertex>& points, PointBlendMode blend = PointBlendMode::Alpha);
 
 private:
   ShaderProgram shader_{};

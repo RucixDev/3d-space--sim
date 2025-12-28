@@ -18,6 +18,13 @@ public:
   bool loadBMP(const std::string& path, std::string* outError = nullptr);
   void createChecker(int w, int h, int checkSize);
 
+  // Create a texture from raw RGBA8 pixels (row-major, 4 bytes per pixel).
+  // Useful for procedural textures and UI sprites.
+  void createRGBA(int w, int h, const void* rgbaPixels,
+                  bool generateMips = false,
+                  bool nearestFilter = true,
+                  bool clampToEdge = true);
+
   void bind(int unit = 0) const;
 
   unsigned int handle() const { return tex_; }

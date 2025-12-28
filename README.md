@@ -9,6 +9,8 @@ This repo contains:
 - "Ambient" **NPC trade traffic** that nudges station inventories (and therefore prices) over time
 - **Squad encounters**: pirate packs + police wingmen, with basic morale/pursuit escalation
   - Pirates may demand **tribute** (jettison cargo pods) before they open fire.
+- Deterministic **procedural UI sprites/icons** (cached)
+- Lightweight **VFX**: starfield background + particle bursts (thrusters / impacts / explosions)
 
 ## What’s playable right now (prototype “feel” pass)
 
@@ -72,6 +74,9 @@ This repo contains:
 - Interdiction: align to escape vector (HUD) | **H** submit
 - FSD jump: **J** (to selected system in Galaxy)
 - UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions, **F6** Scanner
+- Sprite Lab: **F10** (procedural UI icons)
+- VFX Lab: **F11** (starfield + particle effects)
+- Post FX: **F12** (HDR bloom + tonemap)
 - Save/Load: **F5 / F9**
 - Pause: **Space**
 - Time scale: **[ / ]** cycle simulation speed

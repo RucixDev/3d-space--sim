@@ -117,9 +117,19 @@ void ShaderProgram::setUniform1f(const char* name, float v) const {
   if (loc >= 0) gl::Uniform1f(loc, v);
 }
 
+void ShaderProgram::setUniform2f(const char* name, float x, float y) const {
+  const int loc = uniformLocation(name);
+  if (loc >= 0) gl::Uniform2f(loc, x, y);
+}
+
 void ShaderProgram::setUniform3f(const char* name, float x, float y, float z) const {
   const int loc = uniformLocation(name);
   if (loc >= 0) gl::Uniform3f(loc, x, y, z);
+}
+
+void ShaderProgram::setUniform4f(const char* name, float x, float y, float z, float w) const {
+  const int loc = uniformLocation(name);
+  if (loc >= 0) gl::Uniform4f(loc, x, y, z, w);
 }
 
 } // namespace stellar::render

@@ -1,3 +1,22 @@
+## 2025-12-28 (Patch) - HDR PostFX (bloom + tonemap)
+- **Render:** added an HDR offscreen render target and a lightweight **PostFX** pipeline (bright-pass + ping-pong Gaussian blur + composite).
+- **Render:** added film-ish finishing controls (exposure/gamma, vignette, subtle grain, chromatic aberration) and an optional screen-space **warp streak** effect.
+- **UI:** new **Post FX** tuning window (**F12**) to live-adjust bloom + tonemap.
+- **Fix:** scoped GL-backed objects so they destruct **before** `SDL_GL_DeleteContext` (prevents GL deletes after context teardown).
+
+## 2025-12-28 (Patch) - Starfield + particle VFX pass
+- **Render:** added a deterministic procedural **Starfield** background (point sprites) that follows the camera and twinkles.
+- **Render:** added a lightweight CPU **ParticleSystem** (point sprites) for **thrusters**, **impact sparks**, and **explosions**.
+- **Render:** `PointRenderer` now supports **alpha** per vertex and an **additive blend mode** for glowy VFX.
+- **Game:** VFX hooks added for thruster plume, weapon impacts, contact destruction, and player death.
+- **UI:** new **VFX Lab** window (**F11**) for toggling starfield/particles and tuning basic counts/intensity.
+
+## 2025-12-28 (Patch) - Procedural UI sprite generation + icon-rich panels
+- **Render:** added a small **procedural sprite generator** that can produce deterministic **RGBA icon sprites** (Commodity / Faction / Mission / Station / Planet / Star) from a `(kind, seed)` pair.
+- **Render:** added `Texture2D::createRGBA(...)` for uploading raw RGBA8 pixel buffers to OpenGL textures (used by the sprite generator + future procedural art).
+- **UI:** Market, Missions, Contacts, and System Scanner now show **procedural icons** (with hover tooltips that preview larger variants).
+- **UI:** new **Sprite Lab** window (**F10**) to preview sprite kinds, tweak seed/size, browse a commodity icon atlas, and inspect system icon samples.
+
 ## 2025-12-27 (Patch) - Ship-fit mission boards + route-aware multi-hop tuning
 - **Mission Board:** cargo-bearing offers (Delivery / Multi-hop / Smuggle) now size their payload to the player's **current free cargo capacity**, so generated jobs are accept-able immediately without dumping cargo.
 - **Passengers:** passenger offers now respect available **seat capacity** (no more 6-person offers on a 2-seat ship).

@@ -125,6 +125,10 @@ set(STELLAR_RENDER_SOURCES
   src/render/Gl.cpp
   src/render/Shader.cpp
   src/render/Texture.cpp
+  src/render/ProceduralSprite.cpp
+  src/render/Starfield.cpp
+  src/render/ParticleSystem.cpp
+  src/render/PostFX.cpp
   src/render/Mesh.cpp
   src/render/Camera.cpp
   src/render/MeshRenderer.cpp

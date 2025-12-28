@@ -22,7 +22,9 @@ PFNGLDELETEPROGRAMPROC DeleteProgram = nullptr;
 PFNGLGETUNIFORMLOCATIONPROC GetUniformLocation = nullptr;
 PFNGLUNIFORM1IPROC Uniform1i = nullptr;
 PFNGLUNIFORM1FPROC Uniform1f = nullptr;
+PFNGLUNIFORM2FPROC Uniform2f = nullptr;
 PFNGLUNIFORM3FPROC Uniform3f = nullptr;
+PFNGLUNIFORM4FPROC Uniform4f = nullptr;
 PFNGLUNIFORMMATRIX4FVPROC UniformMatrix4fv = nullptr;
 
 PFNGLGENVERTEXARRAYSPROC GenVertexArrays = nullptr;
@@ -50,6 +52,18 @@ PFNGLTEXPARAMETERIPROC TexParameteri = nullptr;
 PFNGLGENERATEMIPMAPPROC GenerateMipmap = nullptr;
 PFNGLDELETETEXTURESPROC DeleteTextures = nullptr;
 
+PFNGLGENFRAMEBUFFERSPROC GenFramebuffers = nullptr;
+PFNGLBINDFRAMEBUFFERPROC BindFramebuffer = nullptr;
+PFNGLFRAMEBUFFERTEXTURE2DPROC FramebufferTexture2D = nullptr;
+PFNGLCHECKFRAMEBUFFERSTATUSPROC CheckFramebufferStatus = nullptr;
+PFNGLDELETEFRAMEBUFFERSPROC DeleteFramebuffers = nullptr;
+
+PFNGLGENRENDERBUFFERSPROC GenRenderbuffers = nullptr;
+PFNGLBINDRENDERBUFFERPROC BindRenderbuffer = nullptr;
+PFNGLRENDERBUFFERSTORAGEPROC RenderbufferStorage = nullptr;
+PFNGLFRAMEBUFFERRENDERBUFFERPROC FramebufferRenderbuffer = nullptr;
+PFNGLDELETERENDERBUFFERSPROC DeleteRenderbuffers = nullptr;
+
 template <class T>
 static T loadProc(const char* name) {
   return reinterpret_cast<T>(SDL_GL_GetProcAddress(name));
@@ -74,7 +88,9 @@ bool load() {
   GetUniformLocation = loadProc<PFNGLGETUNIFORMLOCATIONPROC>("glGetUniformLocation");
   Uniform1i = loadProc<PFNGLUNIFORM1IPROC>("glUniform1i");
   Uniform1f = loadProc<PFNGLUNIFORM1FPROC>("glUniform1f");
+  Uniform2f = loadProc<PFNGLUNIFORM2FPROC>("glUniform2f");
   Uniform3f = loadProc<PFNGLUNIFORM3FPROC>("glUniform3f");
+  Uniform4f = loadProc<PFNGLUNIFORM4FPROC>("glUniform4f");
   UniformMatrix4fv = loadProc<PFNGLUNIFORMMATRIX4FVPROC>("glUniformMatrix4fv");
 
   GenVertexArrays = loadProc<PFNGLGENVERTEXARRAYSPROC>("glGenVertexArrays");
@@ -110,6 +126,19 @@ bool load() {
   }
   DeleteTextures = loadProc<PFNGLDELETETEXTURESPROC>("glDeleteTextures");
 
+  GenFramebuffers = loadProc<PFNGLGENFRAMEBUFFERSPROC>("glGenFramebuffers");
+  BindFramebuffer = loadProc<PFNGLBINDFRAMEBUFFERPROC>("glBindFramebuffer");
+  FramebufferTexture2D = loadProc<PFNGLFRAMEBUFFERTEXTURE2DPROC>("glFramebufferTexture2D");
+  CheckFramebufferStatus = loadProc<PFNGLCHECKFRAMEBUFFERSTATUSPROC>("glCheckFramebufferStatus");
+  DeleteFramebuffers = loadProc<PFNGLDELETEFRAMEBUFFERSPROC>("glDeleteFramebuffers");
+
+  GenRenderbuffers = loadProc<PFNGLGENRENDERBUFFERSPROC>("glGenRenderbuffers");
+  BindRenderbuffer = loadProc<PFNGLBINDRENDERBUFFERPROC>("glBindRenderbuffer");
+  RenderbufferStorage = loadProc<PFNGLRENDERBUFFERSTORAGEPROC>("glRenderbufferStorage");
+  FramebufferRenderbuffer = loadProc<PFNGLFRAMEBUFFERRENDERBUFFERPROC>("glFramebufferRenderbuffer");
+  DeleteRenderbuffers = loadProc<PFNGLDELETERENDERBUFFERSPROC>("glDeleteRenderbuffers");
+
+
   // Fallback for entry points that may be exported directly by the OpenGL library
   // rather than returned by SDL_GL_GetProcAddress (common on Windows for GL 1.1/1.3 funcs).
   if (!GenTextures)   GenTextures   = reinterpret_cast<PFNGLGENTEXTURESPROC>(&::glGenTextures);
@@ -126,12 +155,14 @@ bool load() {
   const bool ok =
       CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog && DeleteShader &&
       CreateProgram && AttachShader && LinkProgram && GetProgramiv && GetProgramInfoLog && UseProgram && DeleteProgram &&
-      GetUniformLocation && Uniform1i && Uniform1f && Uniform3f && UniformMatrix4fv &&
+      GetUniformLocation && Uniform1i && Uniform1f && Uniform2f && Uniform3f && Uniform4f && UniformMatrix4fv &&
       GenVertexArrays && BindVertexArray && DeleteVertexArrays &&
       GenBuffers && BindBuffer && BufferData && BufferSubData && DeleteBuffers &&
       EnableVertexAttribArray && VertexAttribPointer && VertexAttribDivisor &&
       DrawArraysInstanced && DrawElementsInstanced &&
-      ActiveTexture && GenTextures && BindTexture && TexImage2D && TexParameteri && GenerateMipmap && DeleteTextures;
+      ActiveTexture && GenTextures && BindTexture && TexImage2D && TexParameteri && GenerateMipmap && DeleteTextures &&
+      GenFramebuffers && BindFramebuffer && FramebufferTexture2D && CheckFramebufferStatus && DeleteFramebuffers &&
+      GenRenderbuffers && BindRenderbuffer && RenderbufferStorage && FramebufferRenderbuffer && DeleteRenderbuffers;
 
   if (!ok) {
     stellar::core::log(stellar::core::LogLevel::Error, "OpenGL loader: missing required functions (context too old?)");

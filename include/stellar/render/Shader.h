@@ -24,7 +24,9 @@ public:
   void setUniformMat4(const char* name, const float* mat4) const;
   void setUniform1i(const char* name, int v) const;
   void setUniform1f(const char* name, float v) const;
+  void setUniform2f(const char* name, float x, float y) const;
   void setUniform3f(const char* name, float x, float y, float z) const;
+  void setUniform4f(const char* name, float x, float y, float z, float w) const;
 
   unsigned int handle() const { return program_; }
 
