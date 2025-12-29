@@ -10355,14 +10355,14 @@ if (showScanner) {
           const auto& a = asteroids[target.index];
           const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
           showTargetHeader("Asteroid", render::SpriteKind::Asteroid, aSeed, ImVec4(1,1,1,1));
-          ImGui::TextDisabled("Yield: %s", econ::commodityDef(a.yield).name.c_str());
+          ImGui::TextDisabled("Yield: %s", econ::commodityDef(a.yield).name);
           ImGui::TextDisabled("Remaining: %.0f", a.remainingUnits);
           ImGui::TextDisabled("Distance: %.0f km", (a.posKm - ship.positionKm()).length());
         } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
           const auto& pod = floatingCargo[target.index];
           const core::u64 cSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity);
           showTargetHeader("Cargo Pod", render::SpriteKind::Cargo, cSeed, ImVec4(1,1,1,1));
-          ImGui::TextDisabled("Commodity: %s", econ::commodityDef(pod.commodity).name.c_str());
+          ImGui::TextDisabled("Commodity: %s", econ::commodityDef(pod.commodity).name);
           ImGui::TextDisabled("Units: %.0f", pod.units);
           ImGui::TextDisabled("Distance: %.0f km", (pod.posKm - ship.positionKm()).length());
         } else {

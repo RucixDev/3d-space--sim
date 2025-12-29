@@ -1,3 +1,11 @@
+## 2025-12-29 (Patch) - Universe Nearby Query Accelerator + MSVC .c_str() Fix
+- **Fix (MSVC):** removed invalid `.c_str()` calls on `econ::CommodityDef::name` in the target info panel (`CommodityDef::name` is `const char*`).
+- **Sim/Perf:** rewrote `Universe::queryNearby(...)` to avoid scanning the entire sector bounding box when `maxResults` is small:
+  - Best-first sector expansion using a safe AABB distance lower bound.
+  - Early-out once no remaining sector can beat the current worst of the kept top-N.
+  - Preserves deterministic ordering (distance, then `SystemId`).
+- **Tests:** added `test_query_nearby` which cross-checks `Universe::queryNearby(...)` against a brute-force sector scan for multiple cases.
+
 ## 2025-12-29 (Patch) - Build Fixes (MSVC)
 - **Fix:** corrected an invalid numeric literal in `ProceduralLivery.cpp` (previously `0xDECALull`), replacing it with a stable hashed seed salt (`hashCombine(seed, fnv1a64("decal"))`).
 - **Fix:** removed a duplicate `lightPos_` member declaration in `MeshRenderer.h` that caused MSVC `C2086` redefinition errors.

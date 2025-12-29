@@ -2,6 +2,7 @@ add_executable(stellar_tests
   main.cpp
   test_orbit.cpp
   test_streaming.cpp
+  test_query_nearby.cpp
   test_universe_cache.cpp
   test_proc.cpp
   test_economy.cpp

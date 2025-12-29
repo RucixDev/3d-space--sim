@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <queue>
+#include <unordered_set>
 #include <sstream>
 
 namespace stellar::sim {
@@ -103,11 +105,12 @@ std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
                                               double radiusLy,
                                               std::size_t maxResults) {
   std::vector<SystemStub> out;
-  if (radiusLy <= 0.0) return out;
+  if (radiusLy <= 0.0 || maxResults == 0) return out;
 
   const double r2 = radiusLy * radiusLy;
   const double s = galaxyParams_.sectorSizeLy;
 
+  // Conservative bounds on sector coords that could intersect the query sphere.
   const proc::SectorCoord minC{
     static_cast<core::i32>(std::floor((posLy.x - radiusLy) / s)),
     static_cast<core::i32>(std::floor((posLy.y - radiusLy) / s)),
@@ -119,30 +122,142 @@ std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
     static_cast<core::i32>(std::floor((posLy.z + radiusLy) / s)),
   };
 
-  struct Item { SystemStub stub; double d2; };
-  std::vector<Item> items;
+  const auto inBounds = [&](const proc::SectorCoord& c) {
+    return c.x >= minC.x && c.x <= maxC.x &&
+           c.y >= minC.y && c.y <= maxC.y &&
+           c.z >= minC.z && c.z <= maxC.z;
+  };
 
-  for (core::i32 x = minC.x; x <= maxC.x; ++x) {
-    for (core::i32 y = minC.y; y <= maxC.y; ++y) {
-      for (core::i32 z = minC.z; z <= maxC.z; ++z) {
-        const proc::SectorCoord c{x,y,z};
-        const proc::Sector& sec = sector(c);
+  const auto axisDist = [](double v, double lo, double hi) {
+    if (v < lo) return lo - v;
+    if (v > hi) return v - hi;
+    return 0.0;
+  };
 
-        for (const auto& stub : sec.systems) {
-          const math::Vec3d d = stub.posLy - posLy;
-          const double dd = d.lengthSq();
-          if (dd <= r2) items.push_back(Item{stub, dd});
+  // Lower bound on the distance from posLy to *any point* in a sector cube.
+  // Used for best-first sector expansion + safe early-out when maxResults is reached.
+  const auto minDist2ToSector = [&](const proc::SectorCoord& c) -> double {
+    const double x0 = static_cast<double>(c.x) * s;
+    const double y0 = static_cast<double>(c.y) * s;
+    const double z0 = static_cast<double>(c.z) * s;
+
+    const double x1 = x0 + s;
+    const double y1 = y0 + s;
+    const double z1 = z0 + s;
+
+    const double dx = axisDist(posLy.x, x0, x1);
+    const double dy = axisDist(posLy.y, y0, y1);
+    const double dz = axisDist(posLy.z, z0, z1);
+    return dx*dx + dy*dy + dz*dz;
+  };
+
+  struct SectorItem {
+    proc::SectorCoord c{};
+    double minD2{0.0};
+  };
+
+  // Min-heap by minD2 (then coord) so we visit the nearest possible sectors first.
+  struct SectorItemGreater {
+    bool operator()(const SectorItem& a, const SectorItem& b) const {
+      if (a.minD2 != b.minD2) return a.minD2 > b.minD2;
+      if (a.c.x != b.c.x) return a.c.x > b.c.x;
+      if (a.c.y != b.c.y) return a.c.y > b.c.y;
+      return a.c.z > b.c.z;
+    }
+  };
+
+  std::priority_queue<SectorItem, std::vector<SectorItem>, SectorItemGreater> open;
+  std::unordered_set<proc::SectorCoord, proc::SectorCoordHash> seen;
+  seen.reserve(1024);
+
+  // Keep the best maxResults stubs seen so far ("best" = smallest distance, then id).
+  struct Candidate {
+    SystemStub stub{};
+    double d2{0.0};
+  };
+
+  const auto better = [](const Candidate& a, const Candidate& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    return a.stub.id < b.stub.id;
+  };
+
+  // Max-heap by (d2,id) so top() is the current *worst* of the kept candidates.
+  struct CandidateLess {
+    bool operator()(const Candidate& a, const Candidate& b) const {
+      if (a.d2 != b.d2) return a.d2 < b.d2;
+      return a.stub.id < b.stub.id;
+    }
+  };
+
+  std::priority_queue<Candidate, std::vector<Candidate>, CandidateLess> best;
+
+  // Dynamic cutoff: before we have maxResults candidates we must consider the full radius.
+  // Once we have maxResults, we can safely ignore sectors whose AABB is farther than our
+  // current worst candidate (because they cannot contain a closer stub).
+  double stopD2 = r2;
+
+  const auto tryPush = [&](const proc::SectorCoord& c) {
+    if (!inBounds(c)) return;
+    if (!seen.insert(c).second) return;
+    const double md2 = minDist2ToSector(c);
+    if (md2 <= stopD2) open.push(SectorItem{c, md2});
+  };
+
+  const proc::SectorCoord startC = galaxyGen_.sectorOf(posLy);
+  tryPush(startC);
+
+  while (!open.empty()) {
+    // Refresh the cutoff.
+    stopD2 = r2;
+    if (best.size() >= maxResults) stopD2 = std::min(stopD2, best.top().d2);
+
+    const SectorItem cur = open.top();
+    if (cur.minD2 > stopD2) break; // remaining sectors cannot improve the top-N
+    open.pop();
+
+    const proc::Sector& sec = sector(cur.c);
+    for (const auto& stub : sec.systems) {
+      const double dd = (stub.posLy - posLy).lengthSq();
+      if (dd > r2) continue;
+
+      Candidate cand{stub, dd};
+
+      if (best.size() < maxResults) {
+        best.push(std::move(cand));
+      } else {
+        const Candidate& worst = best.top();
+        if (better(cand, worst)) {
+          best.pop();
+          best.push(std::move(cand));
         }
       }
     }
+
+    // Update cutoff after processing this sector (it may have improved).
+    stopD2 = r2;
+    if (best.size() >= maxResults) stopD2 = std::min(stopD2, best.top().d2);
+
+    // Expand in the 6 face-adjacent directions. The set of sectors that intersect
+    // a sphere (or any smaller cutoff sphere) is connected under face adjacency.
+    tryPush(proc::SectorCoord{cur.c.x + 1, cur.c.y, cur.c.z});
+    tryPush(proc::SectorCoord{cur.c.x - 1, cur.c.y, cur.c.z});
+    tryPush(proc::SectorCoord{cur.c.x, cur.c.y + 1, cur.c.z});
+    tryPush(proc::SectorCoord{cur.c.x, cur.c.y - 1, cur.c.z});
+    tryPush(proc::SectorCoord{cur.c.x, cur.c.y, cur.c.z + 1});
+    tryPush(proc::SectorCoord{cur.c.x, cur.c.y, cur.c.z - 1});
   }
 
-  std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
-    if (a.d2 != b.d2) return a.d2 < b.d2;
-    return a.stub.id < b.stub.id;
-  });
+  // Unheap + sort by the required stable order (distance, then id).
+  std::vector<Candidate> items;
+  items.reserve(best.size());
+  while (!best.empty()) {
+    items.push_back(best.top());
+    best.pop();
+  }
 
-  if (items.size() > maxResults) items.resize(maxResults);
+  std::sort(items.begin(), items.end(), [&](const Candidate& a, const Candidate& b) {
+    return better(a, b);
+  });
 
   out.reserve(items.size());
   for (auto& it : items) out.push_back(std::move(it.stub));

@@ -2,6 +2,7 @@
 
 int test_orbit();
 int test_streaming();
+int test_query_nearby();
 int test_universe_cache();
 int test_proc();
 int test_economy();
@@ -18,6 +19,7 @@ int main() {
 
   fails += test_orbit();
   fails += test_streaming();
+  fails += test_query_nearby();
   fails += test_universe_cache();
   fails += test_proc();
   fails += test_economy();
