@@ -5,6 +5,7 @@
 #include "stellar/econ/Market.h"
 #include "stellar/sim/Reputation.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/Orbit.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -166,11 +167,12 @@ void refreshMissionOffers(Universe& universe,
   const double cargoCapKg = std::max(0.0, ioSave.cargoCapacityKg);
   const int freeSeats = std::max(0, ioSave.passengerSeats - activePassengerCount(ioSave));
 
-    // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
+  // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
   const double tCourier = params.wCourier;
   const double tDelivery = tCourier + params.wDelivery;
   const double tMulti = tDelivery + params.wMultiDelivery;
-  const double tSalvage = tMulti + params.wSalvage;
+  const double tEscort = tMulti + params.wEscort;
+  const double tSalvage = tEscort + params.wSalvage;
   const double tPassenger = tSalvage + params.wPassenger;
   const double tSmuggle = tPassenger + params.wSmuggle;
   const double tBountyScan = tSmuggle + params.wBountyScan;
@@ -182,6 +184,7 @@ void refreshMissionOffers(Universe& universe,
     if (r < tCourier) type = MissionType::Courier;
     else if (r < tDelivery) type = MissionType::Delivery;
     else if (r < tMulti) type = MissionType::MultiDelivery;
+    else if (r < tEscort) type = MissionType::Escort;
     else if (r < tSalvage) type = MissionType::Salvage;
     else if (r < tPassenger) type = MissionType::Passenger;
     else if (r < tSmuggle) type = MissionType::Smuggle;
@@ -193,8 +196,8 @@ void refreshMissionOffers(Universe& universe,
       type = MissionType::Delivery;
     }
 
-    // If we don't have any destination candidates, we can still offer local Salvage jobs.
-    if (type != MissionType::Salvage && dests.empty()) {
+    // If we don't have any destination candidates, we can still offer local Salvage/Escort jobs.
+    if (type != MissionType::Salvage && type != MissionType::Escort && dests.empty()) {
       type = MissionType::Salvage;
     }
 
@@ -215,7 +218,7 @@ void refreshMissionOffers(Universe& universe,
     const Station* destSt = nullptr;
     sim::SystemStub destStub{};
 
-    if (type != MissionType::Salvage) {
+    if (type != MissionType::Salvage && type != MissionType::Escort) {
       // Pick a random destination system/station from nearby candidates.
       const int pick = (int)(mrng.nextU32() % (core::u32)dests.size());
       destStub = dests[(std::size_t)pick];
@@ -228,9 +231,43 @@ void refreshMissionOffers(Universe& universe,
 
       distLy = (destStub.posLy - currentSystem.stub.posLy).length();
       m.deadlineDay = timeDays + 1.0 + distLy / 20.0;
-    } else {
+    } else if (type == MissionType::Salvage) {
       // Salvage is a local in-system job: make it snappy.
       m.deadlineDay = timeDays + 0.35 + mrng.range(0.05, 0.20);
+    } else {
+      // Escort is a local in-system job that moves between *stations* in the current system.
+      if (currentSystem.stations.size() < 2) {
+        type = MissionType::Salvage;
+        m.deadlineDay = timeDays + 0.35 + mrng.range(0.05, 0.20);
+      } else {
+        // Pick a destination station different from the issuing station.
+        const Station* picked = nullptr;
+        for (int tries = 0; tries < 8; ++tries) {
+          const auto& cand = currentSystem.stations[(std::size_t)(mrng.nextU32() % (core::u32)currentSystem.stations.size())];
+          if (cand.id != dockedStation.id) { picked = &cand; break; }
+        }
+        if (!picked) {
+          // Deterministic fallback: use the first non-issuing station.
+          for (const auto& cand : currentSystem.stations) {
+            if (cand.id != dockedStation.id) { picked = &cand; break; }
+          }
+        }
+
+        if (!picked) {
+          type = MissionType::Salvage;
+          m.deadlineDay = timeDays + 0.35 + mrng.range(0.05, 0.20);
+        } else {
+          destStub = currentSystem.stub;
+          destSt = picked;
+          m.toSystem = currentSystem.stub.id;
+          m.toStation = destSt->id;
+
+          // In-system escorts should be short compared to interstellar courier jobs.
+          // Scale the deadline loosely with orbital separation in AU.
+          const double distAU = (orbitPosition3DAU(dockedStation.orbit, timeDays) - orbitPosition3DAU(destSt->orbit, timeDays)).length();
+          m.deadlineDay = timeDays + 0.35 + std::clamp(distAU * 0.10, 0.0, 0.65) + mrng.range(0.02, 0.12);
+        }
+      }
     }
 
     if (type == MissionType::Courier) {
@@ -397,6 +434,66 @@ void refreshMissionOffers(Universe& universe,
             m.reward += 140.0 + mrng.range(0.0, 70.0);
             m.deadlineDay = timeDays + 2.05 + routeLy / 18.0 + mrng.range(0.0, 0.25);
           }
+        }
+      }
+    } else if (type == MissionType::Escort) {
+      m.type = MissionType::Escort;
+
+      if (!destSt || destSt->id == dockedStation.id) {
+        // If we can't resolve a destination station, keep the board usable.
+        m.type = MissionType::Courier;
+        m.reward = 360.0;
+      } else {
+        // Convoy payload: reserve real station inventory at accept time.
+        m.cargoProvided = true;
+
+        // Stable convoy id for the game layer.
+        m.targetNpcId = (mrng.nextU64() | 0x4000000000000000ull);
+
+        // Pick a legal cargo load that is in demand at the destination station.
+        CargoMissionSpec spec{};
+        bool ok = false;
+        {
+          auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+
+          // Use a fixed NPC "freighter" capacity. This is separate from the player's ship hold.
+          const double maxCargoKg = 320.0;
+          const int minUnits = 6;
+          const int maxUnitsHard = 220;
+
+          ok = pickCargoMission(mrng,
+                                universe.seed(),
+                                originEcon,
+                                dockedStation.economyModel,
+                                destEcon,
+                                destSt->economyModel,
+                                destSt->factionId,
+                                /*requireLegalAtDest=*/true,
+                                /*cargoProvided=*/true,
+                                /*maxCargoKg=*/maxCargoKg,
+                                /*minUnits=*/minUnits,
+                                /*maxUnitsHard=*/maxUnitsHard,
+                                spec);
+        }
+
+        if (!ok) {
+          // If the economy can't support a convoy job right now, downgrade to courier.
+          m.type = MissionType::Courier;
+          m.reward = 360.0;
+          m.cargoProvided = false;
+          m.targetNpcId = 0;
+        } else {
+          m.commodity = spec.commodity;
+          m.units = (double)spec.units;
+
+          const double distAU = (orbitPosition3DAU(dockedStation.orbit, timeDays) - orbitPosition3DAU(destSt->orbit, timeDays)).length();
+
+          // Reward: distance service component + small share of cargo value.
+          const double cargoValue = spec.originQ.ask * (double)spec.units;
+          const double base = 780.0 + distAU * 210.0 + mrng.range(0.0, 160.0);
+          m.reward = base + cargoValue * (0.10 + mrng.range(0.0, 0.04));
+
+          // Deadline already set in the local-destination selection above.
         }
       }
     } else if (type == MissionType::Salvage) {
@@ -594,6 +691,21 @@ bool acceptMissionOffer(Universe& universe,
     }
   }
 
+  // Escort missions reserve station inventory for an NPC convoy. The player doesn't receive cargo,
+  // but the origin market should still be debited so the economy reflects that the convoy was
+  // loaded.
+  if (m.type == MissionType::Escort && m.units > 0.0) {
+    const econ::CommodityId cid = m.commodity;
+    const double taken = econ::takeInventory(stEcon, dockedStation.economyModel, cid, (double)m.units);
+    if (taken + 1e-6 < (double)m.units) {
+      // Restore any partial transfer.
+      econ::addInventory(stEcon, dockedStation.economyModel, cid, taken);
+      if (outError) *outError = "Station can't load that convoy right now.";
+      return false;
+    }
+    m.cargoProvided = true;
+  }
+
   // Salvage missions don't grant cargo up-front, but we should still ensure the requested salvage will
   // fit in the player's hold (otherwise the job is impossible to complete).
   if (m.type == MissionType::Salvage && m.units > 0.0) {
@@ -665,6 +777,20 @@ MissionDockResult tryCompleteMissionsAtDock(Universe& universe,
       }
     } else if (m.type == MissionType::Passenger) {
       if (atFinal) {
+        m.completed = true;
+        ioSave.credits += m.reward;
+        addReputation(ioSave, m.factionId, repRewardOnComplete);
+        ++r.completed;
+      }
+    } else if (m.type == MissionType::Escort) {
+      // Escort jobs are completed by docking at the destination after the convoy arrives.
+      // The game layer sets m.scanned=true when the NPC convoy reaches the target station.
+      if (atFinal && m.scanned) {
+        if (m.units > 0.0) {
+          auto& econHere = universe.stationEconomy(dockedStation, timeDays);
+          econ::addInventory(econHere, dockedStation.economyModel, m.commodity, m.units);
+        }
+
         m.completed = true;
         ioSave.credits += m.reward;
         addReputation(ioSave, m.factionId, repRewardOnComplete);

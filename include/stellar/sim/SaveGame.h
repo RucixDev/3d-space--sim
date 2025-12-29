@@ -40,18 +40,24 @@ struct SystemTrafficStamp {
 // Lightweight "gameplay" mission representation.
 // Stored in the save file so early progression loops (cargo delivery/courier/bounties)
 // persist across runs.
+// IMPORTANT: MissionType is persisted in save files as an integer.
+//
+// Always use explicit, stable numeric values here.
+// Do not reorder existing members, or older saves can silently remap mission types.
 enum class MissionType : core::u8 {
-  Courier = 0,
-  Delivery,
-  BountyScan,
-  BountyKill,
-  MultiDelivery,
-  Passenger,
-  Smuggle,
-
+  Courier       = 0,
+  Delivery      = 1,
+  BountyScan    = 2,
+  BountyKill    = 3,
+  MultiDelivery = 4,
+  Passenger     = 5,
+  Smuggle       = 6,
 
   // Recover goods from a mission derelict signal and return to a station.
-  Salvage,
+  Salvage       = 7,
+
+  // Escort a convoy from one station/system to another.
+  Escort        = 8,
 };
 
 struct Mission {

@@ -48,6 +48,7 @@ static const char* missionTypeName(sim::MissionType t) {
     case MissionType::Passenger: return "Passenger";
     case MissionType::Smuggle: return "Smuggle";
     case MissionType::Salvage: return "Salvage";
+    case MissionType::Escort: return "Escort";
     default: return "Unknown";
   }
 }
@@ -55,14 +56,14 @@ static const char* missionTypeName(sim::MissionType t) {
 static void printMission(const sim::Mission& m) {
   std::cout << "  [" << missionTypeName(m.type) << "] "
             << "toSystem=" << m.toSystem << " toStation=" << m.toStation;
-  if (m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Smuggle || m.type == sim::MissionType::Salvage) {
+  if (m.type == sim::MissionType::Delivery || m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Smuggle || m.type == sim::MissionType::Salvage || m.type == sim::MissionType::Escort) {
     std::cout << " cargo=" << econ::commodityCode(m.commodity) << " units=" << std::fixed << std::setprecision(0)
               << m.units;
   }
   if (m.type == sim::MissionType::Passenger) {
     std::cout << " party=" << std::fixed << std::setprecision(0) << m.units << " seats";
   }
-  if (m.type == sim::MissionType::BountyScan || m.type == sim::MissionType::BountyKill || m.type == sim::MissionType::Salvage) {
+  if (m.type == sim::MissionType::BountyScan || m.type == sim::MissionType::BountyKill || m.type == sim::MissionType::Salvage || m.type == sim::MissionType::Escort) {
     std::cout << " targetNpcId=" << m.targetNpcId;
   }
   if (m.type == sim::MissionType::Salvage) {

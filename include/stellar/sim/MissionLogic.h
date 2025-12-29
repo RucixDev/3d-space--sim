@@ -24,9 +24,10 @@ struct MissionBoardParams {
   double repThreshold2{50.0};
 
   // Mission type weights (must sum <= 1.0; remainder goes to BountyKill).
-  double wCourier{0.29};
-  double wDelivery{0.29};
+  double wCourier{0.265};
+  double wDelivery{0.265};
   double wMultiDelivery{0.12};
+  double wEscort{0.05};
   double wSalvage{0.08};
   double wPassenger{0.10};
   double wSmuggle{0.04};
