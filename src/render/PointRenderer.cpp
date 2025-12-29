@@ -39,12 +39,24 @@ in vec3 vColor;
 in float vAlpha;
 out vec4 FragColor;
 
+uniform int uUseTex;
+uniform sampler2D uTex;
+
 void main() {
-  // soft circle
+  // soft circle mask (keeps sprites round even if texture isn't)
   vec2 p = gl_PointCoord * 2.0 - 1.0;
   float d = dot(p,p);
-  float a = smoothstep(1.0, 0.7, d) * vAlpha;
-  FragColor = vec4(vColor, a);
+  float circle = smoothstep(1.0, 0.7, d);
+
+  if (uUseTex == 0) {
+    float a = circle * vAlpha;
+    FragColor = vec4(vColor, a);
+  } else {
+    vec4 t = texture(uTex, gl_PointCoord);
+    float a = t.a * vAlpha * circle;
+    vec3 rgb = t.rgb * vColor;
+    FragColor = vec4(rgb, a);
+  }
 }
 )GLSL";
 
@@ -74,6 +86,11 @@ bool PointRenderer::init(std::string* outError) {
     proj_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
   }
 
+  // Default uniforms.
+  shader_.bind();
+  shader_.setUniform1i("uUseTex", 0);
+  shader_.setUniform1i("uTex", 0);
+
   return true;
 }
 
@@ -96,6 +113,40 @@ void PointRenderer::drawPoints(const std::vector<PointVertex>& points, PointBlen
   shader_.bind();
   shader_.setUniformMat4("uView", view_);
   shader_.setUniformMat4("uProj", proj_);
+  shader_.setUniform1i("uUseTex", 0);
+
+  gl::BindVertexArray(vao_);
+  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
+  gl::BufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(points.size() * sizeof(PointVertex)),
+                 points.data(),
+                 GL_DYNAMIC_DRAW);
+
+  glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(points.size()));
+
+  gl::BindVertexArray(0);
+}
+
+void PointRenderer::drawPointsSprite(const std::vector<PointVertex>& points,
+                                    const Texture2D& sprite,
+                                    PointBlendMode blend) {
+  if (points.empty()) return;
+
+  glEnable(GL_PROGRAM_POINT_SIZE);
+  glEnable(GL_BLEND);
+  if (blend == PointBlendMode::Additive) {
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+  } else {
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  }
+
+  shader_.bind();
+  shader_.setUniformMat4("uView", view_);
+  shader_.setUniformMat4("uProj", proj_);
+  shader_.setUniform1i("uUseTex", 1);
+  shader_.setUniform1i("uTex", 0);
+
+  sprite.bind(0);
 
   gl::BindVertexArray(vao_);
   gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);

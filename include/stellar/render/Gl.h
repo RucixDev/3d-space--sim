@@ -28,6 +28,12 @@ typedef void (APIENTRYP PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint i
                                             GLsizei width, GLsizei height, GLint border,
                                             GLenum format, GLenum type, const void* pixels);
 #endif
+#ifndef PFNGLTEXSUBIMAGE2DPROC
+typedef void (APIENTRYP PFNGLTEXSUBIMAGE2DPROC)(GLenum target, GLint level,
+                                               GLint xoffset, GLint yoffset,
+                                               GLsizei width, GLsizei height,
+                                               GLenum format, GLenum type, const void* pixels);
+#endif
 #ifndef PFNGLTEXPARAMETERIPROC
 typedef void (APIENTRYP PFNGLTEXPARAMETERIPROC)(GLenum target, GLenum pname, GLint param);
 #endif
@@ -89,6 +95,7 @@ extern PFNGLACTIVETEXTUREPROC ActiveTexture;
 extern PFNGLGENTEXTURESPROC GenTextures;
 extern PFNGLBINDTEXTUREPROC BindTexture;
 extern PFNGLTEXIMAGE2DPROC TexImage2D;
+extern PFNGLTEXSUBIMAGE2DPROC TexSubImage2D;
 extern PFNGLTEXPARAMETERIPROC TexParameteri;
 extern PFNGLGENERATEMIPMAPPROC GenerateMipmap;
 extern PFNGLDELETETEXTURESPROC DeleteTextures;

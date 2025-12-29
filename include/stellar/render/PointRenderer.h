@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stellar/render/Shader.h"
+#include "stellar/render/Texture.h"
 
 #include <vector>
 
@@ -30,6 +31,12 @@ public:
 
   void setViewProj(const float* view, const float* proj);
   void drawPoints(const std::vector<PointVertex>& points, PointBlendMode blend = PointBlendMode::Alpha);
+
+  // Draw points as textured point-sprites (samples the full sprite using gl_PointCoord).
+  // Useful for stars/particles that want a smoother falloff than a hard-coded circle.
+  void drawPointsSprite(const std::vector<PointVertex>& points,
+                        const Texture2D& sprite,
+                        PointBlendMode blend = PointBlendMode::Alpha);
 
 private:
   ShaderProgram shader_{};

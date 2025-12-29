@@ -48,6 +48,7 @@ PFNGLACTIVETEXTUREPROC ActiveTexture = nullptr;
 PFNGLGENTEXTURESPROC GenTextures = nullptr;
 PFNGLBINDTEXTUREPROC BindTexture = nullptr;
 PFNGLTEXIMAGE2DPROC TexImage2D = nullptr;
+PFNGLTEXSUBIMAGE2DPROC TexSubImage2D = nullptr;
 PFNGLTEXPARAMETERIPROC TexParameteri = nullptr;
 PFNGLGENERATEMIPMAPPROC GenerateMipmap = nullptr;
 PFNGLDELETETEXTURESPROC DeleteTextures = nullptr;
@@ -118,6 +119,7 @@ bool load() {
   GenTextures = loadProc<PFNGLGENTEXTURESPROC>("glGenTextures");
   BindTexture = loadProc<PFNGLBINDTEXTUREPROC>("glBindTexture");
   TexImage2D = loadProc<PFNGLTEXIMAGE2DPROC>("glTexImage2D");
+  TexSubImage2D = loadProc<PFNGLTEXSUBIMAGE2DPROC>("glTexSubImage2D");
   TexParameteri = loadProc<PFNGLTEXPARAMETERIPROC>("glTexParameteri");
   GenerateMipmap = loadProc<PFNGLGENERATEMIPMAPPROC>("glGenerateMipmap");
   if (!GenerateMipmap) {
@@ -144,6 +146,7 @@ bool load() {
   if (!GenTextures)   GenTextures   = reinterpret_cast<PFNGLGENTEXTURESPROC>(&::glGenTextures);
   if (!BindTexture)   BindTexture   = reinterpret_cast<PFNGLBINDTEXTUREPROC>(&::glBindTexture);
   if (!TexImage2D)    TexImage2D    = reinterpret_cast<PFNGLTEXIMAGE2DPROC>(&::glTexImage2D);
+  if (!TexSubImage2D) TexSubImage2D = reinterpret_cast<PFNGLTEXSUBIMAGE2DPROC>(&::glTexSubImage2D);
   if (!TexParameteri) TexParameteri = reinterpret_cast<PFNGLTEXPARAMETERIPROC>(&::glTexParameteri);
   if (!DeleteTextures)DeleteTextures= reinterpret_cast<PFNGLDELETETEXTURESPROC>(&::glDeleteTextures);
 
@@ -160,7 +163,7 @@ bool load() {
       GenBuffers && BindBuffer && BufferData && BufferSubData && DeleteBuffers &&
       EnableVertexAttribArray && VertexAttribPointer && VertexAttribDivisor &&
       DrawArraysInstanced && DrawElementsInstanced &&
-      ActiveTexture && GenTextures && BindTexture && TexImage2D && TexParameteri && GenerateMipmap && DeleteTextures &&
+      ActiveTexture && GenTextures && BindTexture && TexImage2D && TexSubImage2D && TexParameteri && GenerateMipmap && DeleteTextures &&
       GenFramebuffers && BindFramebuffer && FramebufferTexture2D && CheckFramebufferStatus && DeleteFramebuffers &&
       GenRenderbuffers && BindRenderbuffer && RenderbufferStorage && FramebufferRenderbuffer && DeleteRenderbuffers;
 

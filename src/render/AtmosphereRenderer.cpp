@@ -1,4 +1,4 @@
-#include "stellar/render/MeshRenderer.h"
+#include "stellar/render/AtmosphereRenderer.h"
 
 #include "stellar/render/Gl.h"
 
@@ -6,7 +6,7 @@
 
 namespace stellar::render {
 
-MeshRenderer::~MeshRenderer() {
+AtmosphereRenderer::~AtmosphereRenderer() {
   if (instanceVbo_) {
     gl::DeleteBuffers(1, &instanceVbo_);
     instanceVbo_ = 0;
@@ -17,7 +17,6 @@ static const char* kVS = R"GLSL(
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
-layout(location=2) in vec2 aUv;
 
 layout(location=3) in vec3 iPos;
 layout(location=4) in vec3 iScale;
@@ -27,7 +26,6 @@ layout(location=6) in vec3 iColor;
 uniform mat4 uView;
 uniform mat4 uProj;
 
-out vec2 vUv;
 out vec3 vColor;
 out vec3 vNrm;
 out vec3 vWorldPos;
@@ -42,7 +40,6 @@ void main() {
   vec3 local = aPos * iScale;
   vec3 pos = quatRotate(iQuat, local) + iPos;
   gl_Position = uProj * uView * vec4(pos, 1.0);
-  vUv = aUv;
   vColor = iColor;
   vNrm = quatRotate(iQuat, aNrm);
   vWorldPos = pos;
@@ -51,43 +48,51 @@ void main() {
 
 static const char* kFS = R"GLSL(
 #version 330 core
-in vec2 vUv;
 in vec3 vColor;
 in vec3 vNrm;
 in vec3 vWorldPos;
 
-uniform sampler2D uTex;
-uniform float uUnlit;
-uniform vec3 uLightPos;
-uniform float uAlphaFromTex;
-uniform float uAlphaMul;
+uniform vec3 uCamPos;
+uniform float uIntensity;
+uniform float uPower;
+uniform float uSunLitBoost;
+uniform float uForwardScatter;
 
 out vec4 FragColor;
 
 void main() {
   vec3 n = normalize(vNrm);
-  // Point-light position in world space (the star sits at the origin in the prototype).
-  vec3 l = normalize(uLightPos - vWorldPos);
-  float diff = max(dot(n, l), 0.0);
-  vec4 t = texture(uTex, vUv);
-  vec3 tex = t.rgb;
-  float lit = (0.35 + 0.65 * diff);
-  float shade = mix(lit, 1.0, clamp(uUnlit, 0.0, 1.0));
-  vec3 col = tex * vColor * shade;
-  float a = 1.0;
-  if (uAlphaFromTex > 0.5) {
-    a = clamp(t.a * uAlphaMul, 0.0, 1.0);
-  }
-  FragColor = vec4(col, a);
+  vec3 v = normalize(uCamPos - vWorldPos);
+
+  // Prototype star is at the origin.
+  vec3 l = normalize(-vWorldPos);
+
+  float ndotv = clamp(dot(n, v), 0.0, 1.0);
+  float ndotl = clamp(dot(n, l), 0.0, 1.0);
+
+  // Fresnel-style rim factor.
+  float rim = pow(1.0 - ndotv, max(0.25, uPower));
+
+  // Make the rim brighter on the day-side limb.
+  float sun = mix(1.0, 0.35 + 0.65 * ndotl, clamp(uSunLitBoost, 0.0, 1.0));
+
+  // Forward-scatter highlight when looking roughly toward the sun.
+  float forward = pow(clamp(dot(v, -l), 0.0, 1.0), 6.0);
+
+  float a = rim * sun + forward * uForwardScatter * rim;
+  a = clamp(a, 0.0, 1.0);
+
+  // Additive blend: contribution = rgb * alpha.
+  FragColor = vec4(vColor * uIntensity, a);
 }
 )GLSL";
 
-bool MeshRenderer::init(std::string* outError) {
+bool AtmosphereRenderer::init(std::string* outError) {
   if (!shader_.build(kVS, kFS, outError)) return false;
 
   gl::GenBuffers(1, &instanceVbo_);
 
-  // default identity matrices
+  // Default identity matrices.
   for (int i = 0; i < 16; ++i) {
     view_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
     proj_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
@@ -96,26 +101,27 @@ bool MeshRenderer::init(std::string* outError) {
   return true;
 }
 
-void MeshRenderer::setViewProj(const float* view, const float* proj) {
+void AtmosphereRenderer::setViewProj(const float* view, const float* proj) {
   std::memcpy(view_, view, sizeof(float) * 16);
   std::memcpy(proj_, proj, sizeof(float) * 16);
 }
 
-void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
+void AtmosphereRenderer::drawInstances(const std::vector<InstanceData>& instances) {
   if (!mesh_ || instances.empty()) return;
+
+  // Additive limb glow
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 
   shader_.bind();
   shader_.setUniformMat4("uView", view_);
   shader_.setUniformMat4("uProj", proj_);
-  shader_.setUniform1i("uTex", 0);
-  shader_.setUniform1f("uUnlit", unlit_ ? 1.0f : 0.0f);
-  shader_.setUniform3f("uLightPos", lightPos_[0], lightPos_[1], lightPos_[2]);
-  shader_.setUniform1f("uAlphaFromTex", alphaFromTexture_ ? 1.0f : 0.0f);
-  shader_.setUniform1f("uAlphaMul", alphaMul_);
+  shader_.setUniform3f("uCamPos", camPos_[0], camPos_[1], camPos_[2]);
+  shader_.setUniform1f("uIntensity", intensity_);
+  shader_.setUniform1f("uPower", power_);
+  shader_.setUniform1f("uSunLitBoost", sunLitBoost_);
+  shader_.setUniform1f("uForwardScatter", forwardScatter_);
 
-  if (tex_) tex_->bind(0);
-
-  // Bind mesh VAO and configure instance attributes
   mesh_->bind();
 
   gl::BindBuffer(GL_ARRAY_BUFFER, instanceVbo_);

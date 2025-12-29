@@ -25,6 +25,17 @@ public:
                   bool nearestFilter = true,
                   bool clampToEdge = true);
 
+  // Allocate an empty RGBA8 texture (initial contents undefined). Use updateRGBA()
+  // to upload regions.
+  void allocateRGBA(int w, int h,
+                    bool generateMips = false,
+                    bool nearestFilter = true,
+                    bool clampToEdge = true);
+
+  // Update a sub-region of an RGBA8 texture previously created via createRGBA()
+  // or allocateRGBA(). (x,y) is the lower-left corner in texel coordinates.
+  void updateRGBA(int x, int y, int w, int h, const void* rgbaPixels);
+
   void bind(int unit = 0) const;
 
   unsigned int handle() const { return tex_; }

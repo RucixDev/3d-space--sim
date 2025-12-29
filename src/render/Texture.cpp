@@ -203,6 +203,55 @@ void Texture2D::createRGBA(int w, int h, const void* rgbaPixels,
   }
 }
 
+void Texture2D::allocateRGBA(int w, int h,
+                             bool generateMips, bool nearestFilter, bool clampToEdge) {
+  destroy();
+  if (w <= 0 || h <= 0) return;
+  w_ = w;
+  h_ = h;
+
+  gl::GenTextures(1, &tex_);
+  gl::BindTexture(GL_TEXTURE_2D, tex_);
+
+  const GLint minFilter = generateMips
+    ? (nearestFilter ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR)
+    : (nearestFilter ? GL_NEAREST : GL_LINEAR);
+  const GLint magFilter = nearestFilter ? GL_NEAREST : GL_LINEAR;
+
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
+
+  const GLint wrap = clampToEdge ? GL_CLAMP_TO_EDGE : GL_REPEAT;
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+  gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+
+  // Allocate with null pixel data; contents are undefined until updateRGBA().
+  gl::TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  if (generateMips) {
+    gl::GenerateMipmap(GL_TEXTURE_2D);
+  }
+}
+
+void Texture2D::updateRGBA(int x, int y, int w, int h, const void* rgbaPixels) {
+  if (!tex_ || !rgbaPixels) return;
+  if (w <= 0 || h <= 0) return;
+
+  // Clamp update region to the texture bounds.
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x >= w_ || y >= h_) return;
+  if (x + w > w_) w = w_ - x;
+  if (y + h > h_) h = h_ - y;
+  if (w <= 0 || h <= 0) return;
+
+  gl::BindTexture(GL_TEXTURE_2D, tex_);
+
+  // Ensure tight row packing (RGBA8).
+  ::glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+  gl::TexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgbaPixels);
+}
+
 void Texture2D::bind(int unit) const {
   gl::ActiveTexture(GL_TEXTURE0 + unit);
   gl::BindTexture(GL_TEXTURE_2D, tex_);

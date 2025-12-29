@@ -1,3 +1,129 @@
+## 2025-12-29 (Patch) - Build Fixes (MSVC)
+- **Fix:** corrected an invalid numeric literal in `ProceduralLivery.cpp` (previously `0xDECALull`), replacing it with a stable hashed seed salt (`hashCombine(seed, fnv1a64("decal"))`).
+- **Fix:** removed a duplicate `lightPos_` member declaration in `MeshRenderer.h` that caused MSVC `C2086` redefinition errors.
+- **Fix:** added missing `stellar/math/Vec2.h` include in `apps/stellar_game/main.cpp` so `math::Vec2d` is defined for System Map 2.0.
+- **Fix:** replaced invalid `ImGui::GetMouseDelta(...)` call with `ImGui::GetMouseDragDelta(...)` in the Hangar preview (ImGui 1.91+).
+- **Fix:** removed dependency on `IM_PI` (not exposed in this ImGui build) and used `math::kPi` for HUD ring math.
+- **Fix:** corrected `std::string_view` UI usage (commodity name/code) by using span-safe ImGui calls (`%.*s` + `TextUnformatted(text, end)`).
+- **Fix:** fixed Galaxy list jump-range scope error (`jrMaxLy` → `galaxyPlanMaxLy`).
+
+## 2025-12-29 (Patch) - Hangar 3D Preview + Procedural Ship Livery System
+- **UI/Render:** added a new **Hangar / Livery** window (Windows → Hangar / Livery):
+  - A real-time **3D ship preview** rendered into an offscreen OpenGL **FBO render target** and shown in the UI via `ImGui::Image`.
+  - Mouse controls: **drag to rotate**, **scroll to zoom**, optional **auto-spin**.
+- **Render:** introduced `render::RenderTarget2D` (RGBA8 + depth) for general-purpose **render-to-texture previews**.
+- **Render:** added `render::ProceduralLivery` – a new procedural **UV texture** generator for ships/stations with multiple patterns:
+  - Solid, Stripes, Hazard (diagonal warning stripes), Camo, Hex, and Digital.
+  - Optional **decal** (band + dot), plus **wear/dirt** and subtle fabric-like noise.
+- **World:** the player ship now renders in a separate cube pass with the generated livery texture (toggleable: “Apply in world”).
+- **Render:** `MeshRenderer` now supports a configurable point-light position (`setLightPos`) so world lighting stays “star at origin” while UI previews can use a nicer offset light.
+- **UX:** livery settings persist to `livery.txt` with **Save / Load / Reset** plus optional **auto-save on close**.
+
+## 2025-12-28 (Patch) - System Map 2.0 (Orrery) + Time Scrub + Atlas Icons
+- **UI:** rebuilt the Scanner → **System Map** into an **infinite-canvas "orrery"**:
+  - Cursor-anchored **mouse wheel zoom**, RMB/MMB **pan**, **follow ship**, and a right-click **context menu**.
+  - Added a subtle **grid/scale** overlay (concentric AU rings + scale bar) to make distances readable at any zoom level.
+- **UI/Render:** System Map now draws **all icons from the HUD `SpriteAtlas`**, keeping the procedural look consistent and avoiding a pile of texture binds.
+  - Selected objects get a pulsing **selection ring**.
+  - The current nav target also shows a **supercruise drop-distance ring** (station/planet/signal) to help approach planning.
+- **UI:** added an **orbit preview time scrub** (**t ± days**) plus optional animation (days/sec) so you can forecast planetary/station motion **without changing sim time**.
+- **UI:** added a right-side **Selection/Quick Targets** panel with:
+  - Per-target info + actions: **Scan (K)**, **Supercruise (H)**, **Autopilot to station (P)**, **Center map on selection**.
+  - Quick target lists for **Planets / Stations / Signals** (atlas icons included).
+
+## 2025-12-28 (Patch) - Planet Atmospheres (Limb Glow) + Procedural Cloud Shells
+- **Render:** added `render::AtmosphereRenderer` (additive limb glow) for lightweight **planet atmospheres**.
+  - Fresnel-ish rim term + optional **day-side boost** and **forward-scatter** highlight when looking toward the star.
+  - Rendered as an instanced, slightly larger UV-sphere shell with additive blending (no gameplay impact).
+- **Render:** added a new procedural surface kind: **Clouds** (`render::SurfaceKind::Clouds`) generating a seam-free alpha mask on the unit sphere.
+- **Render:** `MeshRenderer` now optionally outputs **alpha from texture** (`setAlphaFromTexture`, `setAlphaMul`) enabling translucent shells (cloud layer) without a new mesh pipeline.
+- **World:** planets now render optional **cloud layers** (alpha blended) and optional **atmospheres** (additive) on top of their surface.
+  - Per-planet tint/strength is derived from planet type + seed; clouds also get a subtle deterministic **rotation**.
+- **UI:** **World Visuals** window gains a new **Secondary layers** section for tuning:
+  - Atmosphere: intensity, rim power, shell scale, day-side boost, forward scatter, tint-with-star.
+  - Clouds: opacity, shell scale, spin rate (requires procedural surfaces).
+- **UI:** Scanner planet tooltips can now show a **Clouds** preview below the surface preview.
+
+## 2025-12-28 (Patch) - HUD Layout Editor (Drag/Drop) + Persistent Overlay Placement
+- **UI:** added a **HUD Layout system** (`hud_layout.txt`) that persists normalized overlay placement (pivot-based) plus per-widget scale and enable flags.
+- **UI:** added a new **HUD Layout** window (HUD → Layout) with:
+  - **Edit mode** (drag HUD panels to reposition)
+  - Per-widget **enabled** toggles + **scale** sliders + **anchor/pivot** presets
+  - Quick actions: **Save/Load/Reset**
+  - Keyboard shortcuts: **Ctrl+H** edit mode, **Ctrl+S** save, **Ctrl+L** load, **Ctrl+R** reset
+- **UI:** while in edit mode, the HUD draws a **safe-area guide** and **pivot markers** for HUD widgets.
+- **UI:** Radar / Objective / Threat / Jump HUD overlays now use the persisted layout for position + scale.
+
+## 2025-12-28 (Patch) - Hyperspace Jump Tunnel (PostFX) + Jump HUD
+- **Render/PostFX:** added a new **hyperspace / jump tunnel** screen-space effect (swirl + rings/sparkles) composited in the PostFX pass.
+  - Controlled via new `render::PostFXSettings` parameters: `hyperspace`, `hyperspaceTwist`, `hyperspaceDensity`, `hyperspaceNoise`, `hyperspaceIntensity`.
+  - Designed to play nicely with existing bloom/tonemap (the effect is added **pre-tonemap**).
+- **Gameplay/UI:** **FSD** now supports a clean **abort during charge**: press **J** again while charging to cancel (fuel is only consumed when the charge completes).
+- **UI:** added a lightweight top-center **Jump HUD overlay** (toggleable) showing destination + charge/hyperspace progress + ETA.
+- **UI:** Post FX panel gains a new **Hyperspace / Jump FX** section with auto-FSD controls and manual tuning sliders.
+
+## 2025-12-28 (Patch) - Procedural Nebula Background Layer (Point Sprites)
+- **Render:** added `render::NebulaField`, a background **nebula/gas layer** built from large **additive point sprites**.
+  - Optional **galactic-plane banding** ("band power"), mild **turbulence**, and tunable **parallax** (0..1) for depth.
+  - HDR-friendly **intensity** control (lets bloom/PostFX give the nebula a soft glow).
+- **Render:** added a new procedural **cloud sprite** generator (`makeCloudSpriteTextureRGBA`) for soft, noisy alpha puffs.
+- **UI:** **VFX Lab** gains a new **Nebula** section: density, variant, banding, radii, parallax, intensity, opacity, size range, and turbulence.
+
+## 2025-12-28 (Patch) - Procedural Planet Surfaces + Star-Relative Lighting
+- **Render:** added a new procedural **surface texture** generator for spherical bodies (`render::ProceduralPlanet`) plus an LRU-ish **runtime GL texture cache** (`render::SurfaceTextureCache`).
+  - Generates 2:1 **equirectangular** albedo textures for **Rocky / Desert / Ocean / Ice / Gas Giant / Star** surfaces.
+  - Deterministic from a seed; safe to call from the main thread and cached to avoid re-uploading.
+- **Render:** upgraded `MeshRenderer` lighting to use a simple **star-at-origin point light** (per-fragment) so planets/stations get a more believable terminator.
+  - Added `MeshRenderer::setUnlit(bool)` to render emissive/unlit bodies (stars, debug).
+- **World:** star + planets now optionally render with procedural surface textures (toggleable).
+  - Added a high-level HDR knob: **star intensity** to let the star drive bloom in the PostFX pass.
+- **UI:** new **World Visuals** window (Windows → World Visuals) to:
+  - Toggle procedural surfaces + UI previews.
+  - Adjust surface texture resolution.
+  - Preview the surface generator output live.
+- **UI:** Scanner tooltips for **Star** and **Planets** optionally show a surface preview (matches the world seed).
+
+## 2025-12-28 (Patch) - Combat HUD Suite (Procedural Reticle + Lead + Flight Path Marker)
+- **HUD → Combat:** added a new **Combat HUD** package with high-visibility flight/combat symbology:
+  - **Procedural reticle** (`HudReticle`) drawn from the HUD atlas (tintable alpha-mask sprite).
+  - **Weapon cooldown rings** around the reticle (primary/secondary, tinted by weapon color).
+  - **Heat ring** around the reticle (grows with ship heat).
+  - **Flight path marker** (`HudVelocity`) that shows your current velocity vector (optionally relative to the **local frame**).
+  - **Projectile lead indicator** (`HudLead`) for contact targets using an analytic moving-target intercept; hold **Shift** to show time-to-impact.
+- **Render:** expanded procedural sprite generation with new HUD kinds: **HudReticle**, **HudLead**, **HudVelocity**.
+- **UX:** firing now tracks the **last fired** weapon so the lead marker matches the weapon you’re actually using.
+
+## 2025-12-28 (Patch) - Galaxy Map 2.0 (Pan/Zoom + Atlas Icons)
+- **UI:** revamped the Galaxy window into a **two-column layout**: interactive map + system list on the left, selection + route planner on the right.
+- **Map:** upgraded the mini-map to an **infinite-canvas** style viewer:
+  - **Mouse wheel** zoom (keeps the world point under the cursor stable).
+  - **MMB/RMB drag** panning.
+  - **Double-click** a system to center the view.
+  - **Right-click** context menu (select, center view, plot route, engage FSD).
+- **Map visuals:** systems are now rendered with the **HUD procedural atlas** (star icon tinted by **star class**), with optional **faction glyph** overlays, plus a pulsing **next-hop** highlight when a route is plotted.
+
+## 2025-12-28 (Patch) - HUD Icon Atlas + Offscreen Target Indicator
+- **Render:** added a lightweight **procedural icon atlas** (`render::SpriteAtlas`) that packs many `(kind, seed)` sprites into **one GL texture**.
+  - Incremental updates via `glTexSubImage2D` (loader support added) so new icons can be uploaded without recreating the whole texture.
+- **HUD:** Radar + Tactical overlay + target label icons now draw from the **atlas** (fewer texture binds, fewer per-size sprite-cache entries).
+- **HUD:** added an optional **offscreen target indicator** (edge-of-screen arrow + icon + distance). Toggle it from **HUD → Offscreen target indicator**.
+- **Sprite Lab:** displays the current HUD atlas (size/capacity) and provides a **Clear HUD atlas** button.
+
+## 2025-12-28 (Patch) - Tactical Overlay + Textured Point Sprites
+- **UI/HUD:** added a **Tactical overlay** (**`**) that projects in-world objects onto the screen with **procedural icons**.
+  - Hover markers for a tooltip; **MMB** targets the hovered marker (avoids conflicting with weapon fire).
+  - Range / marker cap / per-type filters + label toggle (HUD menu).
+- **Render:** upgraded `PointRenderer` with a **textured point-sprite** path (samples a small RGBA sprite via `gl_PointCoord`).
+- **VFX:** starfield + particle passes can now switch between **circle points** and **textured sprites** (VFX Lab toggles).
+- **Art:** added small **procedural radial sprites** for stars + particles (deterministic from the sim seed).
+
+## 2025-12-28 (Patch) - HUD Radar + System Map + Expanded Procedural Icons
+- **UI/HUD:** added a **Radar** overlay (**R**) with clickable blips (target stations/planets/contacts/signals/cargo/asteroids).
+- **UI/Scanner:** added a new **System Map** tab to the scanner (**F6**) featuring a 2D orbit view with **click-to-target** icons and zoom/filter toggles.
+- **Render:** expanded procedural icon generation with new sprite kinds: **Cargo**, **Asteroid**, **Signal**.
+- **UI:** scanner lists for signal sources, asteroids, and floating cargo now include procedural icons + hover previews.
+- **UI/HUD:** target marker now shows the target’s procedural icon beside the distance label.
+
 ## 2025-12-28 (Patch) - HDR PostFX (bloom + tonemap)
 - **Render:** added an HDR offscreen render target and a lightweight **PostFX** pipeline (bright-pass + ping-pong Gaussian blur + composite).
 - **Render:** added film-ish finishing controls (exposure/gamma, vignette, subtle grain, chromatic aberration) and an optional screen-space **warp streak** effect.

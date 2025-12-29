@@ -85,9 +85,16 @@ uniform float uAberration;
 uniform float uWarp;
 uniform float uTime;
 
+// Hyperspace / jump tunnel (screen-space)
+uniform float uHyper;
+uniform float uHyperTwist;
+uniform float uHyperDensity;
+uniform float uHyperNoise;
+uniform float uHyperIntensity;
+
 // Cheap hash noise
 float rand1(vec2 p) {
-  // (not a great RNG, but good enough for grain)
+  // (not a great RNG, but good enough for grain/sparkles)
   return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453123);
 }
 
@@ -102,15 +109,59 @@ vec3 acesFilm(vec3 x) {
 }
 
 void main() {
-  vec2 uv = vUv;
+  vec2 uv0 = vUv;
+  vec2 uv = uv0;
+
   vec2 center = vec2(0.5, 0.5);
   vec2 d = uv - center;
   float dist = length(d);
   vec2 dir = (dist > 1e-6) ? (d / dist) : vec2(0.0, 0.0);
 
+  // Preserve stable radial values for vignette + hyperspace patterns (avoid "swimming" vignette).
+  float dist0 = dist;
+  vec2 dir0 = dir;
+
+  float hyper = clamp(uHyper, 0.0, 1.0);
+  float hyperDensity = clamp(uHyperDensity, 0.0, 1.0);
+  float hyperNoise = clamp(uHyperNoise, 0.0, 1.0);
+  float hyperTwist = clamp(uHyperTwist, 0.0, 1.0);
+
+  // Hyperspace UV distortion: a cheap swirl in polar space, blended back toward the original UV
+  // so the edges don't tear apart.
+  if (hyper > 0.0) {
+    // Max distance to a corner is sqrt(0.5^2 + 0.5^2) ~= 0.7071.
+    float rN = clamp(dist / 0.70710678, 0.0, 1.0);
+    float ang = atan(d.y, d.x);
+
+    float density = mix(8.0, 42.0, hyperDensity);
+    float t = uTime;
+
+    float twist = hyperTwist * hyper;
+
+    // Twist harder near the center; keep edges mostly stable.
+    float ang2 = ang + twist * (1.0 - rN) * (0.55 + 0.11 * density) + t * (0.30 + 0.20 * twist);
+    vec2 rot = vec2(cos(ang2), sin(ang2)) * dist;
+
+    // Small radial wobble so it doesn't look perfectly mathematical.
+    float wobble = sin(t * 1.6 + rN * density) * (0.002 + 0.010 * hyperNoise) * hyper;
+
+    uv = center + rot + dir * wobble;
+    uv = mix(uv0, uv, hyper * 0.85);
+
+    // Update radial values for sampling.
+    d = uv - center;
+    dist = length(d);
+    dir = (dist > 1e-6) ? (d / dist) : vec2(0.0, 0.0);
+  }
+
   // Chromatic aberration: offset R/B slightly along radial direction.
   vec3 scene;
   float ca = uAberration;
+  if (hyper > 0.0) {
+    // Tiny extra CA during hyperspace.
+    ca += hyper * 0.0020 * (0.25 + 0.75 * hyperNoise);
+  }
+
   if (ca > 0.0) {
     vec2 o = dir * ca;
     scene.r = texture(uScene, clamp(uv + o, 0.0, 1.0)).r;
@@ -122,6 +173,11 @@ void main() {
 
   // Warp streaks: sample a few taps "backwards" along radial direction.
   float warp = uWarp;
+  if (hyper > 0.0) {
+    // If hyperspace is enabled (manual or auto), ensure at least a small warp streak.
+    warp = max(warp, hyper * 0.055);
+  }
+
   if (warp > 0.0) {
     vec3 streak = vec3(0.0);
     const int N = 6;
@@ -137,19 +193,50 @@ void main() {
   vec3 bloom = (uBloomEnabled != 0) ? texture(uBloom, uv).rgb : vec3(0.0);
   vec3 color = scene + bloom * uBloomIntensity;
 
+  // Hyperspace overlay (additive, pre-tonemap).
+  if (hyper > 0.0) {
+    float rN = clamp(dist0 / 0.70710678, 0.0, 1.0);
+    float ang = atan(dir0.y, dir0.x);
+
+    float density = mix(8.0, 42.0, hyperDensity);
+    float t = uTime;
+
+    // Moving ring/stripe pattern (strongest near center).
+    float phase = (1.0 - rN) * density * 1.25 + t * (7.0 + 4.0 * hyperDensity);
+    float rings = 0.5 + 0.5 * sin(phase);
+    rings = pow(max(rings, 0.0), 3.0);
+
+    float mask = pow(1.0 - rN, 0.55);
+
+    // Sparkles: occasional bright specks (also strongest near center).
+    float n = rand1(uv0 * vec2(1200.0, 900.0) + vec2(t * 0.41, -t * 0.73));
+    float spark = smoothstep(0.995 - 0.012 * hyperNoise, 1.0, n);
+    spark *= mask * (0.35 + 0.65 * hyperNoise);
+
+    float e = (rings + spark * 1.8) * mask * hyper;
+
+    // Two-color ramp (blue -> magenta) that shifts with time and angle.
+    vec3 cA = vec3(0.08, 0.60, 1.35);
+    vec3 cB = vec3(1.25, 0.22, 0.95);
+    float hue = 0.5 + 0.5 * sin(t * 0.55 + ang * 2.2);
+    vec3 hc = mix(cA, cB, hue);
+
+    color += hc * e * max(0.0, uHyperIntensity);
+  }
+
   // Exposure -> tonemap -> vignette -> grain -> gamma
   color *= max(0.0001, uExposure);
   color = acesFilm(color);
 
   // Vignette
-  float vig = 1.0 - uVignette * smoothstep(0.20, 0.95, dist);
+  float vig = 1.0 - uVignette * smoothstep(0.20, 0.95, dist0);
   color *= clamp(vig, 0.0, 1.0);
 
   // Grain (add in post-tonemap space; subtle)
   float g = uGrain;
   if (g > 0.0) {
-    float n = rand1(uv * vec2(1403.1, 911.7) + uTime);
-    color += (n - 0.5) * g;
+    float gn = rand1(uv0 * vec2(1403.1, 911.7) + uTime);
+    color += (gn - 0.5) * g;
   }
 
   // Gamma correction
@@ -421,6 +508,12 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
   composite_.setUniform1f("uAberration", s.chromaticAberration);
   composite_.setUniform1f("uWarp", s.warp);
   composite_.setUniform1f("uTime", timeSeconds);
+
+  composite_.setUniform1f("uHyper", s.hyperspace);
+  composite_.setUniform1f("uHyperTwist", s.hyperspaceTwist);
+  composite_.setUniform1f("uHyperDensity", s.hyperspaceDensity);
+  composite_.setUniform1f("uHyperNoise", s.hyperspaceNoise);
+  composite_.setUniform1f("uHyperIntensity", s.hyperspaceIntensity);
 
   drawFullscreen();
 

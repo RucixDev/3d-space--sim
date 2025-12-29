@@ -7,6 +7,8 @@
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
+#include "stellar/math/Vec2.h"
+#include "stellar/proc/Noise.h"
 #include "stellar/econ/Market.h"
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/render/Camera.h"
@@ -17,9 +19,16 @@
 #include "stellar/render/MeshRenderer.h"
 #include "stellar/render/Texture.h"
 #include "stellar/render/ProceduralSprite.h"
+#include "stellar/render/ProceduralPlanet.h"
+#include "stellar/render/ProceduralLivery.h"
+#include "stellar/render/RenderTarget.h"
+#include "stellar/render/AtmosphereRenderer.h"
 #include "stellar/render/Starfield.h"
+#include "stellar/render/Nebula.h"
 #include "stellar/render/ParticleSystem.h"
 #include "stellar/render/PostFX.h"
+#include "stellar/ui/HudLayout.h"
+#include "stellar/ui/Livery.h"
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
@@ -38,6 +47,7 @@
 #endif
 
 #include <imgui.h>
+#include "stellar/ui/ImGuiCompat.h"
 #include <backends/imgui_impl_opengl3.h>
 #include <backends/imgui_impl_sdl2.h>
 
@@ -85,6 +95,24 @@ static const char* starClassName(sim::StarClass c) {
     default: return "?";
   }
 }
+
+static void starClassRgb(sim::StarClass cls, float& r, float& g, float& b) {
+  auto set255 = [&](int rr, int gg, int bb) {
+    r = rr / 255.0f;
+    g = gg / 255.0f;
+    b = bb / 255.0f;
+  };
+  switch (cls) {
+    case sim::StarClass::O: set255(120, 180, 255); break;
+    case sim::StarClass::B: set255(155, 205, 255); break;
+    case sim::StarClass::A: set255(240, 240, 255); break;
+    case sim::StarClass::F: set255(255, 248, 220); break;
+    case sim::StarClass::G: set255(255, 236, 175); break;
+    case sim::StarClass::K: set255(255, 200, 140); break;
+    case sim::StarClass::M: set255(255, 165, 140); break;
+    default: set255(200, 200, 220); break;
+  }
+}
 static const char* planetTypeName(sim::PlanetType t) {
   switch (t) {
     case sim::PlanetType::Rocky:    return "Rocky";
@@ -93,6 +121,17 @@ static const char* planetTypeName(sim::PlanetType t) {
     case sim::PlanetType::Ice:      return "Ice";
     case sim::PlanetType::GasGiant: return "Gas Giant";
     default: return "Unknown";
+  }
+}
+
+static render::SurfaceKind planetSurfaceKind(sim::PlanetType t) {
+  switch (t) {
+    case sim::PlanetType::Rocky:    return render::SurfaceKind::Rocky;
+    case sim::PlanetType::Desert:   return render::SurfaceKind::Desert;
+    case sim::PlanetType::Ocean:    return render::SurfaceKind::Ocean;
+    case sim::PlanetType::Ice:      return render::SurfaceKind::Ice;
+    case sim::PlanetType::GasGiant: return render::SurfaceKind::GasGiant;
+    default: return render::SurfaceKind::Rocky;
   }
 }
 
@@ -243,6 +282,31 @@ static bool projectToScreen(const math::Vec3d& worldU,
   return true;
 }
 
+// Like projectToScreen, but always returns a screen position (can be off-screen) as long as
+// the point is in front of the camera. Useful for edge-of-screen indicators.
+static bool projectToScreenAny(const math::Vec3d& worldU,
+                               const math::Mat4d& view,
+                               const math::Mat4d& proj,
+                               int w, int h,
+                               ImVec2& outPx,
+                               bool& outOffscreen) {
+  const math::Mat4d vp = proj * view;
+  const double x = worldU.x, y = worldU.y, z = worldU.z;
+
+  const double cx = vp.m[0]*x + vp.m[4]*y + vp.m[8]*z + vp.m[12];
+  const double cy = vp.m[1]*x + vp.m[5]*y + vp.m[9]*z + vp.m[13];
+  const double cw = vp.m[3]*x + vp.m[7]*y + vp.m[11]*z + vp.m[15];
+  if (cw <= 1e-6) return false;
+
+  const double ndcX = cx / cw;
+  const double ndcY = cy / cw;
+
+  outOffscreen = (ndcX < -1.0 || ndcX > 1.0 || ndcY < -1.0 || ndcY > 1.0);
+  outPx.x = (float)((ndcX * 0.5 + 0.5) * (double)w);
+  outPx.y = (float)((-ndcY * 0.5 + 0.5) * (double)h);
+  return true;
+}
+
 static bool segmentHitsSphere(const math::Vec3d& aKm,
                              const math::Vec3d& bKm,
                              const math::Vec3d& centerKm,
@@ -256,6 +320,139 @@ static bool segmentHitsSphere(const math::Vec3d& aKm,
   const double t = std::clamp(math::dot(centerKm - aKm, ab) / abLenSq, 0.0, 1.0);
   const math::Vec3d closest = aKm + ab * t;
   return (closest - centerKm).lengthSq() <= radiusKm * radiusKm;
+}
+
+static render::Texture2D makeRadialSpriteTextureRGBA(int size,
+                                                     float coreExp,
+                                                     float haloExp,
+                                                     float haloStrength,
+                                                     float spikeStrength,
+                                                     int spikes,
+                                                     core::u64 seed) {
+  // A tiny procedural point-sprite used by the PointRenderer's textured mode.
+  // The result is a white-ish sprite; point color is applied via vertex tint.
+  std::vector<std::uint8_t> rgba;
+  rgba.resize((std::size_t)size * (std::size_t)size * 4);
+
+  auto hash01 = [&](int x, int y) -> float {
+    // Cheap per-pixel deterministic noise in [0,1].
+    core::u64 h = seed;
+    h = core::hashCombine(h, (core::u64)(x * 73856093));
+    h = core::hashCombine(h, (core::u64)(y * 19349663));
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= (h >> 33);
+    // Take high bits.
+    const core::u64 v = (h >> 40) & 0xFFFFULL;
+    return (float)v / 65535.0f;
+  };
+
+  const float inv = (size > 1) ? (1.0f / (float)(size - 1)) : 1.0f;
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      const float fx = (float)x * inv;
+      const float fy = (float)y * inv;
+      const float u = fx * 2.0f - 1.0f;
+      const float v = fy * 2.0f - 1.0f;
+      const float r2 = u*u + v*v;
+
+      // Inside a radius slightly >1 so edges don't get clipped by smoothing.
+      float a = 0.0f;
+      if (r2 <= 1.25f) {
+        const float core = std::exp(-r2 * coreExp);
+        const float halo = std::exp(-r2 * haloExp) * haloStrength;
+        a = core + halo;
+
+        if (spikeStrength > 1e-4f && spikes > 0) {
+          const float ang = std::atan2(v, u);
+          const float s = std::abs(std::sin(ang * (float)spikes));
+          const float sp = std::pow(s, 6.0f);
+          a *= (1.0f - spikeStrength) + spikeStrength * sp;
+        }
+
+        // Subtle dithering so the sprite doesn't band when blurred.
+        const float n = hash01(x, y) * 2.0f - 1.0f;
+        a *= (1.0f + n * 0.06f);
+      }
+
+      a = std::clamp(a, 0.0f, 1.0f);
+      const std::uint8_t alpha = (std::uint8_t)std::lround(a * 255.0f);
+
+      const std::size_t i = ((std::size_t)y * (std::size_t)size + (std::size_t)x) * 4;
+      rgba[i + 0] = 255;
+      rgba[i + 1] = 255;
+      rgba[i + 2] = 255;
+      rgba[i + 3] = alpha;
+    }
+  }
+
+  render::Texture2D out;
+  out.createRGBA(size, size, rgba.data(), true, false, true);
+  return out;
+}
+
+static render::Texture2D makeCloudSpriteTextureRGBA(int size,
+                                                    core::u64 seed,
+                                                    float falloffExp = 2.4f,
+                                                    float noiseScale = 3.2f,
+                                                    int octaves = 5) {
+  // A soft nebula puff sprite (white RGB with noisy alpha). Tint is applied via vertex color.
+  std::vector<std::uint8_t> rgba;
+  rgba.resize((std::size_t)size * (std::size_t)size * 4);
+
+  auto hash01 = [&](int x, int y) -> float {
+    // Cheap per-pixel deterministic noise in [0,1].
+    core::u64 h = seed;
+    h = core::hashCombine(h, (core::u64)(x * 73856093));
+    h = core::hashCombine(h, (core::u64)(y * 19349663));
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= (h >> 33);
+    const core::u64 v = (h >> 40) & 0xFFFFULL;
+    return (float)v / 65535.0f;
+  };
+
+  const float inv = (size > 1) ? (1.0f / (float)(size - 1)) : 1.0f;
+  for (int y = 0; y < size; ++y) {
+    for (int x = 0; x < size; ++x) {
+      const float fx = (float)x * inv;
+      const float fy = (float)y * inv;
+      const float u = fx * 2.0f - 1.0f;
+      const float v = fy * 2.0f - 1.0f;
+      const float r2 = u*u + v*v;
+
+      float a = 0.0f;
+      if (r2 <= 1.35f) {
+        // Radial falloff, then modulate with fBm noise to get cloudiness.
+        const float base = std::exp(-r2 * falloffExp);
+        const double n = proc::fbm2D(seed ^ 0xBADC0FFEE0DDF00DULL,
+                                     (double)u * (double)noiseScale + 12.3,
+                                     (double)v * (double)noiseScale - 7.1,
+                                     octaves, 2.05, 0.52);
+        const float nf = (float)std::clamp(n, 0.0, 1.0);
+        // Bias noise so we get soft holes.
+        const float cloud = std::pow(nf, 1.15f);
+        a = base * (0.35f + 0.75f * cloud);
+
+        // Subtle dither (prevents banding when blurred/bloomed).
+        const float d = (hash01(x, y) * 2.0f - 1.0f) * 0.06f;
+        a *= (1.0f + d);
+      }
+
+      a = std::clamp(a, 0.0f, 1.0f);
+      const std::uint8_t alpha = (std::uint8_t)std::lround(a * 255.0f);
+
+      const std::size_t i = ((std::size_t)y * (std::size_t)size + (std::size_t)x) * 4;
+      rgba[i + 0] = 255;
+      rgba[i + 1] = 255;
+      rgba[i + 2] = 255;
+      rgba[i + 3] = alpha;
+    }
+  }
+
+  render::Texture2D out;
+  out.createRGBA(size, size, rgba.data(), true, false, true);
+  return out;
 }
 
 static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationIndex, bool docked, sim::StationId dockedId) {
@@ -631,6 +828,10 @@ int main(int argc, char** argv) {
   ImGui_ImplSDL2_InitForOpenGL(window, glContext);
   ImGui_ImplOpenGL3_Init("#version 330 core");
 
+  // --- Universe / sim seed ---
+  // Keep this deterministic by default so procedural generation is stable.
+  core::u64 seed = 1337;
+
   // --- Render assets ---
   render::Mesh sphere = render::Mesh::makeUvSphere(48, 24);
   render::Mesh cube   = render::Mesh::makeCube();
@@ -638,17 +839,98 @@ int main(int argc, char** argv) {
   render::Texture2D checker;
   checker.createChecker(256, 256, 16);
 
+  std::string err;
+
+  // --- Ship livery (procedural texture) ---
+  // Stored in a tiny text file next to the savegame for quick iteration.
+  const std::string liveryPath = ui::defaultLiveryPath();
+  ui::LiveryConfig liveryCfg = ui::makeDefaultLivery();
+  (void)ui::loadLiveryFromFile(liveryPath, liveryCfg);
+
+  // Dedicated RNG so randomizing cosmetics doesn't perturb gameplay/system RNG.
+  core::SplitMix64 liveryRng(core::hashCombine(seed, core::fnv1a64("livery")));
+
+  render::Texture2D shipLiveryTex;
+  bool shipLiveryDirty = true;
+  double shipLiveryLastRegenTimeSec = -1e9;
+  float shipLiveryRegenMinIntervalSec = 0.08f;
+
+  auto liveryToDesc = [&](const ui::LiveryConfig& c) -> render::LiveryDesc {
+    render::LiveryDesc d{};
+    d.pattern = c.pattern;
+    d.seed = c.seed;
+    d.base[0] = c.base[0]; d.base[1] = c.base[1]; d.base[2] = c.base[2];
+    d.accent1[0] = c.accent1[0]; d.accent1[1] = c.accent1[1]; d.accent1[2] = c.accent1[2];
+    d.accent2[0] = c.accent2[0]; d.accent2[1] = c.accent2[1]; d.accent2[2] = c.accent2[2];
+    d.scale = c.scale;
+    d.angleDeg = c.angleDeg;
+    d.detail = c.detail;
+    d.wear = c.wear;
+    d.contrast = c.contrast;
+    d.decal = c.decal;
+    return d;
+  };
+
+  auto rebuildShipLivery = [&]() {
+    const render::LiveryDesc desc = liveryToDesc(liveryCfg);
+    const int sizePx = std::clamp(liveryCfg.textureSizePx, 64, 2048);
+    const auto img = render::generateLiveryTexture(desc, sizePx);
+    if (!img.rgba.empty()) {
+      // Repeat wrap: UVs on simple meshes (cube) look nicer with repeat than clamp.
+      shipLiveryTex.createRGBA(img.w, img.h, img.rgba.data(),
+                              /*generateMips=*/true,
+                              /*nearestFilter=*/false,
+                              /*clampToEdge=*/false);
+    }
+    shipLiveryDirty = false;
+  };
+
+  // Initial livery build.
+  rebuildShipLivery();
+
+  // Hangar preview render target (render-to-texture -> ImGui::Image).
+  render::RenderTarget2D hangarTarget;
+  if (!hangarTarget.init(640, 640, &err)) {
+    core::log(core::LogLevel::Warn, err);
+    err.clear();
+  }
+  int hangarPreviewSizePx = 640;
+  bool hangarAnimate = true;
+  float hangarSpinRadPerSec = 0.35f;
+  float hangarYawDeg = 35.0f;
+  float hangarPitchDeg = 18.0f;
+  float hangarZoom = 3.25f;
+  bool liveryAutoSaveOnExit = true;
+
   // UI icon sprites (procedural, cached as GL textures)
   render::SpriteCache spriteCache;
   spriteCache.setMaxEntries(2048);
 
+  // HUD icon atlas: packs many procedural icons into a single texture so HUD overlays
+  // (radar, tactical markers, target reticle) can draw lots of icons without binding
+  // a different texture per marker.
+  render::SpriteAtlas hudAtlas;
+  hudAtlas.init(/*atlasSizePx=*/1024, /*cellSizePx=*/64, /*paddingPx=*/2, /*nearestFilter=*/true);
+  hudAtlas.setMaxEntries(256);
+
+  // Procedural surface textures for stars/planets (UV-sphere equirectangular albedo).
+  // This is separate from the HUD icon sprites: these textures are intended for 3D meshes.
+  render::SurfaceTextureCache surfaceTexCache;
+  surfaceTexCache.setMaxEntries(128);
+
   render::MeshRenderer meshRenderer;
-  std::string err;
   if (!meshRenderer.init(&err)) {
     core::log(core::LogLevel::Error, err);
     return 1;
   }
   meshRenderer.setTexture(&checker);
+
+  render::AtmosphereRenderer atmosphereRenderer;
+  if (!atmosphereRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+  atmosphereRenderer.setMesh(&sphere);
 
   render::LineRenderer lineRenderer;
   if (!lineRenderer.init(&err)) {
@@ -662,6 +944,31 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // Point-sprite textures (procedural): used for starfield/particles when "textured" mode is enabled.
+  // These are small RGBA textures sampled by the PointRenderer shader via gl_PointCoord.
+  render::Texture2D starPointSpriteTex = makeRadialSpriteTextureRGBA(
+      64,
+      /*coreExp*/ 18.0f,
+      /*haloExp*/ 4.0f,
+      /*haloStrength*/ 0.18f,
+      /*spikeStrength*/ 0.35f,
+      /*spikes*/ 4,
+      seed ^ 0xA55A5AA5u);
+
+  render::Texture2D particlePointSpriteTex = makeRadialSpriteTextureRGBA(
+      64,
+      /*coreExp*/ 10.0f,
+      /*haloExp*/ 2.5f,
+      /*haloStrength*/ 0.32f,
+      /*spikeStrength*/ 0.0f,
+      /*spikes*/ 0,
+      seed ^ 0xC0DEC0DEu);
+
+  // Nebula puff sprite texture (procedural alpha clouds; tinted per-vertex).
+  render::Texture2D nebulaPointSpriteTex = makeCloudSpriteTextureRGBA(
+      128,
+      seed ^ 0xF00DF00DF00DF00DULL);
+
   // --- Post-processing (HDR + bloom + tonemap) ---
   render::PostFX postFx;
   if (!postFx.init(&err)) {
@@ -670,24 +977,73 @@ int main(int argc, char** argv) {
   }
   render::PostFXSettings postFxSettings{};
   bool postFxAutoWarpFromSpeed = true;
+  bool postFxAutoHyperspaceFromFsd = true;
+  float postFxFsdWarpBoost = 0.065f;
+  float postFxFsdHyperspaceBoost = 1.00f;
+  bool hudJumpOverlay = true;
 
   // --- Universe / sim state ---
-  core::u64 seed = 1337;
 
   // --- Visual effects (background stars + particles) ---
   bool vfxStarfieldEnabled = true;
+  bool vfxStarfieldTextured = true;
   int vfxStarCount = 5200;
   double vfxStarRadiusU = 18000.0;
 
+  // Nebula (large background cloud puffs)
+  bool vfxNebulaEnabled = true;
+  int vfxNebulaPuffCount = 1400;
+  int vfxNebulaVariant = 0;
+  int vfxNebulaVariantLast = vfxNebulaVariant;
+  double vfxNebulaInnerRadiusU = 9000.0;
+  double vfxNebulaOuterRadiusU = 22000.0;
+  double vfxNebulaParallax = 0.25;
+  float vfxNebulaIntensity = 1.4f;
+  float vfxNebulaOpacity = 0.18f;
+  float vfxNebulaSizeMinPx = 90.0f;
+  float vfxNebulaSizeMaxPx = 320.0f;
+  float vfxNebulaBandPower = 1.8f;
+  float vfxNebulaBandPowerLast = vfxNebulaBandPower;
+  float vfxNebulaTurbulence = 0.35f;
+  float vfxNebulaTurbulenceSpeed = 0.10f;
+
   bool vfxParticlesEnabled = true;
+  bool vfxParticlesTextured = true;
   bool vfxThrustersEnabled = true;
   bool vfxImpactsEnabled = true;
   bool vfxExplosionsEnabled = true;
   float vfxParticleIntensity = 1.0f; // global scaler
 
+  // --- World visuals (stars/planets) ---
+  bool worldUseProceduralSurfaces = true;
+  bool worldUseSurfaceInUi = true; // show surface previews in tooltips
+  int worldSurfaceTexWidth = 512;  // equirectangular width (height is width/2)
+  bool worldStarUnlit = true;
+  float worldStarIntensity = 3.5f; // HDR multiplier; affects bloom
+
+  // Planet secondary layers (visual only).
+  bool worldCloudsEnabled = true;
+  float worldCloudOpacity = 0.55f;      // alpha multiplier (0..1)
+  float worldCloudShellScale = 1.012f;  // sphere scale multiplier
+  float worldCloudSpinDegPerSec = 2.0f; // visual rotation speed
+
+  bool worldAtmospheresEnabled = true;
+  float worldAtmoIntensity = 1.35f;     // additive color multiplier (HDR friendly)
+  float worldAtmoPower = 5.25f;         // rim width
+  float worldAtmoShellScale = 1.035f;   // sphere scale multiplier
+  float worldAtmoSunLitBoost = 0.85f;   // how much day-side brightens the rim
+  float worldAtmoForwardScatter = 0.35f; // when looking toward the star
+  bool worldAtmoTintWithStar = true;
+
   render::Starfield starfield;
   starfield.setRadius(vfxStarRadiusU);
   starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+
+  render::NebulaField nebula;
+  {
+    const core::u64 nSeed = core::hashCombine(seed ^ 0xBADC0FFEE0DDF00DULL, (core::u64)vfxNebulaVariant);
+    nebula.regenerate(nSeed, vfxNebulaPuffCount, vfxNebulaBandPower);
+  }
 
   render::ParticleSystem particles;
   particles.reseed(seed ^ 0xBADC0FFEu);
@@ -1047,6 +1403,73 @@ int main(int argc, char** argv) {
   bool showSprites = false;
   bool showVfx = false;
   bool showPostFx = false;
+  bool showWorldVisuals = false;
+  bool showHangar = false;
+
+  // HUD overlays
+  bool showRadarHud = true;
+  double radarRangeKm = 220000.0;
+  int radarMaxBlips = 72;
+
+  // Pirate demand HUD (threat/tribute): this HUD can appear contextually when pirates
+  // extort you. Keep a master toggle so players can disable it.
+  bool hudThreatOverlayEnabled = true;
+
+  // HUD layout persistence: position + scale for in-flight overlays.
+  const std::string hudLayoutPath = ui::defaultHudLayoutPath();
+  ui::HudLayout hudLayout = ui::makeDefaultHudLayout();
+  bool showHudLayoutWindow = false;
+  bool hudLayoutEditMode = false;
+  bool hudLayoutAutoSaveOnExit = true;
+
+  // Draw an edge-of-screen arrow for the current target when it is off-screen.
+  bool hudOffscreenTargetIndicator = true;
+
+  // Combat HUD symbology (procedural reticle + weapon rings + lead indicator + flight path marker).
+  bool hudCombatHud = true;
+  bool hudUseProceduralReticle = true;
+  bool hudShowWeaponRings = true;
+  bool hudShowHeatRing = true;
+  float hudReticleSizePx = 44.0f;
+  float hudReticleAlpha = 0.80f;
+
+  bool hudShowLeadIndicator = true;
+  bool hudLeadUseLastFiredWeapon = true;
+  float hudLeadSizePx = 22.0f;
+  double hudLeadMaxTimeSec = 18.0; // hide very long leads
+
+  bool hudShowFlightPathMarker = true;
+  bool hudFlightMarkerUseLocalFrame = true;
+  bool hudFlightMarkerClampToEdge = true;
+  float hudFlightMarkerSizePx = 22.0f;
+
+  // Tracks last fired weapon for HUD lead indicator (primary LMB vs secondary RMB).
+  bool hudLastFiredPrimary = true;
+
+  // World-space icon overlay (screen projection + procedural sprites).
+  bool showTacticalOverlay = true;
+  bool tacticalShowLabels = true;
+  double tacticalRangeKm = 450000.0;
+  int tacticalMaxMarkers = 96;
+  bool tacticalShowStations = true;
+  bool tacticalShowPlanets = true;
+  bool tacticalShowContacts = true;
+  bool tacticalShowCargo = true;
+  bool tacticalShowAsteroids = true;
+  bool tacticalShowSignals = true;
+
+  // Load HUD layout file (if present) and apply persisted widget enabled states.
+  {
+    ui::HudLayout loaded = ui::makeDefaultHudLayout();
+    if (ui::loadFromFile(hudLayoutPath, loaded)) {
+      hudLayout = loaded;
+    }
+
+    showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+    objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+    hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+    hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+  }
 
   // Optional mouse steering (relative mouse mode). Toggle with M.
   bool mouseSteer = false;
@@ -1978,6 +2401,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
         if (event.key.keysym.sym == SDLK_ESCAPE) running = false;
 
+        const bool ctrlDown = (event.key.keysym.mod & KMOD_CTRL) != 0;
+
         if (event.key.keysym.sym == SDLK_F5) {
           sim::SaveGame s{};
           s.seed = universe.seed();
@@ -2200,6 +2625,74 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         if (event.key.keysym.sym == SDLK_F10) showSprites = !showSprites;
         if (event.key.keysym.sym == SDLK_F11) showVfx = !showVfx;
         if (event.key.keysym.sym == SDLK_F12) showPostFx = !showPostFx;
+
+        // HUD layout editor shortcuts
+        // Ctrl+H : toggle edit mode
+        // Ctrl+S : save HUD layout
+        // Ctrl+L : load HUD layout
+        // Ctrl+R : reset HUD layout to defaults
+        if (ctrlDown && !io.WantCaptureKeyboard) {
+          if (event.key.keysym.sym == SDLK_h) {
+            hudLayoutEditMode = !hudLayoutEditMode;
+            showHudLayoutWindow = true;
+            toast(toasts,
+                  std::string("HUD layout edit ") + (hudLayoutEditMode ? "ON" : "OFF") + " (Ctrl+H)",
+                  1.8);
+          }
+
+          if (event.key.keysym.sym == SDLK_s) {
+            // Sync enabled toggles into the layout before saving.
+            hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+            hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
+            hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
+            hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
+
+            if (ui::saveToFile(hudLayout, hudLayoutPath)) {
+              toast(toasts, "Saved HUD layout to " + hudLayoutPath, 2.0);
+            } else {
+              toast(toasts, "Failed to save HUD layout.", 2.0);
+            }
+          }
+
+          if (event.key.keysym.sym == SDLK_l) {
+            ui::HudLayout loaded = ui::makeDefaultHudLayout();
+            if (ui::loadFromFile(hudLayoutPath, loaded)) {
+              hudLayout = loaded;
+              showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+              objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+              hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+              hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+              toast(toasts, "Loaded HUD layout from " + hudLayoutPath, 2.0);
+            } else {
+              toast(toasts, "HUD layout file not found (using defaults).", 2.0);
+            }
+            showHudLayoutWindow = true;
+          }
+
+          if (event.key.keysym.sym == SDLK_r) {
+            hudLayout = ui::makeDefaultHudLayout();
+            showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+            objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+            hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+            hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+            toast(toasts, "HUD layout reset to defaults.", 2.0);
+            showHudLayoutWindow = true;
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_r) {
+          if (!ctrlDown && !io.WantCaptureKeyboard) {
+            showRadarHud = !showRadarHud;
+            toast(toasts, std::string("Radar HUD ") + (showRadarHud ? "ON" : "OFF") + " (R)", 1.6);
+          }
+        }
+
+        if (event.key.keysym.sym == SDLK_BACKQUOTE) {
+          if (!io.WantCaptureKeyboard) {
+            showTacticalOverlay = !showTacticalOverlay;
+            toast(toasts, std::string("Tactical overlay ") + (showTacticalOverlay ? "ON" : "OFF") + " (`)", 1.6);
+          }
+        }
 
         if (event.key.keysym.sym == SDLK_SPACE) paused = !paused;
 
@@ -2480,11 +2973,24 @@ if (event.key.keysym.sym == SDLK_m) {
           }
 
         if (event.key.keysym.sym == SDLK_j) {
-          // Jump to next hop in the plotted route, otherwise jump to selected system.
-          if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
-            startFsdJumpTo(navRoute[navRouteHop + 1]);
+          // If we're mid-charge, allow a clean abort (fuel is consumed when charge completes).
+          if (fsdState == FsdState::Charging) {
+            fsdState = FsdState::Idle;
+            fsdTargetSystem = 0;
+            fsdChargeRemainingSec = 0.0;
+            fsdTravelRemainingSec = 0.0;
+            fsdTravelTotalSec = 0.0;
+            fsdFuelCost = 0.0;
+            fsdJumpDistanceLy = 0.0;
+            navAutoRun = false;
+            toast(toasts, "FSD canceled.", 1.6);
           } else {
-            startFsdJumpTo(galaxySelectedSystemId);
+            // Jump to next hop in the plotted route, otherwise jump to selected system.
+            if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
+              startFsdJumpTo(navRoute[navRouteHop + 1]);
+            } else {
+              startFsdJumpTo(galaxySelectedSystemId);
+            }
           }
         }
 if (event.key.keysym.sym == SDLK_t) {
@@ -2653,6 +3159,9 @@ if (event.key.keysym.sym == SDLK_y) {
           if (cd <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
             // NOTE: cooldown is in *sim* seconds, so it naturally scales with timeScale.
             cd = w.cooldownSimSec;
+
+            // Track last fired weapon for HUD lead indicator.
+            hudLastFiredPrimary = primary;
 
             // Better distributors run cooler (a small benefit, not a hard gate).
             const int dMk = std::clamp(distributorMk, 1, 3);
@@ -5384,8 +5893,18 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     matToFloat(proj, projF);
 
     meshRenderer.setViewProj(viewF, projF);
+    // World lighting: treat the main star as a point light at the origin.
+    // UI preview scenes can override this temporarily.
+    meshRenderer.setLightPos(0.0f, 0.0f, 0.0f);
+    atmosphereRenderer.setViewProj(viewF, projF);
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
+
+    // Atmosphere needs the camera position in world/render units for the rim factor.
+    {
+      const math::Vec3d cp = cam.position();
+      atmosphereRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+    }
 
     // Update VFX render buffers.
     if (vfxStarfieldEnabled) {
@@ -5398,6 +5917,31 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       starfield.update(cam.position(), timeRealSec);
     }
 
+    if (vfxNebulaEnabled) {
+      const bool regen = ((int)nebula.puffCount() != vfxNebulaPuffCount)
+                      || (vfxNebulaVariant != vfxNebulaVariantLast)
+                      || (std::abs(vfxNebulaBandPower - vfxNebulaBandPowerLast) > 1e-3f);
+      if (regen) {
+        const core::u64 nSeed = core::hashCombine(seed ^ 0xBADC0FFEE0DDF00DULL, (core::u64)vfxNebulaVariant);
+        nebula.regenerate(nSeed, vfxNebulaPuffCount, vfxNebulaBandPower);
+        vfxNebulaVariantLast = vfxNebulaVariant;
+        vfxNebulaBandPowerLast = vfxNebulaBandPower;
+      }
+
+      render::NebulaField::Settings ns{};
+      ns.innerRadiusU = vfxNebulaInnerRadiusU;
+      ns.outerRadiusU = vfxNebulaOuterRadiusU;
+      ns.parallax = vfxNebulaParallax;
+      ns.intensity = vfxNebulaIntensity;
+      ns.opacity = vfxNebulaOpacity;
+      ns.sizeMinPx = vfxNebulaSizeMinPx;
+      ns.sizeMaxPx = vfxNebulaSizeMaxPx;
+      ns.turbulence = vfxNebulaTurbulence;
+      ns.turbulenceSpeed = vfxNebulaTurbulenceSpeed;
+
+      nebula.update(cam.position(), timeRealSec, ns);
+    }
+
     if (vfxParticlesEnabled) {
       particles.buildPoints(particleVerts);
     } else {
@@ -5405,18 +5949,52 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // ---- Build instances (star + planets) ----
+    // We keep a fallback 'spheres' vector (checker-textured) and also track per-body
+    // procedural surface seeds for the optional procedural planet textures.
     std::vector<render::InstanceData> spheres;
     spheres.reserve(1 + currentSystem->planets.size());
 
+    struct PlanetSurfaceDraw {
+      render::InstanceData inst;
+      render::SurfaceKind surface;
+      core::u64 surfaceSeed;
+    };
+    std::vector<PlanetSurfaceDraw> planetSurfaceDraws;
+    planetSurfaceDraws.reserve(currentSystem->planets.size());
+
+    struct PlanetCloudDraw {
+      render::InstanceData inst;
+      core::u64 cloudSeed;
+      float alphaMul;
+    };
+    std::vector<PlanetCloudDraw> planetCloudDraws;
+    planetCloudDraws.reserve(currentSystem->planets.size());
+
+    std::vector<render::InstanceData> planetAtmoDraws;
+    planetAtmoDraws.reserve(currentSystem->planets.size());
+
     // Star at origin
+    float starR = 1.0f, starG = 0.95f, starB = 0.75f;
+    starClassRgb(currentSystem->star.cls, starR, starG, starB);
+    const core::u64 starSurfaceSeed = core::hashCombine(
+        core::hashCombine(core::fnv1a64("star_surface"), (core::u64)currentSystem->stub.seed),
+        (core::u64)(int)currentSystem->star.cls);
+    render::InstanceData starSphereInst{};
     {
       const double starRadiusKm = currentSystem->star.radiusSol * kSOLAR_RADIUS_KM;
       const float starScale = (float)std::max(0.8, (starRadiusKm / kRENDER_UNIT_KM) * 3.0);
-      spheres.push_back(makeInstUniform({0,0,0}, starScale, 1.0f, 0.95f, 0.75f));
+      // HDR-friendly multiplier to make the star drive bloom.
+      starSphereInst = makeInstUniform({0,0,0}, starScale,
+                                      starR * worldStarIntensity,
+                                      starG * worldStarIntensity,
+                                      starB * worldStarIntensity);
+      spheres.push_back(starSphereInst);
     }
 
     // Planets
-    for (const auto& p : currentSystem->planets) {
+    for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+      const auto& p = currentSystem->planets[i];
+
       const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, timeDays);
       const math::Vec3d posKm = posAU * kAU_KM;
       const math::Vec3d posU = toRenderU(posKm);
@@ -5424,7 +6002,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
       const float scale = (float)std::max(0.25, (radiusKm / kRENDER_UNIT_KM) * 200.0);
 
-      // Simple color palette by type
+      // Fallback color palette by type (checker texture multiplied by this).
       float cr=0.6f, cg=0.6f, cb=0.6f;
       switch (p.type) {
         case sim::PlanetType::Rocky: cr=0.6f; cg=0.55f; cb=0.5f; break;
@@ -5436,6 +6014,90 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
 
       spheres.push_back(makeInstUniform(posU, scale, cr,cg,cb));
+
+      const core::u64 pSurfaceSeed = core::hashCombine(
+          core::hashCombine(core::fnv1a64("planet_surface"), (core::u64)currentSystem->stub.seed),
+          (core::u64)i);
+      planetSurfaceDraws.push_back({makeInstUniform(posU, scale, 1.0f, 1.0f, 1.0f),
+                                    planetSurfaceKind(p.type),
+                                    pSurfaceSeed});
+
+      // ---- Secondary layers: cloud shell + atmosphere rim ----
+      // These are purely visual and intentionally lightweight.
+      const float var = (float)((pSurfaceSeed >> 24) & 0xFFull) / 255.0f;
+      float cloudness = 0.0f;
+      float atmoStrength = 0.0f;
+      float atmoR = 0.45f, atmoG = 0.70f, atmoB = 1.00f; // default Rayleigh-ish
+
+      switch (p.type) {
+        case sim::PlanetType::Rocky:
+          cloudness = 0.15f;
+          atmoStrength = 0.35f;
+          atmoR = 0.45f; atmoG = 0.70f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::Desert:
+          cloudness = 0.08f;
+          atmoStrength = 0.25f;
+          atmoR = 0.90f; atmoG = 0.78f; atmoB = 0.55f;
+          break;
+        case sim::PlanetType::Ocean:
+          cloudness = 0.35f;
+          atmoStrength = 0.55f;
+          atmoR = 0.38f; atmoG = 0.67f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::Ice:
+          cloudness = 0.20f;
+          atmoStrength = 0.28f;
+          atmoR = 0.65f; atmoG = 0.85f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::GasGiant:
+          cloudness = 0.65f;
+          atmoStrength = 0.75f;
+          if (((pSurfaceSeed >> 5) & 1ull) != 0ull) {
+            atmoR = 1.00f; atmoG = 0.65f; atmoB = 0.35f;
+          } else {
+            atmoR = 0.55f; atmoG = 0.75f; atmoB = 1.00f;
+          }
+          break;
+        default: break;
+      }
+
+      cloudness *= (0.85f + 0.30f * var);
+      atmoStrength *= (0.85f + 0.25f * var);
+
+      if (worldAtmoTintWithStar) {
+        const float tr = 0.35f + 0.65f * starR;
+        const float tg = 0.35f + 0.65f * starG;
+        const float tb = 0.35f + 0.65f * starB;
+        atmoR *= tr;
+        atmoG *= tg;
+        atmoB *= tb;
+      }
+
+      if (worldUseProceduralSurfaces && worldCloudsEnabled && cloudness > 1e-4f) {
+        core::u64 cloudSeed = core::hashCombine(pSurfaceSeed, core::fnv1a64("clouds"));
+        cloudSeed = core::hashCombine(cloudSeed, (core::u64)(int)p.type);
+
+        const double cloudScale = (double)scale * (double)worldCloudShellScale;
+        const double phase = (double)((cloudSeed >> 10) & 0xFFFFull) / 65535.0 * (2.0 * math::kPi);
+        const double speed = math::degToRad((double)worldCloudSpinDegPerSec) * (0.4 + 1.2 * (double)var);
+        const double ang = phase + timeRealSec * speed;
+        const math::Quatd q = math::Quatd::fromAxisAngle({0,1,0}, ang);
+
+        PlanetCloudDraw cd{};
+        cd.inst = makeInst(posU, {cloudScale, cloudScale, cloudScale}, q, 1.0f, 1.0f, 1.0f);
+        cd.cloudSeed = cloudSeed;
+        cd.alphaMul = worldCloudOpacity * cloudness;
+        planetCloudDraws.push_back(cd);
+      }
+
+      if (worldAtmospheresEnabled && atmoStrength > 1e-4f) {
+        const double atmoScale = (double)scale * (double)worldAtmoShellScale;
+        planetAtmoDraws.push_back(makeInstUniform(posU, atmoScale,
+                                                  atmoR * atmoStrength,
+                                                  atmoG * atmoStrength,
+                                                  atmoB * atmoStrength));
+      }
     }
 
     // Orbit lines (planets)
@@ -5573,7 +6235,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Station geometry (cubes)
     std::vector<render::InstanceData> cubes;
+    std::vector<render::InstanceData> shipCubes;
     cubes.reserve(1 + currentSystem->stations.size() * 18 + contacts.size());
+    shipCubes.reserve(1);
 
     for (const auto& st : currentSystem->stations) {
       const math::Vec3d stPos = stationPosKm(st, timeDays);
@@ -5582,10 +6246,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // Ship instance (cube, rotated)
-    cubes.push_back(makeInst(toRenderU(ship.positionKm()),
-                             {0.35, 0.20, 0.60},
-                             ship.orientation(),
-                             0.90f, 0.90f, 1.00f));
+    {
+      const auto inst = makeInst(toRenderU(ship.positionKm()),
+                                 {0.35, 0.20, 0.60},
+                                 ship.orientation(),
+                                 1.00f, 1.00f, 1.00f);
+
+      // If the livery system is enabled, draw the ship in a separate pass with
+      // the procedurally generated texture.
+      if (liveryCfg.applyInWorld && shipLiveryTex.handle() != 0) {
+        shipCubes.push_back(inst);
+      } else {
+        cubes.push_back(inst);
+      }
+    }
 
     // Contacts (pirates)
     for (const auto& c : contacts) {
@@ -5648,10 +6322,21 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    // Background nebula (large point sprites, additive blend). Don't write depth.
+    if (vfxNebulaEnabled) {
+      glDepthMask(GL_FALSE);
+      pointRenderer.drawPointsSprite(nebula.points(), nebulaPointSpriteTex, render::PointBlendMode::Additive);
+      glDepthMask(GL_TRUE);
+    }
+
     // Background stars (point sprites, additive blend). Don't write depth.
     if (vfxStarfieldEnabled) {
       glDepthMask(GL_FALSE);
-      pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
+      if (vfxStarfieldTextured) {
+        pointRenderer.drawPointsSprite(starfield.points(), starPointSpriteTex, render::PointBlendMode::Additive);
+      } else {
+        pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
+      }
       glDepthMask(GL_TRUE);
     }
 
@@ -5660,16 +6345,97 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Star + planets
     meshRenderer.setMesh(&sphere);
-    meshRenderer.drawInstances(spheres);
+    meshRenderer.setAlphaFromTexture(false);
+    meshRenderer.setAlphaMul(1.0f);
+    std::vector<render::InstanceData> tmp;
+    tmp.reserve(1);
+    if (worldUseProceduralSurfaces) {
+      // Star (procedural surface + optional unlit)
+      {
+        const auto& starSurf = surfaceTexCache.get(render::SurfaceKind::Star, starSurfaceSeed, worldSurfaceTexWidth);
+        meshRenderer.setTexture(&starSurf);
+        meshRenderer.setUnlit(worldStarUnlit);
+        tmp.clear();
+        tmp.push_back(starSphereInst);
+        meshRenderer.drawInstances(tmp);
+        meshRenderer.setUnlit(false);
+      }
 
-    // Cubes (stations, ship, contacts)
+      // Planets (per-type procedural surfaces)
+      for (const auto& pd : planetSurfaceDraws) {
+        const auto& surf = surfaceTexCache.get(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth);
+        meshRenderer.setTexture(&surf);
+        tmp.clear();
+        tmp.push_back(pd.inst);
+        meshRenderer.drawInstances(tmp);
+      }
+
+      // Cloud shell (alpha-blended) on top of the planet surface.
+      if (worldCloudsEnabled && !planetCloudDraws.empty()) {
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        meshRenderer.setAlphaFromTexture(true);
+        meshRenderer.setUnlit(false);
+
+        for (const auto& cd : planetCloudDraws) {
+          const auto& cloud = surfaceTexCache.get(render::SurfaceKind::Clouds, cd.cloudSeed, worldSurfaceTexWidth);
+          meshRenderer.setTexture(&cloud);
+          meshRenderer.setAlphaMul(cd.alphaMul);
+          tmp.clear();
+          tmp.push_back(cd.inst);
+          meshRenderer.drawInstances(tmp);
+        }
+
+        meshRenderer.setAlphaMul(1.0f);
+        meshRenderer.setAlphaFromTexture(false);
+        glDepthMask(GL_TRUE);
+      }
+
+      // Restore default texture for other meshes.
+      meshRenderer.setTexture(&checker);
+    } else {
+      // Fallback (single instanced draw, checker texture)
+      meshRenderer.setTexture(&checker);
+      meshRenderer.setUnlit(false);
+      meshRenderer.drawInstances(spheres);
+    }
+
+    // Atmosphere limb glow (additive). This pass is independent of the surface texture mode.
+    if (worldAtmospheresEnabled && !planetAtmoDraws.empty()) {
+      glDepthMask(GL_FALSE);
+      atmosphereRenderer.setIntensity(worldAtmoIntensity);
+      atmosphereRenderer.setPower(worldAtmoPower);
+      atmosphereRenderer.setSunLitBoost(worldAtmoSunLitBoost);
+      atmosphereRenderer.setForwardScatter(worldAtmoForwardScatter);
+      atmosphereRenderer.drawInstances(planetAtmoDraws);
+      glDepthMask(GL_TRUE);
+    }
+
+    // Cubes (stations, contacts, salvage, asteroids, signal sources)
     meshRenderer.setMesh(&cube);
+    meshRenderer.setTexture(&checker);
+    meshRenderer.setUnlit(false);
+    meshRenderer.setAlphaFromTexture(false);
     meshRenderer.drawInstances(cubes);
+
+    // Player ship livery pass (separate texture).
+    if (!shipCubes.empty()) {
+      meshRenderer.setTexture(&shipLiveryTex);
+      meshRenderer.setUnlit(false);
+      meshRenderer.setAlphaFromTexture(false);
+      meshRenderer.drawInstances(shipCubes);
+      meshRenderer.setTexture(&checker);
+    }
 
     // Particles (thrusters, impacts, explosions). Depth-tested but no depth writes.
     if (vfxParticlesEnabled) {
       glDepthMask(GL_FALSE);
-      pointRenderer.drawPoints(particleVerts, render::PointBlendMode::Additive);
+      if (vfxParticlesTextured) {
+        pointRenderer.drawPointsSprite(particleVerts, particlePointSpriteTex, render::PointBlendMode::Additive);
+      } else {
+        pointRenderer.drawPoints(particleVerts, render::PointBlendMode::Additive);
+      }
       glDepthMask(GL_TRUE);
     }
 
@@ -5682,6 +6448,30 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const float a = (float)std::clamp((spdKmS - 25.0) / 450.0, 0.0, 1.0);
         s.warp = std::max(s.warp, a * 0.030f);
       }
+
+      // FSD-driven hyperspace tunnel (purely visual).
+      if (postFxAutoHyperspaceFromFsd && fsdState != FsdState::Idle) {
+        auto smooth01 = [](float x) -> float {
+          x = std::clamp(x, 0.0f, 1.0f);
+          return x * x * (3.0f - 2.0f * x);
+        };
+
+        float fx = 0.0f;
+        if (fsdState == FsdState::Charging) {
+          const float t = 1.0f - (float)std::clamp(fsdChargeRemainingSec / kFsdChargeSec, 0.0, 1.0);
+          fx = smooth01(t);
+        } else if (fsdState == FsdState::Jumping) {
+          const float total = (float)std::max(0.001, fsdTravelTotalSec);
+          const float t = 1.0f - (float)std::clamp(fsdTravelRemainingSec / (double)total, 0.0, 1.0);
+          const float fadeIn = smooth01(std::clamp(t / 0.12f, 0.0f, 1.0f));
+          const float fadeOut = 1.0f - smooth01(std::clamp((t - 0.80f) / 0.20f, 0.0f, 1.0f));
+          fx = std::clamp(fadeIn * fadeOut, 0.0f, 1.0f);
+        }
+
+        s.hyperspace = std::max(s.hyperspace, fx * postFxFsdHyperspaceBoost);
+        s.warp = std::max(s.warp, fx * postFxFsdWarpBoost);
+      }
+
       postFx.present(w, h, s, (float)timeRealSec);
     } else {
       // Ensure UI draws to the backbuffer even if PostFX was previously enabled.
@@ -5693,51 +6483,525 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
+    // HUD layout editor: allow dragging borderless overlay windows.
+    // (ImGui defaults to moving windows from the title bar only.)
+    io.ConfigWindowsMoveFromTitleBarOnly = !hudLayoutEditMode;
+
+    // Keep persisted toggles synced with runtime settings so saving is always accurate.
+    hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+    hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
+    hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
+    hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
+
     // DockSpace is only available in Dear ImGui's docking branch; keep UI
     // functional without it (windows will simply be floating).
 
-    // HUD overlay: target marker + crosshair + toasts
+    // Main menu bar (quick window toggles + HUD settings)
+    if (ImGui::BeginMainMenuBar()) {
+      if (ImGui::BeginMenu("Windows")) {
+        ImGui::MenuItem("Galaxy (TAB)", nullptr, &showGalaxy);
+        ImGui::MenuItem("Ship/Status (F1)", nullptr, &showShip);
+        ImGui::MenuItem("Contacts (F3)", nullptr, &showContacts);
+        ImGui::MenuItem("Market (F2)", nullptr, &showEconomy);
+        ImGui::MenuItem("Missions (F4)", nullptr, &showMissions);
+        ImGui::MenuItem("Scanner (F6)", nullptr, &showScanner);
+        ImGui::MenuItem("Trade Finder (F7)", nullptr, &showTrade);
+        ImGui::Separator();
+        ImGui::MenuItem("Guide (F8)", nullptr, &showGuide);
+        ImGui::MenuItem("Sprite Lab (F10)", nullptr, &showSprites);
+        ImGui::MenuItem("World Visuals", nullptr, &showWorldVisuals);
+        ImGui::MenuItem("Hangar / Livery", nullptr, &showHangar);
+        ImGui::MenuItem("VFX Lab (F11)", nullptr, &showVfx);
+        ImGui::MenuItem("PostFX (F12)", nullptr, &showPostFx);
+        ImGui::EndMenu();
+      }
+
+      if (ImGui::BeginMenu("HUD")) {
+        ImGui::MenuItem("Radar (R)", nullptr, &showRadarHud);
+        if (showRadarHud) {
+          const double minKm = 25000.0;
+          const double maxKm = 1200000.0;
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::DragScalar("Range (km)", ImGuiDataType_Double, &radarRangeKm, 5000.0, &minKm, &maxKm, "%.0f");
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderInt("Max blips", &radarMaxBlips, 16, 160);
+        }
+
+        ImGui::MenuItem("Objective HUD overlay", nullptr, &objectiveHudEnabled);
+        ImGui::MenuItem("Threat overlay HUD", nullptr, &hudThreatOverlayEnabled);
+        ImGui::MenuItem("Jump overlay HUD", nullptr, &hudJumpOverlay);
+
+        ImGui::MenuItem("Offscreen target indicator", nullptr, &hudOffscreenTargetIndicator);
+
+        ImGui::SeparatorText("Combat");
+        ImGui::Checkbox("Combat HUD", &hudCombatHud);
+        if (hudCombatHud) {
+          ImGui::Checkbox("Procedural reticle", &hudUseProceduralReticle);
+          ImGui::SameLine();
+          ImGui::Checkbox("Weapon rings", &hudShowWeaponRings);
+          ImGui::SameLine();
+          ImGui::Checkbox("Heat ring", &hudShowHeatRing);
+
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderFloat("Reticle size (px)", &hudReticleSizePx, 24.0f, 96.0f, "%.0f");
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderFloat("Reticle alpha", &hudReticleAlpha, 0.10f, 1.0f, "%.2f");
+
+          ImGui::Separator();
+          ImGui::Checkbox("Lead indicator (projectiles)", &hudShowLeadIndicator);
+          ImGui::SameLine();
+          ImGui::Checkbox("Use last fired weapon", &hudLeadUseLastFiredWeapon);
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderFloat("Lead size (px)", &hudLeadSizePx, 10.0f, 64.0f, "%.0f");
+          const double leadMinT = 0.5;
+          const double leadMaxT = 60.0;
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::DragScalar("Lead max time (s)", ImGuiDataType_Double, &hudLeadMaxTimeSec, 0.5, &leadMinT, &leadMaxT, "%.1f");
+
+          ImGui::Separator();
+          ImGui::Checkbox("Flight path marker", &hudShowFlightPathMarker);
+          ImGui::SameLine();
+          ImGui::Checkbox("Local frame", &hudFlightMarkerUseLocalFrame);
+          ImGui::SameLine();
+          ImGui::Checkbox("Clamp to edge", &hudFlightMarkerClampToEdge);
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderFloat("Marker size (px)", &hudFlightMarkerSizePx, 10.0f, 64.0f, "%.0f");
+
+          ImGui::TextDisabled("Reticle rings show cooldown + heat; lead marker predicts projectile intercept.");
+        }
+
+        ImGui::Separator();
+        ImGui::MenuItem("Tactical overlay (`)", nullptr, &showTacticalOverlay);
+        if (showTacticalOverlay) {
+          ImGui::Checkbox("Labels", &tacticalShowLabels);
+          const double minKm = 25000.0;
+          const double maxKm = 2000000.0;
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::DragScalar("Range (km)##tac", ImGuiDataType_Double, &tacticalRangeKm, 5000.0, &minKm, &maxKm, "%.0f");
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderInt("Max markers##tac", &tacticalMaxMarkers, 16, 200);
+
+          ImGui::SeparatorText("Types");
+          ImGui::Checkbox("Stations", &tacticalShowStations);
+          ImGui::SameLine();
+          ImGui::Checkbox("Planets", &tacticalShowPlanets);
+          ImGui::SameLine();
+          ImGui::Checkbox("Starships", &tacticalShowContacts);
+          ImGui::Checkbox("Cargo", &tacticalShowCargo);
+          ImGui::SameLine();
+          ImGui::Checkbox("Asteroids", &tacticalShowAsteroids);
+          ImGui::SameLine();
+          ImGui::Checkbox("Signals", &tacticalShowSignals);
+
+          ImGui::TextDisabled("Hover markers for tooltips; MMB targets.");
+        }
+
+        ImGui::SeparatorText("Layout");
+        ImGui::Checkbox("Edit HUD layout (Ctrl+H)", &hudLayoutEditMode);
+        ImGui::SameLine();
+        ImGui::Checkbox("Layout window", &showHudLayoutWindow);
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderFloat("Safe margin (px)", &hudLayout.safeMarginPx, 0.0f, 64.0f, "%.0f");
+
+        if (ImGui::MenuItem("Save HUD layout (Ctrl+S)")) {
+          hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+          hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
+          hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
+          hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
+          ui::saveToFile(hudLayout, hudLayoutPath);
+        }
+        if (ImGui::MenuItem("Load HUD layout (Ctrl+L)")) {
+          ui::HudLayout loaded = ui::makeDefaultHudLayout();
+          if (ui::loadFromFile(hudLayoutPath, loaded)) {
+            hudLayout = loaded;
+            showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+            objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+            hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+            hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+          }
+        }
+        if (ImGui::MenuItem("Reset HUD layout (Ctrl+R)")) {
+          hudLayout = ui::makeDefaultHudLayout();
+          showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+          hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+          hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+        }
+
+        ImGui::EndMenu();
+      }
+
+      // Right-side status text.
+      {
+        const std::string sysName = currentSystem ? currentSystem->stub.name : "(no system)";
+        const std::string status = " | " + sysName + " | " + (docked ? "DOCKED" : "IN FLIGHT");
+        const float wText = ImGui::CalcTextSize(status.c_str()).x;
+        ImGui::SameLine(ImGui::GetWindowWidth() - wText - 14.0f);
+        ImGui::TextDisabled("%s", status.c_str());
+      }
+
+      ImGui::EndMainMenuBar();
+    }
+
+    // HUD Layout editor window
+    if (showHudLayoutWindow) {
+      ImGui::SetNextWindowSize(ImVec2(520.0f, 450.0f), ImGuiCond_FirstUseEver);
+      ImGui::Begin("HUD Layout", &showHudLayoutWindow);
+
+      ImGui::TextDisabled(
+          "Reposition in-flight HUD overlays. Drag the HUD panels while Edit mode is enabled.");
+      ImGui::TextDisabled("Shortcuts: Ctrl+H edit | Ctrl+S save | Ctrl+L load | Ctrl+R reset");
+
+      ImGui::Checkbox("Edit mode (drag panels)", &hudLayoutEditMode);
+      ImGui::SameLine();
+      ImGui::Checkbox("Auto-save on exit", &hudLayoutAutoSaveOnExit);
+
+      ImGui::SetNextItemWidth(240.0f);
+      ImGui::SliderFloat("Safe margin guide (px)", &hudLayout.safeMarginPx, 0.0f, 64.0f, "%.0f");
+
+      if (ImGui::Button("Save (Ctrl+S)")) {
+        // Sync enabled toggles into the layout before saving.
+        hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+        hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
+        hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
+        hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
+        if (ui::saveToFile(hudLayout, hudLayoutPath)) {
+          toast(toasts, "Saved HUD layout to " + hudLayoutPath, 2.0);
+        } else {
+          toast(toasts, "Failed to save HUD layout.", 2.0);
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Load (Ctrl+L)")) {
+        ui::HudLayout loaded = ui::makeDefaultHudLayout();
+        if (ui::loadFromFile(hudLayoutPath, loaded)) {
+          hudLayout = loaded;
+          showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+          hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+          hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+          toast(toasts, "Loaded HUD layout from " + hudLayoutPath, 2.0);
+        } else {
+          toast(toasts, "HUD layout file not found.", 2.0);
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Reset (Ctrl+R)")) {
+        hudLayout = ui::makeDefaultHudLayout();
+        showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+        objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+        hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+        hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+        toast(toasts, "HUD layout reset to defaults.", 2.0);
+      }
+
+      ImGui::Separator();
+
+      // Anchor presets (pivot)
+      struct AnchorPreset { const char* label; float px; float py; };
+      static constexpr AnchorPreset kAnchors[] = {
+        {"TopLeft", 0.0f, 0.0f},
+        {"Top", 0.5f, 0.0f},
+        {"TopRight", 1.0f, 0.0f},
+        {"Left", 0.0f, 0.5f},
+        {"Center", 0.5f, 0.5f},
+        {"Right", 1.0f, 0.5f},
+        {"BottomLeft", 0.0f, 1.0f},
+        {"Bottom", 0.5f, 1.0f},
+        {"BottomRight", 1.0f, 1.0f},
+      };
+
+      auto anchorIndexFor = [&](float px, float py) -> int {
+        for (int i = 0; i < (int)std::size(kAnchors); ++i) {
+          if (std::abs(px - kAnchors[i].px) < 1e-4f && std::abs(py - kAnchors[i].py) < 1e-4f) return i;
+        }
+        return 4; // Center
+      };
+
+      if (ImGui::BeginTable("##hudLayoutTable", 6,
+                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("Widget");
+        ImGui::TableSetupColumn("Enabled");
+        ImGui::TableSetupColumn("Scale");
+        ImGui::TableSetupColumn("Anchor");
+        ImGui::TableSetupColumn("X");
+        ImGui::TableSetupColumn("Y");
+        ImGui::TableHeadersRow();
+
+        auto row = [&](ui::HudWidgetId id, bool* enabledPtr) {
+          auto& wLay = hudLayout.widget(id);
+          ImGui::TableNextRow();
+
+          ImGui::TableSetColumnIndex(0);
+          ImGui::TextUnformatted(ui::toString(id));
+
+          ImGui::TableSetColumnIndex(1);
+          if (enabledPtr) {
+            bool en = *enabledPtr;
+            if (ImGui::Checkbox((std::string("##en_") + ui::toString(id)).c_str(), &en)) {
+              *enabledPtr = en;
+              wLay.enabled = en;
+            }
+          } else {
+            ImGui::TextDisabled("(auto)");
+          }
+
+          ImGui::TableSetColumnIndex(2);
+          ImGui::SetNextItemWidth(90.0f);
+          ImGui::SliderFloat((std::string("##sc_") + ui::toString(id)).c_str(), &wLay.scale, 0.50f, 2.50f, "%.2f");
+
+          ImGui::TableSetColumnIndex(3);
+          int aIdx = anchorIndexFor(wLay.pivotX, wLay.pivotY);
+          ImGui::SetNextItemWidth(130.0f);
+          if (ImGui::BeginCombo((std::string("##anc_") + ui::toString(id)).c_str(), kAnchors[aIdx].label)) {
+            for (int i = 0; i < (int)std::size(kAnchors); ++i) {
+              const bool sel = (i == aIdx);
+              if (ImGui::Selectable(kAnchors[i].label, sel)) {
+                wLay.pivotX = kAnchors[i].px;
+                wLay.pivotY = kAnchors[i].py;
+              }
+              if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+          }
+
+          ImGui::TableSetColumnIndex(4);
+          ImGui::SetNextItemWidth(90.0f);
+          ImGui::DragFloat((std::string("##x_") + ui::toString(id)).c_str(), &wLay.posNormX, 0.0025f, 0.0f, 1.0f, "%.3f");
+
+          ImGui::TableSetColumnIndex(5);
+          ImGui::SetNextItemWidth(90.0f);
+          ImGui::DragFloat((std::string("##y_") + ui::toString(id)).c_str(), &wLay.posNormY, 0.0025f, 0.0f, 1.0f, "%.3f");
+        };
+
+        row(ui::HudWidgetId::Radar, &showRadarHud);
+        row(ui::HudWidgetId::Objective, &objectiveHudEnabled);
+        row(ui::HudWidgetId::Threat, &hudThreatOverlayEnabled);
+        row(ui::HudWidgetId::Jump, &hudJumpOverlay);
+
+        ImGui::EndTable();
+      }
+
+      ImGui::TextDisabled("Tip: When Edit mode is ON, you can drag borderless HUD panels from anywhere.");
+      ImGui::End();
+    }
+
+    // HUD overlay: combat symbology + target marker + toasts
     {
       ImDrawList* draw = ImGui::GetForegroundDrawList();
       const ImVec2 center((float)w * 0.5f, (float)h * 0.5f);
-      draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
-      draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, IM_COL32(160,160,170,140), 1.0f);
+
+      // HUD layout edit guides (safe area + pivot markers)
+      if (hudLayoutEditMode) {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float m = std::max(0.0f, hudLayout.safeMarginPx);
+        const ImVec2 a(vp->WorkPos.x + m, vp->WorkPos.y + m);
+        const ImVec2 b(vp->WorkPos.x + vp->WorkSize.x - m, vp->WorkPos.y + vp->WorkSize.y - m);
+        const ImU32 col = IM_COL32(255, 210, 120, 150);
+        draw->AddRect(a, b, col, 0.0f, 0, 1.0f);
+        draw->AddText(ImVec2(a.x + 6.0f, a.y + 6.0f), IM_COL32(255, 210, 120, 220), "HUD EDIT MODE");
+
+        auto pivotPt = [&](ui::HudWidgetId id) -> ImVec2 {
+          const auto& wl = hudLayout.widget(id);
+          return ImVec2(vp->WorkPos.x + vp->WorkSize.x * wl.posNormX,
+                        vp->WorkPos.y + vp->WorkSize.y * wl.posNormY);
+        };
+        auto drawPivot = [&](ui::HudWidgetId id, bool enabled) {
+          if (!enabled) return;
+          const ImVec2 p = pivotPt(id);
+          const float r = 6.0f;
+          draw->AddLine(ImVec2(p.x - r, p.y), ImVec2(p.x + r, p.y), col, 1.0f);
+          draw->AddLine(ImVec2(p.x, p.y - r), ImVec2(p.x, p.y + r), col, 1.0f);
+          draw->AddText(ImVec2(p.x + r + 3.0f, p.y - r - 2.0f), col, ui::toString(id));
+        };
+
+        drawPivot(ui::HudWidgetId::Radar, showRadarHud);
+        drawPivot(ui::HudWidgetId::Objective, objectiveHudEnabled);
+        drawPivot(ui::HudWidgetId::Threat, hudThreatOverlayEnabled);
+        drawPivot(ui::HudWidgetId::Jump, hudJumpOverlay);
+      }
+
+      // Shared atlas texture for HUD icons.
+      const auto& atlasTex = hudAtlas.texture();
+      const ImTextureID atlasId = (ImTextureID)(intptr_t)atlasTex.handle();
+
+      auto clampToEdge = [&](ImVec2 p, float margin) -> ImVec2 {
+        ImVec2 dir(p.x - center.x, p.y - center.y);
+        const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+        if (len < 1.0e-3f) return p;
+        dir.x /= len;
+        dir.y /= len;
+
+        const float halfW = center.x - margin;
+        const float halfH = center.y - margin;
+        const float ax = std::abs(dir.x);
+        const float ay = std::abs(dir.y);
+        const float tx = (ax > 1.0e-4f) ? (halfW / ax) : 1.0e9f;
+        const float ty = (ay > 1.0e-4f) ? (halfH / ay) : 1.0e9f;
+        const float t = std::min(tx, ty);
+        return ImVec2(center.x + dir.x * t, center.y + dir.y * t);
+      };
+
+      auto drawArc = [&](float radius, float a0, float a1, ImU32 col, float thickness) {
+        const int segments = std::max(12, (int)(radius * 0.35f));
+        draw->PathClear();
+        draw->PathArcTo(center, radius, a0, a1, segments);
+        draw->PathStroke(col, false, thickness);
+      };
+
+      const float retA = std::clamp(hudReticleAlpha, 0.0f, 1.0f);
+
+      // Center reticle (procedural sprite) + weapon rings.
+      if (hudCombatHud) {
+        if (hudUseProceduralReticle) {
+          const auto uv = hudAtlas.get(render::SpriteKind::HudReticle,
+                                       core::hashCombine(core::fnv1a64("hud_reticle"), seed));
+          const float sz = std::max(12.0f, hudReticleSizePx);
+          const float oSz = sz * 1.08f;
+          const ImVec2 o0(center.x - oSz * 0.5f, center.y - oSz * 0.5f);
+          const ImVec2 o1(center.x + oSz * 0.5f, center.y + oSz * 0.5f);
+          const ImVec2 p0(center.x - sz * 0.5f, center.y - sz * 0.5f);
+          const ImVec2 p1(center.x + sz * 0.5f, center.y + sz * 0.5f);
+
+          draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                         IM_COL32(0, 0, 0, (int)(100.0f * retA)));
+          draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                         IM_COL32(210, 230, 255, (int)(255.0f * retA)));
+        } else {
+          const ImU32 col = IM_COL32(160,160,170, (int)(200.0f * retA));
+          draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, col, 1.0f);
+          draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, col, 1.0f);
+        }
+
+        const float baseR = std::max(14.0f, (hudReticleSizePx * 0.5f) + 12.0f);
+        const float start = -(float)math::kPi * 0.5f;
+        const float full = (float)math::kPi * 2.0f;
+
+        auto clampByte = [](double x) -> int { return (int)std::clamp(x, 0.0, 255.0); };
+
+        auto drawWeaponRing = [&](WeaponType wt, double cd, float radius, float thickness) {
+          const WeaponDef& wd = weaponDef(wt);
+          if (wd.cooldownSimSec <= 1e-6) return;
+
+          const float prog = (float)std::clamp(1.0 - (cd / wd.cooldownSimSec), 0.0, 1.0);
+          const ImU32 bg = IM_COL32(40, 40, 55, (int)(105.0f * retA));
+          drawArc(radius, start, start + full, bg, thickness);
+
+          const int r = clampByte((double)wd.r * 255.0);
+          const int g = clampByte((double)wd.g * 255.0);
+          const int b = clampByte((double)wd.b * 255.0);
+          const ImU32 fg = IM_COL32(r, g, b, (int)(210.0f * retA));
+          drawArc(radius, start, start + full * prog, fg, thickness);
+        };
+
+        if (hudShowWeaponRings) {
+          drawWeaponRing(weaponPrimary, weaponPrimaryCooldown, baseR + 4.0f, 3.0f);
+          drawWeaponRing(weaponSecondary, weaponSecondaryCooldown, baseR - 2.0f, 3.0f);
+        }
+
+        if (hudShowHeatRing) {
+          const float heatFrac = (float)std::clamp(heat / 100.0, 0.0, 1.0);
+          const ImU32 bg = IM_COL32(35, 35, 45, (int)(95.0f * retA));
+          drawArc(baseR + 10.0f, start, start + full, bg, 2.0f);
+
+          const int r = (int)std::clamp(255.0f * heatFrac, 0.0f, 255.0f);
+          const int g = (int)std::clamp(255.0f * (1.0f - heatFrac), 0.0f, 255.0f);
+          const int b = 60;
+          const ImU32 fg = IM_COL32(r, g, b, (int)(190.0f * retA));
+          drawArc(baseR + 10.0f, start, start + full * heatFrac, fg, 2.0f);
+        }
+      } else {
+        // Minimal crosshair if the combat HUD is disabled.
+        draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
+        draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, IM_COL32(160,160,170,140), 1.0f);
+      }
+
+      // Flight path marker (velocity vector) - useful with Newtonian drift.
+      if (hudCombatHud && hudShowFlightPathMarker && !docked) {
+        math::Vec3d v = ship.velocityKmS();
+        if (hudFlightMarkerUseLocalFrame) v = v - localFrameVelKmS;
+        const double spd = v.length();
+        if (spd > 0.05) {
+          const math::Vec3d dir = v / spd;
+          const math::Vec3d pKm = ship.positionKm() + dir * 120000.0; // direction only (projection stable)
+          ImVec2 p{};
+          bool off = false;
+          if (projectToScreenAny(toRenderU(pKm), view, proj, w, h, p, off)) {
+            ImVec2 drawP = p;
+            if (off && hudFlightMarkerClampToEdge) {
+              drawP = clampToEdge(p, 34.0f);
+            }
+
+            const auto uv = hudAtlas.get(render::SpriteKind::HudVelocity,
+                                         core::hashCombine(core::fnv1a64("hud_vel"), seed));
+            const float sz = std::max(8.0f, hudFlightMarkerSizePx);
+            const float oSz = sz * 1.10f;
+            const ImVec2 o0(drawP.x - oSz * 0.5f, drawP.y - oSz * 0.5f);
+            const ImVec2 o1(drawP.x + oSz * 0.5f, drawP.y + oSz * 0.5f);
+            const ImVec2 p0(drawP.x - sz * 0.5f, drawP.y - sz * 0.5f);
+            const ImVec2 p1(drawP.x + sz * 0.5f, drawP.y + sz * 0.5f);
+
+            draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(0,0,0,120));
+            draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(120, 220, 255, 210));
+
+            if (io.KeyShift) {
+              char buf[64];
+              std::snprintf(buf, sizeof(buf), "v %.2f km/s", spd);
+              draw->AddText(ImVec2(drawP.x + sz * 0.58f, drawP.y - 7.0f), IM_COL32(160, 240, 255, 200), buf);
+            }
+          }
+        }
+      }
 
       // Target marker
       std::optional<math::Vec3d> tgtKm{};
+      std::optional<math::Vec3d> tgtVelKmS{};
       std::string tgtLabel;
+      std::optional<std::pair<render::SpriteKind, core::u64>> tgtIcon{};
 
       if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
         tgtKm = stationPosKm(st, timeDays);
         tgtLabel = st.name;
+        tgtIcon = {render::SpriteKind::Station, core::hashCombine(core::fnv1a64("station"), st.id)};
       } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
         const auto& p = currentSystem->planets[target.index];
         tgtKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
         tgtLabel = p.name;
+        tgtIcon = {render::SpriteKind::Planet,
+                   core::hashCombine(core::hashCombine(core::fnv1a64("planet"), currentSystem->stub.seed), (core::u64)target.index)};
       } else if (target.kind == TargetKind::Star) {
         tgtKm = math::Vec3d{0,0,0};
         tgtLabel = std::string("Star ") + starClassName(currentSystem->star.cls);
+        tgtIcon = {render::SpriteKind::Star, core::hashCombine(core::fnv1a64("star"), currentSystem->stub.seed)};
       } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
         const auto& c = contacts[target.index];
         if (c.alive) {
           tgtKm = c.ship.positionKm();
+          tgtVelKmS = c.ship.velocityKmS();
           tgtLabel = c.name + std::string(" [") + contactRoleName(c.role) + "]";
+          tgtIcon = {render::SpriteKind::Ship, core::hashCombine(core::fnv1a64("ship"), c.id)};
         }
 	      } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
 	        const auto& s = signals[target.index];
 	        tgtKm = s.posKm;
 	        tgtLabel = std::string(signalTypeName(s.type)) + " Signal";
+	        tgtIcon = {render::SpriteKind::Signal,
+	                   core::hashCombine(core::hashCombine(core::fnv1a64("signal"), s.id), (core::u64)(int)s.type)};
 	      } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
 	        const auto& pod = floatingCargo[target.index];
 	        tgtKm = pod.posKm;
 	        const auto& def = econ::commodityDef(pod.commodity);
 	        tgtLabel = def.name + std::string(" Pod") + (pod.units >= 1.0 ? (" x" + std::to_string((int)std::round(pod.units))) : "");
+	        tgtIcon = {render::SpriteKind::Cargo,
+	                   core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity)};
 	      } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
 	        const auto& a = asteroids[target.index];
 	        tgtKm = a.posKm;
 	        const auto& def = econ::commodityDef(a.yield);
 	        tgtLabel = std::string("Asteroid [") + def.name + "]";
+	        tgtIcon = {render::SpriteKind::Asteroid,
+	                   core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield)};
       }
 
       if (tgtKm) {
@@ -5745,8 +7009,156 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (projectToScreen(toRenderU(*tgtKm), view, proj, w, h, px)) {
           const double distKm = (*tgtKm - ship.positionKm()).length();
           draw->AddCircle({px.x, px.y}, 14.0f, IM_COL32(255,170,80,190), 1.5f);
+
+          const float iconSize = 18.0f;
+          float textX = px.x + 18.0f;
+          if (tgtIcon) {
+            const auto uv = hudAtlas.get(tgtIcon->first, tgtIcon->second);
+            const auto& tex = hudAtlas.texture();
+            const ImVec2 p0(textX, px.y - iconSize * 0.55f);
+            const ImVec2 p1(textX + iconSize, px.y - iconSize * 0.55f + iconSize);
+            draw->AddImage((ImTextureID)(intptr_t)tex.handle(), p0, p1,
+                           ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                           IM_COL32(255,255,255,235));
+            textX = p1.x + 6.0f;
+          }
+
           std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
-          draw->AddText({px.x + 18, px.y - 8}, IM_COL32(255,210,170,210), s.c_str());
+          draw->AddText({textX, px.y - 8}, IM_COL32(255,210,170,210), s.c_str());
+
+          // Combat HUD: projectile lead indicator (contacts only).
+          if (hudCombatHud && hudShowLeadIndicator && tgtVelKmS && target.kind == TargetKind::Contact && !docked) {
+            WeaponType wLeadType = hudLeadUseLastFiredWeapon ? (hudLastFiredPrimary ? weaponPrimary : weaponSecondary) : weaponPrimary;
+
+            auto pickLeadWeapon = [&](WeaponType preferred) -> std::optional<WeaponType> {
+              const WeaponDef& w0 = weaponDef(preferred);
+              if (!w0.beam && w0.projSpeedKmS > 1e-6) return preferred;
+              const WeaponType other = (preferred == weaponPrimary) ? weaponSecondary : weaponPrimary;
+              const WeaponDef& w1 = weaponDef(other);
+              if (!w1.beam && w1.projSpeedKmS > 1e-6) return other;
+              return std::nullopt;
+            };
+
+            if (auto wTypeOpt = pickLeadWeapon(wLeadType)) {
+              wLeadType = *wTypeOpt;
+              const WeaponDef& wLead = weaponDef(wLeadType);
+              const double s = wLead.projSpeedKmS;
+
+              // Solve |r + v t| = s t for t>0 (classic lead/intercept quadratic).
+              const math::Vec3d r = (*tgtKm - ship.positionKm());
+              const math::Vec3d v = (*tgtVelKmS - ship.velocityKmS());
+              const double a = v.lengthSq() - s * s;
+              const double b = 2.0 * math::dot(r, v);
+              const double c = r.lengthSq();
+
+              double t = -1.0;
+              const double eps = 1e-9;
+              if (std::abs(a) < eps) {
+                if (std::abs(b) > eps) {
+                  t = -c / b;
+                }
+              } else {
+                const double disc = b * b - 4.0 * a * c;
+                if (disc >= 0.0) {
+                  const double sd = std::sqrt(disc);
+                  const double t1 = (-b - sd) / (2.0 * a);
+                  const double t2 = (-b + sd) / (2.0 * a);
+                  const double tMin = std::min(t1, t2);
+                  const double tMax = std::max(t1, t2);
+                  if (tMin > 1.0e-5) t = tMin;
+                  else if (tMax > 1.0e-5) t = tMax;
+                }
+              }
+
+              const double ttl = wLead.rangeKm / std::max(1e-9, s);
+              if (t > 0.0 && t <= ttl && t <= hudLeadMaxTimeSec) {
+                const math::Vec3d leadKm = *tgtKm + (*tgtVelKmS) * t;
+                ImVec2 leadPx{};
+                if (projectToScreen(toRenderU(leadKm), view, proj, w, h, leadPx)) {
+                  const auto uv = hudAtlas.get(render::SpriteKind::HudLead,
+                                               core::hashCombine(core::fnv1a64("hud_lead"), (core::u64)(int)wLeadType));
+
+                  auto clampByte = [](double x) -> int { return (int)std::clamp(x, 0.0, 255.0); };
+                  const int cr = clampByte((double)wLead.r * 255.0);
+                  const int cg = clampByte((double)wLead.g * 255.0);
+                  const int cb = clampByte((double)wLead.b * 255.0);
+
+                  // Connector line from target to lead.
+                  draw->AddLine(px, leadPx, IM_COL32(cr, cg, cb, 70), 1.0f);
+
+                  const float sz = std::max(8.0f, hudLeadSizePx);
+                  const float oSz = sz * 1.12f;
+                  const ImVec2 o0(leadPx.x - oSz * 0.5f, leadPx.y - oSz * 0.5f);
+                  const ImVec2 o1(leadPx.x + oSz * 0.5f, leadPx.y + oSz * 0.5f);
+                  const ImVec2 p0(leadPx.x - sz * 0.5f, leadPx.y - sz * 0.5f);
+                  const ImVec2 p1(leadPx.x + sz * 0.5f, leadPx.y + sz * 0.5f);
+
+                  draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(0,0,0,120));
+                  draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(cr, cg, cb, 230));
+
+                  if (io.KeyShift) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%.1fs", t);
+                    draw->AddText(ImVec2(leadPx.x + sz * 0.58f, leadPx.y - 7.0f), IM_COL32(cr, cg, cb, 200), buf);
+                  }
+                }
+              }
+            }
+          }
+        } else if (hudOffscreenTargetIndicator) {
+          // If the target is off-screen, draw an edge-of-screen indicator so the player
+          // can still navigate toward it without opening the tactical overlay.
+          bool off = false;
+          ImVec2 pAny{};
+          if (projectToScreenAny(toRenderU(*tgtKm), view, proj, w, h, pAny, off) && off) {
+            const ImVec2 center((float)w * 0.5f, (float)h * 0.5f);
+            ImVec2 dir(pAny.x - center.x, pAny.y - center.y);
+            const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+            if (len > 1.0e-3f) {
+              dir.x /= len;
+              dir.y /= len;
+            } else {
+              dir = ImVec2(1.0f, 0.0f);
+            }
+
+            const float margin = 34.0f;
+            const float halfW = center.x - margin;
+            const float halfH = center.y - margin;
+            const float ax = std::abs(dir.x);
+            const float ay = std::abs(dir.y);
+            const float tx = (ax > 1.0e-3f) ? (halfW / ax) : 1.0e9f;
+            const float ty = (ay > 1.0e-3f) ? (halfH / ay) : 1.0e9f;
+            const float t = std::min(tx, ty);
+
+            const ImVec2 tip(center.x + dir.x * t, center.y + dir.y * t);
+            const float arrowLen = 18.0f;
+            const float arrowW = 12.0f;
+            const ImVec2 base(tip.x - dir.x * arrowLen, tip.y - dir.y * arrowLen);
+            const ImVec2 perp(-dir.y, dir.x);
+            const ImVec2 p1(base.x + perp.x * (arrowW * 0.5f), base.y + perp.y * (arrowW * 0.5f));
+            const ImVec2 p2(base.x - perp.x * (arrowW * 0.5f), base.y - perp.y * (arrowW * 0.5f));
+
+            draw->AddTriangleFilled(tip, p1, p2, IM_COL32(255,170,80,200));
+            draw->AddTriangle(tip, p1, p2, IM_COL32(15, 15, 15, 220), 1.2f);
+
+            // Small icon + distance label near the arrow.
+            const double distKm = (*tgtKm - ship.positionKm()).length();
+            const float iconSz = 20.0f;
+            const ImVec2 iconC(base.x - dir.x * (iconSz * 0.55f), base.y - dir.y * (iconSz * 0.55f));
+            const ImVec2 i0(iconC.x - iconSz * 0.5f, iconC.y - iconSz * 0.5f);
+            const ImVec2 i1(iconC.x + iconSz * 0.5f, iconC.y + iconSz * 0.5f);
+
+            if (tgtIcon) {
+              const auto uv = hudAtlas.get(tgtIcon->first, tgtIcon->second);
+              const auto& tex = hudAtlas.texture();
+              draw->AddImage((ImTextureID)(intptr_t)tex.handle(), i0, i1,
+                             ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                             IM_COL32(255,255,255,235));
+            }
+
+            const std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
+            draw->AddText({iconC.x + 14.0f, iconC.y - 7.0f}, IM_COL32(255,210,170,210), s.c_str());
+          }
         }
       }
 
@@ -5802,6 +7214,215 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                       fwdAlign, upAlign, st.maxApproachSpeedKmS,
                       clearanceGranted ? "CLEARANCE GRANTED" : "NO CLEARANCE (press L to request)");
         draw->AddText({18.0f, y0 + 18.0f}, col, buf);
+      }
+
+      // Tactical overlay: draw projected world icons directly on the screen.
+      // This intentionally does not create an ImGui window (so it won't steal clicks
+      // from other UI) and uses MMB for targeting to avoid conflicting with weapons.
+      if (showTacticalOverlay && currentSystem && !docked) {
+        struct TacMarker {
+          TargetKind kind;
+          std::size_t index;
+          ImVec2 px;
+          double distKm;
+          render::SpriteKind iconKind;
+          core::u64 iconSeed;
+          std::string label;
+        };
+
+        std::vector<TacMarker> markers;
+        markers.reserve(128);
+
+        const math::Vec3d shipPosKm = ship.positionKm();
+
+        auto addMarker = [&](TargetKind kind,
+                             std::size_t index,
+                             const math::Vec3d& posKm,
+                             render::SpriteKind iconKind,
+                             core::u64 iconSeed,
+                             std::string label) {
+          const double distKm = (posKm - shipPosKm).length();
+          if (distKm > tacticalRangeKm) return;
+          ImVec2 px{};
+          if (!projectToScreen(toRenderU(posKm), view, proj, w, h, px)) return;
+          markers.push_back({kind, index, px, distKm, iconKind, iconSeed, std::move(label)});
+        };
+
+        if (tacticalShowStations) {
+          for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+            const auto& st = currentSystem->stations[i];
+            const math::Vec3d posKm = stationPosKm(st, timeDays);
+            addMarker(TargetKind::Station,
+                      i,
+                      posKm,
+                      render::SpriteKind::Station,
+                      core::hashCombine(core::fnv1a64("station"), st.id),
+                      st.name);
+          }
+        }
+
+        if (tacticalShowPlanets) {
+          for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+            const auto& p = currentSystem->planets[i];
+            const math::Vec3d posKm = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
+            const core::u64 seedP = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), currentSystem->stub.seed), (core::u64)i);
+            addMarker(TargetKind::Planet, i, posKm, render::SpriteKind::Planet, seedP, p.name);
+          }
+        }
+
+        if (tacticalShowContacts) {
+          for (std::size_t i = 0; i < contacts.size(); ++i) {
+            const auto& c = contacts[i];
+            if (!c.alive) continue;
+            addMarker(TargetKind::Contact,
+                      i,
+                      c.ship.positionKm(),
+                      render::SpriteKind::Ship,
+                      core::hashCombine(core::fnv1a64("ship"), c.id),
+                      c.name + std::string(" [") + contactRoleName(c.role) + "]");
+          }
+        }
+
+        if (tacticalShowCargo) {
+          for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+            const auto& pod = floatingCargo[i];
+            if (pod.units <= 0.0) continue;
+            const auto& def = econ::commodityDef(pod.commodity);
+            std::string label = def.name + std::string(" Pod");
+            if (pod.units >= 1.0) label += " x" + std::to_string((int)std::round(pod.units));
+            addMarker(TargetKind::Cargo,
+                      i,
+                      pod.posKm,
+                      render::SpriteKind::Cargo,
+                      core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity),
+                      std::move(label));
+          }
+        }
+
+        if (tacticalShowAsteroids) {
+          for (std::size_t i = 0; i < asteroids.size(); ++i) {
+            const auto& a = asteroids[i];
+            if (a.remainingUnits <= 0.0) continue;
+            const auto& def = econ::commodityDef(a.yield);
+            addMarker(TargetKind::Asteroid,
+                      i,
+                      a.posKm,
+                      render::SpriteKind::Asteroid,
+                      core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield),
+                      std::string("Asteroid [") + def.name + "]");
+          }
+        }
+
+        if (tacticalShowSignals) {
+          for (std::size_t i = 0; i < signals.size(); ++i) {
+            const auto& s = signals[i];
+            if (timeDays > s.expireDay) continue;
+            addMarker(TargetKind::Signal,
+                      i,
+                      s.posKm,
+                      render::SpriteKind::Signal,
+                      core::hashCombine(core::hashCombine(core::fnv1a64("signal"), s.id), (core::u64)(int)s.type),
+                      std::string(signalTypeName(s.type)) + " Signal");
+          }
+        }
+
+        // Keep the overlay readable: render closest first and cap count.
+        std::sort(markers.begin(), markers.end(), [](const TacMarker& a, const TacMarker& b) {
+          return a.distKm < b.distKm;
+        });
+        if ((int)markers.size() > tacticalMaxMarkers) markers.resize((std::size_t)tacticalMaxMarkers);
+
+        auto baseSizeFor = [&](TargetKind k) -> float {
+          switch (k) {
+            case TargetKind::Station: return 20.0f;
+            case TargetKind::Planet: return 20.0f;
+            case TargetKind::Contact: return 18.0f;
+            case TargetKind::Cargo: return 16.0f;
+            case TargetKind::Asteroid: return 16.0f;
+            case TargetKind::Signal: return 16.0f;
+            default: return 16.0f;
+          }
+        };
+
+        auto quantSize = [&](float s) -> int {
+          // Keep marker sizes stable: quantize to 4px steps to reduce jitter/shimmer.
+          int q = (int)std::lround(s / 4.0f) * 4;
+          return std::clamp(q, 12, 40);
+        };
+
+        // Hover/click selection (MMB) without an ImGui window.
+        const ImVec2 mouse = ImGui::GetMousePos();
+        int hovered = -1;
+        double bestD2 = 1e30;
+
+        if (!io.WantCaptureMouse) {
+          for (int i = 0; i < (int)markers.size(); ++i) {
+            const auto& m = markers[(std::size_t)i];
+            const double frac = std::clamp(1.0 - (m.distKm / std::max(1.0, tacticalRangeKm)), 0.0, 1.0);
+            float sz = baseSizeFor(m.kind) * (0.75f + 0.55f * (float)std::sqrt(frac));
+            if (m.kind == target.kind && m.index == target.index) sz *= 1.25f;
+            const int szPx = quantSize(sz);
+            const float rad = (float)szPx * 0.60f;
+            const double dx = (double)mouse.x - (double)m.px.x;
+            const double dy = (double)mouse.y - (double)m.px.y;
+            const double d2 = dx*dx + dy*dy;
+            if (d2 <= (double)(rad * rad) && d2 < bestD2) {
+              bestD2 = d2;
+              hovered = i;
+            }
+          }
+        }
+
+        if (hovered >= 0 && !io.WantCaptureMouse && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+          target.kind = markers[(std::size_t)hovered].kind;
+          target.index = markers[(std::size_t)hovered].index;
+        }
+
+        // Draw markers
+        for (int i = 0; i < (int)markers.size(); ++i) {
+          const auto& m = markers[(std::size_t)i];
+          const double frac = std::clamp(1.0 - (m.distKm / std::max(1.0, tacticalRangeKm)), 0.0, 1.0);
+          float sz = baseSizeFor(m.kind) * (0.75f + 0.55f * (float)std::sqrt(frac));
+          if (m.kind == target.kind && m.index == target.index) sz *= 1.25f;
+          if (i == hovered) sz *= 1.10f;
+          const int szPx = quantSize(sz);
+          const float szF = (float)szPx;
+
+          const auto uv = hudAtlas.get(m.iconKind, m.iconSeed);
+          const auto& tex = hudAtlas.texture();
+          const ImVec2 p0(m.px.x - szF * 0.5f, m.px.y - szF * 0.5f);
+          const ImVec2 p1(m.px.x + szF * 0.5f, m.px.y + szF * 0.5f);
+          draw->AddImage((ImTextureID)(intptr_t)tex.handle(), p0, p1,
+                         ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                         IM_COL32(255,255,255,235));
+
+          if (m.kind == target.kind && m.index == target.index) {
+            draw->AddCircle(m.px, szF * 0.62f, IM_COL32(255,170,80,170), 16, 1.5f);
+          }
+          if (i == hovered && !io.WantCaptureMouse) {
+            draw->AddCircle(m.px, szF * 0.62f, IM_COL32(255,255,255,110), 16, 1.25f);
+          }
+
+          if (tacticalShowLabels) {
+            const std::string label = m.label + "  " + std::to_string((int)std::llround(m.distKm)) + " km";
+            draw->AddText({m.px.x + szF * 0.55f + 4.0f, m.px.y - szF * 0.52f}, IM_COL32(230,230,240,190), label.c_str());
+          }
+        }
+
+        // Tooltip (hover)
+        if (hovered >= 0 && !io.WantCaptureMouse) {
+          const auto& m = markers[(std::size_t)hovered];
+          ImGui::BeginTooltip();
+          const auto& big = spriteCache.get(m.iconKind, m.iconSeed, 96);
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(64, 64));
+          ImGui::SameLine();
+          ImGui::BeginGroup();
+          ImGui::TextUnformatted(m.label.c_str());
+          ImGui::TextDisabled("Distance: %.0f km", m.distKm);
+          ImGui::TextDisabled("MMB: target");
+          ImGui::EndGroup();
+          ImGui::EndTooltip();
+        }
       }
 
       // Toasts
@@ -5891,6 +7512,316 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
 
 
 
+// HUD layout helpers (persistent position for overlay windows)
+auto hudSetNextWindowPosFromLayout = [&](ui::HudWidgetId id) {
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  const auto& wl = hudLayout.widget(id);
+  const ImVec2 pos(vp->WorkPos.x + vp->WorkSize.x * wl.posNormX,
+                   vp->WorkPos.y + vp->WorkSize.y * wl.posNormY);
+  ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(wl.pivotX, wl.pivotY));
+};
+
+auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id) {
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  if (vp->WorkSize.x <= 1.0f || vp->WorkSize.y <= 1.0f) return;
+
+  auto& wl = hudLayout.widget(id);
+  const ImVec2 winPos = ImGui::GetWindowPos();
+  const ImVec2 winSize = ImGui::GetWindowSize();
+
+  // We store the location of the pivot point, not the top-left.
+  const ImVec2 pivotPoint(winPos.x + winSize.x * wl.pivotX,
+                          winPos.y + winSize.y * wl.pivotY);
+
+  wl.posNormX = (pivotPoint.x - vp->WorkPos.x) / vp->WorkSize.x;
+  wl.posNormY = (pivotPoint.y - vp->WorkPos.y) / vp->WorkSize.y;
+  wl.posNormX = std::clamp(wl.posNormX, 0.0f, 1.0f);
+  wl.posNormY = std::clamp(wl.posNormY, 0.0f, 1.0f);
+};
+
+// Radar HUD overlay (local space awareness)
+if (showRadarHud && currentSystem) {
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                      | ImGuiWindowFlags_NoFocusOnAppearing
+                      | ImGuiWindowFlags_NoNav
+                      | ImGuiWindowFlags_NoSavedSettings;
+  if (!hudLayoutEditMode) flags |= ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+  const auto& wLay = hudLayout.widget(ui::HudWidgetId::Radar);
+  const float uiScale = std::max(0.50f, wLay.scale);
+  const float baseRad = 94.0f;
+  const float rad = baseRad * uiScale;
+  const float winSide = (baseRad * 2.0f + 22.0f) * uiScale;
+  const ImVec2 winSize(winSide, winSide);
+
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+  hudSetNextWindowPosFromLayout(ui::HudWidgetId::Radar);
+  ImGui::SetNextWindowSize(winSize, ImGuiCond_Always);
+
+  if (hudLayoutEditMode) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+  }
+
+  ImGui::Begin("Radar HUD##radar", nullptr, flags);
+  if (hudLayoutEditMode) {
+    hudCaptureWindowPosToLayout(ui::HudWidgetId::Radar);
+  }
+
+  // Context menu (right click)
+  if (ImGui::BeginPopupContextWindow("RadarCtx", ImGuiPopupFlags_MouseButtonRight)) {
+    ImGui::TextDisabled("Radar HUD");
+    ImGui::Separator();
+    ImGui::Checkbox("Enable", &showRadarHud);
+    const double minKm = 25000.0;
+    const double maxKm = 1200000.0;
+    ImGui::DragScalar("Range (km)", ImGuiDataType_Double, &radarRangeKm, 5000.0, &minKm, &maxKm, "%.0f");
+    ImGui::SliderInt("Max blips", &radarMaxBlips, 16, 160);
+    ImGui::EndPopup();
+  }
+
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const ImVec2 canvasSize(rad * 2.0f, rad * 2.0f);
+  ImGui::Dummy(canvasSize);
+  const ImVec2 p1(p0.x + canvasSize.x, p0.y + canvasSize.y);
+  const ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
+
+  // Background + rings
+  draw->AddCircleFilled(c, rad, IM_COL32(0, 0, 0, 120));
+  draw->AddCircle(c, rad, IM_COL32(120, 140, 170, 160), 0, 1.2f * std::max(0.75f, uiScale));
+  draw->AddCircle(c, rad * 0.50f, IM_COL32(120, 140, 170, 70), 0, 1.0f);
+  draw->AddCircle(c, rad * 0.25f, IM_COL32(120, 140, 170, 50), 0, 1.0f);
+  draw->AddLine(ImVec2(c.x - rad, c.y), ImVec2(c.x + rad, c.y), IM_COL32(120, 140, 170, 70), 1.0f * std::max(0.75f, uiScale));
+  draw->AddLine(ImVec2(c.x, c.y - rad), ImVec2(c.x, c.y + rad), IM_COL32(120, 140, 170, 70), 1.0f * std::max(0.75f, uiScale));
+
+  // Ship marker (always centered)
+  draw->AddTriangleFilled(ImVec2(c.x, c.y - 6 * uiScale),
+                          ImVec2(c.x - 5 * uiScale, c.y + 7 * uiScale),
+                          ImVec2(c.x + 5 * uiScale, c.y + 7 * uiScale),
+                          IM_COL32(230, 230, 240, 210));
+  draw->AddTriangle(ImVec2(c.x, c.y - 6 * uiScale),
+                    ImVec2(c.x - 5 * uiScale, c.y + 7 * uiScale),
+                    ImVec2(c.x + 5 * uiScale, c.y + 7 * uiScale),
+                    IM_COL32(20, 20, 20, 220),
+                    1.0f * std::max(0.75f, uiScale));
+
+  // Range label
+  {
+    const std::string rTxt = std::to_string((int)std::round(radarRangeKm)) + " km";
+    draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p1.y - 18.0f * uiScale),
+                  IM_COL32(200, 210, 230, 170), rTxt.c_str());
+  }
+
+  struct Blip {
+    TargetKind kind{TargetKind::None};
+    std::size_t index{0};
+    math::Vec3d posKm{0,0,0};
+    double distKm{0.0};
+    bool force{false};
+  };
+
+  const math::Vec3d shipPos = ship.positionKm();
+  const math::Quatd shipInv = ship.orientation().conjugate();
+  const double rangeKm = std::max(1.0, radarRangeKm);
+  const float s = (float)(rad / rangeKm);
+
+  std::vector<Blip> blips;
+  blips.reserve(256);
+
+  auto addBlip = [&](TargetKind kind, std::size_t index, const math::Vec3d& posKm, bool force) {
+    const double d = (posKm - shipPos).length();
+    if (force || d <= rangeKm) {
+      blips.push_back(Blip{kind, index, posKm, d, force});
+    }
+  };
+
+  // Always include current target (clamped to edge if out of range)
+  if (target.kind != TargetKind::None) {
+    if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+      addBlip(TargetKind::Station, target.index, stationPosKm(currentSystem->stations[target.index], timeDays), true);
+    } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+      addBlip(TargetKind::Planet, target.index, sim::orbitPosition3DAU(currentSystem->planets[target.index].orbit, timeDays) * kAU_KM, true);
+    } else if (target.kind == TargetKind::Contact && target.index < contacts.size() && contacts[target.index].alive) {
+      addBlip(TargetKind::Contact, target.index, contacts[target.index].ship.positionKm(), true);
+    } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+      addBlip(TargetKind::Signal, target.index, signals[target.index].posKm, true);
+    } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
+      addBlip(TargetKind::Cargo, target.index, floatingCargo[target.index].posKm, true);
+    } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+      addBlip(TargetKind::Asteroid, target.index, asteroids[target.index].posKm, true);
+    }
+  }
+
+  // Contacts
+  for (std::size_t i = 0; i < contacts.size(); ++i) {
+    const auto& ctc = contacts[i];
+    if (!ctc.alive) continue;
+    addBlip(TargetKind::Contact, i, ctc.ship.positionKm(), false);
+  }
+
+  // Signals, floating cargo, asteroids
+  for (std::size_t i = 0; i < signals.size(); ++i) addBlip(TargetKind::Signal, i, signals[i].posKm, false);
+  for (std::size_t i = 0; i < floatingCargo.size(); ++i) addBlip(TargetKind::Cargo, i, floatingCargo[i].posKm, false);
+  for (std::size_t i = 0; i < asteroids.size(); ++i) addBlip(TargetKind::Asteroid, i, asteroids[i].posKm, false);
+
+  // Nearby stations/planets (only if they actually fall within the radar range).
+  for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+    addBlip(TargetKind::Station, i, stationPosKm(currentSystem->stations[i], timeDays), false);
+  }
+  for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+    addBlip(TargetKind::Planet, i, sim::orbitPosition3DAU(currentSystem->planets[i].orbit, timeDays) * kAU_KM, false);
+  }
+
+  // Sort by (force, distance) and cap count.
+  std::sort(blips.begin(), blips.end(), [](const Blip& a, const Blip& b) {
+    if (a.force != b.force) return a.force > b.force;
+    return a.distKm < b.distKm;
+  });
+  if ((int)blips.size() > radarMaxBlips) blips.resize((std::size_t)radarMaxBlips);
+
+  // Draw + interaction.
+  // Preserve cursor position after our absolute-position buttons.
+  const ImVec2 cursorAfter = ImGui::GetCursorScreenPos();
+
+  for (std::size_t bi = 0; bi < blips.size(); ++bi) {
+    const Blip& b = blips[bi];
+    const math::Vec3d relKm = b.posKm - shipPos;
+    const math::Vec3d local = shipInv.rotate(relKm);
+
+    float dx = (float)(local.x * (double)s);
+    float dy = (float)(-local.z * (double)s);
+    const float r2 = dx*dx + dy*dy;
+    const float rMax = rad * 0.92f;
+    if (r2 > rMax * rMax) {
+      const float r = std::sqrt(r2);
+      const float k = (r > 1e-5f) ? (rMax / r) : 1.0f;
+      dx *= k;
+      dy *= k;
+    }
+
+    const ImVec2 bp(c.x + dx, c.y + dy);
+
+    // Pick icon kind/seed.
+    render::SpriteKind iKind = render::SpriteKind::Signal;
+    core::u64 iSeed = 0;
+    float iconSz = (b.force ? 22.0f : 16.0f) * uiScale;
+    switch (b.kind) {
+      case TargetKind::Station: {
+        const auto& st = currentSystem->stations[b.index];
+        iKind = render::SpriteKind::Station;
+        iSeed = core::hashCombine(core::fnv1a64("station"), st.id);
+        iconSz = (b.force ? 24.0f : 18.0f) * uiScale;
+      } break;
+      case TargetKind::Planet: {
+        iKind = render::SpriteKind::Planet;
+        iSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), currentSystem->stub.seed), (core::u64)b.index);
+        iconSz = (b.force ? 26.0f : 20.0f) * uiScale;
+      } break;
+      case TargetKind::Contact: {
+        const auto& ctc = contacts[b.index];
+        iKind = render::SpriteKind::Ship;
+        iSeed = core::hashCombine(core::fnv1a64("ship"), ctc.id);
+        iconSz = (b.force ? 22.0f : 16.0f) * uiScale;
+      } break;
+      case TargetKind::Cargo: {
+        const auto& pod = floatingCargo[b.index];
+        iKind = render::SpriteKind::Cargo;
+        iSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity);
+        iconSz = (b.force ? 22.0f : 15.0f) * uiScale;
+      } break;
+      case TargetKind::Asteroid: {
+        const auto& a = asteroids[b.index];
+        iKind = render::SpriteKind::Asteroid;
+        iSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
+        iconSz = (b.force ? 22.0f : 15.0f) * uiScale;
+      } break;
+      case TargetKind::Signal: {
+        const auto& ssrc = signals[b.index];
+        iKind = render::SpriteKind::Signal;
+        iSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
+        iconSz = (b.force ? 22.0f : 15.0f) * uiScale;
+      } break;
+      default: break;
+    }
+
+    const ImVec2 b0(bp.x - iconSz * 0.5f, bp.y - iconSz * 0.5f);
+    const ImVec2 b1(bp.x + iconSz * 0.5f, bp.y + iconSz * 0.5f);
+
+    // Interactive hitbox (uses ImGui's ID system for hover/click + tooltips)
+    ImGui::SetCursorScreenPos(b0);
+    ImGui::PushID((int)bi);
+    ImGui::InvisibleButton("blip", ImVec2(iconSz, iconSz));
+
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) {
+      ImGui::BeginTooltip();
+      // Show a larger icon and a short label.
+      const auto& big = spriteCache.get(iKind, iSeed, 96);
+      ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(64, 64));
+
+      if (b.kind == TargetKind::Station && b.index < currentSystem->stations.size()) {
+        ImGui::SameLine();
+        ImGui::Text("%s", currentSystem->stations[b.index].name.c_str());
+      } else if (b.kind == TargetKind::Planet && b.index < currentSystem->planets.size()) {
+        ImGui::SameLine();
+        ImGui::Text("%s", currentSystem->planets[b.index].name.c_str());
+      } else if (b.kind == TargetKind::Contact && b.index < contacts.size()) {
+        ImGui::SameLine();
+        const auto& ctc = contacts[b.index];
+        ImGui::Text("%s [%s]", ctc.name.c_str(), contactRoleName(ctc.role));
+      } else if (b.kind == TargetKind::Signal && b.index < signals.size()) {
+        ImGui::SameLine();
+        ImGui::Text("%s Signal", signalTypeName(signals[b.index].type));
+      } else if (b.kind == TargetKind::Cargo && b.index < floatingCargo.size()) {
+        ImGui::SameLine();
+        const auto& pod = floatingCargo[b.index];
+        const auto& def = econ::commodityDef(pod.commodity);
+        ImGui::Text("%s Pod", def.name);
+      } else if (b.kind == TargetKind::Asteroid && b.index < asteroids.size()) {
+        ImGui::SameLine();
+        const auto& a = asteroids[b.index];
+        const auto& def = econ::commodityDef(a.yield);
+        ImGui::Text("Asteroid [%s]", def.name);
+      }
+
+      ImGui::TextDisabled("Dist %.0f km | RelY %.0f km", b.distKm, local.y);
+      ImGui::EndTooltip();
+    }
+
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && b.kind != TargetKind::None) {
+      target.kind = b.kind;
+      target.index = b.index;
+    }
+    ImGui::PopID();
+
+    // Draw icon (atlas-batched)
+    const auto uv = hudAtlas.get(iKind, iSeed);
+    const auto& tex = hudAtlas.texture();
+    const ImU32 tint = b.force ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 215);
+    draw->AddImage((ImTextureID)(intptr_t)tex.handle(), b0, b1,
+                   ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                   tint);
+
+    if (b.force) {
+      draw->AddCircle(bp,
+                      iconSz * 0.65f + 5.0f * uiScale,
+                      IM_COL32(255, 180, 90, 210),
+                      0,
+                      1.5f * std::max(0.75f, uiScale));
+    }
+
+    // Vertical hint for off-plane objects (up/down)
+    if (std::abs(local.y) > 2500.0) {
+      const char* sym = (local.y > 0.0) ? "^" : "v";
+      draw->AddText(ImVec2(bp.x + iconSz * 0.30f, bp.y - iconSz * 0.65f), IM_COL32(230, 230, 240, 190), sym);
+    }
+  }
+
+  ImGui::SetCursorScreenPos(cursorAfter);
+  ImGui::End();
+  if (hudLayoutEditMode) ImGui::PopStyleVar();
+}
+
 
 // Objective HUD overlay (tracked mission summary)
 if (objectiveHudEnabled) {
@@ -5923,14 +7854,23 @@ if (objectiveHudEnabled) {
                         | ImGuiWindowFlags_NoNav
                         | ImGuiWindowFlags_NoSavedSettings;
 
-    ImGui::SetNextWindowBgAlpha(0.35f);
-    const ImVec2 pad(14.0f, 14.0f);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - pad.x, pad.y), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    auto& wLay = hudLayout.widget(ui::HudWidgetId::Objective);
+    const float uiScale = std::max(0.50f, wLay.scale);
+
+    ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+    hudSetNextWindowPosFromLayout(ui::HudWidgetId::Objective);
+    if (hudLayoutEditMode) {
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    }
     ImGui::Begin("Objective HUD##objective", nullptr, flags);
+    ImGui::SetWindowFontScale(uiScale);
+    if (hudLayoutEditMode) {
+      hudCaptureWindowPosToLayout(ui::HudWidgetId::Objective);
+    }
 
     ImGui::Text("Objective");
     ImGui::Separator();
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f * uiScale);
     ImGui::TextWrapped("%s", uiDescribeMission(*tracked).c_str());
     ImGui::PopTextWrapPos();
 
@@ -5999,11 +7939,12 @@ if (objectiveHudEnabled) {
     }
 
     ImGui::End();
+    if (hudLayoutEditMode) ImGui::PopStyleVar();
   }
 }
 
 // Pirate demand HUD (threat/tribute)
-if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0
+if (hudThreatOverlayEnabled && pirateDemand.active && pirateDemand.requiredValueCr > 0.0
     && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
 
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
@@ -6012,10 +7953,19 @@ if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0
                       | ImGuiWindowFlags_NoNav
                       | ImGuiWindowFlags_NoSavedSettings;
 
-  ImGui::SetNextWindowBgAlpha(0.35f);
-  const ImVec2 pad(14.0f, 14.0f);
-  ImGui::SetNextWindowPos(ImVec2(pad.x, pad.y), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+  auto& wLay = hudLayout.widget(ui::HudWidgetId::Threat);
+  const float uiScale = std::max(0.50f, wLay.scale);
+
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+  hudSetNextWindowPosFromLayout(ui::HudWidgetId::Threat);
+  if (hudLayoutEditMode) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+  }
   ImGui::Begin("Threat HUD##pirate_demand", nullptr, flags);
+  ImGui::SetWindowFontScale(uiScale);
+  if (hudLayoutEditMode) {
+    hudCaptureWindowPosToLayout(ui::HudWidgetId::Threat);
+  }
 
   const std::string src = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
   const double need = std::max(0.0, pirateDemand.requiredValueCr);
@@ -6027,10 +7977,57 @@ if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0
   ImGui::TextWrapped("%s demand tribute!", src.c_str());
 
   const float frac = (need > 1e-6) ? (float)std::clamp(have / need, 0.0, 1.0) : 0.0f;
-  ImGui::ProgressBar(frac, ImVec2(240.0f, 0.0f));
+  ImGui::ProgressBar(frac, ImVec2(240.0f * uiScale, 0.0f));
   ImGui::TextDisabled("Drop cargo value: %.0f / %.0f cr | %.0f s left", have, need, leftSec);
   ImGui::TextDisabled("Jettison: Ship/Status -> Cargo management");
   ImGui::End();
+  if (hudLayoutEditMode) ImGui::PopStyleVar();
+}
+
+
+if (hudJumpOverlay && fsdState != FsdState::Idle) {
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                      | ImGuiWindowFlags_AlwaysAutoResize
+                      | ImGuiWindowFlags_NoFocusOnAppearing
+                      | ImGuiWindowFlags_NoNav
+                      | ImGuiWindowFlags_NoSavedSettings;
+
+  auto& wLay = hudLayout.widget(ui::HudWidgetId::Jump);
+  const float uiScale = std::max(0.50f, wLay.scale);
+
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.28f);
+  hudSetNextWindowPosFromLayout(ui::HudWidgetId::Jump);
+  if (hudLayoutEditMode) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+  }
+  ImGui::Begin("FSD Jump##jump_hud", nullptr, flags);
+  ImGui::SetWindowFontScale(uiScale);
+  if (hudLayoutEditMode) {
+    hudCaptureWindowPosToLayout(ui::HudWidgetId::Jump);
+  }
+
+  std::string destName = "(none)";
+  if (fsdTargetSystem != 0) {
+    destName = universe.getSystem(fsdTargetSystem).stub.name;
+  }
+
+  if (fsdState == FsdState::Charging) {
+    const float t = (float)std::clamp(1.0 - (fsdChargeRemainingSec / std::max(0.001, kFsdChargeSec)), 0.0, 1.0);
+    ImGui::Text("FSD CHARGING");
+    ImGui::TextDisabled("Destination: %s | %.1f ly", destName.c_str(), fsdJumpDistanceLy);
+    ImGui::ProgressBar(t, ImVec2(320.0f * uiScale, 0.0f));
+    ImGui::TextDisabled("Press J again to cancel before fuel is consumed.");
+  } else if (fsdState == FsdState::Jumping) {
+    const float t = (float)std::clamp(1.0 - (fsdTravelRemainingSec / std::max(0.001, fsdTravelTotalSec)), 0.0, 1.0);
+    const double eta = std::max(0.0, fsdTravelRemainingSec);
+    ImGui::Text("HYPERSPACE");
+    ImGui::TextDisabled("Destination: %s", destName.c_str());
+    ImGui::ProgressBar(t, ImVec2(320.0f * uiScale, 0.0f));
+    ImGui::TextDisabled("ETA: %.1fs", eta);
+  }
+
+  ImGui::End();
+  if (hudLayoutEditMode) ImGui::PopStyleVar();
 }
 
 
@@ -6041,6 +8038,11 @@ if (showVfx) {
 
   if (ImGui::CollapsingHeader("Starfield", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("Enabled##stars", &vfxStarfieldEnabled);
+
+    if (vfxStarfieldEnabled) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Textured", &vfxStarfieldTextured);
+    }
 
     if (vfxStarfieldEnabled) {
       ImGui::SliderInt("Star count", &vfxStarCount, 0, 20000);
@@ -6055,8 +8057,51 @@ if (showVfx) {
     }
   }
 
+
+
+  if (ImGui::CollapsingHeader("Nebula", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enabled##nebula", &vfxNebulaEnabled);
+
+    if (vfxNebulaEnabled) {
+      ImGui::SliderInt("Puff count", &vfxNebulaPuffCount, 0, 6000);
+      ImGui::SliderInt("Variant##nebula", &vfxNebulaVariant, 0, 50);
+      ImGui::SliderFloat("Band power##nebula", &vfxNebulaBandPower, 1.0f, 4.0f, "%.2f");
+
+      float innerF = (float)vfxNebulaInnerRadiusU;
+      float outerF = (float)vfxNebulaOuterRadiusU;
+      if (ImGui::SliderFloat("Inner radius (U)", &innerF, 2000.0f, 40000.0f, "%.0f")) {
+        vfxNebulaInnerRadiusU = (double)innerF;
+      }
+      if (ImGui::SliderFloat("Outer radius (U)", &outerF, 4000.0f, 80000.0f, "%.0f")) {
+        vfxNebulaOuterRadiusU = (double)outerF;
+      }
+
+      float par = (float)vfxNebulaParallax;
+      if (ImGui::SliderFloat("Parallax", &par, 0.0f, 1.0f, "%.2f")) {
+        vfxNebulaParallax = (double)par;
+      }
+
+      ImGui::SliderFloat("Intensity##nebula", &vfxNebulaIntensity, 0.0f, 6.0f, "%.2f");
+      ImGui::SliderFloat("Opacity##nebula", &vfxNebulaOpacity, 0.0f, 0.60f, "%.3f");
+
+      ImGui::SliderFloat("Size min (px)##nebula", &vfxNebulaSizeMinPx, 8.0f, 400.0f, "%.0f");
+      ImGui::SliderFloat("Size max (px)##nebula", &vfxNebulaSizeMaxPx, 8.0f, 700.0f, "%.0f");
+      if (vfxNebulaSizeMaxPx < vfxNebulaSizeMinPx) vfxNebulaSizeMaxPx = vfxNebulaSizeMinPx;
+
+      ImGui::SliderFloat("Turbulence##nebula", &vfxNebulaTurbulence, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Turbulence speed##nebula", &vfxNebulaTurbulenceSpeed, 0.0f, 0.50f, "%.3f");
+
+      ImGui::TextDisabled("Puffs generated: %zu", nebula.puffCount());
+      ImGui::TextDisabled("Tip: Nebula is additive; tune PostFX bloom/warp for extra glow.");
+    }
+  }
   if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("Enabled##particles", &vfxParticlesEnabled);
+
+    if (vfxParticlesEnabled) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Textured", &vfxParticlesTextured);
+    }
 
     if (vfxParticlesEnabled) {
       ImGui::Text("Alive: %zu / %zu", particles.aliveCount(), particles.maxParticles());
@@ -6124,6 +8169,20 @@ if (showPostFx) {
       ImGui::Separator();
       ImGui::Checkbox("Auto warp from speed", &postFxAutoWarpFromSpeed);
       ImGui::SliderFloat("Warp (manual)", &postFxSettings.warp, 0.0f, 0.08f, "%.4f");
+    }
+
+    if (ImGui::CollapsingHeader("Hyperspace / Jump FX", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Checkbox("Auto hyperspace from FSD", &postFxAutoHyperspaceFromFsd);
+      ImGui::SliderFloat("FSD warp boost", &postFxFsdWarpBoost, 0.0f, 0.12f, "%.3f");
+      ImGui::SliderFloat("FSD hyperspace boost", &postFxFsdHyperspaceBoost, 0.0f, 1.5f, "%.2f");
+      ImGui::Checkbox("Jump overlay HUD", &hudJumpOverlay);
+      ImGui::Separator();
+      ImGui::SliderFloat("Hyperspace (manual)", &postFxSettings.hyperspace, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Twist", &postFxSettings.hyperspaceTwist, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Density", &postFxSettings.hyperspaceDensity, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Noise", &postFxSettings.hyperspaceNoise, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Intensity", &postFxSettings.hyperspaceIntensity, 0.0f, 3.0f, "%.2f");
+      ImGui::TextDisabled("Tip: During FSD charge, press J again to cancel before fuel is consumed.");
     }
   } else {
     ImGui::TextDisabled("(PostFX disabled)");
@@ -6429,9 +8488,12 @@ if (showShip) {
                                       ? isIllegalCommodity(currentSystem->stub.factionId, cid)
                                       : false;
 
-            toast(toasts,
-                  std::string("Jettisoned: ") + econ::commodityName(cid) + " x" + std::to_string((int)std::round(take)),
-                  contraband ? 2.6 : 2.0);
+            const auto cNameSv = econ::commodityName(cid);
+            std::string msg = "Jettisoned: ";
+            msg.append(cNameSv.data(), cNameSv.size());
+            msg += " x";
+            msg += std::to_string((int)std::round(take));
+            toast(toasts, msg, contraband ? 2.6 : 2.0);
 
             const auto wit = authorityWitness();
             if (wit.first) {
@@ -6585,6 +8647,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
 
       ImGui::Text("FSD: %s", label);
       ImGui::ProgressBar((float)std::clamp(timer / total, 0.0, 1.0), ImVec2(-1, 0));
+      if (fsdState == FsdState::Charging) ImGui::TextDisabled("J cancels during charge.");
     }
   }
 
@@ -6756,13 +8819,21 @@ if (showSprites) {
   ImGui::Text("Sprite cache: %zu / %zu", spriteCache.size(), spriteCache.maxEntries());
   if (ImGui::Button("Clear sprite cache")) spriteCache.clear();
 
+  ImGui::Text("HUD icon atlas: %zu / %zu (grid cap %d)", hudAtlas.size(), hudAtlas.maxEntries(), hudAtlas.capacity());
+  ImGui::SameLine();
+  if (ImGui::Button("Clear HUD atlas")) hudAtlas.clear();
+  ImGui::TextDisabled("Atlas %dx%d | Cell %d | Pad %d", hudAtlas.atlasSizePx(), hudAtlas.atlasSizePx(), hudAtlas.cellSizePx(), hudAtlas.paddingPx());
+  ImGui::Image((ImTextureID)(intptr_t)hudAtlas.texture().handle(), ImVec2(256, 256), ImVec2(0,0), ImVec2(1,1));
+
   ImGui::Separator();
 
   static int kindIdx = 0;
   static int texSize = 64;
   static core::u64 seed = 0xC0FFEEULL;
 
-  const char* kindNames[] = {"Commodity", "Faction", "Mission", "Ship", "Station", "Planet", "Star"};
+  const char* kindNames[] = {"Commodity", "Faction", "Mission", "Ship", "Station", "Planet", "Star",
+                             "Cargo", "Asteroid", "Signal",
+                             "HudReticle", "HudLead", "HudVelocity"};
   ImGui::Combo("Kind", &kindIdx, kindNames, IM_ARRAYSIZE(kindNames));
   ImGui::SliderInt("Texture size", &texSize, 16, 128);
   ImGui::InputScalar("Seed (u64)", ImGuiDataType_U64, &seed);
@@ -6789,16 +8860,19 @@ if (showSprites) {
         ImGui::TableNextColumn();
         ImGui::PushID((int)i);
 
+        const auto nameSv = econ::commodityName(cid);
+        const auto codeSv = econ::commodityCode(cid);
+
         ImGui::Image((ImTextureID)(intptr_t)cTex.handle(), ImVec2(26, 26));
         if (ImGui::IsItemHovered()) {
           const auto& big = spriteCache.get(render::SpriteKind::Commodity, cSeed, 96);
           ImGui::BeginTooltip();
-          ImGui::Text("%s (%s)", std::string(econ::commodityName(cid)).c_str(), econ::commodityCode(cid));
+          ImGui::Text("%.*s (%.*s)", (int)nameSv.size(), nameSv.data(), (int)codeSv.size(), codeSv.data());
           ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
           ImGui::EndTooltip();
         }
 
-        ImGui::TextUnformatted(econ::commodityCode(cid));
+        ImGui::TextUnformatted(codeSv.data(), codeSv.data() + codeSv.size());
 
         ImGui::PopID();
       }
@@ -6833,6 +8907,287 @@ if (showSprites) {
 }
 
 
+if (showWorldVisuals) {
+  ImGui::Begin("World Visuals", &showWorldVisuals);
+
+  ImGui::TextDisabled("Procedural surface textures for stars/planets + star-relative lighting.");
+  ImGui::Text("Surface texture cache: %zu / %zu", surfaceTexCache.size(), surfaceTexCache.maxEntries());
+  ImGui::SameLine();
+  if (ImGui::Button("Clear surface cache")) surfaceTexCache.clear();
+
+  ImGui::Separator();
+
+  ImGui::Checkbox("Procedural star/planet surfaces", &worldUseProceduralSurfaces);
+  ImGui::SameLine();
+  ImGui::Checkbox("Surface previews in UI", &worldUseSurfaceInUi);
+
+  if (worldUseProceduralSurfaces) {
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderInt("Surface tex width", &worldSurfaceTexWidth, 128, 1024, "%d");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(height = width/2)");
+
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Star intensity", &worldStarIntensity, 0.5f, 8.0f, "%.2f");
+    ImGui::SameLine();
+    ImGui::Checkbox("Unlit star", &worldStarUnlit);
+  } else {
+    ImGui::TextDisabled("Meshes fall back to the checker texture.");
+  }
+
+  ImGui::Separator();
+  ImGui::TextDisabled("Secondary layers (visual only)");
+
+  ImGui::Checkbox("Atmospheres (limb glow)", &worldAtmospheresEnabled);
+  if (worldAtmospheresEnabled) {
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Atmosphere intensity", &worldAtmoIntensity, 0.0f, 3.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Atmosphere rim power", &worldAtmoPower, 1.5f, 10.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Atmosphere shell scale", &worldAtmoShellScale, 1.005f, 1.10f, "%.3f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Day-side boost", &worldAtmoSunLitBoost, 0.0f, 1.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Forward scatter", &worldAtmoForwardScatter, 0.0f, 1.0f, "%.2f");
+    ImGui::Checkbox("Tint with star color", &worldAtmoTintWithStar);
+  }
+
+  ImGui::BeginDisabled(!worldUseProceduralSurfaces);
+  ImGui::Checkbox("Cloud shell (alpha)", &worldCloudsEnabled);
+  if (worldCloudsEnabled) {
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Cloud opacity", &worldCloudOpacity, 0.0f, 1.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Cloud shell scale", &worldCloudShellScale, 1.002f, 1.06f, "%.3f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Cloud spin (deg/s)", &worldCloudSpinDegPerSec, 0.0f, 18.0f, "%.1f");
+  }
+  ImGui::EndDisabled();
+
+  if (!worldUseProceduralSurfaces) {
+    ImGui::TextDisabled("Cloud shells require procedural surfaces enabled.");
+  }
+
+  if (ImGui::CollapsingHeader("Surface generator preview", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const float thumbW = 192.0f;
+    const float thumbH = thumbW * 0.5f;
+
+    auto preview = [&](render::SurfaceKind kind, const char* name, core::u64 s) {
+      const auto& t = surfaceTexCache.get(kind, s, worldSurfaceTexWidth);
+      ImGui::TextUnformatted(name);
+      ImGui::Image((ImTextureID)(intptr_t)t.handle(), ImVec2(thumbW, thumbH), ImVec2(0, 0), ImVec2(1, 1));
+    };
+
+    const core::u64 base = currentSystem ? (core::u64)currentSystem->stub.seed : seed;
+    preview(render::SurfaceKind::Star, "Star", core::hashCombine(base, core::fnv1a64("surf_star")));
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("surfprev", 2, ImGuiTableFlags_SizingFixedFit)) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::Rocky, "Rocky", core::hashCombine(base, core::fnv1a64("surf_rocky")));
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::Desert, "Desert", core::hashCombine(base, core::fnv1a64("surf_desert")));
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::Ocean, "Ocean", core::hashCombine(base, core::fnv1a64("surf_ocean")));
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::Ice, "Ice", core::hashCombine(base, core::fnv1a64("surf_ice")));
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::GasGiant, "Gas Giant", core::hashCombine(base, core::fnv1a64("surf_gas")));
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::Clouds, "Clouds", core::hashCombine(base, core::fnv1a64("surf_clouds")));
+      ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("Tip: star/planet shading is now computed from a point-light at the origin (the star). ");
+  }
+
+  ImGui::End();
+}
+
+
+if (showHangar) {
+  const bool wasOpen = showHangar;
+  ImGui::Begin("Hangar / Livery", &showHangar);
+
+  ImGui::TextDisabled("3D hangar preview is rendered offscreen (OpenGL FBO) and displayed via ImGui::Image().");
+  ImGui::Separator();
+
+  // Preview configuration
+  {
+    ImGui::SetNextItemWidth(240.0f);
+    const int minPrev = 256;
+    const int maxPrev = 1024;
+    const int before = hangarPreviewSizePx;
+    if (ImGui::SliderInt("Preview size (px)", &hangarPreviewSizePx, minPrev, maxPrev)) {
+      hangarPreviewSizePx = std::clamp(hangarPreviewSizePx, minPrev, maxPrev);
+    }
+    if (hangarPreviewSizePx != before) {
+      hangarTarget.ensureSize(hangarPreviewSizePx, hangarPreviewSizePx);
+    }
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Animate", &hangarAnimate);
+    if (hangarAnimate) {
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(160.0f);
+      ImGui::SliderFloat("Spin (rad/s)", &hangarSpinRadPerSec, 0.0f, 2.5f, "%.2f");
+    }
+
+    ImGui::SetNextItemWidth(240.0f);
+    ImGui::SliderFloat("Zoom", &hangarZoom, 1.5f, 7.5f, "%.2f");
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-save on close", &liveryAutoSaveOnExit);
+  }
+
+  if (ImGui::BeginTable("hangar_table", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+    ImGui::TableNextRow();
+
+    // --- Left: preview ---
+    ImGui::TableNextColumn();
+    {
+      const float maxSize = 560.0f;
+      const float avail = ImGui::GetContentRegionAvail().x;
+      const float imgSize = std::max(140.0f, std::min(avail, maxSize));
+
+      const GLuint prevTex = hangarTarget.color().handle();
+      if (prevTex != 0) {
+        ImGui::Image((ImTextureID)(intptr_t)prevTex, ImVec2(imgSize, imgSize), ImVec2(0, 1), ImVec2(1, 0));
+
+        // Drag to rotate
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+          const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+          hangarYawDeg += d.x * 0.25f;
+          hangarPitchDeg = std::clamp(hangarPitchDeg + d.y * 0.25f, -85.0f, 85.0f);
+          ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+          hangarAnimate = false;
+        }
+
+        // Scroll to zoom
+        if (ImGui::IsItemHovered()) {
+          const float wheel = ImGui::GetIO().MouseWheel;
+          if (wheel != 0.0f) {
+            hangarZoom = std::clamp(hangarZoom - wheel * 0.25f, 1.5f, 7.5f);
+          }
+        }
+
+        ImGui::TextDisabled("Drag: rotate | Scroll: zoom");
+      } else {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "Hangar preview unavailable (FBO init failed).");
+      }
+    }
+
+    // --- Right: livery controls ---
+    ImGui::TableNextColumn();
+    {
+      bool changed = false;
+
+      ImGui::SeparatorText("Livery");
+      {
+        int pat = (int)liveryCfg.pattern;
+        const char* items[] = {"Solid", "Stripes", "Hazard", "Camo", "Hex", "Digital"};
+        if (ImGui::Combo("Pattern", &pat, items, (int)(sizeof(items) / sizeof(items[0])))) {
+          pat = std::clamp(pat, 0, (int)render::LiveryPattern::Count - 1);
+          liveryCfg.pattern = (render::LiveryPattern)pat;
+          changed = true;
+        }
+
+        ImGui::SetNextItemWidth(240.0f);
+        changed |= ImGui::InputScalar("Seed", ImGuiDataType_U64, &liveryCfg.seed);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Random")) {
+          liveryCfg.seed = liveryRng.nextU64();
+          changed = true;
+        }
+
+        if (ImGui::SmallButton("Random palette")) {
+          core::SplitMix64 tmp(core::hashCombine(liveryCfg.seed, core::fnv1a64("palette")));
+          auto rnd = [&]() -> float { return (float)tmp.range(0.08, 0.98); };
+          liveryCfg.base[0] = rnd(); liveryCfg.base[1] = rnd(); liveryCfg.base[2] = rnd();
+          liveryCfg.accent1[0] = rnd(); liveryCfg.accent1[1] = rnd(); liveryCfg.accent1[2] = rnd();
+          liveryCfg.accent2[0] = rnd(); liveryCfg.accent2[1] = rnd(); liveryCfg.accent2[2] = rnd();
+          changed = true;
+        }
+      }
+
+      changed |= ImGui::ColorEdit3("Base", liveryCfg.base);
+      changed |= ImGui::ColorEdit3("Accent A", liveryCfg.accent1);
+      changed |= ImGui::ColorEdit3("Accent B", liveryCfg.accent2);
+
+      ImGui::SeparatorText("Pattern params");
+      ImGui::SetNextItemWidth(240.0f);
+      changed |= ImGui::SliderFloat("Scale", &liveryCfg.scale, 0.25f, 4.0f, "%.2f");
+      ImGui::SetNextItemWidth(240.0f);
+      changed |= ImGui::SliderFloat("Angle (deg)", &liveryCfg.angleDeg, -90.0f, 90.0f, "%.1f");
+      ImGui::SetNextItemWidth(240.0f);
+      changed |= ImGui::SliderFloat("Detail", &liveryCfg.detail, 0.0f, 1.0f, "%.2f");
+      ImGui::SetNextItemWidth(240.0f);
+      changed |= ImGui::SliderFloat("Wear", &liveryCfg.wear, 0.0f, 1.0f, "%.2f");
+      ImGui::SetNextItemWidth(240.0f);
+      changed |= ImGui::SliderFloat("Contrast", &liveryCfg.contrast, 0.0f, 1.0f, "%.2f");
+      changed |= ImGui::Checkbox("Decal", &liveryCfg.decal);
+
+      ImGui::SeparatorText("Texture");
+      {
+        ImGui::SetNextItemWidth(240.0f);
+        changed |= ImGui::SliderInt("Livery tex size", &liveryCfg.textureSizePx, 128, 1024);
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::SliderFloat("Regen throttle (s)", &shipLiveryRegenMinIntervalSec, 0.0f, 0.25f, "%.3f");
+      }
+      changed |= ImGui::Checkbox("Apply in world", &liveryCfg.applyInWorld);
+
+      ImGui::Separator();
+      if (ImGui::Button("Save livery")) {
+        ui::saveLiveryToFile(liveryCfg, liveryPath);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Load livery")) {
+        ui::LiveryConfig loaded = ui::makeDefaultLivery();
+        if (ui::loadLiveryFromFile(liveryPath, loaded)) {
+          liveryCfg = loaded;
+          changed = true;
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Reset")) {
+        liveryCfg = ui::makeDefaultLivery();
+        changed = true;
+      }
+      ImGui::TextDisabled("File: %s", liveryPath.c_str());
+
+      // Mini 2D preview of the generated albedo.
+      if (shipLiveryTex.handle() != 0) {
+        ImGui::SeparatorText("Albedo preview");
+        ImGui::Image((ImTextureID)(intptr_t)shipLiveryTex.handle(), ImVec2(192, 192), ImVec2(0, 1), ImVec2(1, 0));
+      }
+
+      if (changed) shipLiveryDirty = true;
+
+      // Regenerate the livery texture with a simple throttle so dragging sliders
+      // doesn't re-run the generator at unbounded rates.
+      if (shipLiveryDirty) {
+        const bool allow = (!ImGui::IsAnyItemActive()) || ((timeRealSec - shipLiveryLastRegenTimeSec) > (double)shipLiveryRegenMinIntervalSec);
+        if (allow) {
+          rebuildShipLivery();
+          shipLiveryLastRegenTimeSec = timeRealSec;
+        }
+      }
+    }
+
+    ImGui::EndTable();
+  }
+
+  ImGui::End();
+
+  if (wasOpen && !showHangar && liveryAutoSaveOnExit) {
+    ui::saveLiveryToFile(liveryCfg, liveryPath);
+  }
+}
+
+
 if (showScanner) {
   ImGui::Begin("System Scanner");
 
@@ -6845,6 +9200,15 @@ if (showScanner) {
       const auto& big = spriteCache.get(render::SpriteKind::Star, sSeed, 96);
       ImGui::BeginTooltip();
       ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+      if (worldUseProceduralSurfaces && worldUseSurfaceInUi) {
+        const core::u64 surfSeed = core::hashCombine(
+            core::hashCombine(core::fnv1a64("star_surface"), (core::u64)currentSystem->stub.seed),
+            (core::u64)(int)currentSystem->star.cls);
+        const auto& surf = surfaceTexCache.get(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth);
+        ImGui::Separator();
+        ImGui::TextDisabled("Surface");
+        ImGui::Image((ImTextureID)(intptr_t)surf.handle(), ImVec2(192, 96));
+      }
       ImGui::EndTooltip();
     }
     ImGui::SameLine();
@@ -6964,8 +9328,10 @@ if (showScanner) {
     }
   }
 
-  ImGui::Separator();
-  ImGui::Text("Planets");
+  if (ImGui::BeginTabBar("ScannerTabs")) {
+    if (ImGui::BeginTabItem("Catalog")) {
+      ImGui::Separator();
+      ImGui::Text("Planets");
 
   for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
     const auto& p = currentSystem->planets[i];
@@ -6982,6 +9348,24 @@ if (showScanner) {
         ImGui::BeginTooltip();
         ImGui::TextUnformatted(p.name.c_str());
         ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+        if (worldUseProceduralSurfaces && worldUseSurfaceInUi) {
+          const core::u64 surfSeed = core::hashCombine(
+              core::hashCombine(core::fnv1a64("planet_surface"), (core::u64)currentSystem->stub.seed),
+              (core::u64)i);
+          const auto& surf = surfaceTexCache.get(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth);
+          ImGui::Separator();
+          ImGui::TextDisabled("Surface");
+          ImGui::Image((ImTextureID)(intptr_t)surf.handle(), ImVec2(192, 96));
+
+          // Optional cloud layer preview (alpha mask)
+          if (worldCloudsEnabled) {
+            core::u64 cloudSeed = core::hashCombine(surfSeed, core::fnv1a64("clouds"));
+            cloudSeed = core::hashCombine(cloudSeed, (core::u64)(int)p.type);
+            const auto& cloud = surfaceTexCache.get(render::SurfaceKind::Clouds, cloudSeed, worldSurfaceTexWidth);
+            ImGui::TextDisabled("Clouds");
+            ImGui::Image((ImTextureID)(intptr_t)cloud.handle(), ImVec2(192, 96));
+          }
+        }
         ImGui::EndTooltip();
       }
       ImGui::SameLine();
@@ -7075,6 +9459,21 @@ if (showScanner) {
         break;
       }
 
+      // Procedural signal icon
+      {
+        const core::u64 sigSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), (core::u64)s.id), (core::u64)(int)s.type);
+        const auto& sigIcon = spriteCache.get(render::SpriteKind::Signal, sigSeed, 32);
+        ImGui::Image((ImTextureID)(intptr_t)sigIcon.handle(), ImVec2(18, 18));
+        if (ImGui::IsItemHovered()) {
+          const auto& big = spriteCache.get(render::SpriteKind::Signal, sigSeed, 96);
+          ImGui::BeginTooltip();
+          ImGui::Text("%s Signal", signalTypeName(s.type));
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+          ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+      }
+
 	      ImGui::Text("%s%s%s | %.0f km%s", signalTypeName(s.type), s.resolved ? " (resolved)" : "", mtag, distKm,
 	                  (s.expireDay > 0.0) ? (std::string(" | ") + std::to_string((int)std::round(std::max(0.0, minsLeft)))
 	                                        + " min").c_str()
@@ -7102,6 +9501,21 @@ if (showScanner) {
 	      if (a.remainingUnits <= 1e-3) continue;
 	      const double distKm = (a.posKm - ship.positionKm()).length();
 	      ImGui::PushID((int)i + 12000);
+
+      // Procedural asteroid icon
+      {
+        const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), (core::u64)a.id), (core::u64)a.yield);
+        const auto& aIcon = spriteCache.get(render::SpriteKind::Asteroid, aSeed, 32);
+        ImGui::Image((ImTextureID)(intptr_t)aIcon.handle(), ImVec2(18, 18));
+        if (ImGui::IsItemHovered()) {
+          const auto& big = spriteCache.get(render::SpriteKind::Asteroid, aSeed, 96);
+          ImGui::BeginTooltip();
+          ImGui::Text("Asteroid [%s]", econ::commodityDef(a.yield).name);
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+          ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+      }
 	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name,
 	                  std::round(std::max(0.0, a.remainingUnits)), distKm);
 	      ImGui::SameLine();
@@ -7127,6 +9541,21 @@ if (showScanner) {
 	      const double distKm = (pod.posKm - ship.positionKm()).length();
 	      const double minsLeft = (pod.expireDay > 0.0) ? (pod.expireDay - timeDays) * 1440.0 : 0.0;
 	      ImGui::PushID((int)i + 15000);
+
+      // Procedural cargo pod icon
+      {
+        const core::u64 cSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), (core::u64)pod.id), (core::u64)pod.commodity);
+        const auto& cIcon = spriteCache.get(render::SpriteKind::Cargo, cSeed, 32);
+        ImGui::Image((ImTextureID)(intptr_t)cIcon.handle(), ImVec2(18, 18));
+        if (ImGui::IsItemHovered()) {
+          const auto& big = spriteCache.get(render::SpriteKind::Cargo, cSeed, 96);
+          ImGui::BeginTooltip();
+          ImGui::Text("%s Pod", econ::commodityDef(pod.commodity).name);
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+          ImGui::EndTooltip();
+        }
+        ImGui::SameLine();
+      }
 	      const char* ptag = (pod.missionId != 0) ? " [MISSION]" : "";
 	      ImGui::Text("%s%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name, ptag,
 	                  std::round(std::max(0.0, pod.units)), distKm, (int)std::round(std::max(0.0, minsLeft)));
@@ -7153,6 +9582,899 @@ if (showScanner) {
     }
   } else {
     ImGui::TextDisabled("Dock at a station to sell exploration data.");
+  }
+
+      // End Catalog tab.
+      ImGui::EndTabItem();
+    }
+
+    // System Map tab (Orrery 2.0: infinite-canvas pan/zoom + time scrub + atlas icons)
+    if (ImGui::BeginTabItem("System Map")) {
+      struct Vec2AU {
+        double x{0.0}, y{0.0};
+      };
+      struct SystemMapState {
+        core::u64 systemId{0};
+        Vec2AU centerAU{0.0, 0.0};
+        float zoom{1.0f};
+        bool followShip{false};
+
+        bool showGrid{true};
+        bool showOrbits{true};
+        bool showStations{true};
+        bool showContacts{true};
+        bool showSignals{true};
+        bool showAsteroids{true};
+        bool showCargo{true};
+
+        double previewOffsetDays{0.0};
+        bool previewAnimate{false};
+        float previewSpeedDaysPerSec{0.35f};
+      };
+      static SystemMapState map{};
+
+      // Reset view when changing star system.
+      if (map.systemId != currentSystem->stub.id) {
+        map.systemId = currentSystem->stub.id;
+        map.centerAU = {0.0, 0.0};
+        map.zoom = 1.0f;
+        map.followShip = false;
+        map.previewOffsetDays = 0.0;
+        map.previewAnimate = false;
+      }
+
+      if (map.previewAnimate && !paused) {
+        map.previewOffsetDays += (double)map.previewSpeedDaysPerSec * dtReal;
+        map.previewOffsetDays = std::clamp(map.previewOffsetDays, -2.0, 120.0);
+      }
+
+      const double previewTimeDays = timeDays + map.previewOffsetDays;
+
+      // Shared atlas texture for all map icons.
+      const auto& atlasTex = hudAtlas.texture();
+      const ImTextureID atlasId = (ImTextureID)(intptr_t)atlasTex.handle();
+
+      // Mirror the keyboard 'H' supercruise toggle as a UI action.
+      auto uiToggleSupercruise = [&]() {
+        if (docked) { toast(toasts, "Undock to use supercruise.", 1.8); return; }
+        if (fsdState != FsdState::Idle) { toast(toasts, "Supercruise unavailable in hyperspace.", 2.0); return; }
+
+        if (supercruiseState == SupercruiseState::Idle) {
+          if (target.kind == TargetKind::None) {
+            toast(toasts, "No nav target set.", 1.8);
+            return;
+          }
+
+          double nearestPirateKm = 1e99;
+          for (const auto& c : contacts) {
+            if (!c.alive || c.role != ContactRole::Pirate) continue;
+            nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
+          }
+          const bool pirateNearby = (nearestPirateKm < 160000.0);
+
+          supercruiseState = SupercruiseState::Charging;
+          supercruiseChargeRemainingSec = kSupercruiseChargeSec;
+          supercruiseDropRequested = false;
+          interdictionState = InterdictionState::None;
+          interdictionWarningRemainingSec = 0.0;
+          interdictionActiveRemainingSec = 0.0;
+          interdictionEscapeMeter = 0.0;
+          interdictionSubmitRequested = false;
+          autopilot = false;
+          autopilotPhase = 0;
+          scanning = false;
+          scanProgressSec = 0.0;
+          navAutoRun = false;
+
+          toast(toasts,
+                pirateNearby ? "Supercruise charging... (pirate signals nearby)" : "Supercruise charging...",
+                1.8);
+        } else if (supercruiseState == SupercruiseState::Charging) {
+          supercruiseState = SupercruiseState::Idle;
+          supercruiseChargeRemainingSec = 0.0;
+          interdictionState = InterdictionState::None;
+          interdictionSubmitRequested = false;
+          toast(toasts, "Supercruise canceled.", 1.4);
+        } else if (supercruiseState == SupercruiseState::Active) {
+          if (interdictionState != InterdictionState::None) {
+            interdictionSubmitRequested = true;
+            toast(toasts, "Submitted to interdiction.", 1.4);
+          } else {
+            supercruiseDropRequested = true;
+            toast(toasts, "Drop requested.", 1.2);
+          }
+        } else {
+          toast(toasts, "Supercruise cooling down...", 1.6);
+        }
+      };
+
+      auto centerOnStar = [&]() {
+        map.followShip = false;
+        map.centerAU = {0.0, 0.0};
+      };
+
+      auto shipPosAU2 = [&]() -> Vec2AU {
+        const math::Vec3d au = ship.positionKm() / kAU_KM;
+        return {au.x, au.z};
+      };
+
+      ImGui::TextDisabled("Pan: RMB/MMB drag | Zoom: wheel (cursor anchored) | Double-click: center | Right-click: context menu");
+
+      if (ImGui::Button("Center Star")) { centerOnStar(); }
+      ImGui::SameLine();
+      if (ImGui::Button("Center Ship")) { map.centerAU = shipPosAU2(); map.followShip = true; }
+      ImGui::SameLine();
+      ImGui::Checkbox("Follow ship", &map.followShip);
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(180.0f);
+      ImGui::SliderFloat("Zoom", &map.zoom, 0.12f, 14.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+      ImGui::SameLine();
+      ImGui::Checkbox("Grid", &map.showGrid);
+
+      ImGui::Checkbox("Orbits", &map.showOrbits);
+      ImGui::SameLine();
+      ImGui::Checkbox("Stations", &map.showStations);
+      ImGui::SameLine();
+      ImGui::Checkbox("Contacts", &map.showContacts);
+      ImGui::SameLine();
+      ImGui::Checkbox("Signals", &map.showSignals);
+      ImGui::SameLine();
+      ImGui::Checkbox("Asteroids", &map.showAsteroids);
+      ImGui::SameLine();
+      ImGui::Checkbox("Cargo", &map.showCargo);
+
+      ImGui::Separator();
+
+      // Orbit preview time scrub (does not change sim-time; purely for map visualization).
+      {
+        ImGui::TextDisabled("Orbit preview:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(240.0f);
+        double tOff = map.previewOffsetDays;
+        const double tMin = -2.0;
+        const double tMax = 120.0;
+        if (ImGui::SliderScalar("##preview_days", ImGuiDataType_Double, &tOff, &tMin, &tMax, "%+.2f days", ImGuiSliderFlags_Logarithmic)) {
+          map.previewOffsetDays = tOff;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Animate##preview", &map.previewAnimate);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("Speed (d/s)##preview", &map.previewSpeedDaysPerSec, 0.02f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##preview")) { map.previewOffsetDays = 0.0; map.previewAnimate = false; }
+        ImGui::TextDisabled("Preview time: t %+.2f days", (float)map.previewOffsetDays);
+      }
+
+      ImGui::Separator();
+
+      // Layout: map canvas + details panel.
+      if (ImGui::BeginTable("sysmap2_layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Map", ImGuiTableColumnFlags_WidthStretch, 0.68f);
+        ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+        ImGui::TableNextRow();
+
+        // ---- Map column ----
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("sysmap2_canvas", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 canvasSize = ImGui::GetContentRegionAvail();
+        canvasSize.x = std::max(canvasSize.x, 60.0f);
+        canvasSize.y = std::max(canvasSize.y, 60.0f);
+        const ImVec2 p1(p0.x + canvasSize.x, p0.y + canvasSize.y);
+        const ImVec2 centerScreen(p0.x + canvasSize.x * 0.5f, p0.y + canvasSize.y * 0.5f);
+
+        ImGui::InvisibleButton("sysmap2_invis", canvasSize,
+                               ImGuiButtonFlags_MouseButtonLeft |
+                               ImGuiButtonFlags_MouseButtonRight |
+                               ImGuiButtonFlags_MouseButtonMiddle);
+        const bool canvasHovered = ImGui::IsItemHovered();
+        const bool canvasActive = ImGui::IsItemActive();
+        const ImVec2 mouse = io.MousePos;
+
+        // Determine system extent (AU) for scale.
+        double maxAU = 0.25;
+        for (const auto& p : currentSystem->planets) {
+          maxAU = std::max(maxAU, p.orbit.semiMajorAxisAU * (1.0 + p.orbit.eccentricity));
+        }
+        for (const auto& st : currentSystem->stations) {
+          maxAU = std::max(maxAU, st.orbit.semiMajorAxisAU * (1.0 + st.orbit.eccentricity));
+        }
+        // Include ship radius so you can always find yourself if you're far out.
+        {
+          const math::Vec3d shipAU = ship.positionKm() / kAU_KM;
+          maxAU = std::max(maxAU, std::sqrt(shipAU.x * shipAU.x + shipAU.z * shipAU.z));
+        }
+
+        const float pad = 16.0f;
+        const float rad = std::max(20.0f, 0.5f * std::min(canvasSize.x, canvasSize.y) - pad);
+        const float baseScale = (float)(rad / std::max(0.01, maxAU));
+
+        auto clampZoom = [](float z) { return std::clamp(z, 0.08f, 22.0f); };
+        map.zoom = clampZoom(map.zoom);
+        float pxPerAU = baseScale * map.zoom;
+
+        // Follow ship unless the user is actively panning.
+        if (map.followShip && !canvasActive) {
+          map.centerAU = shipPosAU2();
+        }
+
+        auto worldToScreen = [&](const Vec2AU& au) -> ImVec2 {
+          const float x = (float)((au.x - map.centerAU.x) * (double)pxPerAU);
+          const float y = (float)((au.y - map.centerAU.y) * (double)pxPerAU);
+          return ImVec2(centerScreen.x + x, centerScreen.y - y);
+        };
+
+        auto screenToWorld = [&](const ImVec2& sp, float scale) -> Vec2AU {
+          const double wx = map.centerAU.x + (double)(sp.x - centerScreen.x) / (double)scale;
+          const double wy = map.centerAU.y - (double)(sp.y - centerScreen.y) / (double)scale;
+          return {wx, wy};
+        };
+
+        // Zoom (anchored under cursor).
+        if (canvasHovered && std::abs(io.MouseWheel) > 1e-6f) {
+          const Vec2AU wUnder = screenToWorld(mouse, pxPerAU);
+          const float k = (io.MouseWheel > 0.0f) ? 1.18f : 0.85f;
+          map.zoom = clampZoom(map.zoom * k);
+
+          const float newPxPerAU = baseScale * map.zoom;
+          map.centerAU.x = wUnder.x - (double)(mouse.x - centerScreen.x) / (double)newPxPerAU;
+          map.centerAU.y = wUnder.y + (double)(mouse.y - centerScreen.y) / (double)newPxPerAU;
+          pxPerAU = newPxPerAU;
+        }
+
+        // Pan (drag) - disables follow-ship.
+        if (canvasHovered && (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f) ||
+                              ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f))) {
+          map.followShip = false;
+          map.centerAU.x -= (double)io.MouseDelta.x / (double)pxPerAU;
+          map.centerAU.y += (double)io.MouseDelta.y / (double)pxPerAU;
+        }
+
+        // Background
+        draw->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 90), 6.0f);
+        draw->AddRect(p0, p1, IM_COL32(120, 140, 170, 120), 6.0f, 0, 1.0f);
+
+        // Nice-number helper for grid / scale.
+        auto niceNum = [](double x) -> double {
+          if (x <= 0.0) return 1.0;
+          const double expv = std::floor(std::log10(x));
+          const double f = x / std::pow(10.0, expv);
+          double nf = 1.0;
+          if (f < 1.5) nf = 1.0;
+          else if (f < 3.0) nf = 2.0;
+          else if (f < 7.0) nf = 5.0;
+          else nf = 10.0;
+          return nf * std::pow(10.0, expv);
+        };
+
+        // Grid (anchored on star at (0,0) AU)
+        if (map.showGrid) {
+          const float halfAUx = (float)(canvasSize.x * 0.5f / pxPerAU);
+          const float halfAUy = (float)(canvasSize.y * 0.5f / pxPerAU);
+          const float halfAU = std::max(halfAUx, halfAUy);
+          const double stepAU = niceNum((double)halfAU / 5.5);
+          const ImVec2 starP = worldToScreen({0.0, 0.0});
+
+          // Axes
+          draw->AddLine(ImVec2(p0.x, starP.y), ImVec2(p1.x, starP.y), IM_COL32(120, 140, 170, 50), 1.0f);
+          draw->AddLine(ImVec2(starP.x, p0.y), ImVec2(starP.x, p1.y), IM_COL32(120, 140, 170, 50), 1.0f);
+
+          // Concentric circles
+          for (int i = 1; i <= 12; ++i) {
+            const double rAU = stepAU * (double)i;
+            const float rPx = (float)(rAU * (double)pxPerAU);
+            if (rPx > std::max(canvasSize.x, canvasSize.y)) break;
+            const ImU32 col = (i % 2 == 0) ? IM_COL32(120, 140, 170, 38) : IM_COL32(120, 140, 170, 26);
+            draw->AddCircle(starP, rPx, col, 0, 1.0f);
+
+            if (i == 1 || (i % 2 == 0)) {
+              char buf[32];
+              std::snprintf(buf, sizeof(buf), "%.3g AU", rAU);
+              draw->AddText(ImVec2(starP.x + rPx + 4.0f, starP.y + 2.0f), IM_COL32(160, 190, 220, 120), buf);
+            }
+          }
+
+          // Scale bar (bottom-left)
+          double barAU = stepAU;
+          float barPx = (float)(barAU * (double)pxPerAU);
+          while (barPx < 70.0f) { barAU *= 2.0; barPx = (float)(barAU * (double)pxPerAU); }
+          while (barPx > 180.0f) { barAU *= 0.5; barPx = (float)(barAU * (double)pxPerAU); }
+
+          const ImVec2 b0(p0.x + 12.0f, p1.y - 18.0f);
+          const ImVec2 b1(b0.x + barPx, b0.y);
+          draw->AddLine(b0, b1, IM_COL32(200, 220, 255, 180), 2.0f);
+          draw->AddLine(ImVec2(b0.x, b0.y - 4.0f), ImVec2(b0.x, b0.y + 4.0f), IM_COL32(200, 220, 255, 180), 2.0f);
+          draw->AddLine(ImVec2(b1.x, b1.y - 4.0f), ImVec2(b1.x, b1.y + 4.0f), IM_COL32(200, 220, 255, 180), 2.0f);
+          char sb[32];
+          std::snprintf(sb, sizeof(sb), "%.3g AU", barAU);
+          draw->AddText(ImVec2(b0.x, b0.y - 16.0f), IM_COL32(200, 220, 255, 180), sb);
+        }
+
+        // Hover bookkeeping
+        struct Hover {
+          bool has{false};
+          TargetKind kind{TargetKind::None};
+          std::size_t idx{0};
+          render::SpriteKind sprite{render::SpriteKind::Star};
+          core::u64 seed{0};
+          std::string label{};
+          ImVec2 screenPos{};
+          float iconSz{0.0f};
+          float d2{1e30f};
+        } hover;
+
+        auto considerHover = [&](TargetKind kind, std::size_t idx, const ImVec2& pos, float iconSz,
+                                 render::SpriteKind spriteKind, core::u64 spriteSeed,
+                                 const std::string& label) {
+          const float hx = iconSz * 0.5f;
+          if (mouse.x < pos.x - hx || mouse.x > pos.x + hx || mouse.y < pos.y - hx || mouse.y > pos.y + hx) return;
+          const float dx = mouse.x - pos.x;
+          const float dy = mouse.y - pos.y;
+          const float d2 = dx * dx + dy * dy;
+          if (d2 < hover.d2) {
+            hover.has = true;
+            hover.kind = kind;
+            hover.idx = idx;
+            hover.sprite = spriteKind;
+            hover.seed = spriteSeed;
+            hover.label = label;
+            hover.screenPos = pos;
+            hover.iconSz = iconSz;
+            hover.d2 = d2;
+          }
+        };
+
+        auto drawIcon = [&](const ImVec2& pos, float iconSz,
+                            render::SpriteKind kind, core::u64 seed,
+                            ImU32 tint, bool selected) {
+          const auto uv = hudAtlas.get(kind, seed);
+          const ImVec2 b0(pos.x - iconSz * 0.5f, pos.y - iconSz * 0.5f);
+          const ImVec2 b1(pos.x + iconSz * 0.5f, pos.y + iconSz * 0.5f);
+
+          if (selected) {
+            const float ring = iconSz * 0.72f;
+            const float pulse = 0.5f + 0.5f * std::sin((float)timeRealSec * 4.0f);
+            draw->AddCircle(pos, ring, IM_COL32(255, 210, 120, (int)(120.0f + 80.0f * pulse)), 0, 2.0f);
+          }
+
+          // Subtle outline for contrast
+          draw->AddImage(atlasId,
+                         ImVec2(b0.x - 1, b0.y - 1), ImVec2(b1.x + 1, b1.y + 1),
+                         ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                         IM_COL32(0, 0, 0, 140));
+          draw->AddImage(atlasId, b0, b1,
+                         ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                         tint);
+        };
+
+        // Orbits (planets + stations)
+        if (map.showOrbits) {
+          for (const auto& p : currentSystem->planets) {
+            const int N = 96;
+            std::array<ImVec2, N + 1> pts;
+            for (int i = 0; i <= N; ++i) {
+              const double t = previewTimeDays + (double)i / (double)N * p.orbit.periodDays;
+              const math::Vec3d posAU3 = sim::orbitPosition3DAU(p.orbit, t);
+              pts[(std::size_t)i] = worldToScreen({posAU3.x, posAU3.z});
+            }
+            draw->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(120, 140, 170, 55), false, 1.0f);
+          }
+          for (const auto& st : currentSystem->stations) {
+            const int N = 72;
+            std::array<ImVec2, N + 1> pts;
+            for (int i = 0; i <= N; ++i) {
+              const double t = previewTimeDays + (double)i / (double)N * st.orbit.periodDays;
+              const math::Vec3d posAU3 = sim::orbitPosition3DAU(st.orbit, t);
+              pts[(std::size_t)i] = worldToScreen({posAU3.x, posAU3.z});
+            }
+            draw->AddPolyline(pts.data(), (int)pts.size(), IM_COL32(100, 130, 170, 38), false, 1.0f);
+          }
+        }
+
+        const float iconScale = std::clamp(0.95f + 0.10f * std::log2(std::max(0.20f, map.zoom)), 0.70f, 1.35f);
+
+        // Star at origin
+        {
+          const core::u64 sSeed = core::hashCombine(core::fnv1a64("star"), (core::u64)currentSystem->stub.seed);
+          const ImVec2 sp = worldToScreen({0.0, 0.0});
+          const bool sel = (target.kind == TargetKind::Star);
+          drawIcon(sp, 30.0f * iconScale, render::SpriteKind::Star, sSeed, IM_COL32(255, 255, 255, 230), sel);
+          considerHover(TargetKind::Star, 0, sp, 30.0f * iconScale, render::SpriteKind::Star, sSeed,
+                        std::string("Star (") + starClassName(currentSystem->star.cls) + ")");
+        }
+
+        // Ship marker (Ship sprite + forward tick)
+        {
+          const Vec2AU shipAU = shipPosAU2();
+          const ImVec2 sp = worldToScreen(shipAU);
+          const core::u64 sSeed = core::hashCombine(core::fnv1a64("player_ship"), seed);
+          drawIcon(sp, 18.0f * iconScale, render::SpriteKind::Ship, sSeed, IM_COL32(210, 230, 255, 230), false);
+
+          const math::Vec3d f = ship.forward().normalized();
+          const ImVec2 dir((float)f.x, (float)-f.z);
+          const float len = 16.0f;
+          draw->AddLine(sp, ImVec2(sp.x + dir.x * len, sp.y + dir.y * len), IM_COL32(210, 230, 255, 160), 1.5f);
+          draw->AddCircleFilled(sp, 2.0f, IM_COL32(210, 230, 255, 190));
+        }
+
+        // Planets
+        for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+          const auto& p = currentSystem->planets[i];
+          const math::Vec3d posAU3 = sim::orbitPosition3DAU(p.orbit, previewTimeDays);
+          const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+          const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)i);
+          const bool sel = (target.kind == TargetKind::Planet && target.index == i);
+
+          ImU32 tint = IM_COL32(220, 230, 255, 220);
+          if (p.type == sim::PlanetType::Ocean) tint = IM_COL32(120, 190, 255, 230);
+          else if (p.type == sim::PlanetType::Desert) tint = IM_COL32(240, 205, 135, 230);
+          else if (p.type == sim::PlanetType::Ice) tint = IM_COL32(210, 245, 255, 230);
+          else if (p.type == sim::PlanetType::GasGiant) tint = IM_COL32(195, 210, 255, 230);
+
+          drawIcon(sp, 20.0f * iconScale, render::SpriteKind::Planet, pSeed, tint, sel);
+          considerHover(TargetKind::Planet, i, sp, 20.0f * iconScale, render::SpriteKind::Planet, pSeed, p.name);
+        }
+
+        // Stations
+        if (map.showStations) {
+          for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+            const auto& st = currentSystem->stations[i];
+            const math::Vec3d posAU3 = sim::orbitPosition3DAU(st.orbit, previewTimeDays);
+            const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+            const core::u64 stSeed = core::hashCombine(core::fnv1a64("station"), (core::u64)st.id);
+            const bool sel = (target.kind == TargetKind::Station && target.index == i);
+            drawIcon(sp, 17.0f * iconScale, render::SpriteKind::Station, stSeed, IM_COL32(210, 210, 220, 225), sel);
+            considerHover(TargetKind::Station, i, sp, 17.0f * iconScale, render::SpriteKind::Station, stSeed, st.name);
+          }
+        }
+
+        // Contacts / signals / asteroids / cargo
+        if (map.showContacts) {
+          for (std::size_t i = 0; i < contacts.size(); ++i) {
+            const auto& ctc = contacts[i];
+            if (!ctc.alive) continue;
+            const math::Vec3d posAU3 = ctc.ship.positionKm() / kAU_KM;
+            const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+            const core::u64 cSeed = core::hashCombine(core::fnv1a64("ship"), ctc.id);
+            const bool sel = (target.kind == TargetKind::Contact && target.index == i);
+
+            ImU32 tint = IM_COL32(180, 210, 235, 210);
+            if (ctc.role == ContactRole::Pirate) tint = IM_COL32(255, 80, 80, 230);
+            if (ctc.role == ContactRole::Police) tint = IM_COL32(90, 190, 255, 230);
+            if (ctc.role == ContactRole::Trader) tint = IM_COL32(120, 245, 140, 230);
+
+            drawIcon(sp, 14.0f * iconScale, render::SpriteKind::Ship, cSeed, tint, sel);
+            considerHover(TargetKind::Contact, i, sp, 14.0f * iconScale, render::SpriteKind::Ship, cSeed,
+                          ctc.name + " [" + contactRoleName(ctc.role) + "]");
+          }
+        }
+
+        if (map.showSignals) {
+          for (std::size_t i = 0; i < signals.size(); ++i) {
+            const auto& ssrc = signals[i];
+            if (timeDays > ssrc.expireDay) continue;
+            const math::Vec3d posAU3 = ssrc.posKm / kAU_KM;
+            const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+            const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
+            const bool sel = (target.kind == TargetKind::Signal && target.index == i);
+            drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed, IM_COL32(255, 210, 120, 230), sel);
+            considerHover(TargetKind::Signal, i, sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed,
+                          std::string(signalTypeName(ssrc.type)) + " Signal");
+          }
+        }
+
+        if (map.showAsteroids) {
+          for (std::size_t i = 0; i < asteroids.size(); ++i) {
+            const auto& a = asteroids[i];
+            if (a.remainingUnits <= 1e-3) continue;
+            const math::Vec3d posAU3 = a.posKm / kAU_KM;
+            const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+            const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
+            const bool sel = (target.kind == TargetKind::Asteroid && target.index == i);
+            drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Asteroid, aSeed, IM_COL32(190, 190, 200, 220), sel);
+            considerHover(TargetKind::Asteroid, i, sp, 13.0f * iconScale, render::SpriteKind::Asteroid, aSeed,
+                          std::string("Asteroid [") + econ::commodityDef(a.yield).name + "]");
+          }
+        }
+
+        if (map.showCargo) {
+          for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+            const auto& pod = floatingCargo[i];
+            if (pod.units <= 0.0) continue;
+            const math::Vec3d posAU3 = pod.posKm / kAU_KM;
+            const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
+            const core::u64 cSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity);
+            const bool sel = (target.kind == TargetKind::Cargo && target.index == i);
+            drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Cargo, cSeed, IM_COL32(255, 230, 140, 230), sel);
+            considerHover(TargetKind::Cargo, i, sp, 13.0f * iconScale, render::SpriteKind::Cargo, cSeed,
+                          std::string(econ::commodityDef(pod.commodity).name) + " Pod");
+          }
+        }
+
+        // Show supercruise drop ring for the current target (helps the "7-second rule").
+        if (target.kind != TargetKind::None && target.kind != TargetKind::Star) {
+          double dropKm = 0.0;
+          math::Vec3d destKm{0,0,0};
+          bool ok = false;
+
+          if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+            const auto& st = currentSystem->stations[target.index];
+            destKm = stationPosKm(st, timeDays);
+            dropKm = std::max(15000.0, st.radiusKm * 3.0);
+            ok = true;
+          } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+            const auto& p = currentSystem->planets[target.index];
+            destKm = planetPosKm(p, timeDays);
+            const double rKm = p.radiusEarth * 6371.0;
+            dropKm = std::max(60000.0, rKm * 12.0);
+            ok = true;
+          } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+            destKm = signals[target.index].posKm;
+            dropKm = 70000.0;
+            ok = true;
+          }
+
+          if (ok && dropKm > 1.0) {
+            const ImVec2 sp = worldToScreen({destKm.x / kAU_KM, destKm.z / kAU_KM});
+            const float rPx = (float)((dropKm / kAU_KM) * (double)pxPerAU);
+            if (rPx > 4.0f && rPx < 50000.0f) {
+              draw->AddCircle(sp, rPx, IM_COL32(255, 210, 120, 80), 0, 1.5f);
+            }
+          }
+        }
+
+        // Tooltip
+        if (canvasHovered && hover.has) {
+          ImGui::BeginTooltip();
+          ImGui::TextUnformatted(hover.label.c_str());
+
+          // Distance from ship (now)
+          math::Vec3d wPosKm{0,0,0};
+          bool hasPos = false;
+          if (hover.kind == TargetKind::Star) {
+            wPosKm = {0,0,0};
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Planet && hover.idx < currentSystem->planets.size()) {
+            wPosKm = planetPosKm(currentSystem->planets[hover.idx], timeDays);
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Station && hover.idx < currentSystem->stations.size()) {
+            wPosKm = stationPosKm(currentSystem->stations[hover.idx], timeDays);
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Contact && hover.idx < contacts.size()) {
+            wPosKm = contacts[hover.idx].ship.positionKm();
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Signal && hover.idx < signals.size()) {
+            wPosKm = signals[hover.idx].posKm;
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Asteroid && hover.idx < asteroids.size()) {
+            wPosKm = asteroids[hover.idx].posKm;
+            hasPos = true;
+          } else if (hover.kind == TargetKind::Cargo && hover.idx < floatingCargo.size()) {
+            wPosKm = floatingCargo[hover.idx].posKm;
+            hasPos = true;
+          }
+
+          if (hasPos) {
+            const double dKm = (wPosKm - ship.positionKm()).length();
+            ImGui::TextDisabled("Distance: %.0f km (%.4f AU)", dKm, dKm / kAU_KM);
+          }
+
+          const auto& big = spriteCache.get(hover.sprite, hover.seed, 96);
+          ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+          ImGui::TextDisabled("Preview: t %+.2f days", (float)map.previewOffsetDays);
+          ImGui::EndTooltip();
+        }
+
+        // Click interaction (target / context menu)
+        static TargetKind ctxKind = TargetKind::None;
+        static std::size_t ctxIdx = 0;
+        static std::string ctxLabel;
+        static render::SpriteKind ctxSpriteKind = render::SpriteKind::Star;
+        static core::u64 ctxSpriteSeed = 0;
+
+        if (canvasHovered && hover.has) {
+          if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            target.kind = hover.kind;
+            target.index = hover.idx;
+          }
+
+          if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            map.followShip = false;
+            if (hover.kind == TargetKind::Star) map.centerAU = {0.0, 0.0};
+            else if (hover.kind == TargetKind::Planet && hover.idx < currentSystem->planets.size()) {
+              const auto& p = currentSystem->planets[hover.idx];
+              const math::Vec3d posAU3 = sim::orbitPosition3DAU(p.orbit, previewTimeDays);
+              map.centerAU = {posAU3.x, posAU3.z};
+            } else if (hover.kind == TargetKind::Station && hover.idx < currentSystem->stations.size()) {
+              const auto& st = currentSystem->stations[hover.idx];
+              const math::Vec3d posAU3 = sim::orbitPosition3DAU(st.orbit, previewTimeDays);
+              map.centerAU = {posAU3.x, posAU3.z};
+            } else if (hover.kind == TargetKind::Contact && hover.idx < contacts.size()) {
+              const math::Vec3d au = contacts[hover.idx].ship.positionKm() / kAU_KM;
+              map.centerAU = {au.x, au.z};
+            } else if (hover.kind == TargetKind::Signal && hover.idx < signals.size()) {
+              const math::Vec3d au = signals[hover.idx].posKm / kAU_KM;
+              map.centerAU = {au.x, au.z};
+            } else if (hover.kind == TargetKind::Asteroid && hover.idx < asteroids.size()) {
+              const math::Vec3d au = asteroids[hover.idx].posKm / kAU_KM;
+              map.centerAU = {au.x, au.z};
+            } else if (hover.kind == TargetKind::Cargo && hover.idx < floatingCargo.size()) {
+              const math::Vec3d au = floatingCargo[hover.idx].posKm / kAU_KM;
+              map.centerAU = {au.x, au.z};
+            }
+          }
+
+          if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            ctxKind = hover.kind;
+            ctxIdx = hover.idx;
+            ctxLabel = hover.label;
+            ctxSpriteKind = hover.sprite;
+            ctxSpriteSeed = hover.seed;
+            ImGui::OpenPopup("sysmap2_ctx");
+          }
+        } else if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+          ctxKind = TargetKind::None;
+          ctxIdx = 0;
+          ctxLabel.clear();
+          ImGui::OpenPopup("sysmap2_ctx");
+        }
+
+        if (ImGui::BeginPopup("sysmap2_ctx")) {
+          if (!ctxLabel.empty()) {
+            ImGui::TextUnformatted(ctxLabel.c_str());
+            ImGui::Separator();
+
+            const auto& big = spriteCache.get(ctxSpriteKind, ctxSpriteSeed, 64);
+            ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(48, 48));
+            ImGui::SameLine();
+            ImGui::TextDisabled("Actions");
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Target")) {
+              target.kind = ctxKind;
+              target.index = ctxIdx;
+            }
+            if (ImGui::MenuItem("Scan (K)")) {
+              uiStartScan(ctxKind, ctxIdx);
+            }
+
+            // Supercruise only makes sense for station/planet/signal.
+            const bool canSc = (ctxKind == TargetKind::Station || ctxKind == TargetKind::Planet || ctxKind == TargetKind::Signal);
+            if (ImGui::MenuItem("Engage supercruise (H)", nullptr, false, canSc)) {
+              target.kind = ctxKind;
+              target.index = ctxIdx;
+              uiToggleSupercruise();
+            }
+
+            if (ctxKind == TargetKind::Station) {
+              if (ImGui::MenuItem("Autopilot to station (P)")) {
+                target.kind = ctxKind;
+                target.index = ctxIdx;
+                autopilot = true;
+                autopilotPhase = 0;
+              }
+            }
+
+            if (ImGui::MenuItem("Center view")) {
+              map.followShip = false;
+              if (ctxKind == TargetKind::Star) map.centerAU = {0.0, 0.0};
+              else if (ctxKind == TargetKind::Planet && ctxIdx < currentSystem->planets.size()) {
+                const auto& p = currentSystem->planets[ctxIdx];
+                const math::Vec3d posAU3 = sim::orbitPosition3DAU(p.orbit, previewTimeDays);
+                map.centerAU = {posAU3.x, posAU3.z};
+              } else if (ctxKind == TargetKind::Station && ctxIdx < currentSystem->stations.size()) {
+                const auto& st = currentSystem->stations[ctxIdx];
+                const math::Vec3d posAU3 = sim::orbitPosition3DAU(st.orbit, previewTimeDays);
+                map.centerAU = {posAU3.x, posAU3.z};
+              } else if (ctxKind == TargetKind::Contact && ctxIdx < contacts.size()) {
+                const math::Vec3d au = contacts[ctxIdx].ship.positionKm() / kAU_KM;
+                map.centerAU = {au.x, au.z};
+              } else if (ctxKind == TargetKind::Signal && ctxIdx < signals.size()) {
+                const math::Vec3d au = signals[ctxIdx].posKm / kAU_KM;
+                map.centerAU = {au.x, au.z};
+              } else if (ctxKind == TargetKind::Asteroid && ctxIdx < asteroids.size()) {
+                const math::Vec3d au = asteroids[ctxIdx].posKm / kAU_KM;
+                map.centerAU = {au.x, au.z};
+              } else if (ctxKind == TargetKind::Cargo && ctxIdx < floatingCargo.size()) {
+                const math::Vec3d au = floatingCargo[ctxIdx].posKm / kAU_KM;
+                map.centerAU = {au.x, au.z};
+              }
+            }
+          } else {
+            ImGui::TextDisabled("System Map");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Center on star")) centerOnStar();
+            if (ImGui::MenuItem("Center on ship")) { map.centerAU = shipPosAU2(); map.followShip = true; }
+            ImGui::MenuItem("Follow ship", nullptr, &map.followShip);
+            ImGui::MenuItem("Grid", nullptr, &map.showGrid);
+            ImGui::MenuItem("Orbits", nullptr, &map.showOrbits);
+            if (ImGui::MenuItem("Reset zoom")) map.zoom = 1.0f;
+            if (ImGui::MenuItem("Reset preview time")) { map.previewOffsetDays = 0.0; map.previewAnimate = false; }
+          }
+          ImGui::EndPopup();
+        }
+
+        // Double-click empty canvas centers on star.
+        if (canvasHovered && !hover.has && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+          centerOnStar();
+        }
+
+        ImGui::EndChild();
+
+        // ---- Details column ----
+        ImGui::TableNextColumn();
+        ImGui::BeginChild("sysmap2_details", ImVec2(0, 0), true);
+
+        ImGui::Text("Selection");
+        ImGui::Separator();
+
+        auto drawAtlasIconInline = [&](render::SpriteKind kind, core::u64 seed, float sizePx, ImVec4 tint) {
+          const auto uv = hudAtlas.get(kind, seed);
+          ImGui::Image(atlasId, ImVec2(sizePx, sizePx), ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), tint);
+        };
+
+        auto showTargetHeader = [&](const std::string& title, render::SpriteKind sk, core::u64 sseed, ImVec4 tint) {
+          drawAtlasIconInline(sk, sseed, 22.0f, tint);
+          ImGui::SameLine();
+          ImGui::TextUnformatted(title.c_str());
+        };
+
+        if (target.kind == TargetKind::None) {
+          ImGui::TextDisabled("No target selected.");
+        } else if (target.kind == TargetKind::Star) {
+          const core::u64 sSeed = core::hashCombine(core::fnv1a64("star"), (core::u64)currentSystem->stub.seed);
+          showTargetHeader(std::string("Star (") + starClassName(currentSystem->star.cls) + ")",
+                           render::SpriteKind::Star, sSeed, ImVec4(1,1,1,1));
+        } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+          const auto& p = currentSystem->planets[target.index];
+          const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)target.index);
+          showTargetHeader(p.name, render::SpriteKind::Planet, pSeed, ImVec4(1,1,1,1));
+          const math::Vec3d pPos = planetPosKm(p, timeDays);
+          ImGui::TextDisabled("Distance: %.0f km", (pPos - ship.positionKm()).length());
+        } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+          const auto& st = currentSystem->stations[target.index];
+          const core::u64 stSeed = core::hashCombine(core::fnv1a64("station"), (core::u64)st.id);
+          showTargetHeader(st.name, render::SpriteKind::Station, stSeed, ImVec4(1,1,1,1));
+          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          ImGui::TextDisabled("Distance: %.0f km", (stPos - ship.positionKm()).length());
+          ImGui::TextDisabled("Type: %s", stationTypeName(st.type));
+        } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+          const auto& ctc = contacts[target.index];
+          const core::u64 cSeed = core::hashCombine(core::fnv1a64("ship"), ctc.id);
+          showTargetHeader(ctc.name + " [" + contactRoleName(ctc.role) + "]", render::SpriteKind::Ship, cSeed, ImVec4(1,1,1,1));
+          ImGui::TextDisabled("Distance: %.0f km", (ctc.ship.positionKm() - ship.positionKm()).length());
+        } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+          const auto& ssrc = signals[target.index];
+          const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
+          showTargetHeader(std::string(signalTypeName(ssrc.type)) + " Signal", render::SpriteKind::Signal, sSeed, ImVec4(1,1,1,1));
+          ImGui::TextDisabled("Distance: %.0f km", (ssrc.posKm - ship.positionKm()).length());
+        } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+          const auto& a = asteroids[target.index];
+          const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
+          showTargetHeader("Asteroid", render::SpriteKind::Asteroid, aSeed, ImVec4(1,1,1,1));
+          ImGui::TextDisabled("Yield: %s", econ::commodityDef(a.yield).name.c_str());
+          ImGui::TextDisabled("Remaining: %.0f", a.remainingUnits);
+          ImGui::TextDisabled("Distance: %.0f km", (a.posKm - ship.positionKm()).length());
+        } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
+          const auto& pod = floatingCargo[target.index];
+          const core::u64 cSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity);
+          showTargetHeader("Cargo Pod", render::SpriteKind::Cargo, cSeed, ImVec4(1,1,1,1));
+          ImGui::TextDisabled("Commodity: %s", econ::commodityDef(pod.commodity).name.c_str());
+          ImGui::TextDisabled("Units: %.0f", pod.units);
+          ImGui::TextDisabled("Distance: %.0f km", (pod.posKm - ship.positionKm()).length());
+        } else {
+          ImGui::TextDisabled("Invalid selection.");
+        }
+
+        ImGui::Separator();
+
+        // Actions
+        ImGui::BeginDisabled(target.kind == TargetKind::None);
+        if (ImGui::Button("Scan target (K)")) uiStartScan(target.kind, target.index);
+        ImGui::EndDisabled();
+
+        const bool canScTarget = (target.kind == TargetKind::Station || target.kind == TargetKind::Planet || target.kind == TargetKind::Signal);
+        ImGui::BeginDisabled(!canScTarget);
+        if (ImGui::Button("Supercruise (H)")) uiToggleSupercruise();
+        ImGui::EndDisabled();
+
+        if (target.kind == TargetKind::Station) {
+          ImGui::BeginDisabled(docked);
+          if (ImGui::Button("Autopilot to station (P)")) {
+            autopilot = true;
+            autopilotPhase = 0;
+          }
+          ImGui::EndDisabled();
+        }
+
+        if (ImGui::Button("Center map on selection")) {
+          map.followShip = false;
+          if (target.kind == TargetKind::Star) map.centerAU = {0.0, 0.0};
+          else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+            const auto& p = currentSystem->planets[target.index];
+            const math::Vec3d posAU3 = sim::orbitPosition3DAU(p.orbit, previewTimeDays);
+            map.centerAU = {posAU3.x, posAU3.z};
+          } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+            const auto& st = currentSystem->stations[target.index];
+            const math::Vec3d posAU3 = sim::orbitPosition3DAU(st.orbit, previewTimeDays);
+            map.centerAU = {posAU3.x, posAU3.z};
+          } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+            const math::Vec3d au = contacts[target.index].ship.positionKm() / kAU_KM;
+            map.centerAU = {au.x, au.z};
+          } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+            const math::Vec3d au = signals[target.index].posKm / kAU_KM;
+            map.centerAU = {au.x, au.z};
+          } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+            const math::Vec3d au = asteroids[target.index].posKm / kAU_KM;
+            map.centerAU = {au.x, au.z};
+          } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
+            const math::Vec3d au = floatingCargo[target.index].posKm / kAU_KM;
+            map.centerAU = {au.x, au.z};
+          }
+        }
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Quick targets");
+
+        if (ImGui::BeginTabBar("sysmap2_quicktabs", ImGuiTabBarFlags_NoCloseWithMiddleMouseButton)) {
+          if (ImGui::BeginTabItem("Planets")) {
+            for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
+              const auto& p = currentSystem->planets[i];
+              const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)i);
+              drawAtlasIconInline(render::SpriteKind::Planet, pSeed, 18.0f, ImVec4(1,1,1,1));
+              ImGui::SameLine();
+              const bool sel = (target.kind == TargetKind::Planet && target.index == i);
+              if (ImGui::Selectable(p.name.c_str(), sel)) {
+                target.kind = TargetKind::Planet;
+                target.index = i;
+              }
+            }
+            ImGui::EndTabItem();
+          }
+          if (ImGui::BeginTabItem("Stations")) {
+            for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+              const auto& st = currentSystem->stations[i];
+              const core::u64 stSeed = core::hashCombine(core::fnv1a64("station"), (core::u64)st.id);
+              drawAtlasIconInline(render::SpriteKind::Station, stSeed, 18.0f, ImVec4(1,1,1,1));
+              ImGui::SameLine();
+              const bool sel = (target.kind == TargetKind::Station && target.index == i);
+              if (ImGui::Selectable(st.name.c_str(), sel)) {
+                target.kind = TargetKind::Station;
+                target.index = i;
+              }
+            }
+            ImGui::EndTabItem();
+          }
+          if (ImGui::BeginTabItem("Signals")) {
+            for (std::size_t i = 0; i < signals.size(); ++i) {
+              const auto& ssrc = signals[i];
+              if (timeDays > ssrc.expireDay) continue;
+              const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
+              drawAtlasIconInline(render::SpriteKind::Signal, sSeed, 18.0f, ImVec4(1,1,1,1));
+              ImGui::SameLine();
+              const std::string name = std::string(signalTypeName(ssrc.type)) + " #" + std::to_string((int)i);
+              const bool sel = (target.kind == TargetKind::Signal && target.index == i);
+              if (ImGui::Selectable(name.c_str(), sel)) {
+                target.kind = TargetKind::Signal;
+                target.index = i;
+              }
+            }
+            ImGui::EndTabItem();
+          }
+          ImGui::EndTabBar();
+        }
+
+        ImGui::EndChild();
+        ImGui::EndTable();
+      }
+
+      ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
   }
 
   ImGui::End();
@@ -8595,368 +11917,780 @@ if (showContacts) {
 
   ImGui::End();
 }
-
     if (showGalaxy) {
       ImGui::Begin("Galaxy / Streaming");
 
       const auto center = currentSystem->stub.posLy;
       static float radius = 200.0f;
-      ImGui::SliderFloat("Query radius (ly)", &radius, 20.0f, 1200.0f);
+      ImGui::SliderFloat("Query radius (ly)", &radius, 20.0f, 2000.0f);
 
-      auto nearby = universe.queryNearby(center, radius, 128);
+      auto nearby = universe.queryNearby(center, radius, 256);
+
+      const double galaxyJrMaxLy = fsdBaseRangeLy();
+      const double galaxyJrNowLy = fsdCurrentRangeLy();
+      const double galaxyPlanMaxLy = navConstrainToCurrentFuelRange ? galaxyJrNowLy : galaxyJrMaxLy;
 
       ImGui::Text("Nearby systems: %d", (int)nearby.size());
 
-      // Mini-map canvas
-      const ImVec2 canvasSize = ImVec2(420, 420);
-      ImGui::BeginChild("map", canvasSize, true, ImGuiWindowFlags_NoScrollbar);
+      // Plot-route helper so both the detail panel and the map context menu can trigger it.
+      auto plotRouteTo = [&](sim::SystemId dstId) {
+        if (dstId == 0) return;
 
-      ImDrawList* draw = ImGui::GetWindowDrawList();
-      const ImVec2 p0 = ImGui::GetCursorScreenPos();
-      const ImVec2 p1 = ImVec2(p0.x + canvasSize.x, p0.y + canvasSize.y);
-      const ImVec2 centerPx = ImVec2((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-
-      // Background
-      draw->AddRectFilled(p0, p1, IM_COL32(10, 10, 14, 255));
-      draw->AddRect(p0, p1, IM_COL32(80, 80, 95, 255));
-
-      auto toPx = [&](const math::Vec3d& posLy) -> ImVec2 {
-        const math::Vec3d d = posLy - center;
-        const float sx = (float)(d.x / (double)radius) * (canvasSize.x * 0.5f);
-        const float sy = (float)(d.y / (double)radius) * (canvasSize.y * 0.5f);
-        return ImVec2(centerPx.x + sx, centerPx.y + sy);
-      };
-
-      // Build a quick lookup of stub positions for route drawing.
-      std::unordered_map<sim::SystemId, math::Vec3d> stubPosById;
-      stubPosById.reserve(nearby.size());
-      for (const auto& s : nearby) {
-        stubPosById[s.id] = s.posLy;
-      }
-
-      // Jump range feedback.
-      // - Blue ring: max range (cargo-limited)
-      // - Green ring: current-fuel-limited range (what you can do right now)
-      const double jrMaxLy = fsdBaseRangeLy();
-      const double jrNowLy = fsdCurrentRangeLy();
-
-      const float jrMaxPx = (float)(jrMaxLy / (double)radius) * (canvasSize.x * 0.5f);
-      if (jrMaxPx > 2.0f && jrMaxPx < 5000.0f) {
-        draw->AddCircle(centerPx, jrMaxPx, IM_COL32(90, 150, 240, 120), 96, 1.5f);
-      }
-
-      const float jrNowPx = (float)(jrNowLy / (double)radius) * (canvasSize.x * 0.5f);
-      if (jrNowPx > 2.0f && jrNowPx < 5000.0f) {
-        draw->AddCircle(centerPx, jrNowPx, IM_COL32(90, 220, 150, 120), 96, 1.5f);
-      }
-
-      // Plotted route overlay.
-      if (navRoute.size() >= 2) {
-        for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {
-          auto itA = stubPosById.find(navRoute[i]);
-          auto itB = stubPosById.find(navRoute[i + 1]);
-          if (itA == stubPosById.end() || itB == stubPosById.end()) continue;
-          const ImVec2 a = toPx(itA->second);
-          const ImVec2 b = toPx(itB->second);
-          draw->AddLine(a, b, IM_COL32(255, 140, 80, 200), 2.0f);
-        }
-      }
-
-      // Star lanes: connect each system to 3 nearest neighbors in XY
-      const int k = 3;
-      for (std::size_t i = 0; i < nearby.size(); ++i) {
-        struct N { std::size_t j; double d2; };
-        std::vector<N> ns;
-        ns.reserve(nearby.size());
-        for (std::size_t j = 0; j < nearby.size(); ++j) if (j != i) {
-          const auto di = nearby[j].posLy - nearby[i].posLy;
-          const double d2 = di.x*di.x + di.y*di.y + di.z*di.z;
-          ns.push_back({j, d2});
-        }
-        std::sort(ns.begin(), ns.end(), [](const N& a, const N& b){ return a.d2 < b.d2; });
-        const int count = std::min<int>(k, (int)ns.size());
-
-        const ImVec2 a = toPx(nearby[i].posLy);
-        for (int n = 0; n < count; ++n) {
-          const ImVec2 b = toPx(nearby[ns[n].j].posLy);
-          draw->AddLine(a, b, IM_COL32(50, 80, 120, 100), 1.0f);
-        }
-      }
-
-      // Systems
-      sim::SystemId selected = galaxySelectedSystemId;
-      for (const auto& s : nearby) {
-        const ImVec2 p = toPx(s.posLy);
-        const bool isCurrent = (s.id == currentSystem->stub.id);
-        const bool isSel = (s.id == selected);
-
-        const double distLy = (s.posLy - currentSystem->stub.posLy).length();
-        const bool inJumpRange = (distLy <= jrMaxLy + 1e-9);
-
-        ImU32 col = isCurrent ? IM_COL32(255, 240, 160, 255) : IM_COL32(170, 170, 190, 255);
-        if (s.factionId != 0) col = IM_COL32(160, 220, 170, 255);
-        if (isSel) col = IM_COL32(255, 120, 120, 255);
-
-        draw->AddCircleFilled(p, isCurrent ? 5.5f : 4.0f, col);
-
-        // Jump range ring
-        if (!isCurrent && inJumpRange) {
-          draw->AddCircle(p, 6.5f, IM_COL32(80, 140, 220, 140), 24, 1.0f);
-        }
-
-        // Click detection
-        const float rClick = 6.0f;
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-          const ImVec2 mp = ImGui::GetIO().MousePos;
-          const float dx = mp.x - p.x;
-          const float dy = mp.y - p.y;
-          if (dx*dx + dy*dy <= rClick*rClick) selected = s.id;
-        }
-      }
-
-      galaxySelectedSystemId = selected;
-
-      ImGui::EndChild();
-
-      // System list (search + sort) for fast selection (useful once the map gets dense).
-      if (ImGui::CollapsingHeader("System list", ImGuiTreeNodeFlags_DefaultOpen)) {
-        static char sysFilter[64] = "";
-        ImGui::InputText("Filter", sysFilter, sizeof(sysFilter));
-        ImGui::SameLine();
-        static int sortMode = 0;
-        const char* sortNames[] = {"Distance", "Name"};
-        ImGui::Combo("Sort", &sortMode, sortNames, 2);
-
-        auto toLower = [](std::string s) {
-          for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
-          return s;
-        };
-
-        const std::string f = toLower(std::string(sysFilter));
-
-        struct Row {
-          const sim::SystemStub* s;
-          double dist;
-        };
-
-        std::vector<Row> rows;
-        rows.reserve(nearby.size());
-
-        for (const auto& s : nearby) {
-          if (!f.empty()) {
-            const std::string n = toLower(s.name);
-            if (n.find(f) == std::string::npos) continue;
-          }
-          const double d = (s.posLy - currentSystem->stub.posLy).length();
-          rows.push_back(Row{&s, d});
-        }
-
-        if (sortMode == 0) {
-          std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.dist < b.dist; });
-        } else {
-          std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.s->name < b.s->name; });
-        }
-
-        ImGui::BeginChild("system_list", ImVec2(0, 220), true);
-        if (ImGui::BeginTable("sys_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit)) {
-          ImGui::TableSetupColumn("Name");
-          ImGui::TableSetupColumn("Dist (ly)");
-          ImGui::TableSetupColumn("St");
-          ImGui::TableSetupColumn("Faction");
-          ImGui::TableSetupColumn("Range");
-          ImGui::TableHeadersRow();
-
-          for (const auto& r : rows) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            const bool isSel = (r.s->id == galaxySelectedSystemId);
-            if (ImGui::Selectable(r.s->name.c_str(), isSel)) {
-              galaxySelectedSystemId = r.s->id;
-            }
-
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%.1f", r.dist);
-
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%d", r.s->stationCount);
-
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(factionName(r.s->factionId).c_str());
-
-            ImGui::TableSetColumnIndex(4);
-            const bool inRange = (r.s->id == currentSystem->stub.id) || (r.dist <= jrMaxLy + 1e-6);
-            if (inRange) ImGui::TextColored(ImVec4(0.70f, 0.95f, 0.70f, 1.0f), "IN");
-            else ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "OUT");
-          }
-
-          ImGui::EndTable();
-        }
-        ImGui::EndChild();
-      }
-
-      ImGui::Separator();
-      if (galaxySelectedSystemId == 0) {
-        ImGui::Text("Select a system on the map.");
-      } else {
-        const auto& selSys = universe.getSystem(galaxySelectedSystemId);
-        const double distLy = (selSys.stub.posLy - currentSystem->stub.posLy).length();
         const double jrMaxLy = fsdBaseRangeLy();
         const double jrNowLy = fsdCurrentRangeLy();
+        const double planMaxLy = navConstrainToCurrentFuelRange ? jrNowLy : jrMaxLy;
 
-        ImGui::Text("Selected: %s", selSys.stub.name.c_str());
-        ImGui::Text("Distance: %.1f ly", distLy);
-        ImGui::Text("Jump range: %.1f ly max, %.1f ly current-fuel", jrMaxLy, jrNowLy);
+        if (planMaxLy <= 0.0) {
+          toast(toasts, "No jump range available (refuel or reduce cargo).", 2.6);
+          return;
+        }
 
-        if (galaxySelectedSystemId == currentSystem->stub.id) {
-          ImGui::TextDisabled("This is your current system.");
+        sim::RoutePlanStats stats{};
+        double costPerJump = 1.0;
+        double costPerLy = 0.0;
+
+        if (navRouteMode == NavRouteMode::Hops) {
+          costPerJump = 1.0;
+          costPerLy = 0.0;
+          navRoute = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, dstId, planMaxLy, &stats);
+        } else if (navRouteMode == NavRouteMode::Distance) {
+          costPerJump = 0.0;
+          costPerLy = 1.0;
+          navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
         } else {
-          const double fuelCost = fsdFuelCostFor(distLy);
-          const bool inRange = (distLy <= jrMaxLy + 1e-6);
-          const bool hasFuel = (fuel + 1e-6 >= fuelCost);
-          const char* rangeText = !inRange ? "OUT OF RANGE" : (hasFuel ? "IN RANGE" : "IN RANGE (LOW FUEL)");
-          const ImVec4 rangeCol = !inRange ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
-                                          : (hasFuel ? ImVec4(0.70f, 0.95f, 0.70f, 1.0f)
-                                                    : ImVec4(1.0f, 0.75f, 0.35f, 1.0f));
+          costPerJump = kFsdFuelBase;
+          costPerLy = kFsdFuelPerLy;
+          navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+        }
 
-          ImGui::TextColored(rangeCol, "Direct jump: %s", rangeText);
+        navRouteHop = 0;
+        navAutoRun = false;
+
+        if (navRoute.empty()) {
+          navRoutePlanStatsValid = false;
+          toast(toasts, "No route found. Try increasing the scan radius or switching route mode.", 3.0);
+          return;
+        }
+
+        navRoutePlanStats = stats;
+        navRoutePlanStatsValid = true;
+        navRoutePlannedMode = navRouteMode;
+        navRoutePlannedUsedCurrentFuelRange = navConstrainToCurrentFuelRange;
+        navRoutePlanMaxJumpLy = planMaxLy;
+        navRoutePlanCostPerJump = costPerJump;
+        navRoutePlanCostPerLy = costPerLy;
+
+        const double totalDist = sim::routeDistanceLy(nearby, navRoute);
+        const double totalFuel = sim::routeCost(nearby, navRoute, kFsdFuelBase, kFsdFuelPerLy);
+        toast(toasts,
+              "Route plotted (" + std::to_string((int)navRoute.size() - 1)
+              + " jumps, " + std::to_string((int)std::round(totalDist))
+              + " ly, est fuel " + std::to_string((int)std::round(totalFuel)) + ").",
+              2.6);
+      };
+
+      // Star-class tinting for the map.
+      auto starTint = [&](sim::StarClass cls, float alpha) -> ImU32 {
+        alpha = std::clamp(alpha, 0.0f, 1.0f);
+        auto pack = [&](int r, int g, int b) -> ImU32 {
+          return IM_COL32(r, g, b, (int)(alpha * 255.0f));
+        };
+        switch (cls) {
+          case sim::StarClass::O: return pack(120, 180, 255);
+          case sim::StarClass::B: return pack(155, 205, 255);
+          case sim::StarClass::A: return pack(240, 240, 255);
+          case sim::StarClass::F: return pack(255, 248, 220);
+          case sim::StarClass::G: return pack(255, 236, 175);
+          case sim::StarClass::K: return pack(255, 200, 140);
+          case sim::StarClass::M: return pack(255, 165, 140);
+          default: return pack(200, 200, 220);
+        }
+      };
+
+      // Persistent "infinite canvas" style map view state.
+      static sim::SystemId mapLastSystemId = 0;
+      static math::Vec3d mapViewCenterLy{0,0,0};
+      static float mapZoom = 1.0f;
+      static float mapHeight = 520.0f;
+
+      static bool mapShowLanes = true;
+      static bool mapShowGrid = true;
+      static bool mapShowLabels = false;
+      static bool mapShowFactions = true;
+      static bool mapDepthFade = true;
+      static bool mapShowJumpRings = true;
+      static bool mapShowRoute = true;
+
+      if (mapLastSystemId != currentSystem->stub.id) {
+        mapLastSystemId = currentSystem->stub.id;
+        mapViewCenterLy = currentSystem->stub.posLy;
+      }
+
+      if (ImGui::BeginTable("galaxy_layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Map", ImGuiTableColumnFlags_WidthStretch, 0.62f);
+        ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+        ImGui::TableNextRow();
+
+        // ---------------- Left column (map + list) ----------------
+        ImGui::TableSetColumnIndex(0);
+
+        if (ImGui::CollapsingHeader("Map options", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Checkbox("Star lanes", &mapShowLanes); ImGui::SameLine();
+          ImGui::Checkbox("Grid", &mapShowGrid); ImGui::SameLine();
+          ImGui::Checkbox("Labels", &mapShowLabels);
+
+          ImGui::Checkbox("Factions", &mapShowFactions); ImGui::SameLine();
+          ImGui::Checkbox("Depth fade (Z)", &mapDepthFade); ImGui::SameLine();
+          ImGui::Checkbox("Jump rings", &mapShowJumpRings);
+
+          ImGui::Checkbox("Route overlay", &mapShowRoute);
+
+          ImGui::SetNextItemWidth(180.0f);
+          ImGui::SliderFloat("Zoom", &mapZoom, 0.25f, 8.0f, "%.2fx");
+
           ImGui::SameLine();
-          ImGui::TextDisabled("(fuel cost %.1f, fuel %.1f)", fuelCost, fuel);
+          if (ImGui::Button("Center current")) {
+            mapViewCenterLy = currentSystem->stub.posLy;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Center selection") && galaxySelectedSystemId != 0) {
+            mapViewCenterLy = universe.getSystem(galaxySelectedSystemId).stub.posLy;
+          }
 
-          ImGui::Separator();
-          ImGui::Text("Route planner");
+          ImGui::SetNextItemWidth(220.0f);
+          ImGui::SliderFloat("Map height", &mapHeight, 260.0f, 900.0f, "%.0f px");
 
-          {
-            static const char* kRouteModes[] = {"Min jumps", "Min distance", "Min fuel"};
-            int modeIdx = (int)navRouteMode;
-            if (ImGui::Combo("Mode", &modeIdx, kRouteModes, (int)(sizeof(kRouteModes) / sizeof(kRouteModes[0])))) {
-              navRouteMode = (NavRouteMode)modeIdx;
+          ImGui::TextDisabled("Wheel: zoom | MMB/RMB drag: pan | LMB: select | RMB: context");
+        }
+
+        // Interactive galaxy map canvas.
+        {
+          const ImVec2 childSize(0, mapHeight);
+          ImGui::BeginChild("map", childSize, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+          ImDrawList* draw = ImGui::GetWindowDrawList();
+          const ImVec2 canvasP0 = ImGui::GetCursorScreenPos();
+          ImVec2 canvasSz = ImGui::GetContentRegionAvail();
+          canvasSz.x = std::max(canvasSz.x, 60.0f);
+          canvasSz.y = std::max(canvasSz.y, 60.0f);
+
+          const ImVec2 canvasP1(canvasP0.x + canvasSz.x, canvasP0.y + canvasSz.y);
+          const ImVec2 canvasCenter((canvasP0.x + canvasP1.x) * 0.5f, (canvasP0.y + canvasP1.y) * 0.5f);
+
+          // Background
+          draw->AddRectFilled(canvasP0, canvasP1, IM_COL32(10, 10, 14, 255));
+          draw->AddRect(canvasP0, canvasP1, IM_COL32(80, 80, 95, 255));
+
+          // Interaction surface
+          ImGui::InvisibleButton("galaxy_map_btn", canvasSz,
+                                 ImGuiButtonFlags_MouseButtonLeft |
+                                 ImGuiButtonFlags_MouseButtonRight |
+                                 ImGuiButtonFlags_MouseButtonMiddle);
+          const bool isHovered = ImGui::IsItemHovered();
+          const bool isActive = ImGui::IsItemActive();
+          const ImVec2 mouse = ImGui::GetIO().MousePos;
+
+          const float halfMin = 0.5f * std::min(canvasSz.x, canvasSz.y);
+          float pxPerLy = std::max(halfMin / std::max(1.0f, radius) * mapZoom, 1e-6f);
+
+          // Zoom (mouse wheel) - keep the world point under the cursor stable.
+          if (isHovered) {
+            const float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f) {
+              const float zoomFactor = std::pow(1.2f, wheel);
+              const float newZoom = std::clamp(mapZoom * zoomFactor, 0.25f, 12.0f);
+
+              const ImVec2 rel(mouse.x - canvasCenter.x, mouse.y - canvasCenter.y);
+              const math::Vec3d worldUnderMouse = mapViewCenterLy + math::Vec3d((double)rel.x / (double)pxPerLy,
+                                                                               (double)rel.y / (double)pxPerLy, 0.0);
+
+              const float newPxPerLy = std::max(halfMin / std::max(1.0f, radius) * newZoom, 1e-6f);
+
+              mapViewCenterLy = worldUnderMouse - math::Vec3d((double)rel.x / (double)newPxPerLy,
+                                                             (double)rel.y / (double)newPxPerLy, 0.0);
+              mapZoom = newZoom;
+              pxPerLy = newPxPerLy;
             }
           }
 
-          ImGui::Checkbox("Constrain edges to current-fuel range", &navConstrainToCurrentFuelRange);
-          const double planMaxLy = navConstrainToCurrentFuelRange ? jrNowLy : jrMaxLy;
-          ImGui::TextDisabled("Planner max hop: %.1f ly", planMaxLy);
+          // Pan (drag with middle or right mouse button).
+          if (isActive && (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f) ||
+                           ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f))) {
+            const ImVec2 d = ImGui::GetIO().MouseDelta;
+            mapViewCenterLy.x -= (double)d.x / (double)pxPerLy;
+            mapViewCenterLy.y -= (double)d.y / (double)pxPerLy;
+          }
 
-          if (ImGui::Button("Plot route")) {
-            if (planMaxLy <= 0.0) {
-              toast(toasts, "No jump range available (refuel or reduce cargo).", 2.6);
-            } else {
-              sim::RoutePlanStats stats{};
-              double costPerJump = 1.0;
-              double costPerLy = 0.0;
+          auto toPx = [&](const math::Vec3d& posLy) -> ImVec2 {
+            const math::Vec3d d = posLy - mapViewCenterLy;
+            return ImVec2(canvasCenter.x + (float)(d.x * (double)pxPerLy),
+                          canvasCenter.y + (float)(d.y * (double)pxPerLy));
+          };
 
-              if (navRouteMode == NavRouteMode::Hops) {
-                costPerJump = 1.0;
-                costPerLy = 0.0;
-                navRoute = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, galaxySelectedSystemId, planMaxLy, &stats);
-              } else if (navRouteMode == NavRouteMode::Distance) {
-                costPerJump = 0.0;
-                costPerLy = 1.0;
-                navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, galaxySelectedSystemId, planMaxLy, costPerJump, costPerLy, &stats);
-              } else {
-                costPerJump = kFsdFuelBase;
-                costPerLy = kFsdFuelPerLy;
-                navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, galaxySelectedSystemId, planMaxLy, costPerJump, costPerLy, &stats);
+          draw->PushClipRect(canvasP0, canvasP1, true);
+
+          // Grid (nice step size) in view space.
+          if (mapShowGrid) {
+            const double halfWLy = (double)(canvasSz.x * 0.5f) / (double)pxPerLy;
+            const double halfHLy = (double)(canvasSz.y * 0.5f) / (double)pxPerLy;
+            const double minX = mapViewCenterLy.x - halfWLy;
+            const double maxX = mapViewCenterLy.x + halfWLy;
+            const double minY = mapViewCenterLy.y - halfHLy;
+            const double maxY = mapViewCenterLy.y + halfHLy;
+
+            const double targetPx = 70.0;
+            const double rawStep = targetPx / (double)pxPerLy;
+            const double p10 = std::pow(10.0, std::floor(std::log10(std::max(1e-6, rawStep))));
+            const double m = rawStep / p10;
+            const double step = (m < 2.0) ? 2.0 * p10 : (m < 5.0) ? 5.0 * p10 : 10.0 * p10;
+
+            const double gx0 = std::floor(minX / step) * step;
+            const double gy0 = std::floor(minY / step) * step;
+
+            const ImU32 gridCol = IM_COL32(28, 30, 40, 140);
+            for (double gx = gx0; gx <= maxX + 1e-6; gx += step) {
+              const float x = canvasCenter.x + (float)((gx - mapViewCenterLy.x) * (double)pxPerLy);
+              draw->AddLine(ImVec2(x, canvasP0.y), ImVec2(x, canvasP1.y), gridCol, 1.0f);
+            }
+            for (double gy = gy0; gy <= maxY + 1e-6; gy += step) {
+              const float y = canvasCenter.y + (float)((gy - mapViewCenterLy.y) * (double)pxPerLy);
+              draw->AddLine(ImVec2(canvasP0.x, y), ImVec2(canvasP1.x, y), gridCol, 1.0f);
+            }
+
+            // Center crosshair (view-center).
+            draw->AddLine(ImVec2(canvasCenter.x - 8, canvasCenter.y), ImVec2(canvasCenter.x + 8, canvasCenter.y), IM_COL32(60, 60, 80, 200), 1.0f);
+            draw->AddLine(ImVec2(canvasCenter.x, canvasCenter.y - 8), ImVec2(canvasCenter.x, canvasCenter.y + 8), IM_COL32(60, 60, 80, 200), 1.0f);
+          }
+
+          // Build a lookup of stub positions for route drawing.
+          std::unordered_map<sim::SystemId, math::Vec3d> stubPosById;
+          stubPosById.reserve(nearby.size());
+          for (const auto& s : nearby) {
+            stubPosById[s.id] = s.posLy;
+          }
+
+          // Jump range feedback rings around the CURRENT system.
+          const double jrMaxLy = fsdBaseRangeLy();
+          const double jrNowLy = fsdCurrentRangeLy();
+
+          if (mapShowJumpRings) {
+            const float jrMaxPx = (float)(jrMaxLy * (double)pxPerLy);
+            const float jrNowPx = (float)(jrNowLy * (double)pxPerLy);
+            const ImVec2 curPx = toPx(currentSystem->stub.posLy);
+
+            if (jrMaxPx > 2.0f && jrMaxPx < 50000.0f) {
+              draw->AddCircle(curPx, jrMaxPx, IM_COL32(90, 150, 240, 120), 96, 1.5f);
+            }
+            if (jrNowPx > 2.0f && jrNowPx < 50000.0f) {
+              draw->AddCircle(curPx, jrNowPx, IM_COL32(90, 220, 150, 120), 96, 1.5f);
+            }
+          }
+
+          // Plotted route overlay.
+          if (mapShowRoute && navRoute.size() >= 2) {
+            for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {
+              auto itA = stubPosById.find(navRoute[i]);
+              auto itB = stubPosById.find(navRoute[i + 1]);
+              if (itA == stubPosById.end() || itB == stubPosById.end()) continue;
+              const ImVec2 a = toPx(itA->second);
+              const ImVec2 b = toPx(itB->second);
+              draw->AddLine(a, b, IM_COL32(255, 140, 80, 210), 2.5f);
+            }
+          }
+
+          // Star lanes: connect each system to 3 nearest neighbors in 3D (draw projected in XY).
+          if (mapShowLanes) {
+            const int k = 3;
+            for (std::size_t i = 0; i < nearby.size(); ++i) {
+              struct N { std::size_t j; double d2; };
+              std::vector<N> ns;
+              ns.reserve(nearby.size());
+              for (std::size_t j = 0; j < nearby.size(); ++j) if (j != i) {
+                const auto di = nearby[j].posLy - nearby[i].posLy;
+                const double d2 = di.x*di.x + di.y*di.y + di.z*di.z;
+                ns.push_back({j, d2});
+              }
+              std::sort(ns.begin(), ns.end(), [](const N& a, const N& b){ return a.d2 < b.d2; });
+              const int count = std::min<int>(k, (int)ns.size());
+
+              const ImVec2 a = toPx(nearby[i].posLy);
+              for (int n = 0; n < count; ++n) {
+                const ImVec2 b = toPx(nearby[ns[n].j].posLy);
+                draw->AddLine(a, b, IM_COL32(50, 80, 120, 110), 1.0f);
+              }
+            }
+          }
+
+          // Hover detection for click + tooltip.
+          sim::SystemId hoveredId = 0;
+          float hoveredD2 = 1.0e30f;
+          if (isHovered) {
+            for (const auto& s : nearby) {
+              const ImVec2 p = toPx(s.posLy);
+              const bool isCurrent = (s.id == currentSystem->stub.id);
+              const float iconSz = isCurrent ? 26.0f : 18.0f;
+              const float r = iconSz * 0.6f;
+              const float dx = mouse.x - p.x;
+              const float dy = mouse.y - p.y;
+              const float d2 = dx*dx + dy*dy;
+              if (d2 <= r*r && d2 < hoveredD2) {
+                hoveredD2 = d2;
+                hoveredId = s.id;
+              }
+            }
+          }
+
+          // Click to select.
+          if (isHovered && hoveredId != 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            galaxySelectedSystemId = hoveredId;
+          }
+
+          // Double-click to center view on the hovered system.
+          if (isHovered && hoveredId != 0 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            mapViewCenterLy = universe.getSystem(hoveredId).stub.posLy;
+          }
+
+          // Context menu (right click release without drag).
+          static sim::SystemId mapContextId = 0;
+          if (isHovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+              !ImGui::IsMouseDragging(ImGuiMouseButton_Right, 4.0f)) {
+            mapContextId = hoveredId;
+            ImGui::OpenPopup("galaxy_map_context");
+          }
+
+          if (ImGui::BeginPopup("galaxy_map_context")) {
+            if (mapContextId != 0) {
+              const auto& sys = universe.getSystem(mapContextId);
+              ImGui::TextUnformatted(sys.stub.name.c_str());
+              ImGui::Separator();
+
+              if (ImGui::MenuItem("Select")) {
+                galaxySelectedSystemId = mapContextId;
+              }
+              if (ImGui::MenuItem("Center view")) {
+                mapViewCenterLy = sys.stub.posLy;
               }
 
+              ImGui::Separator();
+
+              if (ImGui::MenuItem("Plot route")) {
+                plotRouteTo(mapContextId);
+              }
+              if (ImGui::MenuItem("Engage FSD (direct)")) {
+                startFsdJumpTo(mapContextId);
+              }
+            } else {
+              ImGui::TextUnformatted("Map");
+            }
+
+            ImGui::Separator();
+            if (ImGui::MenuItem("Center current")) {
+              mapViewCenterLy = currentSystem->stub.posLy;
+            }
+            if (ImGui::MenuItem("Reset zoom")) {
+              mapZoom = 1.0f;
+            }
+            ImGui::EndPopup();
+          }
+
+          // Draw systems using the HUD atlas star icon (tinted by star class).
+          const auto& atlasTex = hudAtlas.texture();
+          const ImTextureID atlasId = (ImTextureID)(intptr_t)atlasTex.handle();
+
+          const sim::SystemId nextHopId = (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) ? navRoute[navRouteHop + 1] : 0;
+          const float pulse = 0.55f + 0.45f * (float)std::sin((float)timeRealSec * 3.0f);
+
+          for (const auto& s : nearby) {
+            const ImVec2 p = toPx(s.posLy);
+            const bool isCurrent = (s.id == currentSystem->stub.id);
+            const bool isSel = (s.id == galaxySelectedSystemId);
+            const bool isHover = (s.id == hoveredId);
+            const bool isNextHop = (s.id == nextHopId);
+
+            const double distLy = (s.posLy - currentSystem->stub.posLy).length();
+            const bool inJumpRange = (distLy <= jrMaxLy + 1e-9);
+
+            float alpha = 1.0f;
+            if (mapDepthFade) {
+              const double dz = s.posLy.z - center.z;
+              const double zn = std::min(1.0, std::abs(dz) / std::max(1.0, (double)radius));
+              alpha *= 1.0f - 0.55f * (float)zn;
+            }
+
+            float iconSz = isCurrent ? 26.0f : 18.0f;
+            if (isSel || isHover) iconSz = std::max(iconSz, 22.0f);
+
+            // Star icon
+            const auto uv = hudAtlas.get(render::SpriteKind::Star, core::hashCombine(core::fnv1a64("galaxy_star"), s.seed));
+            const ImVec2 i0(p.x - iconSz * 0.5f, p.y - iconSz * 0.5f);
+            const ImVec2 i1(p.x + iconSz * 0.5f, p.y + iconSz * 0.5f);
+            draw->AddImage(atlasId, i0, i1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), starTint(s.primaryClass, alpha));
+
+            // Faction marker (small overlay glyph)
+            if (mapShowFactions && s.factionId != 0) {
+              const float fSz = std::max(8.0f, iconSz * 0.55f);
+              const auto uvF = hudAtlas.get(render::SpriteKind::Faction, core::hashCombine(core::fnv1a64("faction"), (core::u64)s.factionId));
+              const ImVec2 f0(p.x + iconSz * 0.12f, p.y - iconSz * 0.55f);
+              const ImVec2 f1(f0.x + fSz, f0.y + fSz);
+              draw->AddImage(atlasId, f0, f1, ImVec2(uvF.u0, uvF.v0), ImVec2(uvF.u1, uvF.v1), IM_COL32(200, 255, 210, (int)(alpha * 235.0f)));
+            }
+
+            // Jump range ring
+            if (!isCurrent && inJumpRange) {
+              draw->AddCircle(p, iconSz * 0.62f, IM_COL32(80, 140, 220, (int)(alpha * 150.0f)), 24, 1.0f);
+            }
+
+            // Selected / hovered highlight
+            if (isSel) {
+              draw->AddCircle(p, iconSz * 0.82f, IM_COL32(255, 110, 110, 220), 32, 2.0f);
+            } else if (isHover) {
+              draw->AddCircle(p, iconSz * 0.82f, IM_COL32(255, 255, 255, 160), 32, 2.0f);
+            } else if (isCurrent) {
+              draw->AddCircle(p, iconSz * 0.82f, IM_COL32(255, 240, 160, 210), 32, 2.0f);
+            }
+
+            // Next hop pulse highlight
+            if (isNextHop) {
+              draw->AddCircle(p, iconSz * (0.95f + 0.12f * pulse), IM_COL32(255, 170, 90, (int)(170.0f * pulse)), 48, 2.0f);
+            }
+
+            // Labels
+            if (mapShowLabels || isCurrent || isSel || isHover) {
+              const std::string label = s.name;
+              draw->AddText(ImVec2(p.x + iconSz * 0.65f, p.y - iconSz * 0.35f),
+                            IM_COL32(220, 220, 235, (int)(alpha * 200.0f)), label.c_str());
+            }
+          }
+
+          // Tooltip for hovered system.
+          if (isHovered && hoveredId != 0) {
+            const auto& sys = universe.getSystem(hoveredId);
+            const double distLy = (sys.stub.posLy - currentSystem->stub.posLy).length();
+            const double fuelCost = fsdFuelCostFor(distLy);
+            const bool inRange = (distLy <= jrMaxLy + 1e-6);
+            const bool hasFuel = (fuel + 1e-6 >= fuelCost);
+
+            ImGui::BeginTooltip();
+
+            // Icon + name line
+            {
+              const auto uv = hudAtlas.get(render::SpriteKind::Star, core::hashCombine(core::fnv1a64("galaxy_star"), sys.stub.seed));
+              ImGui::Image((ImTextureID)(intptr_t)hudAtlas.texture().handle(), ImVec2(22, 22),
+                           ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
+                           ImVec4(1, 1, 1, 1));
+              ImGui::SameLine();
+              ImGui::Text("%s", sys.stub.name.c_str());
+            }
+
+            ImGui::Text("Class: %s", starClassName(sys.stub.primaryClass));
+            ImGui::Text("Distance: %.1f ly", distLy);
+            ImGui::Text("Stations: %d  |  Planets: %d", sys.stub.stationCount, sys.stub.planetCount);
+            ImGui::Text("Faction: %s", factionName(sys.stub.factionId).c_str());
+            ImGui::Separator();
+            if (!inRange) {
+              ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Direct jump: OUT OF RANGE");
+            } else if (!hasFuel) {
+              ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "Direct jump: IN RANGE (LOW FUEL)");
+            } else {
+              ImGui::TextColored(ImVec4(0.70f, 0.95f, 0.70f, 1.0f), "Direct jump: IN RANGE");
+            }
+            ImGui::TextDisabled("Fuel cost %.1f | fuel %.1f", fuelCost, fuel);
+            ImGui::TextDisabled("LMB select | Double-click center | RMB menu");
+            ImGui::EndTooltip();
+          }
+
+          // Map legend (top-left).
+          draw->AddText(ImVec2(canvasP0.x + 8.0f, canvasP0.y + 8.0f),
+                        IM_COL32(170, 170, 190, 170),
+                        "Galaxy Map");
+
+          draw->PopClipRect();
+          ImGui::EndChild();
+        }
+
+        // System list (search + sort) for fast selection (useful once the map gets dense).
+        if (ImGui::CollapsingHeader("System list", ImGuiTreeNodeFlags_DefaultOpen)) {
+          static char sysFilter[64] = "";
+          ImGui::InputText("Filter", sysFilter, sizeof(sysFilter));
+          ImGui::SameLine();
+          static int sortMode = 0;
+          const char* sortNames[] = {"Distance", "Name"};
+          ImGui::Combo("Sort", &sortMode, sortNames, 2);
+
+          auto toLower = [](std::string s) {
+            for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+            return s;
+          };
+
+          const std::string f = toLower(std::string(sysFilter));
+
+          struct Row {
+            const sim::SystemStub* s;
+            double dist;
+          };
+
+          std::vector<Row> rows;
+          rows.reserve(nearby.size());
+
+          for (const auto& s : nearby) {
+            if (!f.empty()) {
+              const std::string n = toLower(s.name);
+              if (n.find(f) == std::string::npos) continue;
+            }
+            const double d = (s.posLy - currentSystem->stub.posLy).length();
+            rows.push_back(Row{&s, d});
+          }
+
+          if (sortMode == 0) {
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.dist < b.dist; });
+          } else {
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.s->name < b.s->name; });
+          }
+
+          ImGui::BeginChild("system_list", ImVec2(0, 240), true);
+          if (ImGui::BeginTable("sys_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Dist (ly)");
+            ImGui::TableSetupColumn("St");
+            ImGui::TableSetupColumn("Faction");
+            ImGui::TableSetupColumn("Range");
+            ImGui::TableHeadersRow();
+
+            for (const auto& r : rows) {
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              const bool isSel = (r.s->id == galaxySelectedSystemId);
+              if (ImGui::Selectable(r.s->name.c_str(), isSel)) {
+                galaxySelectedSystemId = r.s->id;
+              }
+
+              ImGui::TableSetColumnIndex(1);
+              ImGui::Text("%.1f", r.dist);
+
+              ImGui::TableSetColumnIndex(2);
+              ImGui::Text("%d", r.s->stationCount);
+
+              ImGui::TableSetColumnIndex(3);
+              ImGui::TextUnformatted(factionName(r.s->factionId).c_str());
+
+              ImGui::TableSetColumnIndex(4);
+              const bool inRange = (r.s->id == currentSystem->stub.id) || (r.dist <= galaxyPlanMaxLy + 1e-6);
+              if (inRange) ImGui::TextColored(ImVec4(0.70f, 0.95f, 0.70f, 1.0f), "IN");
+              else ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "OUT");
+            }
+
+            ImGui::EndTable();
+          }
+          ImGui::EndChild();
+        }
+
+        // ---------------- Right column (details + planner) ----------------
+        ImGui::TableSetColumnIndex(1);
+
+        ImGui::SeparatorText("Selection");
+
+        if (galaxySelectedSystemId == 0) {
+          ImGui::Text("Select a system on the map.");
+        } else {
+          const auto& selSys = universe.getSystem(galaxySelectedSystemId);
+
+          // Icon + title row.
+          {
+            const auto uv = hudAtlas.get(render::SpriteKind::Star, core::hashCombine(core::fnv1a64("galaxy_star"), selSys.stub.seed));
+            ImGui::Image((ImTextureID)(intptr_t)hudAtlas.texture().handle(), ImVec2(28, 28),
+                         ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), ImVec4(1, 1, 1, 1));
+            ImGui::SameLine();
+            ImGui::Text("%s", selSys.stub.name.c_str());
+          }
+
+          const double distLy = (selSys.stub.posLy - currentSystem->stub.posLy).length();
+          const double jrMaxLySel = fsdBaseRangeLy();
+          const double jrNowLySel = fsdCurrentRangeLy();
+
+          ImGui::Text("Class: %s", starClassName(selSys.stub.primaryClass));
+          ImGui::Text("Distance: %.1f ly", distLy);
+          ImGui::Text("Stations: %d  |  Planets: %d", selSys.stub.stationCount, selSys.stub.planetCount);
+          ImGui::Text("Faction: %s", factionName(selSys.stub.factionId).c_str());
+          ImGui::Separator();
+
+          ImGui::Text("Jump range: %.1f ly max, %.1f ly current-fuel", jrMaxLySel, jrNowLySel);
+
+          if (galaxySelectedSystemId == currentSystem->stub.id) {
+            ImGui::TextDisabled("This is your current system.");
+          } else {
+            const double fuelCost = fsdFuelCostFor(distLy);
+            const bool inRange = (distLy <= jrMaxLySel + 1e-6);
+            const bool hasFuel = (fuel + 1e-6 >= fuelCost);
+            const char* rangeText = !inRange ? "OUT OF RANGE" : (hasFuel ? "IN RANGE" : "IN RANGE (LOW FUEL)");
+            const ImVec4 rangeCol = !inRange ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
+                                            : (hasFuel ? ImVec4(0.70f, 0.95f, 0.70f, 1.0f)
+                                                      : ImVec4(1.0f, 0.75f, 0.35f, 1.0f));
+
+            ImGui::TextColored(rangeCol, "Direct jump: %s", rangeText);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(fuel cost %.1f, fuel %.1f)", fuelCost, fuel);
+
+            ImGui::SeparatorText("Route planner");
+
+            {
+              static const char* kRouteModes[] = {"Min jumps", "Min distance", "Min fuel"};
+              int modeIdx = (int)navRouteMode;
+              if (ImGui::Combo("Mode", &modeIdx, kRouteModes, (int)(sizeof(kRouteModes) / sizeof(kRouteModes[0])))) {
+                navRouteMode = (NavRouteMode)modeIdx;
+              }
+            }
+
+            ImGui::Checkbox("Constrain edges to current-fuel range", &navConstrainToCurrentFuelRange);
+            const double planMaxLy = navConstrainToCurrentFuelRange ? jrNowLySel : jrMaxLySel;
+            ImGui::TextDisabled("Planner max hop: %.1f ly", planMaxLy);
+
+            if (ImGui::Button("Plot route")) {
+              plotRouteTo(galaxySelectedSystemId);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear route")) {
+              navRoute.clear();
               navRouteHop = 0;
               navAutoRun = false;
+              navRoutePlanStatsValid = false;
+            }
 
-              if (navRoute.empty()) {
-                navRoutePlanStatsValid = false;
-                toast(toasts, "No route found. Try increasing the scan radius or switching route mode.", 3.0);
-              } else {
-                navRoutePlanStats = stats;
-                navRoutePlanStatsValid = true;
-                navRoutePlannedMode = navRouteMode;
-                navRoutePlannedUsedCurrentFuelRange = navConstrainToCurrentFuelRange;
-                navRoutePlanMaxJumpLy = planMaxLy;
-                navRoutePlanCostPerJump = costPerJump;
-                navRoutePlanCostPerLy = costPerLy;
+            ImGui::Checkbox("Auto-run route", &navAutoRun);
 
-                const double totalDist = sim::routeDistanceLy(nearby, navRoute);
-                const double totalFuel = sim::routeCost(nearby, navRoute, kFsdFuelBase, kFsdFuelPerLy);
-                toast(toasts,
-                      "Route plotted (" + std::to_string((int)navRoute.size() - 1)
-                      + " jumps, " + std::to_string((int)std::round(totalDist))
-                      + " ly, est fuel " + std::to_string((int)std::round(totalFuel)) + ").",
-                      2.6);
+            if (!navRoute.empty()) {
+              const int totalJumps = (int)navRoute.size() - 1;
+              const int remaining = std::max(0, totalJumps - (int)navRouteHop);
+
+              double totalDist = 0.0;
+              double totalFuel = 0.0;
+              double maxHopDist = 0.0;
+              for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {
+                const auto& a = universe.getSystem(navRoute[i]).stub;
+                const auto& b = universe.getSystem(navRoute[i + 1]).stub;
+                const double d = (b.posLy - a.posLy).length();
+                totalDist += d;
+                totalFuel += fsdFuelCostFor(d);
+                if (d > maxHopDist) maxHopDist = d;
+              }
+
+              ImGui::Text("Route: %d jumps (%d remaining)", totalJumps, remaining);
+              ImGui::Text("Total: %.1f ly, est fuel %.1f (no refuel)", totalDist, totalFuel);
+              ImGui::TextDisabled("Max hop: %.1f ly", maxHopDist);
+
+              if (totalFuel > fuel + 1e-6) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "Warning: route needs %.1f fuel, you have %.1f.", totalFuel, fuel);
+              }
+
+              if (navRoutePlanStatsValid) {
+                const char* planName = (navRoutePlannedMode == NavRouteMode::Hops) ? "Min jumps"
+                                     : (navRoutePlannedMode == NavRouteMode::Distance) ? "Min distance"
+                                     : "Min fuel";
+                ImGui::TextDisabled("Planner: %s | max hop %.1f ly | expansions %d", planName, navRoutePlanMaxJumpLy, navRoutePlanStats.expansions);
+                ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly", navRoutePlanCostPerJump, navRoutePlanCostPerLy);
+                ImGui::TextDisabled("Constraint: %s", navRoutePlannedUsedCurrentFuelRange ? "current-fuel range" : "max range");
+              }
+
+              if (navRouteHop + 1 < navRoute.size()) {
+                const auto& nextSys = universe.getSystem(navRoute[navRouteHop + 1]);
+                const double hopDist = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
+                const double hopFuel = fsdFuelCostFor(hopDist);
+                if (fuel + 1e-6 < hopFuel) {
+                  ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+                                     "Next hop: %s (%.1f ly, fuel %.1f > %.1f)",
+                                     nextSys.stub.name.c_str(), hopDist, hopFuel, fuel);
+                } else {
+                  ImGui::Text("Next hop: %s (%.1f ly, fuel %.1f)", nextSys.stub.name.c_str(), hopDist, hopFuel);
+                }
               }
             }
-          }
-          ImGui::SameLine();
-          if (ImGui::Button("Clear route")) {
-            navRoute.clear();
-            navRouteHop = 0;
-            navAutoRun = false;
-            navRoutePlanStatsValid = false;
-          }
 
-          ImGui::Checkbox("Auto-run route", &navAutoRun);
-
-          if (!navRoute.empty()) {
-            const int totalJumps = (int)navRoute.size() - 1;
-            const int remaining = std::max(0, totalJumps - (int)navRouteHop);
-            double totalDist = 0.0;
-            double totalFuel = 0.0;
-            double maxHopDist = 0.0;
-            for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {
-              const auto& a = universe.getSystem(navRoute[i]).stub;
-              const auto& b = universe.getSystem(navRoute[i + 1]).stub;
-              const double d = (b.posLy - a.posLy).length();
-              totalDist += d;
-              totalFuel += fsdFuelCostFor(d);
-              if (d > maxHopDist) maxHopDist = d;
-            }
-            ImGui::Text("Route: %d jumps (%d remaining)", totalJumps, remaining);
-            ImGui::Text("Total: %.1f ly, est fuel %.1f (no refuel)", totalDist, totalFuel);
-            ImGui::TextDisabled("Max hop: %.1f ly", maxHopDist);
-
-            if (totalFuel > fuel + 1e-6) {
-              ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "Warning: route needs %.1f fuel, you have %.1f.", totalFuel, fuel);
-            }
-
-            if (navRoutePlanStatsValid) {
-              const char* planName = (navRoutePlannedMode == NavRouteMode::Hops) ? "Min jumps"
-                                   : (navRoutePlannedMode == NavRouteMode::Distance) ? "Min distance"
-                                   : "Min fuel";
-              ImGui::TextDisabled("Planner: %s | max hop %.1f ly | expansions %d", planName, navRoutePlanMaxJumpLy, navRoutePlanStats.expansions);
-              ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly", navRoutePlanCostPerJump, navRoutePlanCostPerLy);
-              ImGui::TextDisabled("Constraint: %s", navRoutePlannedUsedCurrentFuelRange ? "current-fuel range" : "max range");
-            }
-            if (navRouteHop + 1 < navRoute.size()) {
-              const auto& nextSys = universe.getSystem(navRoute[navRouteHop + 1]);
-              const double hopDist = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
-              const double hopFuel = fsdFuelCostFor(hopDist);
-              if (fuel + 1e-6 < hopFuel) {
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
-                                   "Next hop: %s (%.1f ly, fuel %.1f > %.1f)",
-                                   nextSys.stub.name.c_str(), hopDist, hopFuel, fuel);
+            if (ImGui::Button("Engage FSD (J)")) {
+              if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
+                startFsdJumpTo(navRoute[navRouteHop + 1]);
               } else {
-                ImGui::Text("Next hop: %s (%.1f ly, fuel %.1f)", nextSys.stub.name.c_str(), hopDist, hopFuel);
+                startFsdJumpTo(galaxySelectedSystemId);
               }
-            }
-          }
-
-          if (ImGui::Button("Engage FSD (J)")) {
-            if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
-              startFsdJumpTo(navRoute[navRouteHop + 1]);
-            } else {
-              startFsdJumpTo(galaxySelectedSystemId);
             }
           }
         }
+
+        ImGui::EndTable();
       }
 
       ImGui::TextDisabled("TAB toggles this window, F1 Flight, F2 Market, F3 Contacts, F12 PostFX");
-
       ImGui::End();
+    }
+
+    // ---- Offscreen hangar preview render (render-to-texture -> ImGui) ----
+    // Render AFTER building UI so the preview uses the latest yaw/pitch/zoom (drag UI)
+    // but BEFORE ImGui::Render, so ImGui draws the up-to-date texture.
+    if (showHangar && hangarTarget.color().handle() != 0) {
+      if (hangarAnimate) {
+        hangarYawDeg += (float)(dtReal * (double)hangarSpinRadPerSec * (180.0 / math::kPi));
+      }
+
+      // Render into the hangar target.
+      hangarTarget.begin();
+      glViewport(0, 0, hangarTarget.width(), hangarTarget.height());
+      glEnable(GL_DEPTH_TEST);
+      glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
+      glClearColor(0.035f, 0.040f, 0.050f, 1.0f);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+      // Simple camera looking down -Z with the ship at the origin.
+      render::Camera hangarCam;
+      const double aspect = (double)hangarTarget.width() / (double)std::max(1, hangarTarget.height());
+      hangarCam.setPerspective(math::degToRad(45.0), aspect, 0.01, 50.0);
+      hangarCam.setPosition({0.0, 0.0, (double)hangarZoom});
+      hangarCam.setOrientation(math::Quatd::identity());
+
+      float viewF[16], projF[16];
+      matToFloat(hangarCam.viewMatrix(), viewF);
+      matToFloat(hangarCam.projectionMatrix(), projF);
+      meshRenderer.setViewProj(viewF, projF);
+
+      // Preview light: offset point-light so the model reads nicely.
+      meshRenderer.setLightPos(2.5f, 1.8f, 3.5f);
+      meshRenderer.setMesh(&cube);
+      meshRenderer.setUnlit(false);
+      meshRenderer.setAlphaFromTexture(false);
+      meshRenderer.setTexture((shipLiveryTex.handle() != 0) ? &shipLiveryTex : &checker);
+
+      const math::Quatd q = math::Quatd::fromAxisAngle({0, 1, 0}, math::degToRad((double)hangarYawDeg))
+                          * math::Quatd::fromAxisAngle({1, 0, 0}, math::degToRad((double)hangarPitchDeg));
+
+      std::vector<render::InstanceData> inst;
+      inst.reserve(1);
+      inst.push_back(makeInst({0.0, 0.0, 0.0},
+                              {0.35, 0.20, 0.60},
+                              q,
+                              1.0f, 1.0f, 1.0f));
+      meshRenderer.drawInstances(inst);
+
+      // Restore backbuffer for UI.
+      hangarTarget.end();
+      render::gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
+      glViewport(0, 0, w, h);
+
+      // Restore default light so next frame's world render is correct even if
+      // something draws before the per-frame setLightPos call.
+      meshRenderer.setLightPos(0.0f, 0.0f, 0.0f);
     }
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     SDL_GL_SwapWindow(window);
+  }
+
+  // Persist HUD layout on exit (optional).
+  if (hudLayoutAutoSaveOnExit) {
+    hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+    hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
+    hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
+    hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
+    ui::saveToFile(hudLayout, hudLayoutPath);
   }
 
   // Cleanup

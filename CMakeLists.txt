@@ -101,6 +101,9 @@ set(STELLAR_CORE_SOURCES
   src/core/Hash.cpp
   src/core/Log.cpp
 
+  src/ui/HudLayout.cpp
+  src/ui/Livery.cpp
+
   src/proc/Noise.cpp
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
@@ -126,9 +129,14 @@ set(STELLAR_RENDER_SOURCES
   src/render/Shader.cpp
   src/render/Texture.cpp
   src/render/ProceduralSprite.cpp
+  src/render/ProceduralPlanet.cpp
+  src/render/ProceduralLivery.cpp
+  src/render/AtmosphereRenderer.cpp
   src/render/Starfield.cpp
+  src/render/Nebula.cpp
   src/render/ParticleSystem.cpp
   src/render/PostFX.cpp
+  src/render/RenderTarget.cpp
   src/render/Mesh.cpp
   src/render/Camera.cpp
   src/render/MeshRenderer.cpp

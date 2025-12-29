@@ -28,6 +28,14 @@ struct PostFXSettings {
 
   // Screen-space "warp streaks" (cheap speed effect). 0 disables.
   float warp{0.0f};
+
+  // Hyperspace / jump tunnel overlay (screen-space). 0 disables.
+  // This is intended to be driven by gameplay (FSD state), but can also be tuned manually.
+  float hyperspace{0.0f};        // 0..1
+  float hyperspaceTwist{0.45f};  // 0..1
+  float hyperspaceDensity{0.65f}; // 0..1
+  float hyperspaceNoise{0.35f};  // 0..1
+  float hyperspaceIntensity{1.15f}; // multiplier
 };
 
 // HDR scene render target + post-processing (bloom + tonemap) for the game.
