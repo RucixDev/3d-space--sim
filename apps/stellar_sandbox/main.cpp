@@ -5,6 +5,10 @@
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/proc/GalaxyGenerator.h"
 #include "stellar/sim/MissionLogic.h"
+#include "stellar/sim/Industry.h"
+#include "stellar/sim/Warehouse.h"
+#include "stellar/sim/Reputation.h"
+#include "stellar/sim/TradeScanner.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Signature.h"
@@ -50,6 +54,21 @@ static const char* missionTypeName(sim::MissionType t) {
     case MissionType::Salvage: return "Salvage";
     case MissionType::Escort: return "Escort";
     default: return "Unknown";
+  }
+}
+
+static const char* stationTypeName(econ::StationType t) {
+  using econ::StationType;
+  switch (t) {
+    case StationType::Outpost: return "Outpost";
+    case StationType::Agricultural: return "Agricultural";
+    case StationType::Mining: return "Mining";
+    case StationType::Refinery: return "Refinery";
+    case StationType::Industrial: return "Industrial";
+    case StationType::Research: return "Research";
+    case StationType::TradeHub: return "TradeHub";
+    case StationType::Shipyard: return "Shipyard";
+    default: return "?";
   }
 }
 
@@ -142,7 +161,16 @@ static void printHelp() {
             << "\n"
             << "Save/load (tooling):\n"
             << "  --load <path>          Load a save file before running missions\n"
-            << "  --save <path>          Save the resulting state to a save file\n";
+            << "  --save <path>          Save the resulting state to a save file\n"
+            << "\n"
+            << "Industry (station processing):\n"
+            << "  --industry             Print available industry recipes for the chosen station\n"
+            << "  --batches <n>           Batches to quote (default: 1)\n"
+            << "\n"
+            << "Warehouse (station storage):\n"
+            << "  --warehouse            Quote storage fees for warehousing at the chosen station\n"
+            << "  --storeCommodity <c>   Commodity to store for the quote (code or name; default: FOOD)\n"
+            << "  --storeUnits <u>       Units to store for the quote (default: 10)\n";
 }
 
 int main(int argc, char** argv) {
@@ -194,6 +222,8 @@ int main(int argc, char** argv) {
   const bool emitSysSig = args.hasFlag("sysSig");
 
   const bool doTrade = args.hasFlag("trade");
+  const bool doIndustry = args.hasFlag("industry");
+  const bool doWarehouse = args.hasFlag("warehouse");
   std::size_t fromSysIdx = 0;
   std::size_t fromStationIdx = 0;
   {
@@ -258,6 +288,27 @@ int main(int argc, char** argv) {
   (void)args.getInt("seats", seats);
   int acceptOffer = -1;
   (void)args.getInt("acceptOffer", acceptOffer);
+
+  double industryBatches = 1.0;
+  (void)args.getDouble("batches", industryBatches);
+  if (!std::isfinite(industryBatches)) industryBatches = 1.0;
+  industryBatches = std::max(0.0, industryBatches);
+
+  // Warehouse quote inputs. Uses --rep for reputation and --advanceDays for projection.
+  std::string storeCommodityStr;
+  (void)args.getString("storeCommodity", storeCommodityStr);
+  double storeUnits = 10.0;
+  (void)args.getDouble("storeUnits", storeUnits);
+  if (!std::isfinite(storeUnits)) storeUnits = 0.0;
+  storeUnits = std::max(0.0, storeUnits);
+
+  econ::CommodityId storeCommodity = econ::CommodityId::Food;
+  if (!storeCommodityStr.empty()) {
+    if (!econ::tryParseCommodity(storeCommodityStr, storeCommodity)) {
+      std::cerr << "Invalid --storeCommodity: '" << storeCommodityStr << "'\n";
+      return 1;
+    }
+  }
   double advanceDays = 0.0;
   (void)args.getDouble("advanceDays", advanceDays);
   const bool autoComplete = args.hasFlag("autoComplete");
@@ -368,6 +419,163 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (doWarehouse && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[warehouse] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& st = fromSys.stations[fromStationIdx];
+    const auto stType = st.economyModel.type;
+
+    sim::StationStorage entry{};
+    entry.stationId = st.id;
+    entry.stationType = stType;
+    entry.factionId = st.factionId;
+    entry.feeRate = st.feeRate;
+    entry.lastFeeDay = timeDays;
+    entry.feesDueCr = 0.0;
+    entry.cargo.fill(0.0);
+    if (storeUnits > 0.0) {
+      entry.cargo[(int)storeCommodity] = storeUnits;
+    }
+
+    const double massKg = sim::storageMassKg(entry);
+    const double rate = sim::storageFeeRateCrPerKgPerDay(entry, rep);
+    const double daily = sim::estimateStorageDailyFeeCr(entry, rep);
+
+    sim::StationStorage future = entry;
+    sim::accrueStorageFees(future, timeDays + std::max(0.0, advanceDays), rep);
+
+    if (json) {
+      j.key("warehouse");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("stationId"); j.value((unsigned long long)st.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationName"); j.value(st.name);
+      j.key("stationType"); j.value(stationTypeName(stType));
+      j.key("rep"); j.value(rep);
+      j.key("commodity"); j.value(econ::commodityCode(storeCommodity));
+      j.key("units"); j.value(storeUnits);
+      j.key("massKg"); j.value(massKg);
+      j.key("feeRateCrPerKgPerDay"); j.value(rate);
+      j.key("dailyFeeCr"); j.value(daily);
+      j.key("projectDays"); j.value(std::max(0.0, advanceDays));
+      j.key("projectFeesDueCr"); j.value(future.feesDueCr);
+      j.endObject();
+    } else {
+      std::cout << "\n--- Warehouse quote @ " << fromStub.name << " / " << st.name
+                << " (" << stationTypeName(stType) << ") ---\n";
+      std::cout << "Store: " << econ::commodityCode(storeCommodity)
+                << " (" << econ::commodityName(storeCommodity) << ")"
+                << " units=" << std::fixed << std::setprecision(2) << storeUnits
+                << "  mass=" << std::fixed << std::setprecision(1) << massKg << " kg\n";
+      std::cout << "Fee: rate=" << std::fixed << std::setprecision(5) << rate << " cr/kg/day"
+                << "  estDaily=" << std::fixed << std::setprecision(1) << daily << " cr/day";
+      if (advanceDays > 0.0) {
+        std::cout << "  projected(" << std::fixed << std::setprecision(2) << advanceDays << "d)="
+                  << std::fixed << std::setprecision(1) << future.feesDueCr << " cr";
+      }
+      std::cout << "\n";
+    }
+  }
+
+  if (doIndustry && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[industry] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& st = fromSys.stations[fromStationIdx];
+    const auto stType = st.economyModel.type;
+    const auto recipes = sim::availableIndustryRecipes(stType);
+
+    if (json) {
+      j.key("industry");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("stationId"); j.value((unsigned long long)st.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationName"); j.value(st.name);
+      j.key("stationType"); j.value(stationTypeName(stType));
+      j.key("batches"); j.value(industryBatches);
+      j.key("rep"); j.value(rep);
+
+      j.key("recipes");
+      j.beginArray();
+      for (const auto* r : recipes) {
+        const auto q = sim::quoteIndustryOrder(*r, st.id, stType, industryBatches, st.feeRate, rep);
+        j.beginObject();
+        j.key("code"); j.value(r->code);
+        j.key("name"); j.value(r->name);
+        j.key("desc"); j.value(r->desc);
+
+        j.key("inputA"); j.value(econ::commodityCode(q.inputA));
+        j.key("inputAUnits"); j.value(q.inputAUnits);
+        if (q.inputBUnits > 0.0) {
+          j.key("inputB"); j.value(econ::commodityCode(q.inputB));
+          j.key("inputBUnits"); j.value(q.inputBUnits);
+        }
+        j.key("output"); j.value(econ::commodityCode(q.output));
+        j.key("outputUnits"); j.value(q.outputUnits);
+        j.key("timeDays"); j.value(q.timeDays);
+        j.key("feeCr"); j.value(q.serviceFeeCr);
+
+        j.key("mods");
+        j.beginObject();
+        j.key("yieldMul"); j.value(q.mods.yieldMul);
+        j.key("speedMul"); j.value(q.mods.speedMul);
+        j.key("feeMul"); j.value(q.mods.feeMul);
+        j.endObject();
+
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Industry @ " << fromStub.name << " / " << st.name
+                << " (" << stationTypeName(stType) << ") ---\n";
+      if (recipes.empty()) {
+        std::cout << "No industry facilities here.\n";
+      } else {
+        std::cout << "Batches: " << std::fixed << std::setprecision(2) << industryBatches
+                  << "  rep: " << std::fixed << std::setprecision(1) << rep
+                  << "  feeRate: " << std::fixed << std::setprecision(3) << st.feeRate
+                  << "\n\n";
+        for (const auto* r : recipes) {
+          const auto q = sim::quoteIndustryOrder(*r, st.id, stType, industryBatches, st.feeRate, rep);
+          std::cout << "[" << r->code << "] " << r->name << "\n";
+          std::cout << "  " << r->desc << "\n";
+          std::cout << "  in:  " << econ::commodityCode(q.inputA) << " " << std::fixed << std::setprecision(2) << q.inputAUnits;
+          if (q.inputBUnits > 0.0) {
+            std::cout << " + " << econ::commodityCode(q.inputB) << " " << std::fixed << std::setprecision(2) << q.inputBUnits;
+          }
+          std::cout << "\n";
+          std::cout << "  out: " << econ::commodityCode(q.output) << " " << std::fixed << std::setprecision(2) << q.outputUnits << "\n";
+          std::cout << "  time: " << std::fixed << std::setprecision(2) << (q.timeDays * 24.0) << " h"
+                    << "  fee: " << std::fixed << std::setprecision(0) << q.serviceFeeCr << " cr\n";
+          std::cout << "  mods: yield=" << std::fixed << std::setprecision(3) << q.mods.yieldMul
+                    << " speed=" << std::fixed << std::setprecision(3) << q.mods.speedMul
+                    << " fee=" << std::fixed << std::setprecision(3) << q.mods.feeMul
+                    << "\n\n";
+        }
+      }
+    }
+  }
+
   if (doTrade && !systems.empty()) {
     // Clamp indices so the tool remains easy to use from scripts.
     fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
@@ -381,82 +589,23 @@ int main(int argc, char** argv) {
     fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
     const auto& fromSt = fromSys.stations[fromStationIdx];
 
-    auto& fromEcon = u.stationEconomy(fromSt, timeDays);
-
-    struct Idea {
-      sim::SystemId sysId{0};
-      sim::StationId stationId{0};
-      std::string sysName;
-      std::string stationName;
-      econ::CommodityId commodity{econ::CommodityId::Food};
-      double buyAsk{0.0};
-      double sellBid{0.0};
-      double units{0.0};
-      double netProfitPerUnit{0.0};
-      double netTripProfit{0.0};
-      double distanceLy{0.0};
+    const auto feeEff = [&](const sim::Station& st) {
+      return sim::applyReputationToFeeRate(st.feeRate, rep);
     };
 
-    std::vector<Idea> ideas;
-    ideas.reserve(systems.size());
+    sim::TradeScanParams scan;
+    scan.maxResults = tradeLimit;
+    scan.perStationLimit = 1;
+    scan.cargoCapacityKg = cargoCapacityKg;
+    scan.cargoUsedKg = 0.0;
+    scan.useFreeHold = true;
+    scan.bidAskSpread = 0.10;
+    scan.minNetProfit = minProfit;
+    scan.includeSameSystem = true;
+    scan.commodityFilterEnabled = hasCommodityFilter;
+    scan.commodityFilter = commodityFilterId;
 
-    for (const auto& stub : systems) {
-      const auto& sys = u.getSystem(stub.id, &stub);
-      const double distLy = (stub.posLy - fromStub.posLy).length();
-
-      for (const auto& toSt : sys.stations) {
-        if (stub.id == fromStub.id && toSt.id == fromSt.id) continue;
-
-        auto& toEcon = u.stationEconomy(toSt, timeDays);
-        const std::size_t perStationLimit = hasCommodityFilter ? econ::kCommodityCount : 1;
-        const auto routes = econ::bestRoutesForCargo(fromEcon,
-                                                     fromSt.economyModel,
-                                                     toEcon,
-                                                     toSt.economyModel,
-                                                     cargoCapacityKg,
-                                                     fromSt.feeRate,
-                                                     toSt.feeRate,
-                                                     0.10,
-                                                     perStationLimit);
-
-        if (routes.empty()) continue;
-
-        const econ::RouteOpportunity* pick = &routes.front();
-        if (hasCommodityFilter) {
-          pick = nullptr;
-          for (const auto& r : routes) {
-            if (r.commodity == commodityFilterId) {
-              pick = &r;
-              break;
-            }
-          }
-          if (!pick) continue;
-        }
-
-        if (pick->netProfitTotal + 1e-9 < minProfit) continue;
-
-        Idea it;
-        it.sysId = stub.id;
-        it.stationId = toSt.id;
-        it.sysName = stub.name;
-        it.stationName = toSt.name;
-        it.commodity = pick->commodity;
-        it.buyAsk = pick->buyPrice;
-        it.sellBid = pick->sellPrice;
-        it.units = pick->unitsPossible;
-        it.netProfitPerUnit = pick->netProfitPerUnit;
-        it.netTripProfit = pick->netProfitTotal;
-        it.distanceLy = distLy;
-        ideas.push_back(std::move(it));
-      }
-    }
-
-    std::sort(ideas.begin(), ideas.end(), [](const Idea& a, const Idea& b) {
-      if (a.netTripProfit != b.netTripProfit) return a.netTripProfit > b.netTripProfit;
-      return a.distanceLy < b.distanceLy;
-    });
-
-    if (ideas.size() > tradeLimit) ideas.resize(tradeLimit);
+    const auto ideas = sim::scanTradeOpportunities(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
 
     if (json) {
       j.key("trade");
@@ -477,29 +626,37 @@ int main(int argc, char** argv) {
       j.key("stationId"); j.value((unsigned long long)fromSt.id);
       j.key("stationName"); j.value(fromSt.name);
       j.key("feeRate"); j.value(fromSt.feeRate);
+      j.key("feeRateEff"); j.value(feeEff(fromSt));
       j.endObject();
       j.key("ideas");
       j.beginArray();
       for (const auto& it : ideas) {
         j.beginObject();
         j.key("commodity"); j.value(econ::commodityCode(it.commodity));
-        j.key("toSystemId"); j.value((unsigned long long)it.sysId);
-        j.key("toStationId"); j.value((unsigned long long)it.stationId);
-        j.key("toSystemName"); j.value(it.sysName);
-        j.key("toStationName"); j.value(it.stationName);
+        j.key("toSystemId"); j.value((unsigned long long)it.toSystem);
+        j.key("toStationId"); j.value((unsigned long long)it.toStation);
+        j.key("toSystemName"); j.value(it.toSystemName);
+        j.key("toStationName"); j.value(it.toStationName);
         j.key("distLy"); j.value(it.distanceLy);
-        j.key("units"); j.value(it.units);
+        j.key("unitsFrom"); j.value(it.unitsFrom);
+        j.key("unitsToSpace"); j.value(it.unitsToSpace);
+        j.key("unitsPossible"); j.value(it.unitsPossible);
+        j.key("unitMassKg"); j.value(it.unitMassKg);
+        j.key("feeFrom"); j.value(it.feeFrom);
+        j.key("feeTo"); j.value(it.feeTo);
         j.key("netProfitPerUnit"); j.value(it.netProfitPerUnit);
-        j.key("netTripProfit"); j.value(it.netTripProfit);
-        j.key("buyAsk"); j.value(it.buyAsk);
-        j.key("sellBid"); j.value(it.sellBid);
+        j.key("netTripProfit"); j.value(it.netProfitTotal);
+        j.key("buyAsk"); j.value(it.buyPrice);
+        j.key("sellBid"); j.value(it.sellPrice);
         j.endObject();
       }
       j.endArray();
       j.endObject();
     } else {
       std::cout << "\n--- Trade scan (day=" << timeDays << ", cargoKg=" << cargoCapacityKg << ") ---\n";
-      std::cout << "From: " << fromStub.name << " / " << fromSt.name << "  (fee=" << fromSt.feeRate * 100.0 << "%)\n";
+      std::cout << "From: " << fromStub.name << " / " << fromSt.name
+                << "  (fee=" << fromSt.feeRate * 100.0
+                << "%, eff=" << feeEff(fromSt) * 100.0 << "%)\n";
       if (hasCommodityFilter) {
         std::cout << "Filter: " << econ::commodityCode(commodityFilterId)
                   << " (" << econ::commodityName(commodityFilterId) << ")";
@@ -514,11 +671,11 @@ int main(int argc, char** argv) {
         for (const auto& it : ideas) {
           const auto code = econ::commodityCode(it.commodity);
           std::cout << std::setw(6) << code
-                    << "  to=" << it.sysName << "/" << it.stationName
+                    << "  to=" << it.toSystemName << "/" << it.toStationName
                     << "  dist=" << std::fixed << std::setprecision(1) << it.distanceLy << " ly"
-                    << "  units=" << std::fixed << std::setprecision(0) << it.units
+                    << "  units=" << std::fixed << std::setprecision(0) << it.unitsPossible
                     << "  net/unit=" << std::fixed << std::setprecision(2) << it.netProfitPerUnit
-                    << "  net/trip=" << std::fixed << std::setprecision(0) << it.netTripProfit
+                    << "  net/trip=" << std::fixed << std::setprecision(0) << it.netProfitTotal
                     << "\n";
         }
         std::cout << "Tip: increase --radius (or move --pos) to scan a larger area.\n";

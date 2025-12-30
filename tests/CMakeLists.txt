@@ -13,6 +13,9 @@ add_executable(stellar_tests
   test_nav.cpp
   test_args.cpp
   test_signature.cpp
+  test_industry.cpp
+  test_warehouse.cpp
+  test_trade_scanner.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)

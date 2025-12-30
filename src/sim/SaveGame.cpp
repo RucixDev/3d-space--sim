@@ -87,6 +87,23 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  // Industry orders (station processing queues)
+  f << "nextIndustryOrderId " << s.nextIndustryOrderId << "\n";
+  f << "industry_orders " << s.industryOrders.size() << "\n";
+  for (const auto& o : s.industryOrders) {
+    f << "industry "
+      << o.id << " "
+      << static_cast<int>(o.recipe) << " "
+      << o.stationId << " "
+      << static_cast<int>(o.inputA) << " " << o.inputAUnits << " "
+      << static_cast<int>(o.inputB) << " " << o.inputBUnits << " "
+      << static_cast<int>(o.output) << " " << o.outputUnits << " "
+      << o.submittedDay << " "
+      << o.readyDay << " "
+      << (o.claimed ? 1 : 0)
+      << "\n";
+  }
+
   f << "trackedMissionId " << s.trackedMissionId << "\n";
 
   // Mission board (cached offers)
@@ -137,6 +154,20 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "trafficStamps " << s.trafficStamps.size() << "\n";
   for (const auto& t : s.trafficStamps) {
     f << "traffic " << t.systemId << " " << t.dayStamp << "\n";
+  }
+
+  // Station warehouse / cargo storage (player-owned, per station).
+  f << "station_storage " << s.stationStorage.size() << "\n";
+  for (const auto& st : s.stationStorage) {
+    f << "storage "
+      << st.stationId << " "
+      << static_cast<int>(st.stationType) << " "
+      << st.factionId << " "
+      << st.feeRate << " "
+      << st.lastFeeDay << " "
+      << st.feesDueCr;
+    for (double u : st.cargo) f << " " << u;
+    f << "\n";
   }
 
   f << "station_overrides " << s.stationOverrides.size() << "\n";
@@ -293,6 +324,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.trackedMissionId;
     } else if (key == "nextMissionId") {
       f >> out.nextMissionId;
+    } else if (key == "nextIndustryOrderId") {
+      f >> out.nextIndustryOrderId;
     } else if (key == "missions") {
       std::size_t n = 0;
       f >> n;
@@ -349,6 +382,51 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         }
 
         out.missions.push_back(std::move(m));
+      }
+    } else if (key == "industry_orders") {
+      std::size_t n = 0;
+      f >> n;
+      out.industryOrders.clear();
+      out.industryOrders.reserve(std::min<std::size_t>(n, 4096));
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tok;
+        if (!(f >> tok)) break;
+        if (tok != "industry") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        // Parse the rest of the order line so we can grow fields over time.
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        IndustryOrder o{};
+        int recipe = 0;
+        int inA = 0;
+        int inB = 0;
+        int outC = 0;
+        int claimed = 0;
+
+        iss >> o.id
+            >> recipe
+            >> o.stationId
+            >> inA >> o.inputAUnits
+            >> inB >> o.inputBUnits
+            >> outC >> o.outputUnits
+            >> o.submittedDay
+            >> o.readyDay
+            >> claimed;
+
+        o.recipe = static_cast<IndustryRecipeId>(recipe);
+        o.inputA = static_cast<econ::CommodityId>(inA);
+        o.inputB = static_cast<econ::CommodityId>(inB);
+        o.output = static_cast<econ::CommodityId>(outC);
+        o.claimed = (claimed != 0);
+
+        out.industryOrders.push_back(o);
       }
     } else if (key == "mission_offers_station") {
       f >> out.missionOffersStationId;
@@ -477,6 +555,42 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         SystemTrafficStamp t{};
         if (!(f >> t.systemId >> t.dayStamp)) break;
         out.trafficStamps.push_back(std::move(t));
+      }
+    } else if (key == "station_storage") {
+      std::size_t n = 0;
+      f >> n;
+
+      out.stationStorage.clear();
+      out.stationStorage.reserve(std::min<std::size_t>(n, 4096));
+
+      // Robustness strategy: if the count is stale/corrupt, stop when we no longer see "storage"
+      // and continue parsing subsequent top-level keys.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "storage") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        StationStorage st{};
+        int stType = 0;
+        iss >> st.stationId >> stType >> st.factionId >> st.feeRate >> st.lastFeeDay >> st.feesDueCr;
+        st.stationType = static_cast<econ::StationType>(std::clamp(stType, 0, (int)econ::StationType::Count - 1));
+
+        for (std::size_t ci = 0; ci < econ::kCommodityCount; ++ci) {
+          double u = 0.0;
+          if (iss >> u) st.cargo[ci] = u;
+          else st.cargo[ci] = 0.0;
+        }
+
+        out.stationStorage.push_back(std::move(st));
       }
     } else if (key == "station_overrides") {
       std::size_t n = 0;

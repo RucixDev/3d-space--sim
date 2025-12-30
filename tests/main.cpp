@@ -13,6 +13,9 @@ int test_missions();
 int test_nav();
 int test_args();
 int test_signature();
+int test_industry();
+int test_warehouse();
+int test_trade_scanner();
 
 int main() {
   int fails = 0;
@@ -30,6 +33,9 @@ int main() {
   fails += test_nav();
   fails += test_args();
   fails += test_signature();
+  fails += test_industry();
+  fails += test_warehouse();
+  fails += test_trade_scanner();
 
   if (fails == 0) {
     std::cout << "[stellar_tests] ALL PASS\n";

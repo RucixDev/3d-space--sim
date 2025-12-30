@@ -112,8 +112,11 @@ set(STELLAR_CORE_SOURCES
   src/sim/Faction.cpp
   src/sim/Orbit.cpp
   src/sim/Ship.cpp
+  src/sim/Industry.cpp
+  src/sim/Warehouse.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
+  src/sim/TradeScanner.cpp
   src/sim/Universe.cpp
   src/sim/NavRoute.cpp
   src/sim/MissionLogic.cpp

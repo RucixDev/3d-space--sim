@@ -4,6 +4,7 @@
 #include "stellar/math/Quat.h"
 #include "stellar/math/Vec3.h"
 #include "stellar/sim/Celestial.h"
+#include "stellar/sim/Industry.h"
 
 #include <array>
 #include <string>
@@ -35,6 +36,28 @@ struct FactionBounty {
 struct SystemTrafficStamp {
   SystemId systemId{0};
   int dayStamp{-1};
+};
+
+// Player-owned cargo stored at a specific station.
+//
+// This is intentionally lightweight (no pointers/strings) and persists across runs.
+// Storage fees are accrued lazily using lastFeeDay -> current timeDays.
+struct StationStorage {
+  StationId stationId{0};
+  econ::StationType stationType{econ::StationType::Outpost};
+  core::u32 factionId{0};
+
+  // Snapshot of station tariff at the time the storage record was created.
+  // Used by the fee model (see sim/Warehouse).
+  double feeRate{0.0};
+
+  // Storage fees are accrued from lastFeeDay up to the current timeDays when the
+  // player interacts with the warehouse.
+  double lastFeeDay{0.0};
+  double feesDueCr{0.0};
+
+  // Stored commodity units.
+  std::array<double, econ::kCommodityCount> cargo{};
 };
 
 // Lightweight "gameplay" mission representation.
@@ -103,7 +126,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{14};
+  int version{16};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -155,6 +178,10 @@ struct SaveGame {
   core::u64 nextMissionId{1};
   std::vector<Mission> missions{};
 
+  // Industry / fabrication orders (station processing queues).
+  core::u64 nextIndustryOrderId{1};
+  std::vector<IndustryOrder> industryOrders{};
+
   // Mission tracker UI (quality-of-life): remember which active mission is "tracked".
   core::u64 trackedMissionId{0};
 
@@ -173,6 +200,9 @@ struct SaveGame {
 
   // Background NPC traffic simulation (for markets). Stores last simulated day per system.
   std::vector<SystemTrafficStamp> trafficStamps{};
+
+  // Player station storage / warehouse entries.
+  std::vector<StationStorage> stationStorage{};
 
   std::vector<StationEconomyOverride> stationOverrides{};
 };
