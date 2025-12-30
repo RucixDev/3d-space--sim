@@ -5,7 +5,36 @@
 
 namespace stellar::sim {
 
-Ship::Ship() = default;
+Ship::Ship() {
+  // Default boost caps preserve legacy behavior (1.8x linear, 1.4x angular).
+  // Gameplay code can override these via the boost setters.
+  maxLinAccelBoostKmS2_ = maxLinAccelKmS2_ * 1.8;
+  maxAngAccelBoostRadS2_ = maxAngAccelRadS2_ * 1.4;
+}
+
+void Ship::setMaxLinearAccelKmS2(double a) {
+  maxLinAccelKmS2_ = a;
+  if (!customLinBoost_) {
+    maxLinAccelBoostKmS2_ = maxLinAccelKmS2_ * 1.8;
+  }
+}
+
+void Ship::setMaxAngularAccelRadS2(double a) {
+  maxAngAccelRadS2_ = a;
+  if (!customAngBoost_) {
+    maxAngAccelBoostRadS2_ = maxAngAccelRadS2_ * 1.4;
+  }
+}
+
+void Ship::setMaxLinearAccelBoostKmS2(double a) {
+  maxLinAccelBoostKmS2_ = a;
+  customLinBoost_ = true;
+}
+
+void Ship::setMaxAngularAccelBoostRadS2(double a) {
+  maxAngAccelBoostRadS2_ = a;
+  customAngBoost_ = true;
+}
 
 static stellar::math::Vec3d clampMagnitude(const stellar::math::Vec3d& v, double maxLen) {
   const double len = v.length();
@@ -42,8 +71,7 @@ void Ship::step(double dtSeconds, const ShipInput& input) {
     // --------
     // Linear
     // --------
-    double linCap = maxLinAccelKmS2_;
-    if (in.boost) linCap *= 1.8;
+    const double linCap = in.boost ? maxLinAccelBoostKmS2_ : maxLinAccelKmS2_;
 
     stellar::math::Vec3d accelWorld = orient_.rotate(in.thrustLocal) * linCap;
 
@@ -67,8 +95,7 @@ void Ship::step(double dtSeconds, const ShipInput& input) {
     // --------
     // Angular (body-local)
     // --------
-    double angCap = maxAngAccelRadS2_;
-    if (in.boost) angCap *= 1.4;
+    const double angCap = in.boost ? maxAngAccelBoostRadS2_ : maxAngAccelRadS2_;
 
     stellar::math::Vec3d angAccel = in.torqueLocal * angCap;
 

@@ -38,6 +38,13 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "hull " << s.hull << "\n";
   f << "shield " << s.shield << "\n";
   f << "heat " << s.heat << "\n";
+  f << "pipsEng " << s.pipsEng << "\n";
+  f << "pipsWep " << s.pipsWep << "\n";
+  f << "pipsSys " << s.pipsSys << "\n";
+  f << "capEngFrac " << s.capEngFrac << "\n";
+  f << "capWepFrac " << s.capWepFrac << "\n";
+  f << "capSysFrac " << s.capSysFrac << "\n";
+
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
   f << "passengerSeats " << s.passengerSeats << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
@@ -251,6 +258,25 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.shield;
     } else if (key == "heat") {
       f >> out.heat;
+    } else if (key == "pipsEng") {
+      f >> out.pipsEng;
+      out.pipsEng = std::clamp(out.pipsEng, 0, 4);
+    } else if (key == "pipsWep") {
+      f >> out.pipsWep;
+      out.pipsWep = std::clamp(out.pipsWep, 0, 4);
+    } else if (key == "pipsSys") {
+      f >> out.pipsSys;
+      out.pipsSys = std::clamp(out.pipsSys, 0, 4);
+    } else if (key == "capEngFrac") {
+      f >> out.capEngFrac;
+      out.capEngFrac = std::clamp(out.capEngFrac, 0.0, 1.0);
+    } else if (key == "capWepFrac") {
+      f >> out.capWepFrac;
+      out.capWepFrac = std::clamp(out.capWepFrac, 0.0, 1.0);
+    } else if (key == "capSysFrac") {
+      f >> out.capSysFrac;
+      out.capSysFrac = std::clamp(out.capSysFrac, 0.0, 1.0);
+
     } else if (key == "cargoCapacityKg") {
       f >> out.cargoCapacityKg;
     } else if (key == "passengerSeats") {

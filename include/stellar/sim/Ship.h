@@ -47,12 +47,25 @@ public:
   void setMassKg(double m) { massKg_ = m; }
   void setInertiaDiagKgKm2(const math::Vec3d& i) { inertiaDiagKgKm2_ = i; }
 
-  // Thruster limits (force in kN translated into km/s^2 via mass)
-  void setMaxLinearAccelKmS2(double a) { maxLinAccelKmS2_ = a; }
-  void setMaxAngularAccelRadS2(double a) { maxAngAccelRadS2_ = a; }
+  // Thruster limits (acceleration caps; km/s^2 and rad/s^2).
+  //
+  // Boost caps are configurable so gameplay code (player modules, NPC archetypes)
+  // can tune ships without baking a fixed multiplier into the physics step.
+  //
+  // If you never call the boost setters, boost defaults to legacy behavior:
+  //  - linear: 1.8x base
+  //  - angular: 1.4x base
+  void setMaxLinearAccelKmS2(double a);
+  void setMaxAngularAccelRadS2(double a);
+
+  void setMaxLinearAccelBoostKmS2(double a);
+  void setMaxAngularAccelBoostRadS2(double a);
 
   double maxLinearAccelKmS2() const { return maxLinAccelKmS2_; }
   double maxAngularAccelRadS2() const { return maxAngAccelRadS2_; }
+
+  double maxLinearAccelBoostKmS2() const { return maxLinAccelBoostKmS2_; }
+  double maxAngularAccelBoostRadS2() const { return maxAngAccelBoostRadS2_; }
 
   double dampingLinear() const { return dampingLinear_; }
   double dampingAngular() const { return dampingAngular_; }
@@ -82,6 +95,13 @@ private:
   // Limits
   double maxLinAccelKmS2_{0.05};     // km/s^2 (~50 m/s^2) (arcade-ish but usable)
   double maxAngAccelRadS2_{0.8};     // rad/s^2
+
+  // Boost limits (configurable). Defaults are set in the constructor.
+  double maxLinAccelBoostKmS2_{0.09}; // 1.8x default base
+  double maxAngAccelBoostRadS2_{1.12}; // 1.4x default base
+
+  bool customLinBoost_{false};
+  bool customAngBoost_{false};
 
   // Dampers (simple exponential decay)
   double dampingLinear_{0.15};       // 1/s

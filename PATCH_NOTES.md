@@ -1,3 +1,97 @@
+## 2025-12-30 (Patch) - Ballistics Lead Solver + NPC Weapons/Loadouts (Combat Integration)
+
+This round pushes combat toward a more unified, systems-driven model: NPCs now use real weapons (beams/projectiles), loadout-derived stats, and the same power distributor mechanics as the player.
+
+### New: `sim::Ballistics`
+- Added `stellar::sim::Ballistics` (`include/stellar/sim/Ballistics.h` + `src/sim/Ballistics.cpp`):
+  - Robust intercept-time solver for constant-speed projectiles that inherit shooter velocity.
+  - Helper `solveProjectileLead(...)` that returns both **time-to-hit** and the **lead point**.
+- Added unit tests: `test_ballistics`.
+
+### Game: HUD lead indicator uses shared ballistics
+- Replaced the HUD lead quadratic in `stellar_game` with `sim::solveProjectileLead(...)`.
+  - Keeps the HUD consistent with how projectiles are actually simulated.
+
+### Game: NPC combat now uses shared Combat + Loadout + Distributor
+- Contacts gained a lightweight “combat loadout”:
+  - `ShipHullClass`, module Mks (thrusters/shields/distributor), weapon type, AI skill.
+  - Per-contact distributor config/state + pips.
+- NPC shield regen is now:
+  - Driven by **loadout-derived regen rate**.
+  - Scaled by **SYS pips**.
+  - Limited by and consumes **SYS capacitor**, like the player.
+- Pirate + police firing now routes through `sim::tryFireWeapon(...)`:
+  - Beams raycast and apply immediate damage via shared `applyDamage(...)`.
+  - Projectile weapons spawn `sim::Projectile` instances (with proper lead aiming via `sim::Ballistics`).
+- Projectile hit resolution now supports **NPC → NPC ship** hits (not just NPC → player).
+
+## 2025-12-30 (Patch) - Power distributor (Pips + Capacitors)
+
+This round adds a 3-channel power distributor system (ENG/WEP/SYS) inspired by classic space sims.
+
+- **New core module**: `stellar::sim::PowerDistributor` (pips normalization, capacitor recharge, boost consumption, weapon capacitor cost helper).
+- **Gameplay integration** (player ship):
+  - Boost now consumes **ENG capacitor** (partial boost supported per frame when energy is low).
+  - Weapon firing now requires and consumes **WEP capacitor**.
+  - Shield regen is now limited by and consumes **SYS capacitor**, and scales with SYS pips.
+- **HUD**: optional capacitor rings around the reticle (toggled by `hudShowDistributorRings`).
+- **Ship/Status UI**: new Power distributor section to view capacitors + adjust pips.
+- **Save game**: pips + capacitor fractions are persisted (SaveGame version bumped to 17).
+- **Tests**: added unit tests for normalization, recharge redistribution, boost consumption, and weapon cost heuristics.
+
+
+## 2025-12-30 (Patch) - Combat (Core) + Weapon/Projectile Extraction
+
+
+- **Sim:** added `sim::Combat` (`stellar/sim/Combat.h` + `src/sim/Combat.cpp`) to move combat math out of `main.cpp`:
+  - Shield-first `applyDamage(...)`
+  - Ray-sphere intersection + nearest-hit raycast with optional aim-cone filter
+  - Projectile stepping with segment collision checks + hit event emission
+  - A shared `tryFireWeapon(...)` helper that spawns beams/projectiles and returns hit metadata
+- **Game:** refactored player firing + projectile updates to use the shared combat module.
+  - Kinetic projectiles now also collide with asteroids (sparks only; mining still requires the mining laser).
+- **Tests:** added `test_combat` to lock down damage, ray hits, nearest-target selection, and projectile hit emission.
+
+## 2025-12-30 (Patch) - ShipLoadout (Core) + Balance Extraction
+- **Sim:** added `sim::ShipLoadout` (`stellar/sim/ShipLoadout.h`) to centralize gameplay tuning tables:
+  - Hull definitions (Scout / Hauler / Fighter)
+  - Mk module definitions (Thrusters / Shields / Distributors)
+  - Weapon definitions (beam/pulse/cannon/rail/mining)
+- **Sim:** added a shared derived-stat helper `computeShipDerivedStats(...)` so the ship stat formula lives in one place.
+- **Game:** refactored `stellar_game` to use the shared definitions (removes a large block of balance data from `main.cpp`).
+- **Tests:** added `test_ship_loadout` to validate monotonic upgrades (Mk3 > Mk1) and lock down the derived-stat formula.
+
+## 2025-12-30 (Patch) - Deterministic Per-Faction Law Profiles (Smuggling)
+- **Sim:** added `sim::LawProfile` (`sim/Law.h` + `sim/Law.cpp`): deterministic per-faction tuning for:
+  - Cargo-scan *strictness* (scan frequency multiplier)
+  - Enforcement *fine schedule* (base + rate)
+  - *Corruption* scalar (affects bribe offer chance)
+  - Rep penalties for contraband compliance vs. evasion
+- **Game:** wired the profile into the smuggling loop:
+  - Contraband fine + rep penalty now come from the faction's law profile.
+  - Police bribe chance is multiplied by faction corruption.
+  - Cargo-scan start rate is multiplied by faction scan strictness.
+- **Tests:** added `test_law` to lock down determinism, bounds, and monotonicity.
+
+## 2025-12-30 (Patch) - FlightController (Core) + Autopilot/NPC AI Refactor
+- **Sim:** added `sim::FlightController` (new module) to centralize "approach/chase + face direction" logic:
+  - Produces a normalized `sim::ShipInput` from a moving target point + velocity.
+  - Conservative speed profiling (distance gain + stopping-distance clamp) for smoother arrivals.
+  - Optional boost selection (disabled by default) and optional roll alignment to an up vector.
+- **Game:** migrated two in-game controllers onto the shared module:
+  - Player station **Autopilot** now uses `sim::approachTarget(...)` (better damping near the slot).
+  - NPC "chaseTarget" behavior is now powered by the same controller (consistent feel across roles).
+- **Tests:** added `test_flight_controller` to validate convergence + input range safety.
+
+## 2025-12-30 (Patch) - Ship Boost Caps + stellar_game Compile Fixes (Convoys)
+- **Sim:** upgraded `sim::Ship` to support configurable **boost acceleration caps**:
+  - New APIs: `setMaxLinearAccelBoostKmS2(...)` / `setMaxAngularAccelBoostRadS2(...)` plus getters.
+  - Defaults preserve legacy behavior (boost = **1.8x linear**, **1.4x angular**) unless explicitly overridden.
+- **Game:** fixed several `stellar_game` build breaks in convoy/escort code caused by stale Ship/Contact fields:
+  - Updated convoy + escort spawns to use `Ship` setters (no more direct member access).
+  - Added `Contact::tradeCargoValueCr` and kept it in sync for normal traders (used for ambush scaling).
+- **Tests:** added `test_ship` to lock down boost-cap behavior.
+
 ## 2025-12-29 (Patch) - Universe Nearby Query Accelerator + MSVC .c_str() Fix
 - **Fix (MSVC):** removed invalid `.c_str()` calls on `econ::CommodityDef::name` in the target info panel (`CommodityDef::name` is `const char*`).
 - **Sim/Perf:** rewrote `Universe::queryNearby(...)` to avoid scanning the entire sector bounding box when `maxResults` is small:

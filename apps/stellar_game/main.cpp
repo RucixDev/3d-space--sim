@@ -32,10 +32,16 @@
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/Law.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/TradeScanner.h"
 #include "stellar/sim/Ship.h"
+#include "stellar/sim/ShipLoadout.h"
+#include "stellar/sim/Combat.h"
+#include "stellar/sim/Ballistics.h"
+#include "stellar/sim/PowerDistributor.h"
+#include "stellar/sim/FlightController.h"
 #include "stellar/sim/Traffic.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/Universe.h"
@@ -319,15 +325,8 @@ static bool segmentHitsSphere(const math::Vec3d& aKm,
                              const math::Vec3d& bKm,
                              const math::Vec3d& centerKm,
                              double radiusKm) {
-  const math::Vec3d ab = bKm - aKm;
-  const double abLenSq = ab.lengthSq();
-  if (abLenSq < 1e-12) {
-    return (aKm - centerKm).lengthSq() <= radiusKm * radiusKm;
-  }
-
-  const double t = std::clamp(math::dot(centerKm - aKm, ab) / abLenSq, 0.0, 1.0);
-  const math::Vec3d closest = aKm + ab * t;
-  return (closest - centerKm).lengthSq() <= radiusKm * radiusKm;
+  // Share the core collision helper (extracted from main.cpp in Round 5).
+  return sim::segmentHitsSphereKm(aKm, bKm, centerKm, radiusKm);
 }
 
 static render::Texture2D makeRadialSpriteTextureRGBA(int size,
@@ -570,16 +569,37 @@ struct Contact {
   bool hostileToPlayer{false}; // police become hostile when you're wanted / shoot them
   double fleeUntilDays{0.0};   // traders flee after being attacked
 
-  // Combat stats (very lightweight for now, but enough for early combat/mining loops)
+  // --- Ship loadout + combat stats ---
+  // NPCs use the same core loadout tables as the player.
+  ShipHullClass hullClass{ShipHullClass::Scout};
+  int thrusterMk{1};
+  int shieldMk{1};
+  int distributorMk{1};
+  WeaponType weapon{WeaponType::BeamLaser};
+
   double shield{60.0};
   double shieldMax{60.0};
-  double shieldRegenPerSec{0.0}; // points per simulated second
-
   double hull{70.0};
   double hullMax{70.0};
 
+  // Derived from loadout (points per simulated minute, before pips multipliers).
+  double shieldRegenPerSimMin{2.0};
+
+  // Power distributor state (capacitors + pips).
+  sim::Pips pips{2,2,2};
+  sim::DistributorConfig distributorCfg{};
+  sim::DistributorState distributorState{};
+
+  // Basic AI tuning: 0..1 where higher = more accurate and more aggressive firing windows.
+  double aiSkill{0.55};
+
   // Traders can have an approximate loot value (paid on destruction for now).
   double cargoValueCr{0.0};
+
+  // Best-effort value of *current haul* used for ambush scaling.
+  // For normal traders this can mirror `cargoValueCr`; for escort convoys it is
+  // set from the mission payload at launch.
+  double tradeCargoValueCr{0.0};
 
   // Escort-mission convoy marker (leader ship). Used only for UI/logic; not saved.
   bool escortConvoy{false};
@@ -602,7 +622,7 @@ struct Contact {
   bool supercruiseShadow{false};
   math::Vec3d shadowOffsetLocalKm{0,0,0};
 
-  double fireCooldown{0.0}; // seconds
+  double fireCooldown{0.0}; // simulated seconds
   bool alive{true};
 };
 
@@ -662,14 +682,8 @@ struct SignalSource {
 };
 
 static void applyDamage(double dmg, double& shield, double& hull) {
-  if (shield > 0.0) {
-    const double s = std::min(shield, dmg);
-    shield -= s;
-    dmg -= s;
-  }
-  if (dmg > 0.0) {
-    hull -= dmg;
-  }
+  // Keep the prototype's call sites stable, but share the core damage rule.
+  sim::applyDamage(dmg, shield, hull);
 }
 
 static void emitStationGeometry(const sim::Station& st,
@@ -1110,89 +1124,22 @@ int main(int argc, char** argv) {
 
   sim::Ship ship;
 
-  // --- Ship loadout / progression (early, lightweight) ---
-  enum class ShipHullClass : int {
-    Scout = 0,
-    Hauler,
-    Fighter,
-  };
+  // --- Ship loadout / progression (shared: stellar/sim/ShipLoadout.h) ---
+  using ShipHullClass = sim::ShipHullClass;
+  using WeaponType = sim::WeaponType;
+  using HullDef = sim::HullDef;
+  using MkDef = sim::MkDef;
+  using WeaponDef = sim::WeaponDef;
 
-  enum class WeaponType : int {
-    BeamLaser = 0,
-    PulseLaser,
-    Cannon,
-    Railgun,
-    MiningLaser,
-  };
-
-  struct HullDef {
-    const char* name;
-    double priceCr;
-    double hullMax;
-    double shieldBase;
-    double linAccelKmS2;
-    double angAccelRadS2;
-    double cargoMult;
-    double fuelMult;
-  };
-
-  static const HullDef kHullDefs[] = {
-    // name,  price, hull, shield, linAccel, angAccel, cargoMult, fuelMult
-    {"Scout",  0.0,   100.0, 100.0, 0.080,  1.20,     1.00,      1.00},
-    {"Hauler", 14000.0, 125.0,  90.0, 0.070,  1.05,     1.35,      1.25},
-    {"Fighter", 22000.0,  95.0, 120.0, 0.095,  1.35,     0.90,      1.05},
-  };
-
-  struct MkDef {
-    const char* name;
-    double priceCr;
-    double mult;
-  };
-
-  static const MkDef kThrusters[] = {
-    {"(invalid)", 0.0, 1.0},
-    {"Thrusters Mk1", 0.0, 1.00},
-    {"Thrusters Mk2", 8500.0, 1.18},
-    {"Thrusters Mk3", 17500.0, 1.35},
-  };
-
-  static const MkDef kShields[] = {
-    {"(invalid)", 0.0, 1.0},
-    {"Shields Mk1", 0.0, 1.00},
-    {"Shields Mk2", 9000.0, 1.25},
-    {"Shields Mk3", 18500.0, 1.55},
-  };
-
-  static const MkDef kDistributors[] = {
-    {"(invalid)", 0.0, 1.0},
-    {"Distributor Mk1", 0.0, 1.00},
-    {"Distributor Mk2", 7500.0, 1.22},
-    {"Distributor Mk3", 16000.0, 1.45},
-  };
-
-  struct WeaponDef {
-    WeaponType type;
-    const char* name;
-    double priceCr;
-    double cooldownSimSec;
-    double heatPerShot;
-    double dmg;
-    double rangeKm;
-    double projSpeedKmS; // ignored for beam
-    bool beam;
-    float r, g, b;
-  };
-
-  static const WeaponDef kWeaponDefs[] = {
-    {WeaponType::BeamLaser, "Beam Laser", 0.0, 0.18, 2.2, 7.5, 210000.0, 0.0, true, 1.00f, 0.35f, 0.15f},
-    {WeaponType::PulseLaser, "Pulse Laser", 5200.0, 0.28, 1.9, 6.0, 230000.0, 0.0, true, 1.00f, 0.80f, 0.20f},
-    {WeaponType::Cannon, "Cannon", 0.0, 0.90, 4.5, 22.0, 260000.0, 120.0, false, 1.00f, 1.00f, 0.90f},
-    {WeaponType::Railgun, "Railgun", 9800.0, 1.65, 7.5, 45.0, 320000.0, 240.0, false, 0.60f, 0.90f, 1.00f},
-    {WeaponType::MiningLaser, "Mining Laser", 6500.0, 0.22, 1.6, 3.0, 180000.0, 0.0, true, 0.30f, 1.00f, 0.35f},
-  };
+  // Local aliases to keep the rest of main.cpp diffs small.
+  const auto& kHullDefs = sim::kHullDefs;
+  const auto& kThrusters = sim::kThrusters;
+  const auto& kShields = sim::kShields;
+  const auto& kDistributors = sim::kDistributors;
+  const auto& kWeaponDefs = sim::kWeaponDefs;
 
   auto weaponDef = [&](WeaponType t) -> const WeaponDef& {
-    return kWeaponDefs[(int)t];
+    return sim::weaponDef(t);
   };
 
   ShipHullClass shipHullClass = ShipHullClass::Scout;
@@ -1216,35 +1163,90 @@ int main(int argc, char** argv) {
   double playerHull = 100.0;
   double weaponPrimaryCooldown = 0.0;   // simulated seconds
   double weaponSecondaryCooldown = 0.0; // simulated seconds
+  // Power distributor (pips + capacitors)
+  sim::Pips distributorPips{2, 2, 2};
+  sim::DistributorConfig distributorCfg = sim::distributorConfig(shipHullClass, distributorMk);
+  sim::DistributorState distributorState = sim::makeFull(distributorCfg);
+
+  // Used to scale heat input when boost is only partially available in a frame.
+  double boostAppliedFrac = 0.0;
+
 
   // Baseline NPC combat tuning (used for random encounters / ambushes)
   const double npcShieldMax = 80.0;
   const double npcHullMax = 90.0;
   const double npcShieldRegenPerSec = 0.035; // points per simulated second (~2.1 per sim minute)
 
+  // Helper: initialize a contact's loadout-derived stats + distributor.
+  // NPCs are not persisted, so it's fine to reconstruct from these knobs at spawn time.
+  auto configureContactLoadout = [&](Contact& c,
+                                     ShipHullClass hull,
+                                     int tMk,
+                                     int sMk,
+                                     int dMk,
+                                     WeaponType weapon,
+                                     double hullMul,
+                                     double shieldMul,
+                                     double regenMul,
+                                     double accelMul,
+                                     double aiSkill) {
+    c.hullClass = hull;
+    c.thrusterMk = std::clamp(tMk, 1, 3);
+    c.shieldMk = std::clamp(sMk, 1, 3);
+    c.distributorMk = std::clamp(dMk, 1, 3);
+    c.weapon = weapon;
+    c.aiSkill = std::clamp(aiSkill, 0.05, 0.98);
+
+    const sim::ShipDerivedStats ds = sim::computeShipDerivedStats(
+      c.hullClass, c.thrusterMk, c.shieldMk, c.distributorMk
+    );
+
+    // Use derived accelerations, but NPCs are intentionally a bit slower than the player by default.
+    const double am = std::clamp(accelMul, 0.20, 2.0);
+    c.ship.setMaxLinearAccelKmS2(ds.baseLinAccelKmS2 * am);
+    c.ship.setMaxAngularAccelRadS2(ds.baseAngAccelRadS2 * am);
+
+    c.hullMax = std::max(1.0, ds.hullMax * hullMul);
+    c.hull = c.hullMax;
+    c.shieldMax = std::max(0.0, ds.shieldMax * shieldMul);
+    c.shield = c.shieldMax;
+    c.shieldRegenPerSimMin = std::max(0.0, ds.shieldRegenPerSimMin * regenMul);
+
+    c.pips = {2, 2, 2};
+    sim::normalizePips(c.pips);
+    c.distributorCfg = sim::distributorConfig(c.hullClass, c.distributorMk);
+    c.distributorState = sim::makeFull(c.distributorCfg);
+  };
+
   auto recalcPlayerStats = [&]() {
-    const auto& hull = kHullDefs[(int)shipHullClass];
+    const sim::ShipDerivedStats ds = sim::computeShipDerivedStats(
+      shipHullClass, thrusterMk, shieldMk, distributorMk
+    );
 
-    const int tMk = std::clamp(thrusterMk, 1, 3);
-    const int sMk = std::clamp(shieldMk, 1, 3);
-    const int dMk = std::clamp(distributorMk, 1, 3);
-
-    const double thrMult = kThrusters[tMk].mult;
-    const double shMult  = kShields[sMk].mult;
-    const double distMult = kDistributors[dMk].mult;
-
-    playerHullMax = hull.hullMax;
-    playerShieldMax = hull.shieldBase * shMult;
-
-    playerBaseLinAccelKmS2 = hull.linAccelKmS2 * thrMult;
-    playerBaseAngAccelRadS2 = hull.angAccelRadS2 * (0.92 + 0.08 * thrMult);
-
-    // Regen & cooling scale mostly with distributor. Shields help slightly.
-    playerShieldRegenPerSimMin = 2.5 * (0.85 + 0.15 * (double)sMk) * (0.85 + 0.15 * (double)dMk);
-    playerHeatCoolRate = 10.0 * distMult;
+    playerHullMax = ds.hullMax;
+    playerShieldMax = ds.shieldMax;
+    playerShieldRegenPerSimMin = ds.shieldRegenPerSimMin;
+    playerHeatCoolRate = ds.heatCoolRate;
+    playerBaseLinAccelKmS2 = ds.baseLinAccelKmS2;
+    playerBaseAngAccelRadS2 = ds.baseAngAccelRadS2;
 
     ship.setMaxLinearAccelKmS2(playerBaseLinAccelKmS2);
     ship.setMaxAngularAccelRadS2(playerBaseAngAccelRadS2);
+
+    // Recompute distributor config and preserve capacitor fractions across loadout changes.
+    {
+      const double engFrac = (distributorCfg.capEng > 1e-9) ? (distributorState.eng / distributorCfg.capEng) : 1.0;
+      const double wepFrac = (distributorCfg.capWep > 1e-9) ? (distributorState.wep / distributorCfg.capWep) : 1.0;
+      const double sysFrac = (distributorCfg.capSys > 1e-9) ? (distributorState.sys / distributorCfg.capSys) : 1.0;
+
+      distributorCfg = sim::distributorConfig(shipHullClass, distributorMk);
+      sim::normalizePips(distributorPips);
+
+      distributorState.eng = std::clamp(engFrac, 0.0, 1.0) * distributorCfg.capEng;
+      distributorState.wep = std::clamp(wepFrac, 0.0, 1.0) * distributorCfg.capWep;
+      distributorState.sys = std::clamp(sysFrac, 0.0, 1.0) * distributorCfg.capSys;
+    }
+
 
     playerHull = std::clamp(playerHull, 0.0, playerHullMax);
     playerShield = std::clamp(playerShield, 0.0, playerShieldMax);
@@ -1296,6 +1298,10 @@ int main(int argc, char** argv) {
   // Smuggling / contraband legality (per faction, deterministic bitmask of illegal commodities)
   std::unordered_map<core::u32, core::u32> illegalMaskByFaction;
 
+  // Per-faction enforcement tuning (scan strictness, fine schedule, corruption).
+  // Deterministic from (universe seed, faction id).
+  std::unordered_map<core::u32, sim::LawProfile> lawProfileByFaction;
+
   // Law / crime (per-faction bounties)
   std::unordered_map<core::u32, double> bountyByFaction;
   // Bounty vouchers (earned by destroying criminals; redeem later at stations).
@@ -1341,7 +1347,7 @@ int main(int argc, char** argv) {
     // One-shot pirate ambush scheduling.
     bool ambushSpawned{false};
     double nextAmbushDays{0.0};
-    core::u64 ambushGroupId{0};
+    core::u64 pirateGroupId{0};
   };
   std::vector<EscortRuntime> escortRuntime;
 
@@ -1449,18 +1455,7 @@ int main(int argc, char** argv) {
   std::vector<Beam> beams;
 
   // Projectiles (kinetic cannons / slugs)
-  struct Projectile {
-    math::Vec3d prevKm;
-    math::Vec3d posKm;
-    math::Vec3d velKmS;
-    float r{1}, g{1}, b{1};
-    double ttlSim{0.0};      // simulated seconds remaining
-    double radiusKm{450.0};  // collision radius
-    double dmg{0.0};
-    bool fromPlayer{false};
-    core::u64 shooterId{0};
-  };
-  std::vector<Projectile> projectiles;
+  std::vector<sim::Projectile> projectiles;
 
   // Save/load
   const std::string savePath = "savegame.txt";
@@ -1547,6 +1542,7 @@ int main(int argc, char** argv) {
   bool hudUseProceduralReticle = true;
   bool hudShowWeaponRings = true;
   bool hudShowHeatRing = true;
+  bool hudShowDistributorRings = true;
   float hudReticleSizePx = 44.0f;
   float hudReticleAlpha = 0.80f;
 
@@ -1933,6 +1929,17 @@ auto hasIllegalCargo = [&](core::u32 factionId) -> bool {
   return sim::hasIllegalCargo(universe.seed(), factionId, cargo);
 };
 
+auto lawForFaction = [&](core::u32 factionId) -> sim::LawProfile {
+  if (factionId == 0) return sim::LawProfile{};
+
+  auto it = lawProfileByFaction.find(factionId);
+  if (it != lawProfileByFaction.end()) return it->second;
+
+  const sim::LawProfile prof = sim::lawProfile(universe.seed(), factionId);
+  lawProfileByFaction.emplace(factionId, prof);
+  return prof;
+};
+
 // Apply confiscation + fine + reputation/bounty/alert effects when contraband is enforced.
 // `scannedIllegal` is what security saw during the scan (used for messaging + smuggle mission attribution).
 auto enforceContraband = [&](core::u32 jurisdiction,
@@ -1952,12 +1959,13 @@ auto enforceContraband = [&](core::u32 jurisdiction,
     }
   }
 
-  const double fineCr = 200.0 + illegalValueCr * 0.65;
+  const sim::LawProfile law = lawForFaction(jurisdiction);
+  const double fineCr = law.contrabandFineCr(illegalValueCr);
   const double paidCr = std::min(credits, fineCr);
   credits -= paidCr;
   const double unpaidCr = fineCr - paidCr;
 
-  const double repPenalty = -std::clamp(2.0 + illegalValueCr / 3000.0, 2.0, 10.0);
+  const double repPenalty = law.contrabandRepPenalty(illegalValueCr);
   addRep(jurisdiction, repPenalty);
 
   if (unpaidCr > 1e-6) {
@@ -1969,7 +1977,8 @@ auto enforceContraband = [&](core::u32 jurisdiction,
   nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
 
   // Raise local security alert (affects patrol spawn rate / response).
-  policeHeat = std::clamp(policeHeat + std::min(1.8, 0.5 + illegalValueCr / 5000.0), 0.0, 6.0);
+  const double strictMult = std::clamp(0.85 + 0.15 * law.scanStrictness, 0.75, 1.15);
+  policeHeat = std::clamp(policeHeat + std::min(1.8, (0.5 + illegalValueCr / 5000.0) * strictMult), 0.0, 6.0);
 
   std::string msg = "Contraband detected! Confiscated: "
                     + (detail.empty() ? std::string("illegal cargo") : detail)
@@ -2597,6 +2606,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.hull = std::clamp(playerHull / std::max(1e-6, playerHullMax), 0.0, 1.0);
           s.shield = std::clamp(playerShield / std::max(1e-6, playerShieldMax), 0.0, 1.0);
           s.heat = std::clamp(heat, 0.0, 200.0);
+          // Power distributor
+          s.pipsEng = distributorPips.eng;
+          s.pipsWep = distributorPips.wep;
+          s.pipsSys = distributorPips.sys;
+          s.capEngFrac = (distributorCfg.capEng > 1e-9) ? std::clamp(distributorState.eng / distributorCfg.capEng, 0.0, 1.0) : 1.0;
+          s.capWepFrac = (distributorCfg.capWep > 1e-9) ? std::clamp(distributorState.wep / distributorCfg.capWep, 0.0, 1.0) : 1.0;
+          s.capSysFrac = (distributorCfg.capSys > 1e-9) ? std::clamp(distributorState.sys / distributorCfg.capSys, 0.0, 1.0) : 1.0;
+
           s.fsdReadyDay = fsdReadyDay;
 
           // Loadout
@@ -2703,6 +2720,17 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             playerHull = std::clamp(s.hull, 0.0, 1.0) * playerHullMax;
             playerShield = std::clamp(s.shield, 0.0, 1.0) * playerShieldMax;
             heat = std::clamp(s.heat, 0.0, 200.0);
+
+            // Power distributor
+            distributorPips.eng = std::clamp(s.pipsEng, 0, 4);
+            distributorPips.wep = std::clamp(s.pipsWep, 0, 4);
+            distributorPips.sys = std::clamp(s.pipsSys, 0, 4);
+            sim::normalizePips(distributorPips);
+
+            distributorState.eng = std::clamp(s.capEngFrac, 0.0, 1.0) * distributorCfg.capEng;
+            distributorState.wep = std::clamp(s.capWepFrac, 0.0, 1.0) * distributorCfg.capWep;
+            distributorState.sys = std::clamp(s.capSysFrac, 0.0, 1.0) * distributorCfg.capSys;
+
 
             nextMissionId = s.nextMissionId;
             missions = s.missions;
@@ -3367,37 +3395,38 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                   convoy.name = "Convoy";
                 }
 
-                // Slightly tougher than a generic trader.
-                convoy.shieldMax = npcShieldMax * 1.25;
-                convoy.shield = convoy.shieldMax;
-                convoy.hullMax = npcHullMax * 1.25;
-                convoy.hull = convoy.hullMax;
+                // Loadout: hauler with stronger shields. Match legacy convoy durability while
+                // switching to the unified loadout/distributor model.
+                configureContactLoadout(convoy,
+                                       ShipHullClass::Hauler,
+                                       /*thrMk=*/1,
+                                       /*shieldMk=*/2,
+                                       /*distMk=*/1,
+                                       /*weapon=*/WeaponType::MiningLaser,
+                                       /*hullMul=*/0.90,
+                                       /*shieldMul=*/0.90,
+                                       /*regenMul=*/1.0,
+                                       /*accelMul=*/0.72,
+                                       /*aiSkill=*/0.50);
 
-                // Ship tuning: trading ships are less agile, but still supercruise capable.
-                convoy.ship.maxLinearAccel = 0.050;
-                convoy.ship.maxLinearAccelBoost = 0.090;
-                convoy.ship.maxAngularAccel = 0.080;
-                convoy.ship.radiusKm = 7.2;
-                convoy.ship.baseMassKg = 20000.0;
+                convoy.ship.setMassKg(20000.0);
                 convoy.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.dockRangeKm + 3500.0));
                 convoy.ship.setVelocityKmS(originVelKmS);
 
                 // Mission haul: destination is fixed and cargo is already reserved at acceptance.
-                convoy.tradeLastStationIndex = (int)*fromIdx;
                 convoy.tradeDestStationIndex = (int)*toIdx;
                 convoy.tradeCommodity = m.commodity;
                 convoy.tradeUnits = m.units;
                 const double cargoMassKg = std::max(0.0, m.units) * econ::commodityDef(m.commodity).massKg;
                 convoy.tradeCapacityKg = std::max(240.0, cargoMassKg * 1.15);
                 convoy.tradeCooldownUntilDays = timeDays + (20.0 / 86400.0);
-                convoy.tradeSupercruiseMaxSpeedKmS = rng.range(9500.0, 16500.0);
                 convoy.tradeSupercruiseSpeedKmS = 0.0;
-                convoy.tradeSupercruiseUntilDays = 0.0;
 
                 if (m.units > 0.0) {
                   auto& originEcon = universe.stationEconomy(originSt, timeDays);
                   const econ::Quote q = econ::quote(originEcon, originSt.economyModel, m.commodity);
                   convoy.tradeCargoValueCr = q.mid * m.units;
+                  convoy.cargoValueCr = convoy.tradeCargoValueCr;
                 }
 
                 contacts.push_back(std::move(convoy));
@@ -3414,15 +3443,18 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                   escort.followId = m.targetNpcId;
                   escort.groupId = m.targetNpcId;
                   escort.leaderId = m.targetNpcId;
-                  escort.shieldMax = npcShieldMax * 1.20;
-                  escort.shield = escort.shieldMax;
-                  escort.hullMax = npcHullMax * 1.15;
-                  escort.hull = escort.hullMax;
-                  escort.ship.maxLinearAccel = 0.055;
-                  escort.ship.maxLinearAccelBoost = 0.110;
-                  escort.ship.maxAngularAccel = 0.105;
-                  escort.ship.radiusKm = 6.0;
-                  escort.ship.baseMassKg = 13000.0;
+                  configureContactLoadout(escort,
+                                         ShipHullClass::Fighter,
+                                         /*thrMk=*/1,
+                                         /*shieldMk=*/1,
+                                         /*distMk=*/1,
+                                         /*weapon=*/WeaponType::PulseLaser,
+                                         /*hullMul=*/1.10,
+                                         /*shieldMul=*/0.80,
+                                         /*regenMul=*/1.0,
+                                         /*accelMul=*/0.75,
+                                         /*aiSkill=*/0.65);
+                  escort.ship.setMassKg(13000.0);
                   escort.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.dockRangeKm + 4200.0));
                   escort.ship.setVelocityKmS(originVelKmS);
                   contacts.push_back(std::move(escort));
@@ -3505,109 +3537,98 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           double& cd = primary ? weaponPrimaryCooldown : weaponSecondaryCooldown;
 
           if (cd <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
-            // NOTE: cooldown is in *sim* seconds, so it naturally scales with timeScale.
-            cd = w.cooldownSimSec;
+            const double capCost = sim::weaponCapacitorCost(w);
+            if (distributorState.wep + 1e-9 < capCost) {
+              // Not enough weapon capacitor to fire.
+              continue;
+            }
 
-            // Track last fired weapon for HUD lead indicator.
-            hudLastFiredPrimary = primary;
+            // Contact aim cone (soft aim assist) is slightly wider for pulse lasers.
+            const double contactCone = (wType == WeaponType::PulseLaser) ? 0.993 : 0.995;
 
-            // Better distributors run cooler (a small benefit, not a hard gate).
-            const int dMk = std::clamp(distributorMk, 1, 3);
-            const double heatFactor = std::clamp(1.08 - 0.08 * (double)dMk, 0.80, 1.10);
-            heat = std::min(120.0, heat + w.heatPerShot * heatFactor);
-
+            // Build beam target list on demand so combat logic stays reusable.
+            // (Contacts use an aim cone, asteroids do not.)
+            std::vector<sim::SphereTarget> beamTargets;
             if (w.beam) {
-              const double rangeKm = w.rangeKm;
-              const double dmg = w.dmg;
+              beamTargets.reserve(contacts.size() + asteroids.size());
 
-              const math::Vec3d aKm = ship.positionKm();
-              const math::Vec3d dir = ship.forward().normalized();
-
-	              // Find best hit (contacts: simple cone + nearest along ray, asteroids: sphere intersection).
-	              int bestIdx = -1;
-	              double bestT = rangeKm;
-	              const double cone = (wType == WeaponType::PulseLaser) ? 0.993 : 0.995;
-
-              for (int i = 0; i < (int)contacts.size(); ++i) {
-                auto& c = contacts[(std::size_t)i];
+              for (std::size_t i = 0; i < contacts.size(); ++i) {
+                const auto& c = contacts[i];
                 if (!c.alive) continue;
-
-                const math::Vec3d to = c.ship.positionKm() - aKm;
-                const double dist = to.length();
-                if (dist > rangeKm) continue;
-
-                const math::Vec3d toN = to / std::max(1e-9, dist);
-                const double aim = math::dot(dir, toN);
-                if (aim < cone) continue;
-
-                const double t = dist * aim;
-                if (t < bestT) { bestT = t; bestIdx = i; }
+                sim::SphereTarget t{};
+                t.kind = sim::CombatTargetKind::Ship;
+                t.index = i;
+                t.id = c.id;
+                t.centerKm = c.ship.positionKm();
+                t.radiusKm = 900.0;
+                t.minAimCos = contactCone;
+                beamTargets.push_back(t);
               }
 
-	              // Asteroid hit test
-	              int bestAstIdx = -1;
-	              double bestAstT = rangeKm;
-	              for (int i = 0; i < (int)asteroids.size(); ++i) {
-	                const auto& a = asteroids[(std::size_t)i];
-	                const math::Vec3d toCenter = a.posKm - aKm;
-	                const double tProj = math::dot(toCenter, dir);
-	                if (tProj < 0.0 || tProj > rangeKm) continue;
-	                const math::Vec3d closest = aKm + dir * tProj;
-	                const double d2 = (a.posKm - closest).lengthSq();
-	                const double r2 = a.radiusKm * a.radiusKm;
-	                if (d2 > r2) continue;
-	                const double thc = std::sqrt(std::max(0.0, r2 - d2));
-	                const double tHit = std::clamp(tProj - thc, 0.0, rangeKm);
-	                if (tHit < bestAstT) { bestAstT = tHit; bestAstIdx = i; }
-	              }
+              for (std::size_t i = 0; i < asteroids.size(); ++i) {
+                const auto& a = asteroids[i];
+                sim::SphereTarget t{};
+                t.kind = sim::CombatTargetKind::Asteroid;
+                t.index = i;
+                t.id = a.id;
+                t.centerKm = a.posKm;
+                t.radiusKm = a.radiusKm;
+                t.minAimCos = -1.0;
+                beamTargets.push_back(t);
+              }
+            }
 
-	              // Choose nearest along the ray.
-	              const bool hitAsteroidFirst = (bestAstIdx >= 0 && bestAstT <= bestT);
-	              const double finalT = hitAsteroidFirst ? bestAstT : bestT;
-	              const math::Vec3d bKm = aKm + dir * finalT;
-	              beams.push_back({toRenderU(aKm), toRenderU(bKm), w.r, w.g, w.b, 0.10});
+            const sim::FireResult fr = sim::tryFireWeapon(
+              ship,
+              wType,
+              cd,
+              distributorMk,
+              /*shooterId*/0,
+              /*fromPlayer*/true,
+              beamTargets.empty() ? nullptr : beamTargets.data(),
+              beamTargets.size()
+            );
 
-	              if (hitAsteroidFirst) {
-	                if (wType == WeaponType::MiningLaser) {
-	                  auto& a = asteroids[(std::size_t)bestAstIdx];
-	                  if (a.remainingUnits > 1e-6) {
-	                    const double chunk = std::min(a.remainingUnits, rng.range(6.0, 14.0));
-	                    a.remainingUnits -= chunk;
-	                    spawnCargoPod(a.yield, chunk, bKm, math::Vec3d{0,0,0}, 0.45);
-	                    toast(toasts,
-	                          std::string("Mined ") + econ::commodityDef(a.yield).name + " x" + std::to_string((int)std::round(chunk)),
-	                          2.0);
-	                  } else {
-	                    toast(toasts, "Asteroid depleted.", 1.5);
-	                  }
-	                }
-	              } else {
-	                if (bestIdx >= 0) playerDamageContact(bestIdx, dmg);
-	              }
-            } else {
-              const double muzzleSpeedKmS = std::max(1e-6, w.projSpeedKmS);
-              const double rangeKm = w.rangeKm;
-              const double dmg = w.dmg;
+            if (fr.fired) {
+              distributorState.wep = std::max(0.0, distributorState.wep - capCost);
+              // NOTE: cooldown is in *sim* seconds, so it naturally scales with timeScale.
+              cd = fr.newCooldownSimSec;
 
-              const double ttlSim = rangeKm / muzzleSpeedKmS;
+              // Track last fired weapon for HUD lead indicator.
+              hudLastFiredPrimary = primary;
 
-              const math::Vec3d fwd = ship.forward().normalized();
-              const math::Vec3d spawnKm = ship.positionKm() + fwd * 400.0;
+              heat = std::min(120.0, heat + fr.heatDelta);
 
-              Projectile p{};
-              p.prevKm = spawnKm;
-              p.posKm = spawnKm;
-              p.velKmS = ship.velocityKmS() + fwd * muzzleSpeedKmS;
-              p.r = w.r; p.g = w.g; p.b = w.b;
-              p.ttlSim = ttlSim;
-              p.radiusKm = (wType == WeaponType::Railgun) ? 520.0 : 700.0;
-              p.dmg = dmg;
-              p.fromPlayer = true;
-              p.shooterId = 0;
-              projectiles.push_back(p);
+              if (fr.hasBeam) {
+                beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
+              }
 
-              // Tiny recoil impulse
-              ship.setVelocityKmS(ship.velocityKmS() - fwd * (wType == WeaponType::Railgun ? 0.003 : 0.002));
+              if (fr.hasProjectile) {
+                projectiles.push_back(fr.projectile);
+              }
+
+              // Resolve beam hit effects (mining/damage). Projectile impacts are handled in the tick.
+              if (w.beam && fr.hit) {
+                if (fr.hitKind == sim::CombatTargetKind::Asteroid) {
+                  if (wType == WeaponType::MiningLaser && fr.hitIndex < asteroids.size()) {
+                    auto& a = asteroids[fr.hitIndex];
+                    if (a.remainingUnits > 1e-6) {
+                      const double chunk = std::min(a.remainingUnits, rng.range(6.0, 14.0));
+                      a.remainingUnits -= chunk;
+                      spawnCargoPod(a.yield, chunk, fr.hitPointKm, math::Vec3d{0,0,0}, 0.45);
+                      toast(toasts,
+                            std::string("Mined ") + econ::commodityDef(a.yield).name + " x" + std::to_string((int)std::round(chunk)),
+                            2.0);
+                    } else {
+                      toast(toasts, "Asteroid depleted.", 1.5);
+                    }
+                  }
+                } else if (fr.hitKind == sim::CombatTargetKind::Ship) {
+                  if (fr.hitIndex < contacts.size()) {
+                    playerDamageContact((int)fr.hitIndex, w.dmg);
+                  }
+                }
+              }
             }
           }
         }
@@ -3677,44 +3698,45 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       else desiredLocal = {0,0, zEntrance + st.radiusKm * 0.7};
 
       const math::Vec3d desiredPoint = stPos + stQ.rotate(desiredLocal);
-      const math::Vec3d rel = desiredPoint - ship.positionKm();
-      const double dist = rel.length();
-      const math::Vec3d dir = (dist > 1e-6) ? (rel / dist) : math::Vec3d{0,0,0};
-
-      const double maxV = (autopilotPhase == 0) ? std::max(st.maxApproachSpeedKmS * 2.5, 0.45)
-                                                : (st.maxApproachSpeedKmS * 0.85);
-      double vMag = std::min(maxV, 0.004 * dist);
 
       // Slow down more if we're not centered when committing.
+      double speedScale = 1.0;
       if (autopilotPhase == 1) {
         const double frac = std::clamp(lateralDist / std::max(1.0, st.approachRadiusKm), 0.0, 1.0);
-        vMag *= (1.0 - 0.55 * frac);
+        speedScale = (1.0 - 0.55 * frac);
       }
 
-      const math::Vec3d desiredVel = stV + dir * vMag;
-      const math::Vec3d dv = desiredVel - ship.velocityKmS();
+      const double baseMaxV = (autopilotPhase == 0) ? std::max(st.maxApproachSpeedKmS * 2.5, 0.45)
+                                                    : (st.maxApproachSpeedKmS * 0.85);
 
-      if (dv.lengthSq() > 1e-12) input.thrustLocal = ship.orientation().conjugate().rotate(dv.normalized());
-      else input.thrustLocal = {0,0,0};
+      sim::FlightControlParams fp{};
+      fp.maxSpeedKmS = baseMaxV * speedScale;
+      fp.speedGain = 0.004 * speedScale;
+      fp.velGain = 1.35;
+      fp.desiredDistKm = 0.0;
+      fp.allowBoost = false;
+      fp.dampers = true;
 
-      input.dampers = true;
+      sim::AttitudeControlParams ap{};
+      ap.faceGain = 1.8;
+      ap.rollGain = 1.6;
+      ap.alignUp = true;
 
-      // Align forward into station (towards -axisOut).
+      // Align forward into station (towards -axisOut) and keep ship "up" aligned to station +Y.
       const math::Vec3d axisOut = stQ.rotate({0,0,1});
       const math::Vec3d desiredFwdWorld = -axisOut;
-
-      const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(desiredFwdWorld);
-      const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
-      const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
-
-      // Roll: keep ship "up" aligned to station +Y so you fly the slot level.
       const math::Vec3d desiredUpWorld = stQ.rotate({0,1,0});
-      const math::Vec3d desiredUpLocal = ship.orientation().conjugate().rotate(desiredUpWorld);
-      const double rollErr = std::atan2(desiredUpLocal.x, desiredUpLocal.y);
 
-      input.torqueLocal.x = (float)std::clamp(pitchErr * 1.8, -1.0, 1.0);
-      input.torqueLocal.y = (float)std::clamp(yawErr * 1.8, -1.0, 1.0);
-      input.torqueLocal.z = (float)std::clamp(rollErr * 1.6, -1.0, 1.0);
+      const auto out = sim::approachTarget(ship, desiredPoint, stV, fp, ap, desiredFwdWorld, &desiredUpWorld);
+
+      input.thrustLocal = out.input.thrustLocal;
+      input.torqueLocal = out.input.torqueLocal;
+      input.dampers = out.input.dampers;
+
+      // Ensure we don't leak the player's boost/brake inputs into autopilot
+      // (FlightController scales thrust by the selected accel cap).
+      input.boost = out.input.boost;
+      input.brake = out.input.brake;
     }
 
     // Supercruise: fast in-system travel assist to current target.
@@ -3896,8 +3918,17 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	            p.id = allocWorldId();
 	            p.role = ContactRole::Pirate;
 	            p.name = "Pirate " + std::to_string((int)contacts.size() + 1);
-	            p.ship.setMaxLinearAccelKmS2(0.06);
-	            p.ship.setMaxAngularAccelRadS2(0.9);
+	            configureContactLoadout(p,
+	                                   ShipHullClass::Fighter,
+	                                   /*thrMk=*/1,
+	                                   /*shieldMk=*/1,
+	                                   /*distMk=*/1,
+	                                   /*weapon=*/WeaponType::Cannon,
+	                                   /*hullMul=*/0.95,
+	                                   /*shieldMul=*/0.67,
+	                                   /*regenMul=*/0.84,
+	                                   /*accelMul=*/0.70,
+	                                   /*aiSkill=*/0.55);
 	            p.hostileToPlayer = true;
 	            p.supercruiseShadow = true;
 	            // Keep them behind you so they can pressure an interdiction.
@@ -3906,11 +3937,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	            p.ship.setVelocityKmS(ship.velocityKmS());
 	            p.ship.setOrientation(ship.orientation());
 	            p.ship.setAngularVelocityRadS({0,0,0});
-	            p.shield = npcShieldMax;
-	            p.shieldMax = npcShieldMax;
-	            p.shieldRegenPerSec = npcShieldRegenPerSec;
-	            p.hull = npcHullMax;
-	            p.hullMax = npcHullMax;
 	            contacts.push_back(std::move(p));
 	            toast(toasts, "Contact: pirate wake signature detected!", 2.8);
 	          }
@@ -3924,19 +3950,23 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	            pc.role = ContactRole::Police;
 	            pc.factionId = jurisdiction;
 	            pc.name = "Police";
-	            pc.ship.setMaxLinearAccelKmS2(0.07);
-	            pc.ship.setMaxAngularAccelRadS2(1.0);
+	            configureContactLoadout(pc,
+	                                   ShipHullClass::Fighter,
+	                                   /*thrMk=*/1,
+	                                   /*shieldMk=*/1,
+	                                   /*distMk=*/1,
+	                                   /*weapon=*/WeaponType::PulseLaser,
+	                                   /*hullMul=*/0.95,
+	                                   /*shieldMul=*/0.75,
+	                                   /*regenMul=*/0.90,
+	                                   /*accelMul=*/0.75,
+	                                   /*aiSkill=*/0.65);
 	            pc.supercruiseShadow = true;
 	            pc.shadowOffsetLocalKm = {rng.range(-22000.0, 22000.0), rng.range(-10000.0, 10000.0), -rng.range(140000.0, 200000.0)};
 	            pc.ship.setPositionKm(ship.positionKm() + ship.orientation().rotate(pc.shadowOffsetLocalKm));
 	            pc.ship.setVelocityKmS(ship.velocityKmS());
 	            pc.ship.setOrientation(ship.orientation());
 	            pc.ship.setAngularVelocityRadS({0,0,0});
-	            pc.shield = npcShieldMax;
-	            pc.shieldMax = npcShieldMax;
-	            pc.shieldRegenPerSec = npcShieldRegenPerSec;
-	            pc.hull = npcHullMax;
-	            pc.hullMax = npcHullMax;
 	            contacts.push_back(std::move(pc));
 	          }
 	        }
@@ -4304,6 +4334,11 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
         }
       }
 
+
+      // --- Power distributor ---
+      boostAppliedFrac = 0.0;
+      sim::stepDistributor(distributorState, distributorCfg, distributorPips, dtSim);
+
       // --- Ship physics ---
       if (!docked) {
         if (fsdState != FsdState::Idle || fsdJustArrived) {
@@ -4312,7 +4347,23 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           hold.brake = true;
           ship.step(dtSim, hold);
         } else {
-          ship.step(dtSim, input);
+          // Apply boost only for the fraction we have ENG capacitor for.
+          boostAppliedFrac = input.boost ? sim::consumeBoostFraction(distributorState, distributorCfg, dtSim) : 0.0;
+          input.boost = (boostAppliedFrac > 1e-6);
+
+          const double dtBoost = dtSim * boostAppliedFrac;
+          const double dtNoBoost = dtSim - dtBoost;
+
+          if (dtBoost > 0.0) {
+            sim::ShipInput inBoost = input;
+            inBoost.boost = true;
+            ship.step(dtBoost, inBoost);
+          }
+          if (dtNoBoost > 0.0) {
+            sim::ShipInput inNoBoost = input;
+            inNoBoost.boost = false;
+            ship.step(dtNoBoost, inNoBoost);
+          }
         }
       } else {
         // While docked, keep ship attached to station.
@@ -4588,16 +4639,37 @@ auto spawnPiratePack = [&](int maxCount) -> int {
                       : ("Pirate Wing " + std::to_string((int)contacts.size() + 1));
     if (k == 0) leaderName = p.name;
 
+    const bool leader = (k == 0);
+    const int tMk = leader ? 2 : ((rng.nextUnit() < 0.20) ? 2 : 1);
+    const int dMk = leader ? 2 : 1;
 
-    const double statMul = (k == 0) ? 1.15 : 0.92;
-    p.shield = p.shield * statMul;
-    p.shieldMax = p.shield;
-    p.hull = p.hull * statMul;
-    p.hullMax = p.hull;
-    p.shieldRegenPerSec = npcShieldRegenPerSec * ((k == 0) ? 0.85 : 0.70);
+    auto pickPirateWeapon = [&](bool isLeader) -> WeaponType {
+      const double r = rng.nextUnit();
+      if (isLeader) {
+        if (r < 0.40) return WeaponType::Railgun;
+        if (r < 0.85) return WeaponType::Cannon;
+        return WeaponType::PulseLaser;
+      }
+      if (r < 0.48) return WeaponType::Cannon;
+      if (r < 0.80) return WeaponType::BeamLaser;
+      return WeaponType::PulseLaser;
+    };
 
-    p.ship.setMaxLinearAccelKmS2((k == 0) ? 0.065 : 0.058);
-    p.ship.setMaxAngularAccelRadS2((k == 0) ? 0.95 : 0.85);
+    configureContactLoadout(p,
+                            ShipHullClass::Fighter,
+                            tMk,
+                            /*shieldMk=*/1,
+                            dMk,
+                            pickPirateWeapon(leader),
+                            /*hullMul=*/leader ? 1.05 : 0.95,
+                            /*shieldMul=*/leader ? 0.75 : 0.67,
+                            /*regenMul=*/leader ? 0.70 : 0.63,
+                            /*accelMul=*/leader ? 0.72 : 0.70,
+                            /*aiSkill=*/leader ? 0.68 : 0.55);
+
+    // Pirates like to keep weapons hot.
+    p.pips = {1, 3, 2};
+    sim::normalizePips(p.pips);
 
     // Slight spread so squads don't overlap perfectly.
     const math::Vec3d spread = randDir() * rng.range(1200.0, 7200.0) + math::Vec3d{0,1,0} * rng.range(-1200.0, 1200.0);
@@ -4638,10 +4710,21 @@ auto spawnTrader = [&]() {
     t.factionId = localFaction;
     t.homeStationIndex = chooseHomeStation();
     t.name = "Trader " + std::to_string((int)contacts.size() + 1);
-    t.shield = 35.0;
-    t.shieldMax = t.shield;
-    t.hull = 55.0;
-    t.hullMax = t.hull;
+    configureContactLoadout(t,
+                            ShipHullClass::Hauler,
+                            /*thrMk=*/1,
+                            /*shieldMk=*/1,
+                            /*distMk=*/1,
+                            /*weapon=*/WeaponType::MiningLaser,
+                            /*hullMul=*/0.56,
+                            /*shieldMul=*/0.62,
+                            /*regenMul=*/0.0,
+                            /*accelMul=*/0.72,
+                            /*aiSkill=*/0.35);
+
+    // Traders bias pips into engines for escape.
+    t.pips = {4, 1, 1};
+    sim::normalizePips(t.pips);
 
     // Cargo capacity (kg) varies per trader.
     t.tradeCapacityKg = rng.range(120.0, 420.0);
@@ -4653,8 +4736,6 @@ auto spawnTrader = [&]() {
     // Assign an initial hauling job (if possible) and load from source inventory.
     planTraderHaul(t, t.homeStationIndex);
 
-    t.ship.setMaxLinearAccelKmS2(0.05);
-    t.ship.setMaxAngularAccelRadS2(0.6);
     spawnNearStation(t.homeStationIndex, 18.0, 30.0, t.ship);
 
     contacts.push_back(std::move(t));
@@ -4693,14 +4774,36 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       p.name = "Security " + std::to_string((int)contacts.size() + 1);
     }
 
-    p.shield = 90.0 * tierMul;
-    p.shieldMax = p.shield;
-    p.shieldRegenPerSec = npcShieldRegenPerSec * tierMul;
-    p.hull = 90.0 * tierMul;
-    p.hullMax = p.hull;
+    const bool leader = (k == 0);
+    const WeaponType w = (tier >= 3 && leader) ? WeaponType::Railgun : WeaponType::PulseLaser;
 
-    p.ship.setMaxLinearAccelKmS2(0.075 * tierMul);
-    p.ship.setMaxAngularAccelRadS2(1.05 * tierMul);
+    // Police ships are balanced to roughly match the legacy stats (90 hull/shield baseline),
+    // but use the unified loadout + distributor model.
+    const int thrMk = 2;
+    const int shieldMk = 1;
+    const int distMk = tier;
+
+    const sim::ShipDerivedStats dsTmp = sim::computeShipDerivedStats(ShipHullClass::Scout, thrMk, shieldMk, distMk);
+    const double targetRegenPerSimMin = (npcShieldRegenPerSec * 60.0) * tierMul;
+    const double regenMul = (dsTmp.shieldRegenPerSimMin > 1e-9)
+                              ? (targetRegenPerSimMin / dsTmp.shieldRegenPerSimMin)
+                              : 0.0;
+
+    configureContactLoadout(p,
+                            ShipHullClass::Scout,
+                            thrMk,
+                            shieldMk,
+                            distMk,
+                            w,
+                            /*hullMul=*/0.90 * tierMul,
+                            /*shieldMul=*/0.90 * tierMul,
+                            /*regenMul=*/regenMul,
+                            /*accelMul=*/0.80 * tierMul,
+                            /*aiSkill=*/leader ? (tier >= 3 ? 0.78 : 0.70) : (0.64 + 0.03 * (double)(tier - 1)));
+
+    // Police bias a bit toward SYS for survival.
+    p.pips = {2, 2, 2};
+    sim::normalizePips(p.pips);
 
     // Wingmen spawn slightly further out to avoid immediate overlaps.
     spawnNearStation(p.homeStationIndex, 16.0 + 1.5 * (double)k, 22.0 + 2.0 * (double)k, p.ship);
@@ -4781,13 +4884,20 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       tgt.role = ContactRole::Pirate;
       tgt.missionTarget = true;
       tgt.name = "Bounty Target";
-      tgt.shield = 80.0;
-      tgt.shieldMax = tgt.shield;
-      tgt.shieldRegenPerSec = npcShieldRegenPerSec * 0.9;
-      tgt.hull = 90.0;
-      tgt.hullMax = tgt.hull;
-      tgt.ship.setMaxLinearAccelKmS2(0.07);
-      tgt.ship.setMaxAngularAccelRadS2(1.0);
+      configureContactLoadout(tgt,
+                              ShipHullClass::Fighter,
+                              /*thrMk=*/2,
+                              /*shieldMk=*/1,
+                              /*distMk=*/2,
+                              /*weapon=*/WeaponType::Railgun,
+                              /*hullMul=*/1.05,
+                              /*shieldMul=*/0.80,
+                              /*regenMul=*/0.72,
+                              /*accelMul=*/0.75,
+                              /*aiSkill=*/0.78);
+      tgt.hostileToPlayer = true;
+      tgt.pips = {1, 3, 2};
+      sim::normalizePips(tgt.pips);
 
       const math::Vec3d d = randDir();
       const double distKm = rng.range(65000.0, 150000.0);
@@ -4820,30 +4930,46 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                          double desiredDistKm,
                          double maxSpeedKmS,
                          double faceGain) {
-    ai.dampers = true;
+	    sim::FlightControlParams fp{};
+	    fp.maxSpeedKmS = maxSpeedKmS;
+	    fp.speedGain = 0.000004;
+	    fp.velGain = 1.8;
+	    fp.desiredDistKm = desiredDistKm;
+	    fp.allowBoost = false;
+	    fp.dampers = true;
 
-    const math::Vec3d to = targetPosKm - selfShip.positionKm();
-    const double dist = to.length();
-    const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
+	    sim::AttitudeControlParams ap{};
+	    ap.faceGain = faceGain;
+	    ap.alignUp = false;
 
-    // Face target
-    const math::Vec3d desiredFwdWorld = toN;
-    const math::Vec3d desiredFwdLocal = selfShip.orientation().conjugate().rotate(desiredFwdWorld);
-    const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
-    const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
-    ai.torqueLocal.x = std::clamp(pitchErr * faceGain, -1.0, 1.0);
-    ai.torqueLocal.y = std::clamp(yawErr * faceGain, -1.0, 1.0);
-    ai.torqueLocal.z = 0.0;
+	    const auto out = sim::chaseTarget(selfShip, targetPosKm, targetVelKmS, fp, ap);
+	    ai = out.input;
+  };
 
-    // Speed control
-    double vAim = 0.0;
-    if (dist > desiredDistKm) vAim = std::min(maxSpeedKmS, 0.000004 * (dist - desiredDistKm));
-    if (dist < desiredDistKm * 0.60) vAim = -0.10;
+  // Variant that lets AI keep chasing a point while aiming elsewhere (e.g. projectile lead).
+  auto chaseTargetFace = [&](sim::Ship& selfShip,
+                             sim::ShipInput& ai,
+                             const math::Vec3d& targetPosKm,
+                             const math::Vec3d& targetVelKmS,
+                             double desiredDistKm,
+                             double maxSpeedKmS,
+                             double faceGain,
+                             const math::Vec3d& desiredForwardWorld,
+                             bool allowBoost) {
+    sim::FlightControlParams fp{};
+    fp.maxSpeedKmS = maxSpeedKmS;
+    fp.speedGain = 0.000004;
+    fp.velGain = 1.8;
+    fp.desiredDistKm = desiredDistKm;
+    fp.allowBoost = allowBoost;
+    fp.dampers = true;
 
-    const math::Vec3d desiredVel = targetVelKmS + toN * vAim;
-    const math::Vec3d dv = desiredVel - selfShip.velocityKmS();
-    const math::Vec3d accelWorldDir = (dv.lengthSq() > 1e-9) ? dv.normalized() : math::Vec3d{0,0,0};
-    ai.thrustLocal = selfShip.orientation().conjugate().rotate(accelWorldDir);
+    sim::AttitudeControlParams ap{};
+    ap.faceGain = faceGain;
+    ap.alignUp = false;
+
+    const auto out = sim::approachTarget(selfShip, targetPosKm, targetVelKmS, fp, ap, desiredForwardWorld);
+    ai = out.input;
   };
 
   // Contacts AI + combat
@@ -4853,8 +4979,26 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     // Keep contact dampers in the same local reference frame as the player.
     c.ship.setDampingFrameVelocityKmS(localFrameVelKmS);
 
+    // Power distributor regen (NPCs share the same capacitor + pip model as the player).
+    sim::stepDistributor(c.distributorState, c.distributorCfg, c.pips, dtSim);
+
     // cooldowns
     c.fireCooldown = std::max(0.0, c.fireCooldown - dtSim);
+
+    // Shields regen (consumes SYS capacitor, scaled by SYS pips).
+    if (c.alive && c.hull > 0.0 && c.shieldMax > 0.0 && c.shieldRegenPerSimMin > 0.0 && c.shield < c.shieldMax) {
+      const double regenMul = sim::pipsSysShieldRegenMultiplier(c.pips.sys);
+      const double desired = c.shieldRegenPerSimMin * regenMul * (dtSim / 60.0);
+      if (desired > 0.0) {
+        const double costPerPt = c.distributorCfg.shieldRegenCostPerPoint;
+        const double affordable = (costPerPt > 0.0) ? (c.distributorState.sys / costPerPt) : desired;
+        const double actual = std::clamp(desired, 0.0, affordable);
+        if (actual > 0.0) {
+          c.shield = std::min(c.shieldMax, c.shield + actual);
+          if (costPerPt > 0.0) c.distributorState.sys = std::max(0.0, c.distributorState.sys - actual * costPerPt);
+        }
+      }
+    }
 
     // ---- PIRATES ----
     if (c.role == ContactRole::Pirate) {
@@ -4904,30 +5048,125 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       const math::Vec3d aimPos = tgtPos + right * s + up * u;
 
       const double standOffKm = 35000.0 + ((c.leaderId != 0) ? 5000.0 : 0.0);
-      chaseTarget(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8);
+      const WeaponDef& w = weaponDef(c.weapon);
+
+      // Aim at lead point for projectiles (so pirates with cannons/railguns actually hit).
+      math::Vec3d aimPointKm = tgtPos;
+      if (!w.beam && w.projSpeedKmS > 1e-6) {
+        const double ttl = w.rangeKm / w.projSpeedKmS;
+        if (auto sol = sim::solveProjectileLead(c.ship.positionKm(), c.ship.velocityKmS(), tgtPos, tgtVel, w.projSpeedKmS, ttl)) {
+          aimPointKm = sol->leadPointKm;
+        }
+      }
+
+      chaseTargetFace(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8, (aimPointKm - c.ship.positionKm()), /*allowBoost*/false);
       c.ship.step(dtSim, ai);
 
-      // Fire if aligned
+      // Fire if aligned and we have weapon capacitor.
       const math::Vec3d to = tgtPos - c.ship.positionKm();
       const double dist = to.length();
-      if (hostile && c.fireCooldown <= 0.0 && dist < 90000.0) {
-        const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
-        const double aim = math::dot(c.ship.forward().normalized(), toN);
-        if (aim > 0.992) {
-          c.fireCooldown = 0.35;
-          const double dmg = 11.0;
-          if (targetContact) {
-            applyDamage(dmg, targetContact->shield, targetContact->hull);
-            if (targetContact->hull <= 0.0) {
-              targetContact->alive = false;
-            }
-          } else {
-            applyDamage(dmg, playerShield, playerHull);
+      if (hostile && c.fireCooldown <= 0.0 && dist < w.rangeKm) {
+        // Recompute aim point (post-step) so the dot test matches current geometry.
+        math::Vec3d fireAimPointKm = tgtPos;
+        if (!w.beam && w.projSpeedKmS > 1e-6) {
+          const double ttl = w.rangeKm / w.projSpeedKmS;
+          if (auto sol = sim::solveProjectileLead(c.ship.positionKm(), c.ship.velocityKmS(), tgtPos, tgtVel, w.projSpeedKmS, ttl)) {
+            fireAimPointKm = sol->leadPointKm;
           }
+        }
 
-          const math::Vec3d aKm = c.ship.positionKm();
-          const math::Vec3d bKm = tgtPos;
-          beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.95f, 0.45f, 0.10f, 0.08});
+        const math::Vec3d toAim = fireAimPointKm - c.ship.positionKm();
+        const double distAim = toAim.length();
+        if (distAim > 1e-6) {
+          const math::Vec3d toAimN = toAim / distAim;
+          const double aim = math::dot(c.ship.forward().normalized(), toAimN);
+
+          // Lower skill => stricter aim requirement (so they don't hit with perfect turret tracking).
+          const double baseThresh = w.beam ? 0.992 : 0.995;
+          const double aimThresh = std::clamp(baseThresh + (1.0 - c.aiSkill) * 0.010, 0.990, 0.999);
+
+          if (aim > aimThresh) {
+            const double capCost = sim::weaponCapacitorCost(w);
+            if (c.distributorState.wep + 1e-9 >= capCost) {
+              std::vector<sim::SphereTarget> beamTargets;
+              if (w.beam) {
+                beamTargets.reserve(1 + contacts.size() + asteroids.size());
+
+                // Player target
+                {
+                  sim::SphereTarget t{};
+                  t.kind = sim::CombatTargetKind::Player;
+                  t.index = 0;
+                  t.id = 0;
+                  t.centerKm = ship.positionKm();
+                  t.radiusKm = 900.0;
+                  t.minAimCos = -1.0;
+                  beamTargets.push_back(t);
+                }
+
+                for (std::size_t i = 0; i < contacts.size(); ++i) {
+                  const auto& oc = contacts[i];
+                  if (!oc.alive) continue;
+                  sim::SphereTarget t{};
+                  t.kind = sim::CombatTargetKind::Ship;
+                  t.index = i;
+                  t.id = oc.id;
+                  t.centerKm = oc.ship.positionKm();
+                  t.radiusKm = 900.0;
+                  t.minAimCos = -1.0;
+                  beamTargets.push_back(t);
+                }
+
+                for (std::size_t i = 0; i < asteroids.size(); ++i) {
+                  const auto& a = asteroids[i];
+                  sim::SphereTarget t{};
+                  t.kind = sim::CombatTargetKind::Asteroid;
+                  t.index = i;
+                  t.id = a.id;
+                  t.centerKm = a.posKm;
+                  t.radiusKm = a.radiusKm;
+                  t.minAimCos = -1.0;
+                  beamTargets.push_back(t);
+                }
+              }
+
+              const sim::FireResult fr = sim::tryFireWeapon(
+                c.ship,
+                c.weapon,
+                c.fireCooldown,
+                c.distributorMk,
+                c.id,
+                /*fromPlayer*/false,
+                beamTargets.empty() ? nullptr : beamTargets.data(),
+                beamTargets.size()
+              );
+
+              if (fr.fired) {
+                c.distributorState.wep = std::max(0.0, c.distributorState.wep - capCost);
+                c.fireCooldown = fr.newCooldownSimSec;
+
+                if (fr.hasBeam) {
+                  beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
+                }
+                if (fr.hasProjectile) {
+                  projectiles.push_back(fr.projectile);
+                }
+
+                if (w.beam && fr.hit) {
+                  if (fr.hitKind == sim::CombatTargetKind::Player) {
+                    applyDamage(w.dmg, playerShield, playerHull);
+                  } else if (fr.hitKind == sim::CombatTargetKind::Ship && fr.hitIndex < contacts.size()) {
+                    auto& v = contacts[fr.hitIndex];
+                    if (v.alive) {
+                      applyDamage(w.dmg, v.shield, v.hull);
+                      v.underFireUntilDays = timeDays + (18.0 / 86400.0);
+                      if (v.hull <= 0.0) v.alive = false;
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
       continue;
@@ -5020,8 +5259,10 @@ auto spawnPolicePack = [&](int maxCount) -> int {
               if (c.tradeUnits > 0.0) {
                 const auto q = econ::quote(stEcon, st.economyModel, c.tradeCommodity, 0.10);
                 c.cargoValueCr = std::max(0.0, c.tradeUnits * q.mid);
+                c.tradeCargoValueCr = c.cargoValueCr;
               } else {
                 c.cargoValueCr = 0.0;
+                c.tradeCargoValueCr = 0.0;
               }
 
               // Cooldown to prevent multiple trades in one arrival.
@@ -5076,14 +5317,34 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        }
 	      }
 
-	      sim::ShipInput ai{};
-	      if (hostile) {
-	        const double standoff = 42000.0 + ((c.leaderId != 0) ? 7000.0 : 0.0) + (double)((c.id % 3) * 1500);
-	        chaseTarget(c.ship, ai, ship.positionKm(), ship.velocityKmS(), standoff, 0.26, 2.0);
+	      // Decide who we're engaging this frame.
+	      const sim::WeaponDef w = sim::weaponDef(c.weapon);
+	      const sim::Ship* engageShip = nullptr;
+	      const Contact* engageContact = nullptr;
+	      const bool chasePlayer = hostile;
+	      const bool shootPlayer = canFireAtPlayer;
+	      if (chasePlayer) {
+	        engageShip = &ship;
 	      } else if (pirateIdx) {
-	        const auto& p = contacts[*pirateIdx];
-	        const double standoff = 42000.0 + ((c.leaderId != 0) ? 6500.0 : 0.0) + (double)((c.id % 3) * 1400);
-	        chaseTarget(c.ship, ai, p.ship.positionKm(), p.ship.velocityKmS(), standoff, 0.26, 2.0);
+	        engageContact = &contacts[*pirateIdx];
+	        engageShip = &engageContact->ship;
+	      }
+
+	      sim::ShipInput ai{};
+	      if (engageShip) {
+	        const math::Vec3d tgtPos = engageShip->positionKm();
+	        const math::Vec3d tgtVel = engageShip->velocityKmS();
+	        const double standoff = 42000.0 + ((c.leaderId != 0) ? 7000.0 : 0.0) + (double)((c.id % 3) * 1500);
+
+	        // Aim at either the current position (beams) or a predicted intercept point (projectiles).
+	        math::Vec3d aimPointKm = tgtPos;
+	        if (!w.beam && w.projSpeedKmS > 1e-6) {
+	          const double ttl = w.rangeKm / w.projSpeedKmS;
+	          if (auto lead = sim::solveProjectileLead(c.ship.positionKm(), c.ship.velocityKmS(), tgtPos, tgtVel, w.projSpeedKmS, ttl)) {
+	            aimPointKm = lead->leadPointKm;
+	          }
+	        }
+	        chaseTargetFace(c.ship, ai, tgtPos, tgtVel, standoff, 0.26, 2.0, aimPointKm - c.ship.positionKm(), false);
 	      } else if (followTarget) {
 	        const double standoff = 36000.0 + ((c.leaderId != 0) ? 5500.0 : 0.0) + (double)((c.id % 3) * 1200);
 	        chaseTarget(c.ship, ai, followTarget->ship.positionKm(), followTarget->ship.velocityKmS(), standoff, 0.22, 1.8);
@@ -5099,35 +5360,104 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
 	      c.ship.step(dtSim, ai);
 
-	      // Fire if aligned (at player OR pirate target).
-	      const math::Vec3d targetPos = canFireAtPlayer ? ship.positionKm()
-	                                                    : (pirateIdx ? contacts[*pirateIdx].ship.positionKm() : math::Vec3d{0,0,0});
-	      const bool hasTarget = canFireAtPlayer || (bool)pirateIdx;
-	      if (hasTarget) {
-	        const math::Vec3d to = targetPos - c.ship.positionKm();
-	        const double dist = to.length();
-	        if (c.fireCooldown <= 0.0 && dist < 95000.0) {
-	          const math::Vec3d toN = (dist > 1e-6) ? (to / dist) : math::Vec3d{0,0,1};
-	          const double aim = math::dot(c.ship.forward().normalized(), toN);
-	          if (aim > 0.993) {
-	            c.fireCooldown = 0.28;
-	            const double dmg = 12.0;
+	      // Fire if aligned at the chosen target.
+	      if (engageShip && (shootPlayer || engageContact)) {
+	        const math::Vec3d tgtPos = engageShip->positionKm();
+	        const math::Vec3d tgtVel = engageShip->velocityKmS();
+	        const double dist = (tgtPos - c.ship.positionKm()).length();
+	        if (c.fireCooldown <= 0.0 && dist < w.rangeKm) {
+	          math::Vec3d aimPointKm = tgtPos;
+	          if (!w.beam && w.projSpeedKmS > 1e-6) {
+	            const double ttl = w.rangeKm / w.projSpeedKmS;
+	            if (auto lead = sim::solveProjectileLead(c.ship.positionKm(), c.ship.velocityKmS(), tgtPos, tgtVel, w.projSpeedKmS, ttl)) {
+	              aimPointKm = lead->leadPointKm;
+	            }
+	          }
 
-	            if (canFireAtPlayer) {
-	              applyDamage(dmg, playerShield, playerHull);
-	              const math::Vec3d aKm = c.ship.positionKm();
-	              const math::Vec3d bKm = ship.positionKm();
-	              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
-	            } else if (pirateIdx) {
-	              auto& p = contacts[*pirateIdx];
-	              applyDamage(dmg, p.shield, p.hull);
-	              const math::Vec3d aKm = c.ship.positionKm();
-	              const math::Vec3d bKm = p.ship.positionKm();
-	              beams.push_back({toRenderU(aKm), toRenderU(bKm), 0.35f, 0.75f, 1.0f, 0.07});
-	              if (p.hull <= 0.0) {
-	                p.alive = false;
-	                credits += 180.0;
-	                toast(toasts, "Security destroyed a pirate (+180).", 2.0);
+	          const math::Vec3d toAim = aimPointKm - c.ship.positionKm();
+	          const double distAim = toAim.length();
+	          const math::Vec3d toAimN = (distAim > 1e-6) ? (toAim / distAim) : math::Vec3d{0,0,1};
+	          const double aim = math::dot(c.ship.forward().normalized(), toAimN);
+	          const double baseThr = w.beam ? 0.993 : 0.995;
+	          const double aimThr = std::clamp(baseThr + (1.0 - c.aiSkill) * 0.010, 0.975, 0.9995);
+
+	          if (aim > aimThr) {
+	            const double capCost = sim::weaponCapacitorCost(w);
+	            if (c.distributorState.wep + 1e-9 >= capCost) {
+	              std::vector<sim::SphereTarget> beamTargets;
+	              if (w.beam) {
+	                beamTargets.reserve(1 + contacts.size() + asteroids.size());
+	                if (shootPlayer) {
+	                  sim::SphereTarget pt{};
+	                  pt.kind = sim::CombatTargetKind::Player;
+	                  pt.index = 0;
+	                  pt.id = 0;
+	                  pt.centerKm = ship.positionKm();
+	                  pt.radiusKm = 900.0;
+	                  pt.minAimCos = -1.0;
+	                  beamTargets.push_back(pt);
+	                }
+	                for (std::size_t i = 0; i < contacts.size(); ++i) {
+	                  const auto& t = contacts[i];
+	                  if (!t.alive) continue;
+	                  sim::SphereTarget st{};
+	                  st.kind = sim::CombatTargetKind::Ship;
+	                  st.index = (int)i;
+	                  st.id = t.id;
+	                  st.centerKm = t.ship.positionKm();
+	                  st.radiusKm = 900.0;
+	                  st.minAimCos = -1.0;
+	                  beamTargets.push_back(st);
+	                }
+	                for (std::size_t i = 0; i < asteroids.size(); ++i) {
+	                  const auto& a = asteroids[i];
+	                  sim::SphereTarget at{};
+	                  at.kind = sim::CombatTargetKind::Asteroid;
+	                  at.index = (int)i;
+	                  at.id = a.id;
+	                  at.centerKm = a.posKm;
+	                  at.radiusKm = a.radiusKm;
+	                  at.minAimCos = -1.0;
+	                  beamTargets.push_back(at);
+	                }
+	              }
+
+	              const sim::FireResult fr = sim::tryFireWeapon(c.ship,
+	                                                          c.weapon,
+	                                                          c.fireCooldown,
+	                                                          c.distributorMk,
+	                                                          c.id,
+	                                                          /*fromPlayer=*/false,
+	                                                          beamTargets.empty() ? nullptr : beamTargets.data(),
+	                                                          (int)beamTargets.size());
+	              if (fr.fired) {
+	                c.distributorState.wep = std::max(0.0, c.distributorState.wep - capCost);
+	                c.fireCooldown = fr.newCooldownSimSec;
+	                if (fr.hasBeam) beams.push_back(fr.beam);
+	                if (fr.hasProjectile) projectiles.push_back(fr.projectile);
+
+	                if (fr.hit && w.beam) {
+	                  if (fr.hitKind == sim::CombatTargetKind::Player) {
+	                    if (shootPlayer) {
+	                      applyDamage(w.dmg, playerShield, playerHull);
+	                    }
+	                  } else if (fr.hitKind == sim::CombatTargetKind::Ship) {
+	                    if (fr.hitIndex >= 0 && (std::size_t)fr.hitIndex < contacts.size()) {
+	                      auto& t = contacts[(std::size_t)fr.hitIndex];
+	                      if (t.alive) {
+	                        applyDamage(w.dmg, t.shield, t.hull);
+	                        t.underFireUntilDays = timeDays + (14.0 / 86400.0);
+	                        if (t.hull <= 0.0) {
+	                          t.alive = false;
+	                          if (t.role == ContactRole::Pirate) {
+	                            credits += 180.0;
+	                            toast(toasts, "Security destroyed a pirate (+180).", 2.0);
+	                          }
+	                        }
+	                      }
+	                    }
+	                  }
+	                }
 	              }
 	            }
 	          }
@@ -5227,14 +5557,17 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       // Resolve any pending bribe/compliance window first (from a completed contraband scan).
       if (bribeOffer.active) {
         auto issueFleeBounty = [&](const std::string& why, bool escalateLocal) {
-          const double repPenalty = -std::clamp(3.0 + bribeOffer.illegalValueCr / 2800.0, 3.0, 12.0);
+          const sim::LawProfile law = lawForFaction(bribeOffer.factionId);
+          const double repPenalty = law.contrabandEvadeRepPenalty(bribeOffer.illegalValueCr);
           addRep(bribeOffer.factionId, repPenalty);
 
           // Running turns the fine into a bounty. (You keep the cargo, but you're now WANTED.)
           addBounty(bribeOffer.factionId, bribeOffer.fineCr);
 
           if (escalateLocal) {
-            policeHeat = std::clamp(policeHeat + 1.2 + std::min(2.0, bribeOffer.fineCr / 2500.0), 0.0, 6.0);
+            // Strict jurisdictions escalate local response slightly faster.
+            const double strictMult = std::clamp(0.90 + 0.20 * law.scanStrictness, 0.80, 1.25);
+            policeHeat = std::clamp(policeHeat + (1.2 + std::min(2.0, bribeOffer.fineCr / 2500.0)) * strictMult, 0.0, 6.0);
             policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (140.0 / 86400.0));
             nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (4.0 / 86400.0));
           }
@@ -5398,12 +5731,15 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                     toast(toasts, policeDemand.sourceName + ": outstanding bounty detected. Submit (I) or face enforcement.", 3.2);
                   }
                 } else {
-                  const double fineCr = 200.0 + illegalValueCr * 0.65;
+                  const sim::LawProfile law = lawForFaction(jurisdiction);
+                  const double fineCr = law.contrabandFineCr(illegalValueCr);
 
                   // Chance that the scanning police contact is corrupt and offers a bribe.
                   bool offerBribe = false;
                   if (cargoScanSourceKind == CargoScanSourceKind::Police) {
                     double chance = 0.33;
+                    // Some factions are simply less corrupt (or better supervised).
+                    chance *= std::clamp(law.corruption, 0.0, 1.0);
 
                     // Less bribable when your heat is already high.
                     chance *= std::clamp(1.10 - (heat / 110.0), 0.25, 1.10);
@@ -5426,7 +5762,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                     bribeOffer.scannerRangeKm = cargoScanRangeKm;
                     bribeOffer.illegalValueCr = illegalValueCr;
                     bribeOffer.fineCr = fineCr;
-                    bribeOffer.amountCr = std::max(200.0, 250.0 + illegalValueCr * 0.55);
+                    bribeOffer.amountCr = law.contrabandBribeCr(illegalValueCr);
                     bribeOffer.amountCr = std::round(bribeOffer.amountCr / 10.0) * 10.0; // nicer UI numbers
                     bribeOffer.startDays = timeDays;
                     bribeOffer.untilDays = timeDays + (14.0 / 86400.0);
@@ -5458,7 +5794,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
           } else if (timeDays >= cargoScanCooldownUntilDays) {
             // Start a scan sometimes when close to a station (or if police are nearby).
             // Contraband makes it more likely.
-            const double baseRatePerSec = contraband ? 0.06 : 0.012;
+            const sim::LawProfile law = lawForFaction(jurisdiction);
+            const double baseRatePerSec = (contraband ? 0.06 : 0.012) * std::clamp(law.scanStrictness, 0.5, 2.0);
 
             // Smuggling compartments reduce scan frequency significantly.
             const double holdMult = (smuggleHoldMk <= 0) ? 1.0
@@ -5989,13 +6326,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                  p.ship.setVelocityKmS({0,0,0});
 	                  p.ship.setOrientation(ship.orientation());
 	                  p.ship.setAngularVelocityRadS({0,0,0});
-	                  p.ship.setMaxLinearAccelKmS2(0.06);
-	                  p.ship.setMaxAngularAccelRadS2(0.9);
-	                  p.hullMax = npcHullMax;
-	                  p.hull = npcHullMax;
-	                  p.shieldMax = npcShieldMax;
-	                  p.shield = npcShieldMax;
-	                  p.shieldRegenPerSec = npcShieldRegenPerSec;
+	                  const WeaponType w = (rng.nextUnit() < 0.55) ? WeaponType::Cannon : WeaponType::BeamLaser;
+	                  configureContactLoadout(p,
+	                                          ShipHullClass::Fighter,
+	                                          1,
+	                                          1,
+	                                          1,
+	                                          w,
+	                                          /*hullMul=*/0.95,
+	                                          /*shieldMul=*/0.67,
+	                                          /*regenMul=*/0.63,
+	                                          /*accelMul=*/0.70,
+	                                          /*aiSkill=*/0.55);
+	                  p.pips = sim::Pips{1, 3, 2};
+	                  sim::normalizePips(p.pips);
 	                  contacts.push_back(p);
 	                }
 	                toast(toasts, "Ambush! Pirate signatures inbound.", 3.0);
@@ -6044,7 +6388,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       {
         double heatIn = 0.0;
         if (!docked) {
-          if (input.boost) heatIn += 18.0;
+          heatIn += 18.0 * boostAppliedFrac;
           if (supercruiseState == SupercruiseState::Active) heatIn += 6.0;
           if (fsdState == FsdState::Charging) heatIn += 12.0;
           if (fsdState == FsdState::Jumping) heatIn += 16.0;
@@ -6180,14 +6524,31 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
             // Slightly tougher leader so the pack doesn't melt instantly.
             const double statMul = (i == 0) ? 1.22 : (0.90 + 0.18 * rng.nextUnit());
-            p.shieldMax *= statMul;
-            p.shield = p.shieldMax;
-            p.hullMax *= statMul;
-            p.hull = p.hullMax;
-            p.shieldRegenPerSec = npcShieldRegenPerSec * ((i == 0) ? 0.80 : 0.65);
-            p.ship.setMaxLinearAccelKmS2((i == 0) ? 0.066 : 0.060);
-            p.ship.setMaxAngularAccelRadS2((i == 0) ? 1.0 : 0.88);
-            p.ship.setMaxLinearAccelBoostKmS2((i == 0) ? 0.12 : 0.10);
+            const bool leader = (i == 0);
+            const int tMk = leader ? 2 : 1;
+            const int dMk = leader ? 2 : 1;
+
+            const double r = rng.nextUnit();
+            WeaponType w = WeaponType::Cannon;
+            if (leader) {
+              w = (r < 0.55) ? WeaponType::Railgun : WeaponType::Cannon;
+            } else {
+              w = (r < 0.55) ? WeaponType::Cannon : WeaponType::BeamLaser;
+            }
+
+            configureContactLoadout(p,
+                                    ShipHullClass::Fighter,
+                                    tMk,
+                                    /*sMk=*/1,
+                                    dMk,
+                                    w,
+                                    /*hullMul=*/0.95 * statMul,
+                                    /*shieldMul=*/0.67 * statMul,
+                                    /*regenMul=*/leader ? 0.70 : 0.63,
+                                    /*accelMul=*/leader ? 0.72 : 0.70,
+                                    /*aiSkill=*/leader ? 0.68 : 0.55);
+            p.pips = leader ? sim::Pips{1, 3, 2} : sim::Pips{1, 3, 2};
+            sim::normalizePips(p.pips);
 
             p.name = (i == 0) ? "Raid Leader" : "Raider";
 
@@ -6388,55 +6749,114 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
 
       // Projectiles update (simple ballistic slugs)
-      for (auto& p : projectiles) {
-        if (p.ttlSim <= 0.0) continue;
+      {
+        // Build a light-weight target list for collision tests.
+        // (We include the player so NPC projectiles can hit later; player shots ignore it.)
+        std::vector<sim::SphereTarget> projTargets;
+        projTargets.reserve(1 + contacts.size() + asteroids.size());
 
-        const math::Vec3d a = p.posKm;
-        const math::Vec3d b = p.posKm + p.velKmS * dtSim;
+        sim::SphereTarget playerT{};
+        playerT.kind = sim::CombatTargetKind::Player;
+        playerT.index = 0;
+        playerT.id = 0;
+        playerT.centerKm = ship.positionKm();
+        playerT.radiusKm = 900.0;
+        projTargets.push_back(playerT);
 
-        p.prevKm = a;
-        p.posKm = b;
-        p.ttlSim -= dtSim;
+        for (std::size_t i = 0; i < contacts.size(); ++i) {
+          const auto& c = contacts[i];
+          if (!c.alive) continue;
+          sim::SphereTarget t{};
+          t.kind = sim::CombatTargetKind::Ship;
+          t.index = i;
+          t.id = c.id;
+          t.centerKm = c.ship.positionKm();
+          t.radiusKm = 900.0;
+          projTargets.push_back(t);
+        }
 
-        // Collisions
-        if (p.fromPlayer) {
-          for (int i = 0; i < (int)contacts.size(); ++i) {
-            const auto& c = contacts[(std::size_t)i];
-            if (!c.alive) continue;
-            if (p.shooterId != 0 && c.id == p.shooterId) continue;
+        for (std::size_t i = 0; i < asteroids.size(); ++i) {
+          const auto& a = asteroids[i];
+          sim::SphereTarget t{};
+          t.kind = sim::CombatTargetKind::Asteroid;
+          t.index = i;
+          t.id = a.id;
+          t.centerKm = a.posKm;
+          t.radiusKm = a.radiusKm;
+          projTargets.push_back(t);
+        }
 
-            const double hitRadiusKm = 900.0 + p.radiusKm;
-            if (segmentHitsSphere(a, b, c.ship.positionKm(), hitRadiusKm)) {
-              playerDamageContact(i, p.dmg);
-              p.ttlSim = 0.0;
-              break;
-            }
-          }
-        } else {
-          if (!docked) {
-            const double playerHitRadiusKm = 900.0 + p.radiusKm;
-            if (segmentHitsSphere(a, b, ship.positionKm(), playerHitRadiusKm)) {
-              applyDamage(p.dmg, playerShield, playerHull);
+        std::vector<sim::ProjectileHit> hits;
+        sim::stepProjectiles(
+          projectiles,
+          dtSim,
+          projTargets.empty() ? nullptr : projTargets.data(),
+          projTargets.size(),
+          hits
+        );
 
+        for (const auto& h : hits) {
+          if (h.fromPlayer) {
+            if (h.kind == sim::CombatTargetKind::Ship) {
+              if (h.targetIndex < contacts.size()) {
+                playerDamageContact((int)h.targetIndex, h.dmg);
+              }
+            } else if (h.kind == sim::CombatTargetKind::Asteroid) {
+              // Projectiles don't mine, but they do spark (small feedback loop).
               if (vfxParticlesEnabled && vfxImpactsEnabled) {
-                // Approximate impact normal by projectile travel direction.
-                math::Vec3d n = -p.velKmS;
+                math::Vec3d n = h.pointKm - ship.positionKm();
                 if (n.lengthSq() < 1e-12) n = ship.forward();
                 n = n.normalized();
+                const double energy = std::clamp((h.dmg / 18.0) * (double)vfxParticleIntensity, 0.10, 1.6);
+                particles.spawnSparks(toRenderU(h.pointKm), n, toRenderU(ship.velocityKmS()), energy);
+              }
+            }
+          } else {
+            // NPC projectiles (not used heavily yet, but supported by the core module).
+            if (!docked && h.kind == sim::CombatTargetKind::Player) {
+              applyDamage(h.dmg, playerShield, playerHull);
 
-                const double energy = std::clamp((p.dmg / 16.0) * (double)vfxParticleIntensity, 0.12, 2.2);
+              if (vfxParticlesEnabled && vfxImpactsEnabled) {
+                // Approximate impact normal as projectile->player direction.
+                math::Vec3d n = ship.positionKm() - h.pointKm;
+                if (n.lengthSq() < 1e-12) n = ship.forward();
+                n = n.normalized();
+                const double energy = std::clamp((h.dmg / 16.0) * (double)vfxParticleIntensity, 0.12, 2.2);
                 particles.spawnSparks(toRenderU(ship.positionKm()), n, toRenderU(ship.velocityKmS()), energy);
               }
+            } else if (h.kind == sim::CombatTargetKind::Ship) {
+              if (h.targetIndex < contacts.size()) {
+                Contact& victim = contacts[h.targetIndex];
+                if (victim.alive && victim.hull > 0.0) {
+                  applyDamage(h.dmg, victim.shield, victim.hull);
+                  victim.underFireUntilDays = timeDays + (14.0 / 86400.0);
 
-              p.ttlSim = 0.0;
+                  if (victim.hull <= 0.0) {
+                    victim.alive = false;
+
+                    // Small reward if police clean up pirates (keeps the world feeling alive).
+                    Contact* shooter = nullptr;
+                    for (auto& s : contacts) {
+                      if (s.id == h.shooterId) {
+                        shooter = &s;
+                        break;
+                      }
+                    }
+                    if (shooter && shooter->role == ContactRole::Police && victim.role == ContactRole::Pirate) {
+                      credits += 180.0;
+                      toast(toasts, "Police destroyed a pirate. +180 cr", 2.2);
+                    }
+                  }
+                }
+              }
             }
           }
         }
-      }
 
-      projectiles.erase(
-        std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.ttlSim <= 0.0; }),
-        projectiles.end());
+        projectiles.erase(
+          std::remove_if(projectiles.begin(), projectiles.end(), [](const sim::Projectile& p) { return p.ttlSimSec <= 0.0; }),
+          projectiles.end());
+      }
 
 
       weaponPrimaryCooldown = std::max(0.0, weaponPrimaryCooldown - dtSim);
@@ -6444,18 +6864,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // Shield regen (slow)
       if (!paused && playerHull > 0.0 && playerShield < playerShieldMax) {
-        playerShield = std::min(playerShieldMax, playerShield + playerShieldRegenPerSimMin * (dtSim / 60.0));
+        const double regenMul = sim::shieldRegenMultiplierFromPips(distributorPips.sys);
+        const double desiredRegen = playerShieldRegenPerSimMin * regenMul * (dtSim / 60.0);
+
+        const double costPerPt = std::max(0.0, distributorCfg.shieldRegenCostPerPoint);
+        const double affordableRegen = (costPerPt > 1e-12) ? (distributorState.sys / costPerPt) : desiredRegen;
+        const double actualRegen = std::max(0.0, std::min(desiredRegen, affordableRegen));
+
+        if (costPerPt > 1e-12) {
+          distributorState.sys = std::max(0.0, distributorState.sys - actualRegen * costPerPt);
+        }
+        playerShield = std::min(playerShieldMax, playerShield + actualRegen);
       }
 
-      // NPC shield regen (simple; gives fights a bit of pacing without heavy AI)
-      for (auto& c : contacts) {
-        if (!c.alive) continue;
-        if (c.hull <= 0.0) continue;
-        if (c.shieldRegenPerSec <= 0.0) continue;
-        if (c.shieldMax <= 0.0) continue;
-        if (c.shield >= c.shieldMax) continue;
-        c.shield = std::min(c.shieldMax, c.shield + c.shieldRegenPerSec * dtSim);
-      }
     }
 
     // Death / respawn
@@ -7947,6 +8368,35 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           const ImU32 fg = IM_COL32(r, g, b, (int)(190.0f * retA));
           drawArc(baseR + 10.0f, start, start + full * heatFrac, fg, 2.0f);
         }
+
+        // Capacitor rings (ENG/WEP/SYS)
+        if (hudShowDistributorRings) {
+          auto capFrac = [](double v, double cap) {
+            return (float)std::clamp((cap > 1e-9) ? (v / cap) : 1.0, 0.0, 1.0);
+          };
+
+          const float engFrac = capFrac(distributorState.eng, distributorCfg.capEng);
+          const float wepFrac = capFrac(distributorState.wep, distributorCfg.capWep);
+          const float sysFrac = capFrac(distributorState.sys, distributorCfg.capSys);
+
+          const float ringR = baseR + 15.0f;
+          const float seg = full / 3.0f;
+          const float th = 2.0f;
+
+          const ImU32 bg = IM_COL32(35, 35, 45, (int)(85.0f * retA));
+
+          auto drawSeg = [&](int idx, float frac, ImU32 fg) {
+            const float a0 = start + seg * (float)idx;
+            const float a1 = a0 + seg;
+            drawArc(ringR, a0, a1, bg, th);
+            drawArc(ringR, a0, a0 + seg * frac, fg, th);
+          };
+
+          drawSeg(0, engFrac, IM_COL32(80, 200, 255, (int)(190.0f * retA))); // ENG
+          drawSeg(1, wepFrac, IM_COL32(255, 170, 80, (int)(190.0f * retA))); // WEP
+          drawSeg(2, sysFrac, IM_COL32(110, 255, 150, (int)(190.0f * retA))); // SYS
+        }
+
       } else {
         // Minimal crosshair if the combat HUD is disabled.
         draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
@@ -8081,35 +8531,14 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               const WeaponDef& wLead = weaponDef(wLeadType);
               const double s = wLead.projSpeedKmS;
 
-              // Solve |r + v t| = s t for t>0 (classic lead/intercept quadratic).
-              const math::Vec3d r = (*tgtKm - ship.positionKm());
-              const math::Vec3d v = (*tgtVelKmS - ship.velocityKmS());
-              const double a = v.lengthSq() - s * s;
-              const double b = 2.0 * math::dot(r, v);
-              const double c = r.lengthSq();
-
-              double t = -1.0;
-              const double eps = 1e-9;
-              if (std::abs(a) < eps) {
-                if (std::abs(b) > eps) {
-                  t = -c / b;
-                }
-              } else {
-                const double disc = b * b - 4.0 * a * c;
-                if (disc >= 0.0) {
-                  const double sd = std::sqrt(disc);
-                  const double t1 = (-b - sd) / (2.0 * a);
-                  const double t2 = (-b + sd) / (2.0 * a);
-                  const double tMin = std::min(t1, t2);
-                  const double tMax = std::max(t1, t2);
-                  if (tMin > 1.0e-5) t = tMin;
-                  else if (tMax > 1.0e-5) t = tMax;
-                }
-              }
-
               const double ttl = wLead.rangeKm / std::max(1e-9, s);
-              if (t > 0.0 && t <= ttl && t <= hudLeadMaxTimeSec) {
-                const math::Vec3d leadKm = *tgtKm + (*tgtVelKmS) * t;
+              const double maxT = std::min(ttl, hudLeadMaxTimeSec);
+
+              if (auto sol = sim::solveProjectileLead(ship.positionKm(), ship.velocityKmS(),
+                                                      *tgtKm, *tgtVelKmS,
+                                                      s, maxT)) {
+                const double t = sol->tSec;
+                const math::Vec3d leadKm = sol->leadPointKm;
                 ImVec2 leadPx{};
                 if (projectToScreen(toRenderU(leadKm), view, proj, w, h, leadPx)) {
                   const auto uv = hudAtlas.get(render::SpriteKind::HudLead,
@@ -9410,6 +9839,35 @@ if (showShip) {
 
   ImGui::Text("Credits: %.0f | Exploration data: %.0f cr", credits, explorationDataCr);
   ImGui::Text("Fuel: %.1f | Ship heat: %.0f", fuel, heat);
+
+  // Power distributor
+  {
+    ImGui::Separator();
+    ImGui::Text("Power distributor");
+
+    auto capFrac = [](double v, double cap) {
+      return (cap > 1e-9) ? std::clamp(v / cap, 0.0, 1.0) : 1.0;
+    };
+
+    const double engFrac = capFrac(distributorState.eng, distributorCfg.capEng);
+    const double wepFrac = capFrac(distributorState.wep, distributorCfg.capWep);
+    const double sysFrac = capFrac(distributorState.sys, distributorCfg.capSys);
+    ImGui::Text("Capacitors: ENG %.0f%% | WEP %.0f%% | SYS %.0f%%", engFrac * 100.0, wepFrac * 100.0, sysFrac * 100.0);
+
+    bool pipsChanged = false;
+    pipsChanged |= ImGui::SliderInt("ENG pips", &distributorPips.eng, 0, sim::kPipMax);
+    pipsChanged |= ImGui::SliderInt("WEP pips", &distributorPips.wep, 0, sim::kPipMax);
+    pipsChanged |= ImGui::SliderInt("SYS pips", &distributorPips.sys, 0, sim::kPipMax);
+    if (pipsChanged) {
+      sim::normalizePips(distributorPips);
+    }
+
+    ImGui::TextDisabled("Pips total: %d (target %d)", distributorPips.eng + distributorPips.wep + distributorPips.sys, sim::kPipTotal);
+    if (ImGui::SmallButton("Reset pips")) {
+      distributorPips = sim::Pips{2, 2, 2};
+    }
+  }
+
   ImGui::Text("Cargo: %.0f / %.0f kg", cargoMassKg(cargo), cargoCapacityKg);
   ImGui::Text("Passengers: %d seats", std::max(0, passengerSeats));
 	  ImGui::Text(

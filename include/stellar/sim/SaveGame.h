@@ -126,7 +126,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{16};
+  int version{17};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -155,6 +155,14 @@ struct SaveGame {
   double hull{1.0}; // 0..1
   double shield{1.0}; // 0..1
   double heat{0.0}; // gameplay heat (0..~120)
+  // Power distributor state
+  int pipsEng{2};
+  int pipsWep{2};
+  int pipsSys{2};
+  double capEngFrac{1.0};
+  double capWepFrac{1.0};
+  double capSysFrac{1.0};
+
   double cargoCapacityKg{420.0};
 
   // Passenger capacity (seats) for cabin-style missions.
