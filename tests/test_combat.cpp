@@ -104,6 +104,53 @@ int test_combat() {
     }
   }
 
+  // --- Missile step + detonation + splash hit ---
+  {
+    std::vector<sim::Missile> ms;
+    sim::Missile m{};
+    m.posKm = {0, 0, 0};
+    m.prevKm = m.posKm;
+    m.velKmS = {0, 0, 10};
+    m.ttlSimSec = 2.0;
+    m.radiusKm = 0.1;
+    m.blastRadiusKm = 2.0;
+    m.dmg = 5.0;
+    m.fromPlayer = true;
+    m.shooterId = 0;
+    m.hasTarget = true;
+    m.targetKind = sim::CombatTargetKind::Ship;
+    m.targetId = 999;
+    ms.push_back(m);
+
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 7;
+    tgt.id = 999;
+    tgt.centerKm = {0, 0, 5};
+    tgt.velKmS = {0, 0, 0};
+    tgt.radiusKm = 0.5;
+
+    std::vector<sim::MissileDetonation> dets;
+    std::vector<sim::MissileHit> hits;
+    sim::stepMissiles(ms, 1.0, &tgt, 1, dets, hits);
+
+    if (dets.size() != 1) {
+      std::cerr << "[test_combat] stepMissiles should emit one detonation. got=" << dets.size() << "\n";
+      ++fails;
+    }
+    if (hits.size() != 1 || hits[0].targetId != 999 || !approx(hits[0].dmg, 5.0)) {
+      std::cerr << "[test_combat] stepMissiles should splash-hit the target. hits=" << hits.size()
+                << " id=" << (hits.empty() ? 0 : hits[0].targetId)
+                << " dmg=" << (hits.empty() ? 0.0 : hits[0].dmg) << "\n";
+      ++fails;
+    }
+    if (ms.empty() || ms[0].ttlSimSec > 0.0) {
+      std::cerr << "[test_combat] missile should be consumed on detonation. ttl="
+                << (ms.empty() ? -1.0 : ms[0].ttlSimSec) << "\n";
+      ++fails;
+    }
+  }
+
   if (fails == 0) {
     std::cout << "[test_combat] PASS\n";
   }

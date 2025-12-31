@@ -5,10 +5,14 @@
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/proc/GalaxyGenerator.h"
 #include "stellar/sim/MissionLogic.h"
+#include "stellar/sim/Contraband.h"
+#include "stellar/sim/Law.h"
+#include "stellar/sim/PoliceScan.h"
 #include "stellar/sim/Industry.h"
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/Reputation.h"
 #include "stellar/sim/TradeScanner.h"
+#include "stellar/sim/IndustryScanner.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Signature.h"
@@ -135,10 +139,15 @@ static void printHelp() {
             << "\n"
             << "Trade scanning (headless route planner):\n"
             << "  --trade                Print best trade opportunities from a chosen station\n"
+            << "  --tradeMix             Print best multi-commodity cargo manifests (trade mix)\n"
             << "  --fromSys <idx>        Origin system index in the printed list (default: 0)\n"
             << "  --fromStation <idx>    Origin station index inside that system (default: 0)\n"
             << "  --cargoKg <kg>         Cargo capacity (kg) used for trip profit (default: 420)\n"
             << "  --tradeLimit <n>       Max trade opportunities to print (default: 12)\n"
+            << "  --mixStepKg <kg>       Planner resolution in kg (default: 1.0)\n"
+            << "  --mixNoImpact          Disable price-impact simulation (static quotes)\n"
+            << "  --mixMaxSpend <cr>     Optional max buy budget (default: 0 = unlimited)\n"
+            << "  --mixLines <n>         Max manifest lines to print per destination (default: 6)\n"
             << "  --commodity <c>        Optional filter (code or name), e.g. FOOD | H2O | water\n"
             << "  --minProfit <cr>       Min net trip profit filter (default: 0)\n"
             << "\n"
@@ -159,12 +168,21 @@ static void printHelp() {
             << "  --advanceDays <d>      Advance time by d days before auto-complete (default: 0)\n"
             << "  --autoComplete         After accepting, attempt to complete at destination\n"
             << "\n"
+            << "Law / contraband (headless):\n"
+            << "  --law                 Print law + contraband profile for the chosen station\n"
+            << "  --faction <id>         Override faction id (default: station faction)\n"
+            << "  --lawRep <r>           Player reputation used for bribe chance (default: 0)\n"
+            << "  --heat <h>             Player heat used for bribe chance (default: 0)\n"
+            << "  --illegalValue <cr>    Illegal cargo value used for fine/bribe examples (default: 5000)\n"
+            << "  --smuggleHoldMk <mk>   Smuggle hold grade (0-3) for scan math (default: 0)\n"
+            << "\n"
             << "Save/load (tooling):\n"
             << "  --load <path>          Load a save file before running missions\n"
             << "  --save <path>          Save the resulting state to a save file\n"
             << "\n"
             << "Industry (station processing):\n"
             << "  --industry             Print available industry recipes for the chosen station\n"
+            << "  --industryTrade        Scan profitable process+haul routes (buy inputs @ origin, sell output elsewhere)\n"
             << "  --batches <n>           Batches to quote (default: 1)\n"
             << "\n"
             << "Warehouse (station storage):\n"
@@ -222,7 +240,9 @@ int main(int argc, char** argv) {
   const bool emitSysSig = args.hasFlag("sysSig");
 
   const bool doTrade = args.hasFlag("trade");
+  const bool doTradeMix = args.hasFlag("tradeMix");
   const bool doIndustry = args.hasFlag("industry");
+  const bool doIndustryTrade = args.hasFlag("industryTrade");
   const bool doWarehouse = args.hasFlag("warehouse");
   std::size_t fromSysIdx = 0;
   std::size_t fromStationIdx = 0;
@@ -238,6 +258,25 @@ int main(int argc, char** argv) {
     unsigned long long v = 0;
     if (args.getU64("tradeLimit", v)) tradeLimit = (std::size_t)v;
   }
+
+
+  // Trade-mix planner settings.
+  double mixStepKg = 1.0;
+  (void)args.getDouble("mixStepKg", mixStepKg);
+  if (!std::isfinite(mixStepKg)) mixStepKg = 1.0;
+  mixStepKg = std::max(0.05, mixStepKg);
+
+  const bool mixNoImpact = args.hasFlag("mixNoImpact");
+
+  double mixMaxSpend = 0.0;
+  (void)args.getDouble("mixMaxSpend", mixMaxSpend);
+  if (!std::isfinite(mixMaxSpend)) mixMaxSpend = 0.0;
+  mixMaxSpend = std::max(0.0, mixMaxSpend);
+
+  int mixLines = 6;
+  (void)args.getInt("mixLines", mixLines);
+  mixLines = std::max(0, mixLines);
+
 
   // Optional trade-scan filters.
   std::string commodityFilter;
@@ -288,6 +327,24 @@ int main(int argc, char** argv) {
   (void)args.getInt("seats", seats);
   int acceptOffer = -1;
   (void)args.getInt("acceptOffer", acceptOffer);
+
+  const bool doLaw = args.hasFlag("law");
+  core::u32 lawFactionOverride = 0;
+  {
+    unsigned long long v = 0;
+    if (args.getU64("faction", v)) lawFactionOverride = (core::u32)v;
+  }
+  double lawRep = 0.0;
+  (void)args.getDouble("lawRep", lawRep);
+  double lawHeat = 0.0;
+  (void)args.getDouble("heat", lawHeat);
+  double lawIllegalValueCr = 5000.0;
+  (void)args.getDouble("illegalValue", lawIllegalValueCr);
+  if (!std::isfinite(lawIllegalValueCr)) lawIllegalValueCr = 0.0;
+  lawIllegalValueCr = std::max(0.0, lawIllegalValueCr);
+  int smuggleHoldMk = 0;
+  (void)args.getInt("smuggleHoldMk", smuggleHoldMk);
+  smuggleHoldMk = std::clamp(smuggleHoldMk, 0, 3);
 
   double industryBatches = 1.0;
   (void)args.getDouble("batches", industryBatches);
@@ -416,6 +473,109 @@ int main(int argc, char** argv) {
     std::cout << "Stations:\n";
     for (const auto& st : sys.stations) {
       std::cout << "  - " << st.name << " (fee=" << st.feeRate << ")\n";
+    }
+  }
+
+
+  if (doLaw && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[law] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& st = fromSys.stations[fromStationIdx];
+
+    const core::u32 factionId = (lawFactionOverride != 0) ? lawFactionOverride : st.factionId;
+    const sim::LawProfile law = sim::lawProfile(seed, factionId);
+    const std::string illegalList = sim::illegalCommodityListString(seed, factionId);
+
+    const double fineCr = law.contrabandFineCr(lawIllegalValueCr);
+    const double bribeChance = sim::bribeOfferChance(law, lawRep, lawHeat, lawIllegalValueCr);
+    const double bribeCr = sim::bribeAmountCrRounded(law, lawIllegalValueCr, 10.0);
+
+    const double rateClean = sim::cargoScanStartRatePerSec(false, law, smuggleHoldMk);
+    const double rateContraband = sim::cargoScanStartRatePerSec(true, law, smuggleHoldMk);
+
+    const double durStationClean = sim::cargoScanDurationSecStation(false, smuggleHoldMk);
+    const double durStationContraband = sim::cargoScanDurationSecStation(true, smuggleHoldMk);
+    const double durPolice = sim::cargoScanDurationSecPolice(smuggleHoldMk);
+
+    if (json) {
+      j.key("law");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("stationId"); j.value((unsigned long long)st.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationName"); j.value(st.name);
+      j.key("factionId"); j.value((unsigned long long)factionId);
+      j.key("illegal"); j.value(illegalList);
+
+      j.key("profile");
+      j.beginObject();
+      j.key("scanStrictness"); j.value(law.scanStrictness);
+      j.key("corruption"); j.value(law.corruption);
+      j.key("fineBaseCr"); j.value(law.fineBaseCr);
+      j.key("fineRate"); j.value(law.fineRate);
+      j.key("repBase"); j.value(law.repBase);
+      j.key("repDiv"); j.value(law.repDiv);
+      j.key("repMin"); j.value(law.repMin);
+      j.key("repMax"); j.value(law.repMax);
+      j.key("evadeRepMult"); j.value(law.evadeRepMult);
+      j.endObject();
+
+      j.key("smuggleHoldMk"); j.value((int)smuggleHoldMk);
+      j.key("scan");
+      j.beginObject();
+      j.key("ratePerSecClean"); j.value(rateClean);
+      j.key("ratePerSecContraband"); j.value(rateContraband);
+      j.key("durationStationSecClean"); j.value(durStationClean);
+      j.key("durationStationSecContraband"); j.value(durStationContraband);
+      j.key("durationPoliceSec"); j.value(durPolice);
+      j.endObject();
+
+      j.key("example");
+      j.beginObject();
+      j.key("illegalValueCr"); j.value(lawIllegalValueCr);
+      j.key("fineCr"); j.value(fineCr);
+      j.key("bribeChance"); j.value(bribeChance);
+      j.key("bribeCr"); j.value(bribeCr);
+      j.key("rep"); j.value(lawRep);
+      j.key("heat"); j.value(lawHeat);
+      j.endObject();
+
+      j.endObject();
+    } else {
+      std::cout << "\n--- Law / contraband profile @ " << fromStub.name << " / " << st.name << " ---\n";
+      std::cout << "FactionId=" << factionId << "\n";
+      std::cout << "Illegal: " << illegalList << "\n";
+      std::cout << "Profile: scanStrictness=" << std::fixed << std::setprecision(2) << law.scanStrictness
+                << " corruption=" << std::fixed << std::setprecision(2) << law.corruption
+                << " fineBase=" << std::fixed << std::setprecision(0) << law.fineBaseCr
+                << " fineRate=" << std::fixed << std::setprecision(2) << law.fineRate
+                << " repBase=" << law.repBase
+                << " repDiv=" << law.repDiv
+                << " repMin=" << law.repMin
+                << " repMax=" << law.repMax
+                << " evadeMult=" << law.evadeRepMult
+                << "\n";
+      std::cout << "Scan: holdMk=" << smuggleHoldMk
+                << " rateClean=" << std::fixed << std::setprecision(5) << rateClean << "/s"
+                << " rateContraband=" << std::fixed << std::setprecision(5) << rateContraband << "/s"
+                << " durStationClean=" << std::fixed << std::setprecision(2) << durStationClean << "s"
+                << " durStationContraband=" << std::fixed << std::setprecision(2) << durStationContraband << "s"
+                << " durPolice=" << std::fixed << std::setprecision(2) << durPolice << "s"
+                << "\n";
+      std::cout << "Example: illegalValue=" << std::fixed << std::setprecision(1) << lawIllegalValueCr
+                << " fine=" << std::fixed << std::setprecision(1) << fineCr
+                << " bribeChance=" << std::fixed << std::setprecision(3) << bribeChance
+                << " bribe=" << std::fixed << std::setprecision(1) << bribeCr
+                << " (rep=" << lawRep << " heat=" << lawHeat << ")\n";
     }
   }
 
@@ -576,6 +736,115 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (doIndustryTrade && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[industryTrade] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& fromSt = fromSys.stations[fromStationIdx];
+
+    const auto feeEff = [&](const sim::Station& st) {
+      // Tooling mode: use a single rep value across all factions.
+      return sim::applyReputationToFeeRate(st.feeRate, rep);
+    };
+
+    sim::IndustryTradeScanParams scan;
+    scan.maxResults = tradeLimit;
+    scan.perStationLimit = 1;
+    scan.cargoCapacityKg = cargoCapacityKg;
+    scan.cargoUsedKg = 0.0;
+    scan.useFreeHold = true;
+    scan.bidAskSpread = 0.10;
+    scan.processingRep = rep;
+    scan.minNetProfit = minProfit;
+    scan.includeSameSystem = true;
+
+    const auto ideas = sim::scanIndustryTradeOpportunities(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+
+    if (json) {
+      j.key("industryTrade");
+      j.beginObject();
+      j.key("fromSystemId"); j.value((unsigned long long)fromStub.id);
+      j.key("fromStationId"); j.value((unsigned long long)fromSt.id);
+      j.key("fromSystemName"); j.value(fromStub.name);
+      j.key("fromStationName"); j.value(fromSt.name);
+      j.key("fromStationType"); j.value(stationTypeName(fromSt.type));
+      j.key("cargoKg"); j.value(cargoCapacityKg);
+      j.key("rep"); j.value(rep);
+      j.key("minProfit"); j.value(minProfit);
+
+      j.key("opportunities");
+      j.beginArray();
+      for (const auto& t : ideas) {
+        const auto* def = sim::findIndustryRecipe(t.recipe);
+        j.beginObject();
+        j.key("toSystemId"); j.value((unsigned long long)t.toSystem);
+        j.key("toStationId"); j.value((unsigned long long)t.toStation);
+        j.key("toSystemName"); j.value(t.toSystemName);
+        j.key("toStationName"); j.value(t.toStationName);
+        j.key("distanceLy"); j.value(t.distanceLy);
+        j.key("recipe"); j.value(def ? def->code : "RECIPE");
+        j.key("batches"); j.value(t.batches);
+        j.key("inputA"); j.value(econ::commodityCode(t.inputA));
+        j.key("inputAUnits"); j.value(t.inputAUnits);
+        if (t.inputBUnits > 0.0) {
+          j.key("inputB"); j.value(econ::commodityCode(t.inputB));
+          j.key("inputBUnits"); j.value(t.inputBUnits);
+        }
+        j.key("output"); j.value(econ::commodityCode(t.output));
+        j.key("outputUnits"); j.value(t.outputUnits);
+        j.key("serviceFeeCr"); j.value(t.serviceFeeCr);
+        j.key("timeDays"); j.value(t.timeDays);
+        j.key("inputCostCr"); j.value(t.inputACostCr + t.inputBCostCr);
+        j.key("outputRevenueCr"); j.value(t.outputRevenueCr);
+        j.key("netProfitCr"); j.value(t.netProfitCr);
+        j.key("netProfitPerKg"); j.value(t.netProfitPerKg);
+        j.key("netProfitPerDay"); j.value(t.netProfitPerDay);
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Industry Trade @ " << fromStub.name << " / " << fromSt.name
+                << " (" << stationTypeName(fromSt.type) << ") ---\n";
+      std::cout << "Assumes buying recipe inputs at the origin station, then selling the output elsewhere.\n";
+      if (ideas.empty()) {
+        std::cout << "No profitable industrial routes found in the current query set.\n";
+      } else {
+        for (const auto& t : ideas) {
+          const auto* def = sim::findIndustryRecipe(t.recipe);
+          const char* code = def ? def->code : "RECIPE";
+
+          std::cout << "[" << code << "] "
+                    << "batches=" << std::fixed << std::setprecision(0) << t.batches
+                    << "  out=" << econ::commodityCode(t.output) << " " << std::fixed << std::setprecision(1) << t.outputUnits
+                    << "  profit=" << std::fixed << std::setprecision(0) << t.netProfitCr << " cr"
+                    << " (" << std::fixed << std::setprecision(1) << t.netProfitPerKg << " cr/kg"
+                    << ", " << std::fixed << std::setprecision(0) << t.netProfitPerDay << " cr/day)"
+                    << "  -> " << t.toSystemName << " / " << t.toStationName
+                    << "  dist=" << std::fixed << std::setprecision(1) << t.distanceLy << " ly\n";
+
+          std::cout << "  in:  " << econ::commodityCode(t.inputA) << " " << std::fixed << std::setprecision(1) << t.inputAUnits
+                    << " (ask=" << std::fixed << std::setprecision(1) << t.inputAAsk << ")";
+          if (t.inputBUnits > 0.0) {
+            std::cout << " + " << econ::commodityCode(t.inputB) << " " << std::fixed << std::setprecision(1) << t.inputBUnits
+                      << " (ask=" << std::fixed << std::setprecision(1) << t.inputBAsk << ")";
+          }
+          std::cout << "\n";
+          std::cout << "  fee: service=" << std::fixed << std::setprecision(0) << t.serviceFeeCr
+                    << " cr  time=" << std::fixed << std::setprecision(1) << (t.timeDays * 24.0) << " h\n";
+        }
+      }
+    }
+  }
+
   if (doTrade && !systems.empty()) {
     // Clamp indices so the tool remains easy to use from scripts.
     fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
@@ -682,6 +951,136 @@ int main(int argc, char** argv) {
       }
     }
   }
+
+
+  if (doTradeMix && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[tradeMix] origin system has no stations\n";
+      return 1;
+    }
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& fromSt = fromSys.stations[fromStationIdx];
+
+    const auto feeEff = [&](const sim::Station& st) {
+      return sim::applyReputationToFeeRate(st.feeRate, rep);
+    };
+
+    sim::TradeManifestScanParams scan;
+    scan.maxResults = tradeLimit;
+    scan.cargoCapacityKg = cargoCapacityKg;
+    scan.cargoUsedKg = 0.0;
+    scan.useFreeHold = true;
+    scan.bidAskSpread = 0.10;
+    scan.stepKg = mixStepKg;
+    scan.maxBuyCreditsCr = mixMaxSpend;
+    scan.simulatePriceImpact = !mixNoImpact;
+    scan.minNetProfit = minProfit;
+    scan.includeSameSystem = true;
+
+    const auto ideas = sim::scanTradeManifests(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+
+    if (json) {
+      j.key("tradeMix");
+      j.beginObject();
+      j.key("day"); j.value(timeDays);
+      j.key("cargoKg"); j.value(cargoCapacityKg);
+      j.key("stepKg"); j.value(mixStepKg);
+      j.key("simulatePriceImpact"); j.value(!mixNoImpact);
+      j.key("maxBuyCreditsCr"); j.value(mixMaxSpend);
+      j.key("minProfit"); j.value(minProfit);
+
+      j.key("from");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationId"); j.value((unsigned long long)fromSt.id);
+      j.key("stationName"); j.value(fromSt.name);
+      j.key("feeRate"); j.value(fromSt.feeRate);
+      j.key("feeRateEff"); j.value(feeEff(fromSt));
+      j.endObject();
+
+      j.key("ideas");
+      j.beginArray();
+      for (const auto& it : ideas) {
+        j.beginObject();
+        j.key("toSystemId"); j.value((unsigned long long)it.toSystem);
+        j.key("toStationId"); j.value((unsigned long long)it.toStation);
+        j.key("toSystemName"); j.value(it.toSystemName);
+        j.key("toStationName"); j.value(it.toStationName);
+        j.key("distLy"); j.value(it.distanceLy);
+
+        j.key("cargoFilledKg"); j.value(it.cargoFilledKg);
+        j.key("netBuyCr"); j.value(it.netBuyCr);
+        j.key("netSellCr"); j.value(it.netSellCr);
+        j.key("netTripProfit"); j.value(it.netProfitCr);
+
+        j.key("lines");
+        j.beginArray();
+        for (const auto& ln : it.lines) {
+          j.beginObject();
+          j.key("commodity"); j.value(econ::commodityCode(ln.commodity));
+          j.key("units"); j.value(ln.units);
+          j.key("massKg"); j.value(ln.massKg);
+          j.key("avgNetBuy"); j.value(ln.avgNetBuyPrice);
+          j.key("avgNetSell"); j.value(ln.avgNetSellPrice);
+          j.key("netProfit"); j.value(ln.netProfitCr);
+          j.key("netProfitPerKg"); j.value(ln.netProfitPerKg);
+          j.endObject();
+        }
+        j.endArray();
+
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Trade mix scan (day=" << timeDays
+                << ", cargoKg=" << cargoCapacityKg
+                << ", stepKg=" << mixStepKg
+                << ", impact=" << (!mixNoImpact ? "yes" : "no")
+                << ") ---\n";
+      std::cout << "From: " << fromStub.name << " / " << fromSt.name
+                << "  (fee=" << fromSt.feeRate * 100.0
+                << "%, eff=" << feeEff(fromSt) * 100.0 << "%)\n";
+
+      if (minProfit > 0.0) {
+        std::cout << "Min profit: " << std::fixed << std::setprecision(0) << minProfit << "\n";
+      }
+      if (mixMaxSpend > 0.0) {
+        std::cout << "Max spend: " << std::fixed << std::setprecision(0) << mixMaxSpend << " cr\n";
+      }
+
+      if (ideas.empty()) {
+        std::cout << "No profitable manifests found inside the query set.\n";
+      } else {
+        for (const auto& it : ideas) {
+          std::cout << "to=" << it.toSystemName << "/" << it.toStationName
+                    << "  dist=" << std::fixed << std::setprecision(1) << it.distanceLy << " ly"
+                    << "  fill=" << std::fixed << std::setprecision(1) << it.cargoFilledKg << " kg"
+                    << "  net/trip=" << std::fixed << std::setprecision(0) << it.netProfitCr
+                    << "\n";
+
+          const int take = std::min<int>(mixLines, (int)it.lines.size());
+          for (int i = 0; i < take; ++i) {
+            const auto& ln = it.lines[(std::size_t)i];
+            std::cout << "  - " << std::setw(6) << econ::commodityCode(ln.commodity)
+                      << "  units=" << std::fixed << std::setprecision(1) << ln.units
+                      << "  mass=" << std::fixed << std::setprecision(1) << ln.massKg << " kg"
+                      << "  net/kg=" << std::fixed << std::setprecision(1) << ln.netProfitPerKg
+                      << "  net=" << std::fixed << std::setprecision(0) << ln.netProfitCr
+                      << "\n";
+          }
+        }
+        std::cout << "Tip: decrease --mixStepKg for a more precise mix (slower), increase for speed.\n";
+      }
+    }
+  }
+
 
   if (doRoute && !systems.empty()) {
     fromSysIdx = std::min(fromSysIdx, systems.size() - 1);

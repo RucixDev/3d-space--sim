@@ -1,5 +1,7 @@
 #include "stellar/sim/Combat.h"
 
+#include "stellar/sim/Ballistics.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -106,6 +108,37 @@ static double segmentClosestT(const math::Vec3d& aKm,
   return std::clamp(math::dot(pKm - aKm, ab) / abLenSq, 0.0, 1.0);
 }
 
+static math::Vec3d rotateTowards(const math::Vec3d& fromDir,
+                                 const math::Vec3d& toDir,
+                                 double maxAngleRad) {
+  const math::Vec3d f = fromDir.normalized();
+  const math::Vec3d t = toDir.normalized();
+  if (f.lengthSq() < 1e-12) return t;
+  if (t.lengthSq() < 1e-12) return f;
+
+  const double c = std::clamp(math::dot(f, t), -1.0, 1.0);
+  const double ang = std::acos(c);
+  if (ang <= 1e-9) return t;
+  if (maxAngleRad <= 0.0) return f;
+  if (ang <= maxAngleRad) return t;
+
+  math::Vec3d axis = math::cross(f, t);
+  const double al2 = axis.lengthSq();
+  if (al2 < 1e-18) {
+    // Nearly opposite; just keep current direction.
+    return f;
+  }
+  axis = axis / std::sqrt(al2);
+
+  const double ca = std::cos(maxAngleRad);
+  const double sa = std::sin(maxAngleRad);
+
+  // Rodrigues rotation formula.
+  const math::Vec3d v = f;
+  const math::Vec3d v2 = math::cross(axis, v);
+  return (v * ca + v2 * sa).normalized();
+}
+
 void stepProjectiles(std::vector<Projectile>& projectiles,
                      double dtSim,
                      const SphereTarget* targets,
@@ -165,6 +198,157 @@ void stepProjectiles(std::vector<Projectile>& projectiles,
   }
 }
 
+void stepMissiles(std::vector<Missile>& missiles,
+                  double dtSim,
+                  const SphereTarget* targets,
+                  std::size_t targetCount,
+                  std::vector<MissileDetonation>& outDetonations,
+                  std::vector<MissileHit>& outHits) {
+  if (dtSim <= 0.0) return;
+  if (missiles.empty()) return;
+
+  outDetonations.clear();
+  outHits.clear();
+
+  for (auto& m : missiles) {
+    if (m.ttlSimSec <= 0.0) continue;
+
+    const math::Vec3d a = m.posKm;
+
+    // --- Guidance ---
+    math::Vec3d v = m.velKmS;
+    double speed = v.length();
+    if (speed < 1e-6) {
+      speed = 1.0;
+      v = {0, 0, 1};
+    }
+
+    math::Vec3d desiredDir = v.normalized();
+    const SphereTarget* tgt = nullptr;
+    if (m.hasTarget && targets && targetCount > 0) {
+      for (std::size_t i = 0; i < targetCount; ++i) {
+        const SphereTarget& t = targets[i];
+        if (t.kind != m.targetKind) continue;
+        if (t.id != m.targetId) continue;
+        tgt = &t;
+        break;
+      }
+
+      if (tgt) {
+        // Lead solve (missile treated as constant-speed projectile).
+        const auto lead = solveProjectileLead(m.posKm,
+                                              /*shooterVelKmS=*/{0, 0, 0},
+                                              tgt->centerKm,
+                                              tgt->velKmS,
+                                              speed,
+                                              /*maxTimeSec=*/1.0e6,
+                                              /*minTimeSec=*/1.0e-3);
+        if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
+          desiredDir = lead->aimDirWorld;
+        } else {
+          const math::Vec3d to = tgt->centerKm - m.posKm;
+          if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
+        }
+      }
+    }
+
+    const double maxTurn = std::max(0.0, m.turnRateRadS) * dtSim;
+    const math::Vec3d newDir = rotateTowards(v.normalized(), desiredDir, maxTurn);
+    m.velKmS = newDir * speed;
+
+    const math::Vec3d b = m.posKm + m.velKmS * dtSim;
+
+    m.prevKm = a;
+    m.posKm = b;
+    m.ttlSimSec -= dtSim;
+
+    // --- Collision & detonation ---
+    bool detonated = false;
+    math::Vec3d detPoint = b;
+
+    if (targets && targetCount > 0) {
+      const bool allowHitPlayer = !m.fromPlayer;
+      const bool allowHitShips = true;
+      const bool allowHitAsteroids = true;
+
+      double bestT = 2.0; // [0,1]
+
+      for (std::size_t ti = 0; ti < targetCount; ++ti) {
+        const SphereTarget& t = targets[ti];
+
+        if (!allowHitPlayer && t.kind == CombatTargetKind::Player) continue;
+        if (!allowHitShips && t.kind == CombatTargetKind::Ship) continue;
+        if (!allowHitAsteroids && t.kind == CombatTargetKind::Asteroid) continue;
+
+        // Avoid immediate self-hits when the shooter has a real id.
+        if (m.shooterId != 0 && t.id != 0 && t.id == m.shooterId) continue;
+
+        const double hitRadiusKm = std::max(0.0, t.radiusKm) + std::max(0.0, m.radiusKm);
+        if (!segmentHitsSphereKm(a, b, t.centerKm, hitRadiusKm)) continue;
+
+        const double tt = segmentClosestT(a, b, t.centerKm);
+        if (tt < bestT) {
+          bestT = tt;
+          detonated = true;
+          detPoint = a + (b - a) * tt;
+        }
+      }
+    }
+
+    // Expired missiles disappear without a detonation (keeps background clutter down).
+    if (!detonated) {
+      if (m.ttlSimSec <= 0.0) {
+        m.ttlSimSec = 0.0;
+      }
+      continue;
+    }
+
+    // Detonate.
+    MissileDetonation det{};
+    det.pointKm = detPoint;
+    det.blastRadiusKm = std::max(0.0, m.blastRadiusKm);
+    det.baseDmg = std::max(0.0, m.dmg);
+    det.fromPlayer = m.fromPlayer;
+    det.shooterId = m.shooterId;
+    outDetonations.push_back(det);
+
+    // Splash hits.
+    if (targets && targetCount > 0 && det.blastRadiusKm > 1e-6 && det.baseDmg > 1e-9) {
+      const bool allowHitPlayer = !m.fromPlayer;
+      const bool allowHitShips = true;
+      const bool allowHitAsteroids = true;
+
+      for (std::size_t ti = 0; ti < targetCount; ++ti) {
+        const SphereTarget& t = targets[ti];
+
+        if (!allowHitPlayer && t.kind == CombatTargetKind::Player) continue;
+        if (!allowHitShips && t.kind == CombatTargetKind::Ship) continue;
+        if (!allowHitAsteroids && t.kind == CombatTargetKind::Asteroid) continue;
+
+        // Avoid self splash when shooter has a real id.
+        if (m.shooterId != 0 && t.id != 0 && t.id == m.shooterId) continue;
+
+        const double dist = (t.centerKm - detPoint).length();
+        const double surface = std::max(0.0, dist - std::max(0.0, t.radiusKm));
+        const double k = std::clamp(1.0 - surface / det.blastRadiusKm, 0.0, 1.0);
+        if (k <= 0.0) continue;
+
+        MissileHit h{};
+        h.kind = t.kind;
+        h.targetIndex = t.index;
+        h.targetId = t.id;
+        h.pointKm = detPoint;
+        h.dmg = det.baseDmg * k;
+        h.fromPlayer = m.fromPlayer;
+        h.shooterId = m.shooterId;
+        outHits.push_back(h);
+      }
+    }
+
+    m.ttlSimSec = 0.0;
+  }
+}
+
 double weaponHeatDelta(const WeaponDef& w, int distributorMk) {
   // Better distributors run cooler.
   const int dMk = std::clamp(distributorMk, 1, 3);
@@ -214,6 +398,87 @@ FireResult tryFireWeapon(Ship& shooter,
       out.hitId = hit.id;
       out.hitPointKm = hit.pointKm;
     }
+    return out;
+  }
+
+  // Guided weapon (missile).
+  if (w.guided) {
+    const double muzzleSpeedKmS = std::max(1e-6, w.projSpeedKmS);
+    const double rangeKm = std::max(0.0, w.rangeKm);
+    const double ttlSim = rangeKm / muzzleSpeedKmS;
+
+    math::Vec3d fwd = shooter.forward();
+    if (fwd.lengthSq() < 1e-12) fwd = {0, 0, 1};
+    fwd = fwd.normalized();
+
+    // Lock onto a target in front of the shooter.
+    bool hasLock = false;
+    CombatTargetKind lockKind = CombatTargetKind::Ship;
+    core::u64 lockId = 0;
+
+    if (beamTargets && beamTargetCount > 0) {
+      double bestAim = -1.0;
+      double bestDist = 1.0e30;
+      const math::Vec3d origin = shooter.positionKm();
+      const math::Vec3d dir = fwd;
+
+      for (std::size_t i = 0; i < beamTargetCount; ++i) {
+        const SphereTarget& t = beamTargets[i];
+        if (t.kind != CombatTargetKind::Ship && t.kind != CombatTargetKind::Player) continue;
+        if (fromPlayer && t.kind == CombatTargetKind::Player) continue;
+        if (shooterId != 0 && t.id != 0 && t.id == shooterId) continue;
+
+        const math::Vec3d to = t.centerKm - origin;
+        const double dist2 = to.lengthSq();
+        if (dist2 < 1e-12) continue;
+        const double dist = std::sqrt(dist2);
+        if (dist > rangeKm) continue;
+
+        const double aim = math::dot(dir, to / dist);
+        // Don't lock behind.
+        if (aim <= 0.0) continue;
+
+        const double req = (t.minAimCos > -0.5) ? t.minAimCos : -1.0;
+        if (aim < req) continue;
+
+        // Prefer highest aim, then nearest.
+        if (aim > bestAim + 1e-6 || (std::abs(aim - bestAim) <= 1e-6 && dist < bestDist)) {
+          bestAim = aim;
+          bestDist = dist;
+          hasLock = true;
+          lockKind = t.kind;
+          lockId = t.id;
+        }
+      }
+    }
+
+    const math::Vec3d spawnKm = shooter.positionKm() + fwd * 520.0;
+
+    Missile m{};
+    m.prevKm = spawnKm;
+    m.posKm = spawnKm;
+    m.velKmS = shooter.velocityKmS() + fwd * muzzleSpeedKmS;
+    m.r = w.r;
+    m.g = w.g;
+    m.b = w.b;
+    m.ttlSimSec = ttlSim;
+    m.radiusKm = 760.0;
+    m.dmg = w.dmg;
+    m.blastRadiusKm = std::max(0.0, w.blastRadiusKm);
+    m.turnRateRadS = std::max(0.0, w.turnRateRadS);
+    m.fromPlayer = fromPlayer;
+    m.shooterId = shooterId;
+
+    m.hasTarget = hasLock;
+    m.targetKind = lockKind;
+    m.targetId = lockId;
+
+    out.hasMissile = true;
+    out.missile = m;
+
+    // Minimal recoil.
+    shooter.setVelocityKmS(shooter.velocityKmS() - fwd * 0.0015);
+
     return out;
   }
 

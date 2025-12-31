@@ -50,6 +50,34 @@ struct AttitudeControlParams {
   bool alignUp{false};
 };
 
+// Optional intercept-course ("lead") tuning for chasing moving targets.
+//
+// When a target has significant lateral velocity, a naive pursuit controller can end up
+// "tail chasing" and orbiting around it. Enabling intercept-course guidance computes a
+// lead direction (using the same closed-form intercept solve as projectile lead) and
+// uses that direction for the translation velocity setpoint.
+//
+// This is still an approximation (ships are acceleration-limited, not speed-limited),
+// but it significantly improves chase behavior in practice without requiring a full
+// guidance law.
+struct InterceptCourseParams {
+  // Master toggle.
+  bool enabled{true};
+
+  // Reject lead solutions that would require aiming too far into the future.
+  // Large values can look "psychic" for very distant targets.
+  double maxLeadTimeSec{120.0};
+
+  // Only compute a lead solution when the commanded closing speed is at least this.
+  // Prevents noisy/unstable lead directions when maneuvering slowly near a target.
+  double minSpeedKmS{0.05};
+
+  // If true, use params.maxSpeedKmS for the lead solve instead of the current desired
+  // closing speed. This tends to yield more stable lead directions at the cost of a
+  // small loss of near-range accuracy.
+  bool useMaxSpeedForSolve{true};
+};
+
 struct FlightControlOutput {
   ShipInput input{};
   math::Vec3d desiredVelKmS{0,0,0};
@@ -69,6 +97,20 @@ FlightControlOutput approachTarget(
   const math::Vec3d& desiredForwardWorld,
   const math::Vec3d* desiredUpWorld = nullptr);
 
+// Like approachTarget(), but uses an intercept-course lead direction for translation.
+//
+// The caller still chooses the facing direction (desiredForwardWorld). This allows
+// AI to keep moving on an intercept course while aiming elsewhere (e.g. projectile lead).
+FlightControlOutput approachTargetIntercept(
+  const Ship& ship,
+  const math::Vec3d& targetPosKm,
+  const math::Vec3d& targetVelKmS,
+  const FlightControlParams& params,
+  const AttitudeControlParams& attitude,
+  const math::Vec3d& desiredForwardWorld,
+  const InterceptCourseParams& intercept,
+  const math::Vec3d* desiredUpWorld = nullptr);
+
 // Convenience wrapper: desired forward points toward the target.
 FlightControlOutput chaseTarget(
   const Ship& ship,
@@ -76,5 +118,15 @@ FlightControlOutput chaseTarget(
   const math::Vec3d& targetVelKmS,
   const FlightControlParams& params,
   const AttitudeControlParams& attitude);
+
+// Convenience wrapper: faces the target like chaseTarget(), but uses intercept-course
+// translation guidance.
+FlightControlOutput chaseTargetIntercept(
+  const Ship& ship,
+  const math::Vec3d& targetPosKm,
+  const math::Vec3d& targetVelKmS,
+  const FlightControlParams& params,
+  const AttitudeControlParams& attitude,
+  const InterceptCourseParams& intercept);
 
 } // namespace stellar::sim

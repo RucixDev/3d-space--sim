@@ -74,6 +74,9 @@ int test_savegame() {
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Metals)] = 5.5;
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Food)] = 12.0;
   s.scannedKeys = {111, 222, 333};
+  s.resolvedSignalIds = {0x2000000000000001ull, 0x2000000000000002ull};
+  s.asteroidStates.push_back({0x20000000000000AAull, 42.25});
+  s.asteroidStates.push_back({0x20000000000000BBull, 0.0});
   s.trackedMissionId = 1;
 
   // One accepted mission.
@@ -96,6 +99,43 @@ int test_savegame() {
     m.cargoProvided = true;
     m.scanned = true;
     s.missions.push_back(m);
+  }
+
+  // Persisted escort convoy state (mission-critical NPC).
+  {
+    EscortConvoyState c{};
+    c.convoyId = 0x40000000000000CCull;
+    c.missionId = 1;
+    c.systemId = s.currentSystem;
+    c.fromStation = 11;
+    c.toStation = 21;
+    c.posKm = {7.0, 8.0, 9.0};
+    c.velKmS = {0.0, 0.1, 0.2};
+    c.orient = {0.9238795325, 0.0, 0.3826834323, 0.0};
+    c.angVelRadS = {0.01, 0.02, 0.03};
+    c.hullFrac = 0.55;
+    c.shieldFrac = 0.25;
+    c.cargoValueCr = 1234.5;
+    c.tooFarSec = 6.25;
+    c.ambushSpawned = true;
+    c.nextAmbushDays = 42.55;
+    s.escortConvoys.push_back(c);
+  }
+
+  // Persisted bounty target state (mission-critical NPC).
+  {
+    BountyTargetState b{};
+    b.targetId = 0x50000000000000DDull;
+    b.missionId = 1;
+    b.systemId = s.currentSystem;
+    b.hideoutStation = 21;
+    b.posKm = {11.0, 12.0, 13.0};
+    b.velKmS = {0.2, 0.0, -0.1};
+    b.orient = {0.9659258263, 0.0, 0.2588190451, 0.0};
+    b.angVelRadS = {0.02, 0.01, 0.00};
+    b.hullFrac = 0.45;
+    b.shieldFrac = 0.80;
+    s.bountyTargets.push_back(b);
   }
 
   // Mission offers (board persistence).
@@ -202,9 +242,77 @@ int test_savegame() {
     }
   }
 
+  // Escort convoy persistence.
+  if (l.escortConvoys.size() != s.escortConvoys.size()) {
+    std::cerr << "[test_savegame] escortConvoys size mismatch\n";
+    ++fails;
+  } else if (!l.escortConvoys.empty()) {
+    const auto& a = l.escortConvoys.front();
+    const auto& b = s.escortConvoys.front();
+    if (a.convoyId != b.convoyId || a.missionId != b.missionId || a.systemId != b.systemId) {
+      std::cerr << "[test_savegame] escortConvoys id fields mismatch\n";
+      ++fails;
+    }
+    if (!nearly(a.posKm.x, b.posKm.x) || !nearly(a.velKmS.y, b.velKmS.y)) {
+      std::cerr << "[test_savegame] escortConvoys kinematics mismatch\n";
+      ++fails;
+    }
+    if (!nearly(a.hullFrac, b.hullFrac) || !nearly(a.shieldFrac, b.shieldFrac)) {
+      std::cerr << "[test_savegame] escortConvoys health mismatch\n";
+      ++fails;
+    }
+    if (a.ambushSpawned != b.ambushSpawned || !nearly(a.nextAmbushDays, b.nextAmbushDays)) {
+      std::cerr << "[test_savegame] escortConvoys ambush state mismatch\n";
+      ++fails;
+    }
+  }
+  // Bounty target persistence.
+  if (l.bountyTargets.size() != s.bountyTargets.size()) {
+    std::cerr << "[test_savegame] bountyTargets size mismatch\n";
+    ++fails;
+  } else if (!l.bountyTargets.empty()) {
+    const auto& a = l.bountyTargets.front();
+    const auto& b = s.bountyTargets.front();
+    if (a.targetId != b.targetId || a.missionId != b.missionId || a.systemId != b.systemId || a.hideoutStation != b.hideoutStation) {
+      std::cerr << "[test_savegame] bountyTargets id fields mismatch\n";
+      ++fails;
+    }
+    if (!nearly(a.posKm.x, b.posKm.x) || !nearly(a.velKmS.z, b.velKmS.z)) {
+      std::cerr << "[test_savegame] bountyTargets kinematics mismatch\n";
+      ++fails;
+    }
+    if (!nearly(a.hullFrac, b.hullFrac) || !nearly(a.shieldFrac, b.shieldFrac)) {
+      std::cerr << "[test_savegame] bountyTargets health mismatch\n";
+      ++fails;
+    }
+  }
+
+
   if (l.trackedMissionId != s.trackedMissionId) {
     std::cerr << "[test_savegame] trackedMissionId mismatch\n";
     ++fails;
+  }
+
+  // World state persistence.
+  if (l.resolvedSignalIds.size() != s.resolvedSignalIds.size()) {
+    std::cerr << "[test_savegame] resolvedSignalIds size mismatch\n";
+    ++fails;
+  } else if (l.resolvedSignalIds != s.resolvedSignalIds) {
+    std::cerr << "[test_savegame] resolvedSignalIds values mismatch\n";
+    ++fails;
+  }
+  if (l.asteroidStates.size() != s.asteroidStates.size()) {
+    std::cerr << "[test_savegame] asteroidStates size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.asteroidStates.size(); ++i) {
+      if (l.asteroidStates[i].asteroidId != s.asteroidStates[i].asteroidId ||
+          !nearly(l.asteroidStates[i].remainingUnits, s.asteroidStates[i].remainingUnits)) {
+        std::cerr << "[test_savegame] asteroidStates entry mismatch\n";
+        ++fails;
+        break;
+      }
+    }
   }
 
   // Mission board persistence.
@@ -285,6 +393,66 @@ int test_savegame() {
         }
       }
 
+      // If the resolved_signals count is wrong, the loader should stop when it no longer sees
+      // "signal_resolved" and continue parsing later sections (e.g. missions/trackedMissionId).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "resolved_signals", s.resolvedSignalIds.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_resolved_signals.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt resolved_signals save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale resolved_signals count\n";
+            ++fails;
+          } else {
+            if (x.resolvedSignalIds.size() != s.resolvedSignalIds.size()) {
+              std::cerr << "[test_savegame] stale resolved_signals count changed parsed signal count\n";
+              ++fails;
+            }
+            if (x.missions.size() != s.missions.size()) {
+              std::cerr << "[test_savegame] stale resolved_signals count broke parsing of later keys (missions)\n";
+              ++fails;
+            }
+            if (x.trackedMissionId != s.trackedMissionId) {
+              std::cerr << "[test_savegame] stale resolved_signals count broke trackedMissionId parsing\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If the asteroid_states count is wrong, the loader should stop when it no longer sees
+      // "asteroid" and continue parsing keys that follow.
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "asteroid_states", s.asteroidStates.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_asteroid_states.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt asteroid_states save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale asteroid_states count\n";
+            ++fails;
+          } else {
+            if (x.asteroidStates.size() != s.asteroidStates.size()) {
+              std::cerr << "[test_savegame] stale asteroid_states count changed parsed asteroidStates count\n";
+              ++fails;
+            }
+            if (x.missionOffers.size() != s.missionOffers.size()) {
+              std::cerr << "[test_savegame] stale asteroid_states count broke parsing of later keys (mission_offers)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
       // If the mission_offers count is wrong, the loader should stop when it no longer sees "offer"
       // and continue parsing keys that follow (e.g. reputation).
       {
@@ -339,6 +507,63 @@ int test_savegame() {
           std::filesystem::remove(p);
         }
       }
+
+      // If escort_convoys count is wrong, the loader should stop when it no longer sees
+      // "convoy" and continue parsing later keys (e.g. trackedMissionId).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "escort_convoys", s.escortConvoys.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_escort_convoys.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt escort_convoys save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale escort_convoys count\n";
+            ++fails;
+          } else {
+            if (x.escortConvoys.size() != s.escortConvoys.size()) {
+              std::cerr << "[test_savegame] stale escort_convoys count changed parsed escortConvoys count\n";
+              ++fails;
+            }
+            if (x.trackedMissionId != s.trackedMissionId) {
+              std::cerr << "[test_savegame] stale escort_convoys count broke trackedMissionId parsing\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If bounty_targets count is wrong, the loader should stop when it no longer sees
+      // "bounty_target" and continue parsing later keys (e.g. trackedMissionId).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "bounty_targets", s.bountyTargets.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_bounty_targets.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt bounty_targets save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale bounty_targets count\n";
+            ++fails;
+          } else {
+            if (x.bountyTargets.size() != s.bountyTargets.size()) {
+              std::cerr << "[test_savegame] stale bounty_targets count changed parsed bountyTargets count\n";
+              ++fails;
+            }
+            if (x.trackedMissionId != s.trackedMissionId) {
+              std::cerr << "[test_savegame] stale bounty_targets count broke trackedMissionId parsing\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
     }
   }
 

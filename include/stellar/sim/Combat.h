@@ -40,6 +40,9 @@ struct SphereTarget {
   core::u64 id{0};
 
   math::Vec3d centerKm{0, 0, 0};
+  // Optional kinematics for guidance / lead solves.
+  // Leave at zero if unknown.
+  math::Vec3d velKmS{0, 0, 0};
   double radiusKm{1.0};
 
   // Optional aim-cone filter for soft aim assist.
@@ -117,6 +120,54 @@ struct Projectile {
   core::u64 shooterId{0};
 };
 
+// Guided projectile (simple homing missile). Units are kilometers.
+//
+// The game treats missiles as a constant-speed projectile that can steer toward
+// a target with a limited turn rate.
+struct Missile {
+  math::Vec3d prevKm{0, 0, 0};
+  math::Vec3d posKm{0, 0, 0};
+  math::Vec3d velKmS{0, 0, 0};
+
+  float r{1.0f}, g{1.0f}, b{1.0f};
+
+  double ttlSimSec{0.0};
+  double radiusKm{650.0};
+  double dmg{0.0};
+
+  // Explosion radius for splash damage.
+  double blastRadiusKm{0.0};
+
+  // Max steering rate (rad/s) toward the desired aim direction.
+  double turnRateRadS{0.0};
+
+  bool fromPlayer{false};
+  core::u64 shooterId{0};
+
+  // Target lock.
+  bool hasTarget{false};
+  CombatTargetKind targetKind{CombatTargetKind::Ship};
+  core::u64 targetId{0};
+};
+
+struct MissileDetonation {
+  math::Vec3d pointKm{0, 0, 0};
+  double blastRadiusKm{0.0};
+  double baseDmg{0.0};
+  bool fromPlayer{false};
+  core::u64 shooterId{0};
+};
+
+struct MissileHit {
+  CombatTargetKind kind{CombatTargetKind::Ship};
+  std::size_t targetIndex{0};
+  core::u64 targetId{0};
+  math::Vec3d pointKm{0, 0, 0};
+  double dmg{0.0};
+  bool fromPlayer{false};
+  core::u64 shooterId{0};
+};
+
 struct ProjectileHit {
   CombatTargetKind kind{CombatTargetKind::Ship};
   std::size_t targetIndex{0};
@@ -140,6 +191,17 @@ void stepProjectiles(std::vector<Projectile>& projectiles,
                      std::size_t targetCount,
                      std::vector<ProjectileHit>& outHits);
 
+// Move missiles forward by dtSim seconds, steer toward locked targets, and emit
+// detonation events + splash hit events.
+//
+// Missiles are consumed when they detonate.
+void stepMissiles(std::vector<Missile>& missiles,
+                  double dtSim,
+                  const SphereTarget* targets,
+                  std::size_t targetCount,
+                  std::vector<MissileDetonation>& outDetonations,
+                  std::vector<MissileHit>& outHits);
+
 // Weapon firing output. This does not apply damage; it only emits the geometry
 // and hit metadata required for gameplay code to resolve the effect.
 struct FireResult {
@@ -158,6 +220,9 @@ struct FireResult {
 
   bool hasProjectile{false};
   Projectile projectile{};
+
+  bool hasMissile{false};
+  Missile missile{};
 
   // For beams: whether something was hit and, if so, which target.
   bool hit{false};

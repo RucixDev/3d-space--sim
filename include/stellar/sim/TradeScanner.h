@@ -104,4 +104,95 @@ std::vector<TradeOpportunity> scanTradeOpportunities(Universe& u,
                                                      const TradeScanParams& params,
                                                      TradeFeeRateFn feeRate = {});
 
+
+
+// ------------------------------
+// Cargo-manifest scanner (multi-commodity trade mix)
+//
+// Where TradeOpportunity represents the best *single commodity* trade between
+// two stations, TradeManifestOpportunity represents a best-effort *multi-commodity*
+// cargo manifest that maximizes trip profit under a cargo mass limit.
+
+struct TradeManifestScanParams {
+  // Universe query settings (only used by scanTradeManifests()).
+  double radiusLy{200.0};
+  std::size_t maxSystems{192};
+
+  // Output shaping.
+  std::size_t maxResults{12};
+
+  // Cargo sizing.
+  double cargoCapacityKg{420.0};
+  double cargoUsedKg{0.0};
+  bool useFreeHold{true};
+
+  // Market assumptions.
+  double bidAskSpread{0.10};
+
+  // Planner knobs.
+  double stepKg{1.0};
+  double maxBuyCreditsCr{0.0};   // <= 0 => ignore player credits
+  bool simulatePriceImpact{true};
+
+  // Filtering.
+  double minNetProfit{0.0}; // min net profit per trip (after fees)
+  bool includeSameSystem{true};
+};
+
+struct TradeManifestLine {
+  econ::CommodityId commodity{econ::CommodityId::Food};
+
+  double units{0.0};
+  double unitMassKg{0.0};
+  double massKg{0.0};
+
+  double avgNetBuyPrice{0.0};
+  double avgNetSellPrice{0.0};
+
+  double netBuyCr{0.0};
+  double netSellCr{0.0};
+  double netProfitCr{0.0};
+
+  double netProfitPerUnit{0.0};
+  double netProfitPerKg{0.0};
+};
+
+struct TradeManifestOpportunity {
+  SystemId toSystem{0};
+  StationId toStation{0};
+
+  std::string toSystemName;
+  std::string toStationName;
+
+  // Totals (net-of-fees).
+  double cargoFilledKg{0.0};
+  double netBuyCr{0.0};
+  double netSellCr{0.0};
+  double netProfitCr{0.0};
+
+  // A compact manifest (one line per commodity traded).
+  std::vector<TradeManifestLine> lines;
+
+  // Geometry.
+  double distanceLy{0.0};
+};
+
+// Scan multi-commodity cargo manifests inside a sphere around the origin system.
+std::vector<TradeManifestOpportunity> scanTradeManifests(Universe& u,
+                                                         const SystemStub& originStub,
+                                                         const Station& originStation,
+                                                         double timeDays,
+                                                         const TradeManifestScanParams& params,
+                                                         TradeFeeRateFn feeRate = {});
+
+// Scan multi-commodity cargo manifests using a pre-selected candidate list.
+std::vector<TradeManifestOpportunity> scanTradeManifests(Universe& u,
+                                                         const SystemStub& originStub,
+                                                         const Station& originStation,
+                                                         double timeDays,
+                                                         const std::vector<SystemStub>& candidates,
+                                                         const TradeManifestScanParams& params,
+                                                         TradeFeeRateFn feeRate = {});
+
+
 } // namespace stellar::sim

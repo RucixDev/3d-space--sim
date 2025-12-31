@@ -18,8 +18,8 @@ int test_ship_loadout() {
       std::cerr << "[test_ship_loadout] expected 3 hull defs, got=" << sim::hullDefCount() << "\n";
       ++fails;
     }
-    if (sim::weaponDefCount() != 5) {
-      std::cerr << "[test_ship_loadout] expected 5 weapon defs, got=" << sim::weaponDefCount() << "\n";
+    if (sim::weaponDefCount() != 6) {
+      std::cerr << "[test_ship_loadout] expected 6 weapon defs, got=" << sim::weaponDefCount() << "\n";
       ++fails;
     }
     for (std::size_t i = 0; i < sim::hullDefCount(); ++i) {

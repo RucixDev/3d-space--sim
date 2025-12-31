@@ -35,6 +35,7 @@ enum class WeaponType : core::u8 {
   Cannon      = 2,
   Railgun     = 3,
   MiningLaser = 4,
+  HomingMissile = 5,
 };
 
 struct HullDef {
@@ -64,6 +65,9 @@ struct WeaponDef {
   double rangeKm;
   double projSpeedKmS; // ignored for beam
   bool beam;
+  bool guided;         // homing projectile (missile) if true
+  double blastRadiusKm; // explosion/splash radius for guided munitions (0 for none)
+  double turnRateRadS;  // max turn rate for guided munitions (0 for none)
   float r, g, b;       // HUD/beam tint (game-side convenience)
 };
 
@@ -99,12 +103,13 @@ inline constexpr MkDef kDistributors[] = {
 };
 
 inline constexpr WeaponDef kWeaponDefs[] = {
-  // type,               name,          price,  cd,   heat, dmg,  range,    proj,   beam,   rgb
-  {WeaponType::BeamLaser,   "Beam Laser",   0.0, 0.18, 2.2,  7.5, 210000.0, 0.0,   true,  1.00f, 0.35f, 0.15f},
-  {WeaponType::PulseLaser,  "Pulse Laser",  5200.0, 0.28, 1.9,  6.0, 230000.0, 0.0,   true,  1.00f, 0.80f, 0.20f},
-  {WeaponType::Cannon,      "Cannon",       0.0, 0.90, 4.5, 22.0, 260000.0, 120.0, false, 1.00f, 1.00f, 0.90f},
-  {WeaponType::Railgun,     "Railgun",      9800.0, 1.65, 7.5, 45.0, 320000.0, 240.0, false, 0.60f, 0.90f, 1.00f},
-  {WeaponType::MiningLaser, "Mining Laser", 6500.0, 0.22, 1.6,  3.0, 180000.0, 0.0,   true,  0.30f, 1.00f, 0.35f},
+  // type,               name,          price,    cd,    heat, dmg,  range,    proj,   beam, guided, blast,  turn,   rgb
+  {WeaponType::BeamLaser,   "Beam Laser",   0.0,     0.18,  2.2,  7.5, 210000.0,   0.0,  true,  false,  0.0,   0.0,  1.00f, 0.35f, 0.15f},
+  {WeaponType::PulseLaser,  "Pulse Laser",  5200.0,  0.28,  1.9,  6.0, 230000.0,   0.0,  true,  false,  0.0,   0.0,  1.00f, 0.80f, 0.20f},
+  {WeaponType::Cannon,      "Cannon",       0.0,     0.90,  4.5, 22.0, 260000.0, 120.0, false, false,  0.0,   0.0,  1.00f, 1.00f, 0.90f},
+  {WeaponType::Railgun,     "Railgun",      9800.0,  1.65,  7.5, 45.0, 320000.0, 240.0, false, false,  0.0,   0.0,  0.60f, 0.90f, 1.00f},
+  {WeaponType::MiningLaser, "Mining Laser", 6500.0,  0.22,  1.6,  3.0, 180000.0,   0.0,  true,  false,  0.0,   0.0,  0.30f, 1.00f, 0.35f},
+  {WeaponType::HomingMissile, "Homing Missile", 12000.0, 2.80, 6.2, 60.0, 300000.0, 150.0, false, true,  5200.0, 0.55,  1.00f, 0.35f, 0.10f},
 };
 
 // ---- Derived stat helpers ----

@@ -29,6 +29,32 @@ static double effectiveCargoKg(const TradeScanParams& p) {
   return std::max(0.0, cap - used);
 }
 
+
+static double effectiveCargoKg(const TradeManifestScanParams& p) {
+  double cap = p.cargoCapacityKg;
+  if (!std::isfinite(cap)) cap = 0.0;
+  cap = std::max(0.0, cap);
+
+  if (!p.useFreeHold) return cap;
+
+  double used = p.cargoUsedKg;
+  if (!std::isfinite(used)) used = 0.0;
+  used = std::max(0.0, used);
+
+  return std::max(0.0, cap - used);
+}
+
+static void pushManifestOpportunity(std::vector<TradeManifestOpportunity>& out,
+                                    const TradeManifestOpportunity& t,
+                                    const TradeManifestScanParams& params) {
+  if (t.cargoFilledKg <= 1e-9) return;
+  if (t.netProfitCr <= 1e-9) return;
+  if (t.netProfitCr + 1e-9 < params.minNetProfit) return;
+  if (t.lines.empty()) return;
+  out.push_back(t);
+}
+
+
 static TradeFeeRateFn defaultFeeFn() {
   return [](const Station& st) { return st.feeRate; };
 }
@@ -177,5 +203,122 @@ std::vector<TradeOpportunity> scanTradeOpportunities(Universe& u,
   const auto candidates = u.queryNearby(originStub.posLy, params.radiusLy, maxSystems);
   return scanTradeOpportunities(u, originStub, originStation, timeDays, candidates, params, std::move(feeRate));
 }
+
+
+
+std::vector<TradeManifestOpportunity> scanTradeManifests(Universe& u,
+                                                         const SystemStub& originStub,
+                                                         const Station& originStation,
+                                                         double timeDays,
+                                                         const std::vector<SystemStub>& candidates,
+                                                         const TradeManifestScanParams& params,
+                                                         TradeFeeRateFn feeRate) {
+  std::vector<TradeManifestOpportunity> out;
+
+  if (!std::isfinite(timeDays)) return out;
+  if (originStub.id == 0 || originStation.id == 0) return out;
+  if (candidates.empty()) return out;
+
+  const double capKg = effectiveCargoKg(params);
+  if (capKg <= 0.0) return out;
+
+  if (!feeRate) feeRate = defaultFeeFn();
+
+  // Pre-compute origin economy and fee.
+  auto& fromEcon = u.stationEconomy(originStation, timeDays);
+  const double feeFrom = clampFee(feeRate(originStation));
+
+  econ::CargoManifestParams mp;
+  mp.cargoCapacityKg = capKg;
+  mp.bidAskSpread = params.bidAskSpread;
+  mp.fromFeeRate = feeFrom;
+  mp.stepKg = params.stepKg;
+  mp.maxBuyCreditsCr = params.maxBuyCreditsCr;
+  mp.simulatePriceImpact = params.simulatePriceImpact;
+
+  out.reserve(std::min<std::size_t>(params.maxResults * 3, candidates.size() * 2));
+
+  for (const auto& stub : candidates) {
+    if (stub.id == 0) continue;
+    if (!params.includeSameSystem && stub.id == originStub.id) continue;
+
+    const auto& sys = u.getSystem(stub.id, &stub);
+    const double distLy = (stub.posLy - originStub.posLy).length();
+
+    for (const auto& toSt : sys.stations) {
+      if (toSt.id == 0) continue;
+      if (stub.id == originStub.id && toSt.id == originStation.id) continue;
+
+      auto& toEcon = u.stationEconomy(toSt, timeDays);
+      const double feeTo = clampFee(feeRate(toSt));
+      mp.toFeeRate = feeTo;
+
+      const auto plan = econ::bestManifestForCargo(fromEcon,
+                                                   originStation.economyModel,
+                                                   toEcon,
+                                                   toSt.economyModel,
+                                                   mp);
+
+      if (plan.lines.empty()) continue;
+
+      TradeManifestOpportunity t;
+      t.toSystem = sys.stub.id;
+      t.toStation = toSt.id;
+      t.toSystemName = sys.stub.name;
+      t.toStationName = toSt.name;
+
+      t.cargoFilledKg = plan.cargoFilledKg;
+      t.netBuyCr = plan.netBuyCr;
+      t.netSellCr = plan.netSellCr;
+      t.netProfitCr = plan.netProfitCr;
+
+      t.lines.reserve(plan.lines.size());
+      for (const auto& l : plan.lines) {
+        TradeManifestLine tl;
+        tl.commodity = l.commodity;
+        tl.units = l.units;
+        tl.unitMassKg = l.unitMassKg;
+        tl.massKg = l.massKg;
+        tl.avgNetBuyPrice = l.avgNetBuyPrice;
+        tl.avgNetSellPrice = l.avgNetSellPrice;
+        tl.netBuyCr = l.netBuyCr;
+        tl.netSellCr = l.netSellCr;
+        tl.netProfitCr = l.netProfitCr;
+        tl.netProfitPerUnit = l.netProfitPerUnit;
+        tl.netProfitPerKg = l.netProfitPerKg;
+        t.lines.push_back(std::move(tl));
+      }
+
+      t.distanceLy = distLy;
+
+      pushManifestOpportunity(out, t, params);
+    }
+  }
+
+  std::sort(out.begin(), out.end(), [](const TradeManifestOpportunity& a, const TradeManifestOpportunity& b) {
+    if (a.netProfitCr != b.netProfitCr) return a.netProfitCr > b.netProfitCr;
+    if (a.distanceLy != b.distanceLy) return a.distanceLy < b.distanceLy;
+    if (a.toSystem != b.toSystem) return a.toSystem < b.toSystem;
+    return a.toStation < b.toStation;
+  });
+
+  if (params.maxResults > 0 && out.size() > params.maxResults) {
+    out.resize(params.maxResults);
+  }
+
+  return out;
+}
+
+std::vector<TradeManifestOpportunity> scanTradeManifests(Universe& u,
+                                                         const SystemStub& originStub,
+                                                         const Station& originStation,
+                                                         double timeDays,
+                                                         const TradeManifestScanParams& params,
+                                                         TradeFeeRateFn feeRate) {
+  const std::size_t maxSystems = std::max<std::size_t>(1, params.maxSystems);
+  const auto candidates = u.queryNearby(originStub.posLy, params.radiusLy, maxSystems);
+  return scanTradeManifests(u, originStub, originStation, timeDays, candidates, params, std::move(feeRate));
+}
+
 
 } // namespace stellar::sim

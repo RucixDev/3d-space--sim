@@ -8,19 +8,24 @@ add_executable(stellar_tests
   test_economy.cpp
   test_traffic.cpp
   test_route_planner.cpp
+  test_manifest_planner.cpp
   test_savegame.cpp
   test_missions.cpp
   test_law.cpp
+  test_police_scan.cpp
+  test_docking.cpp
   test_nav.cpp
   test_args.cpp
   test_signature.cpp
   test_industry.cpp
+  test_industry_scanner.cpp
   test_warehouse.cpp
   test_trade_scanner.cpp
   test_ship.cpp
   test_ship_loadout.cpp
   test_power_distributor.cpp
   test_flight_controller.cpp
+  test_intercept_course.cpp
   test_combat.cpp
   test_ballistics.cpp
 )

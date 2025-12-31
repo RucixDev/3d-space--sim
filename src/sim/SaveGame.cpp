@@ -69,6 +69,17 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
     f << "scan " << k << "\n";
   }
 
+  // World state (signals / mining depletion)
+  f << "resolved_signals " << s.resolvedSignalIds.size() << "\n";
+  for (core::u64 id : s.resolvedSignalIds) {
+    f << "signal_resolved " << id << "\n";
+  }
+
+  f << "asteroid_states " << s.asteroidStates.size() << "\n";
+  for (const auto& a : s.asteroidStates) {
+    f << "asteroid " << a.asteroidId << " " << a.remainingUnits << "\n";
+  }
+
   // Missions
   f << "nextMissionId " << s.nextMissionId << "\n";
   f << "missions " << s.missions.size() << "\n";
@@ -91,6 +102,48 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << m.viaSystem << " " << m.viaStation << " "
       << static_cast<int>(m.leg) << " "
       << (m.scanned ? 1 : 0)
+      << "\n";
+  }
+
+  // Escort convoys (mission-critical NPC persistence).
+  // Stored as lightweight kinematic + health state so escort missions survive save/load.
+  f << "escort_convoys " << s.escortConvoys.size() << "\n";
+  for (const auto& c : s.escortConvoys) {
+    f << "convoy "
+      << c.convoyId << " "
+      << c.missionId << " "
+      << c.systemId << " "
+      << c.fromStation << " "
+      << c.toStation << " "
+      << c.posKm.x << " " << c.posKm.y << " " << c.posKm.z << " "
+      << c.velKmS.x << " " << c.velKmS.y << " " << c.velKmS.z << " "
+      << c.orient.w << " " << c.orient.x << " " << c.orient.y << " " << c.orient.z << " "
+      << c.angVelRadS.x << " " << c.angVelRadS.y << " " << c.angVelRadS.z << " "
+      << c.hullFrac << " "
+      << c.shieldFrac << " "
+      << c.cargoValueCr << " "
+      << c.tooFarSec << " "
+      << (c.ambushSpawned ? 1 : 0) << " "
+      << c.nextAmbushDays
+      << "\n";
+  }
+
+
+  // Bounty targets (mission-critical NPC persistence).
+  // Stored as lightweight kinematic + health state so bounty missions don't reset on save/load.
+  f << "bounty_targets " << s.bountyTargets.size() << "\n";
+  for (const auto& b : s.bountyTargets) {
+    f << "bounty_target "
+      << b.targetId << " "
+      << b.missionId << " "
+      << b.systemId << " "
+      << b.hideoutStation << " "
+      << b.posKm.x << " " << b.posKm.y << " " << b.posKm.z << " "
+      << b.velKmS.x << " " << b.velKmS.y << " " << b.velKmS.z << " "
+      << b.orient.w << " " << b.orient.x << " " << b.orient.y << " " << b.orient.z << " "
+      << b.angVelRadS.x << " " << b.angVelRadS.y << " " << b.angVelRadS.z << " "
+      << b.hullFrac << " "
+      << b.shieldFrac
       << "\n";
   }
 
@@ -346,6 +399,44 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (!(f >> k)) break;
         out.scannedKeys.push_back(k);
       }
+    } else if (key == "resolved_signals") {
+      std::size_t n = 0;
+      f >> n;
+      out.resolvedSignalIds.clear();
+      out.resolvedSignalIds.reserve(std::min<std::size_t>(n, 8192));
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "signal_resolved") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        core::u64 id = 0;
+        if (!(f >> id)) break;
+        out.resolvedSignalIds.push_back(id);
+      }
+    } else if (key == "asteroid_states") {
+      std::size_t n = 0;
+      f >> n;
+      out.asteroidStates.clear();
+      out.asteroidStates.reserve(std::min<std::size_t>(n, 16384));
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "asteroid") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        AsteroidState st{};
+        if (!(f >> st.asteroidId >> st.remainingUnits)) break;
+        out.asteroidStates.push_back(st);
+      }
     } else if (key == "trackedMissionId") {
       f >> out.trackedMissionId;
     } else if (key == "nextMissionId") {
@@ -408,6 +499,93 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         }
 
         out.missions.push_back(std::move(m));
+      }
+    } else if (key == "escort_convoys") {
+      std::size_t n = 0;
+      f >> n;
+      out.escortConvoys.clear();
+      out.escortConvoys.reserve(std::min<std::size_t>(n, 1024));
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tok;
+        if (!(f >> tok)) break;
+        if (tok != "convoy") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        // Parse the rest of the convoy line so we can extend fields over time.
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        EscortConvoyState c{};
+        int ambushSpawned = 0;
+        iss >> c.convoyId
+            >> c.missionId
+            >> c.systemId
+            >> c.fromStation
+            >> c.toStation
+            >> c.posKm.x >> c.posKm.y >> c.posKm.z
+            >> c.velKmS.x >> c.velKmS.y >> c.velKmS.z
+            >> c.orient.w >> c.orient.x >> c.orient.y >> c.orient.z
+            >> c.angVelRadS.x >> c.angVelRadS.y >> c.angVelRadS.z
+            >> c.hullFrac
+            >> c.shieldFrac
+            >> c.cargoValueCr
+            >> c.tooFarSec
+            >> ambushSpawned
+            >> c.nextAmbushDays;
+
+        c.hullFrac = std::clamp(c.hullFrac, 0.0, 1.0);
+        c.shieldFrac = std::clamp(c.shieldFrac, 0.0, 1.0);
+        c.tooFarSec = std::max(0.0, c.tooFarSec);
+        c.ambushSpawned = (ambushSpawned != 0);
+
+        if (c.convoyId != 0) {
+          out.escortConvoys.push_back(std::move(c));
+        }
+      }
+    } else if (key == "bounty_targets") {
+      std::size_t n = 0;
+      f >> n;
+      out.bountyTargets.clear();
+      out.bountyTargets.reserve(std::min<std::size_t>(n, 2048));
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tok;
+        if (!(f >> tok)) break;
+        if (tok != "bounty_target") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        // Parse the rest of the target line so we can extend fields over time.
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        BountyTargetState b{};
+        iss >> b.targetId
+            >> b.missionId
+            >> b.systemId
+            >> b.hideoutStation
+            >> b.posKm.x >> b.posKm.y >> b.posKm.z
+            >> b.velKmS.x >> b.velKmS.y >> b.velKmS.z
+            >> b.orient.w >> b.orient.x >> b.orient.y >> b.orient.z
+            >> b.angVelRadS.x >> b.angVelRadS.y >> b.angVelRadS.z
+            >> b.hullFrac
+            >> b.shieldFrac;
+
+        b.hullFrac = std::clamp(b.hullFrac, 0.0, 1.0);
+        b.shieldFrac = std::clamp(b.shieldFrac, 0.0, 1.0);
+
+        if (b.targetId != 0) {
+          out.bountyTargets.push_back(std::move(b));
+        }
       }
     } else if (key == "industry_orders") {
       std::size_t n = 0;

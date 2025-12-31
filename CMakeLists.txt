@@ -115,9 +115,13 @@ set(STELLAR_CORE_SOURCES
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
   src/sim/FlightController.cpp
+  src/sim/Docking.cpp
+  src/sim/DockingComputer.cpp
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
+  src/sim/PoliceScan.cpp
   src/sim/Industry.cpp
+  src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp

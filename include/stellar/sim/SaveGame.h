@@ -60,6 +60,73 @@ struct StationStorage {
   std::array<double, econ::kCommodityCount> cargo{};
 };
 
+// Persisted asteroid depletion state (for deterministic in-system resource fields).
+//
+// The game can generate asteroid nodes deterministically per system and then
+// override the remainingUnits from this table so mining progress persists across
+// system transitions and save/load.
+struct AsteroidState {
+  core::u64 asteroidId{0};
+  double remainingUnits{0.0};
+};
+
+// Persisted state for an escort-mission convoy NPC.
+//
+// Escort missions spawn a specific convoy ship (mission.targetNpcId). Without persisting
+// minimal state, a save/load mid-escort would recreate the world without the convoy and
+// the mission would immediately fail.
+//
+// This is intentionally small: just enough to respawn the convoy near its last known
+// state and keep the escort mission's one-shot ambush scheduling stable.
+struct EscortConvoyState {
+  core::u64 convoyId{0};
+  core::u64 missionId{0};
+
+  SystemId systemId{0};
+  StationId fromStation{0};
+  StationId toStation{0};
+
+  // Physics state (km / km/s).
+  math::Vec3d posKm{0,0,0};
+  math::Vec3d velKmS{0,0,0};
+  math::Quatd orient{1,0,0,0};
+  math::Vec3d angVelRadS{0,0,0};
+
+  // Combat state (fractions of max; max values are derived from the NPC loadout).
+  double hullFrac{1.0};
+  double shieldFrac{1.0};
+
+  // Best-effort haul value used for ambush scaling / UI.
+  double cargoValueCr{0.0};
+
+  // Escort mission runtime state (kept small so missions behave consistently across save/load).
+  double tooFarSec{0.0};
+  bool ambushSpawned{false};
+  double nextAmbushDays{0.0};
+};
+
+
+// Mission-critical bounty targets (for bounty scan/kill missions) are persisted so they don't
+// reset when the player saves/loads or leaves/returns to the system.
+struct BountyTargetState {
+  core::u64 targetId{0};
+  core::u64 missionId{0};
+
+  SystemId systemId{0};
+  StationId hideoutStation{0}; // station the target tends to linger near (best-effort)
+
+  // Physics state (km / km/s).
+  math::Vec3d posKm{0,0,0};
+  math::Vec3d velKmS{0,0,0};
+  math::Quatd orient{1,0,0,0};
+  math::Vec3d angVelRadS{0,0,0};
+
+  // Combat state (fractions of max; max values are derived from the NPC loadout).
+  double hullFrac{1.0};
+  double shieldFrac{1.0};
+};
+
+
 // Lightweight "gameplay" mission representation.
 // Stored in the save file so early progression loops (cargo delivery/courier/bounties)
 // persist across runs.
@@ -126,7 +193,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{17};
+  int version{20};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -147,6 +214,14 @@ struct SaveGame {
   // Exploration
   double explorationDataCr{0.0};
   std::vector<core::u64> scannedKeys{};
+
+  // World state (in-system signals / resource depletion)
+  //
+  // These are intentionally lightweight: only IDs (signals) and per-asteroid
+  // remaining units (resource fields). The game uses deterministic IDs for
+  // procedurally generated objects so it can safely persist partial depletion.
+  std::vector<core::u64> resolvedSignalIds{};
+  std::vector<AsteroidState> asteroidStates{};
 
   // Ship meta/progression
   double fuel{45.0};
@@ -185,6 +260,12 @@ struct SaveGame {
   // Missions
   core::u64 nextMissionId{1};
   std::vector<Mission> missions{};
+
+  // Escort mission persistence (mission-critical NPCs).
+  std::vector<EscortConvoyState> escortConvoys{};
+
+  // Mission-critical bounty targets (bounty scan/kill missions).
+  std::vector<BountyTargetState> bountyTargets{};
 
   // Industry / fabrication orders (station processing queues).
   core::u64 nextIndustryOrderId{1};
