@@ -1,6 +1,9 @@
 // On Windows, SDL may redefine main() to SDL_main unless SDL2main is linked.
 // We provide our own entry point, so prevent SDL from overriding it.
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define SDL_MAIN_HANDLED
 #endif
 
@@ -87,6 +90,11 @@
 #include <vector>
 
 using namespace stellar;
+
+// Convenience aliases for frequently used gameplay enums.
+// (The game prototype uses these heavily; keep the names short in this TU.)
+using sim::ShipHullClass;
+using sim::WeaponType;
 
 static constexpr double kAU_KM = 149597870.7;
 static constexpr double kSOLAR_RADIUS_KM = 695700.0;
@@ -797,6 +805,26 @@ int main(int argc, char** argv) {
 #endif
   ImGui::StyleColorsDark();
 
+  // ---- UI appearance / layout ----
+  // NOTE: These are referenced during initial ImGui setup (HiDPI scaling + docking layout
+  // seed) and then later during runtime UI menus, so they must live for the full app.
+  bool uiAutoScaleFromDpi = true;
+  float uiScale = 1.0f;        // user-configurable global scale
+  float uiScaleApplied = 1.0f; // internal: style already scaled to this value
+  bool showImGuiDemo = false;
+  bool showImGuiMetrics = false;
+
+#ifdef IMGUI_HAS_DOCK
+  // Docking (requires Dear ImGui docking branch/tag).
+  bool uiDockingEnabled = true;
+  bool uiDockPassthruCentral = true;  // keeps 3D view visible when central node is empty
+  bool uiDockLockCentralView = true;  // prevents docking into the central node
+  bool uiDockResetLayout = false;     // rebuild default layout next frame
+  float uiDockLeftRatio = 0.26f;
+  float uiDockRightRatio = 0.30f;
+  float uiDockBottomRatio = 0.25f;
+#endif
+
   // Optional UI scaling (useful on HiDPI displays). Can be tuned at runtime from the UI menu.
   if (uiAutoScaleFromDpi) {
     float ddpi = 0.0f;
@@ -1471,24 +1499,6 @@ int main(int argc, char** argv) {
   bool showWorldVisuals = false;
   bool showHangar = false;
   bool showControls = false;
-
-  // UI appearance / layout
-  bool uiAutoScaleFromDpi = true;
-  float uiScale = 1.0f;        // user-configurable global scale
-  float uiScaleApplied = 1.0f; // internal: style already scaled to this value
-  bool showImGuiDemo = false;
-  bool showImGuiMetrics = false;
-
-#ifdef IMGUI_HAS_DOCK
-  // Docking (requires Dear ImGui docking branch/tag).
-  bool uiDockingEnabled = true;
-  bool uiDockPassthruCentral = true;  // keeps 3D view visible when central node is empty
-  bool uiDockLockCentralView = true; // prevents docking into the central node
-  bool uiDockResetLayout = false;    // rebuild default layout next frame
-  float uiDockLeftRatio = 0.26f;
-  float uiDockRightRatio = 0.30f;
-  float uiDockBottomRatio = 0.25f;
-#endif
 
   // HUD overlays
   bool showRadarHud = true;
@@ -3008,7 +3018,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	
 	                if (m.units > 0.0 && convoy.tradeCargoValueCr <= 0.0) {
 	                  auto& originEcon = universe.stationEconomy(originSt, timeDays);
-	                  const econ::Quote q = econ::quote(originEcon, originSt.economyModel, m.commodity);
+	                  const econ::MarketQuote q = econ::quote(originEcon, originSt.economyModel, m.commodity);
 	                  convoy.tradeCargoValueCr = q.mid * m.units;
 	                  convoy.cargoValueCr = convoy.tradeCargoValueCr;
 	                }
@@ -3693,7 +3703,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                                        /*aiSkill=*/0.50);
 
                 convoy.ship.setMassKg(20000.0);
-                convoy.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.dockRangeKm + 3500.0));
+                convoy.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.commsRangeKm + 3500.0));
                 convoy.ship.setVelocityKmS(originVelKmS);
 
                 // Mission haul: destination is fixed and cargo is already reserved at acceptance.
@@ -3707,7 +3717,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
                 if (m.units > 0.0) {
                   auto& originEcon = universe.stationEconomy(originSt, timeDays);
-                  const econ::Quote q = econ::quote(originEcon, originSt.economyModel, m.commodity);
+                  const econ::MarketQuote q = econ::quote(originEcon, originSt.economyModel, m.commodity);
                   convoy.tradeCargoValueCr = q.mid * m.units;
                   convoy.cargoValueCr = convoy.tradeCargoValueCr;
                 }
@@ -3738,7 +3748,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                                          /*accelMul=*/0.75,
                                          /*aiSkill=*/0.65);
                   escort.ship.setMassKg(13000.0);
-                  escort.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.dockRangeKm + 4200.0));
+                  escort.ship.setPositionKm(originPosKm + randUnit() * (originSt.radiusKm + originSt.commsRangeKm + 4200.0));
                   escort.ship.setVelocityKmS(originVelKmS);
                   contacts.push_back(std::move(escort));
                 }
@@ -5315,7 +5325,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         core::u64 seed = core::hashCombine(core::fnv1a64("bounty_spawn"), (core::u64)m.targetNpcId);
         seed = core::hashCombine(seed, (core::u64)m.id);
         seed = core::hashCombine(seed, (core::u64)m.toStation);
-        core::Rng brng(seed);
+        core::SplitMix64 brng(seed);
 
         if (hideoutIdx && currentSystem && *hideoutIdx < currentSystem->stations.size()) {
           const auto& st = currentSystem->stations[*hideoutIdx];
@@ -5454,7 +5464,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
     // Shields regen (consumes SYS capacitor, scaled by SYS pips).
     if (c.alive && c.hull > 0.0 && c.shieldMax > 0.0 && c.shieldRegenPerSimMin > 0.0 && c.shield < c.shieldMax) {
-      const double regenMul = sim::pipsSysShieldRegenMultiplier(c.pips.sys);
+      const double regenMul = sim::shieldRegenMultiplierFromPips(c.pips.sys);
       const double desired = c.shieldRegenPerSimMin * regenMul * (dtSim / 60.0);
       if (desired > 0.0) {
         const double costPerPt = c.distributorCfg.shieldRegenCostPerPoint;
@@ -7005,7 +7015,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           return escortRuntime.back();
         };
 
-        auto repDelta = [&](sim::FactionId fid, double delta) {
+        auto repDelta = [&](core::u32 fid, double delta) {
           auto& r = repByFaction[fid];
           r = std::clamp(r + delta, -100.0, 100.0);
         };
