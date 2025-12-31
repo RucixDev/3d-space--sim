@@ -31,7 +31,11 @@
 #include "stellar/render/ParticleSystem.h"
 #include "stellar/render/PostFX.h"
 #include "stellar/ui/HudLayout.h"
+#include "stellar/ui/HudSettings.h"
 #include "stellar/ui/Livery.h"
+#include "stellar/ui/UiSettings.h"
+#include "stellar/ui/Bookmarks.h"
+#include "stellar/ui/FuzzySearch.h"
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
@@ -39,6 +43,7 @@
 #include "stellar/sim/PoliceScan.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Warehouse.h"
+#include "stellar/sim/IndustryService.h"
 #include "stellar/sim/TradeScanner.h"
 #include "stellar/sim/Ship.h"
 #include "stellar/sim/ShipLoadout.h"
@@ -46,13 +51,20 @@
 #include "stellar/sim/Ballistics.h"
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
+#include "stellar/sim/SupercruiseComputer.h"
+#include "stellar/sim/EncounterDirector.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
+#include "stellar/sim/DockingClearanceService.h"
+#include "stellar/sim/ThermalSystem.h"
 #include "stellar/sim/Traffic.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/Universe.h"
 
 #include "ControlsConfig.h"
+#include "CommandPalette.h"
+#include "ControlsWindow.h"
+#include "ConsoleWindow.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -75,11 +87,15 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <cstring>
 #include <cstdio>
 #include <cctype>
 #include <cstdint>
+#include <deque>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -512,19 +528,35 @@ static bool beginStationSelectorHUD(const sim::StarSystem& sys, int& stationInde
 
 struct ToastMsg {
   std::string text;
-  double ttl{3.0}; // seconds remaining
+  double ttl{3.0};      // seconds remaining
+  double ttlTotal{3.0}; // initial ttl (for fade)
 };
 
-static void toast(std::vector<ToastMsg>& toasts, std::string msg, double ttlSec=3.0) {
-  toasts.push_back({std::move(msg), ttlSec});
+struct ToastHistoryEntry {
+  double timeDays{0.0};
+  std::string text;
+};
+
+static std::deque<ToastHistoryEntry>* gToastHistorySink = nullptr;
+static const double* gToastTimeDaysPtr = nullptr;
+
+static void setToastHistorySink(std::deque<ToastHistoryEntry>* sink, const double* timeDaysPtr) {
+  gToastHistorySink = sink;
+  gToastTimeDaysPtr = timeDaysPtr;
 }
 
-struct ClearanceState {
-  bool granted{false};
-  double expiresDays{0.0};
-  double cooldownUntilDays{0.0};
-  double lastRequestDays{0.0};
-};
+static void toast(std::vector<ToastMsg>& toasts, std::string msg, double ttlSec=3.0) {
+  if (ttlSec <= 0.0) ttlSec = 0.01;
+  toasts.push_back({std::move(msg), ttlSec, ttlSec});
+
+  if (gToastHistorySink && gToastTimeDaysPtr) {
+    gToastHistorySink->push_back({*gToastTimeDaysPtr, toasts.back().text});
+    static constexpr std::size_t kCap = 1200;
+    while (gToastHistorySink->size() > kCap) gToastHistorySink->pop_front();
+  }
+}
+
+using ClearanceState = sim::DockingClearanceState;
 
 enum class TargetKind : int {
   None = 0,
@@ -803,41 +835,190 @@ int main(int argc, char** argv) {
 #ifdef IMGUI_HAS_DOCK
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 #endif
-  ImGui::StyleColorsDark();
+  // ---- UI settings (persistent) ----
+  // Stored separately from Dear ImGui's imgui.ini so users can tweak look/scale/layout
+  // without nuking window positions.
+  const std::string uiSettingsPath = ui::defaultUiSettingsPath();
+  ui::UiSettings uiSettings = ui::makeDefaultUiSettings();
+  bool uiSettingsDirty = false;
+  bool showUiSettingsWindow = false;
+
+  (void)ui::loadUiSettingsFromFile(uiSettingsPath, uiSettings);
+
+  // Allow users to keep multiple ImGui layout profiles by pointing ImGui at a
+  // different ini file.
+  std::string uiIniFilename = uiSettings.imguiIniFile;
+  if (uiIniFilename.empty()) uiIniFilename = "imgui.ini";
+  io.IniFilename = uiIniFilename.c_str();
+
+  ui::UiTheme uiTheme = uiSettings.theme;
+
+  auto rebuildUiStyle = [&](ui::UiTheme theme, float scale) {
+    // Rebuild the style from scratch so switching themes doesn't leave behind
+    // old border/rounding sizes, etc.
+    ImGuiStyle st = ImGuiStyle();
+    switch (theme) {
+      case ui::UiTheme::Dark: ImGui::StyleColorsDark(&st); break;
+      case ui::UiTheme::Light: ImGui::StyleColorsLight(&st); break;
+      case ui::UiTheme::Classic: ImGui::StyleColorsClassic(&st); break;
+      case ui::UiTheme::HighContrast: {
+        // Start from Dark and push borders/frames toward higher contrast.
+        ImGui::StyleColorsDark(&st);
+        st.WindowRounding = 0.0f;
+        st.FrameRounding = 0.0f;
+        st.GrabRounding = 0.0f;
+        st.ScrollbarRounding = 0.0f;
+        st.WindowBorderSize = 1.0f;
+        st.FrameBorderSize = 1.0f;
+
+        ImVec4* c = st.Colors;
+        c[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+        c[ImGuiCol_TextDisabled] = ImVec4(0.70f, 0.70f, 0.70f, 1.00f);
+        c[ImGuiCol_WindowBg] = ImVec4(0.02f, 0.02f, 0.02f, 1.00f);
+        c[ImGuiCol_ChildBg] = ImVec4(0.02f, 0.02f, 0.02f, 0.00f);
+        c[ImGuiCol_PopupBg] = ImVec4(0.02f, 0.02f, 0.02f, 0.98f);
+        c[ImGuiCol_Border] = ImVec4(0.80f, 0.80f, 0.80f, 0.30f);
+        c[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+        c[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
+        c[ImGuiCol_FrameBgHovered] = ImVec4(0.16f, 0.16f, 0.16f, 1.00f);
+        c[ImGuiCol_FrameBgActive] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+
+        c[ImGuiCol_TitleBg] = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
+        c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.00f, 0.00f, 0.00f, 0.80f);
+
+        c[ImGuiCol_MenuBarBg] = ImVec4(0.05f, 0.05f, 0.05f, 1.00f);
+        c[ImGuiCol_ScrollbarBg] = ImVec4(0.02f, 0.02f, 0.02f, 0.80f);
+        c[ImGuiCol_ScrollbarGrab] = ImVec4(0.60f, 0.60f, 0.60f, 0.50f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.75f, 0.75f, 0.75f, 0.70f);
+        c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.90f, 0.90f, 0.90f, 0.80f);
+
+        c[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
+        c[ImGuiCol_SliderGrab] = ImVec4(0.85f, 0.85f, 0.85f, 0.70f);
+        c[ImGuiCol_SliderGrabActive] = ImVec4(0.95f, 0.95f, 0.95f, 0.90f);
+
+        c[ImGuiCol_Button] = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.28f, 0.28f, 0.28f, 1.00f);
+
+        c[ImGuiCol_Header] = ImVec4(0.18f, 0.18f, 0.18f, 1.00f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+        c[ImGuiCol_HeaderActive] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+
+        c[ImGuiCol_Separator] = ImVec4(0.85f, 0.85f, 0.85f, 0.25f);
+        c[ImGuiCol_SeparatorHovered] = ImVec4(0.95f, 0.95f, 0.95f, 0.45f);
+        c[ImGuiCol_SeparatorActive] = ImVec4(1.00f, 1.00f, 1.00f, 0.60f);
+
+        c[ImGuiCol_Tab] = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
+        c[ImGuiCol_TabHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+        c[ImGuiCol_TabActive] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
+      } break;
+      default: ImGui::StyleColorsDark(&st); break;
+    }
+
+    if (std::abs(scale - 1.0f) > 0.001f) {
+      st.ScaleAllSizes(scale);
+    }
+    ImGui::GetStyle() = st;
+  };
 
   // ---- UI appearance / layout ----
   // NOTE: These are referenced during initial ImGui setup (HiDPI scaling + docking layout
   // seed) and then later during runtime UI menus, so they must live for the full app.
-  bool uiAutoScaleFromDpi = true;
-  float uiScale = 1.0f;        // user-configurable global scale
-  float uiScaleApplied = 1.0f; // internal: style already scaled to this value
+  bool uiAutoScaleFromDpi = uiSettings.autoScaleFromDpi;
+  float uiScaleUser = uiSettings.scaleUser; // multiplier (not DPI-derived)
+  float uiScaleDpi = 1.0f;                 // derived from SDL_GetDisplayDPI
+  float uiScale = 1.0f;                    // effective scale applied to style + fonts
+  float uiScaleApplied = 1.0f;             // internal: style already scaled to this value
+  bool uiSettingsAutoSaveOnExit = uiSettings.autoSaveOnExit;
   bool showImGuiDemo = false;
   bool showImGuiMetrics = false;
 
 #ifdef IMGUI_HAS_DOCK
   // Docking (requires Dear ImGui docking branch/tag).
-  bool uiDockingEnabled = true;
-  bool uiDockPassthruCentral = true;  // keeps 3D view visible when central node is empty
-  bool uiDockLockCentralView = true;  // prevents docking into the central node
+  bool uiDockingEnabled = uiSettings.dock.dockingEnabled;
+  bool uiDockPassthruCentral = uiSettings.dock.passthruCentral;  // keeps 3D view visible when central node is empty
+  bool uiDockLockCentralView = uiSettings.dock.lockCentralView;  // prevents docking into the central node
   bool uiDockResetLayout = false;     // rebuild default layout next frame
-  float uiDockLeftRatio = 0.26f;
-  float uiDockRightRatio = 0.30f;
-  float uiDockBottomRatio = 0.25f;
+  float uiDockLeftRatio = uiSettings.dock.leftRatio;
+  float uiDockRightRatio = uiSettings.dock.rightRatio;
+  float uiDockBottomRatio = uiSettings.dock.bottomRatio;
 #endif
 
-  // Optional UI scaling (useful on HiDPI displays). Can be tuned at runtime from the UI menu.
-  if (uiAutoScaleFromDpi) {
+  auto recomputeUiDpiScale = [&]() {
+    uiScaleDpi = 1.0f;
+    if (!uiAutoScaleFromDpi) return;
     float ddpi = 0.0f;
     if (SDL_GetDisplayDPI(0, &ddpi, nullptr, nullptr) == 0 && ddpi > 0.0f) {
-      uiScale = std::clamp(ddpi / 96.0f, 0.75f, 1.75f);
+      uiScaleDpi = std::clamp(ddpi / 96.0f, 0.75f, 1.75f);
     }
-  }
-  uiScaleApplied = 1.0f;
-  if (std::abs(uiScale - 1.0f) > 0.001f) {
-    ImGui::GetStyle().ScaleAllSizes(uiScale);
+  };
+
+  auto recomputeUiScale = [&]() {
+    const float dpiFactor = uiAutoScaleFromDpi ? uiScaleDpi : 1.0f;
+    uiScale = std::clamp(uiScaleUser * dpiFactor, 0.75f, 2.50f);
+  };
+
+  // Initial UI scaling + theme.
+  recomputeUiDpiScale();
+  recomputeUiScale();
+  rebuildUiStyle(uiTheme, uiScale);
+  io.FontGlobalScale = uiScale;
+  uiScaleApplied = uiScale;
+
+  auto applyUiScaleNow = [&]() {
+    recomputeUiScale();
+    const float denom = std::max(0.001f, uiScaleApplied);
+    ImGui::GetStyle().ScaleAllSizes(uiScale / denom);
     io.FontGlobalScale = uiScale;
     uiScaleApplied = uiScale;
-  }
+  };
+
+  auto syncUiSettingsFromRuntime = [&]() {
+    uiSettings.imguiIniFile = uiIniFilename;
+    uiSettings.autoScaleFromDpi = uiAutoScaleFromDpi;
+    uiSettings.scaleUser = uiScaleUser;
+    uiSettings.theme = uiTheme;
+    uiSettings.autoSaveOnExit = uiSettingsAutoSaveOnExit;
+#ifdef IMGUI_HAS_DOCK
+    uiSettings.dock.dockingEnabled = uiDockingEnabled;
+    uiSettings.dock.passthruCentral = uiDockPassthruCentral;
+    uiSettings.dock.lockCentralView = uiDockLockCentralView;
+    uiSettings.dock.leftRatio = uiDockLeftRatio;
+    uiSettings.dock.rightRatio = uiDockRightRatio;
+    uiSettings.dock.bottomRatio = uiDockBottomRatio;
+#endif
+  };
+
+  auto applyUiSettingsToRuntime = [&](const ui::UiSettings& s, bool loadImGuiIni) {
+    uiTheme = s.theme;
+    uiAutoScaleFromDpi = s.autoScaleFromDpi;
+    uiScaleUser = s.scaleUser;
+    uiSettingsAutoSaveOnExit = s.autoSaveOnExit;
+
+    uiIniFilename = s.imguiIniFile.empty() ? std::string("imgui.ini") : s.imguiIniFile;
+    io.IniFilename = uiIniFilename.c_str();
+
+#ifdef IMGUI_HAS_DOCK
+    uiDockingEnabled = s.dock.dockingEnabled;
+    uiDockPassthruCentral = s.dock.passthruCentral;
+    uiDockLockCentralView = s.dock.lockCentralView;
+    uiDockLeftRatio = s.dock.leftRatio;
+    uiDockRightRatio = s.dock.rightRatio;
+    uiDockBottomRatio = s.dock.bottomRatio;
+#endif
+
+    recomputeUiDpiScale();
+    recomputeUiScale();
+    rebuildUiStyle(uiTheme, uiScale);
+    io.FontGlobalScale = uiScale;
+    uiScaleApplied = uiScale;
+
+    if (loadImGuiIni && io.IniFilename && io.IniFilename[0] != '\0') {
+      ImGui::LoadIniSettingsFromDisk(io.IniFilename);
+    }
+  };
 
 #ifdef IMGUI_HAS_DOCK
   // If this is the first run (no imgui.ini yet), seed a sensible default dock layout.
@@ -1247,6 +1428,9 @@ int main(int argc, char** argv) {
 
   // Heat (0..100). Kept intentionally simple for early gameplay feedback.
   double heat = 0.0;
+  // Per-frame accumulator for instantaneous heat spikes (weapons, emergency drops, etc).
+  // This is consumed by the ThermalSystem step.
+  double heatImpulse = 0.0;
 
   // Missions + reputation
   core::u64 nextMissionId = 1;
@@ -1420,9 +1604,7 @@ int main(int argc, char** argv) {
   // Contacts (pirates etc.)
   std::vector<Contact> contacts;
   core::SplitMix64 rng(seed ^ 0xC0FFEEu);
-  double nextPirateSpawnDays = 0.01; // soon after start
-  double nextTraderSpawnDays = 0.008;
-  double nextPoliceSpawnDays = 0.006;
+  sim::EncounterDirectorState encounterDirector = sim::makeEncounterDirector(seed, timeDays);
 
   // Salvage / mining / signal sources
   bool cargoScoopDeployed = true;
@@ -1461,28 +1643,13 @@ int main(int argc, char** argv) {
   const std::string savePath = "savegame.txt";
 
   // Controls (keybindings)
-  const std::string controlsPath = game::defaultControlsPath();
+  std::string controlsPath = game::defaultControlsPath();
   game::ControlsConfig controls = game::makeDefaultControls();
+  const game::ControlsConfig controlsDefaults = game::makeDefaultControls();
   bool controlsDirty = false;
   bool controlsAutoSaveOnExit = true;
-
-  enum class RebindKind : int {
-    None = 0,
-    Action,
-    Hold,
-    AxisPositive,
-    AxisNegative,
-  };
-
-  struct RebindRequest {
-    RebindKind kind{RebindKind::None};
-    std::string label;
-    game::KeyChord* chord{nullptr};
-    SDL_Scancode* hold{nullptr};
-    game::AxisPair* axis{nullptr};
-  };
-
-  RebindRequest rebind{};
+  game::ControlsWindowState controlsWindow{};
+  game::ConsoleWindowState consoleWindow{};
 
   // UI state
   bool showGalaxy = true;
@@ -1498,7 +1665,7 @@ int main(int argc, char** argv) {
   bool showPostFx = false;
   bool showWorldVisuals = false;
   bool showHangar = false;
-  bool showControls = false;
+  // controls window state lives in controlsWindow
 
   // HUD overlays
   bool showRadarHud = true;
@@ -1515,6 +1682,14 @@ int main(int argc, char** argv) {
   bool showHudLayoutWindow = false;
   bool hudLayoutEditMode = false;
   bool hudLayoutAutoSaveOnExit = true;
+
+  // HUD settings persistence: master toggles + tuning (radar/combat/tactical).
+  const std::string hudSettingsPath = ui::defaultHudSettingsPath();
+  ui::HudSettings hudSettings = ui::makeDefaultHudSettings();
+  ui::HudSettings hudSettingsSaved = hudSettings;
+  bool showHudSettingsWindow = false;
+  bool hudSettingsDirty = false;
+  bool hudSettingsAutoSaveOnExit = true;
 
   // Draw an edge-of-screen arrow for the current target when it is off-screen.
   bool hudOffscreenTargetIndicator = true;
@@ -1566,9 +1741,154 @@ int main(int argc, char** argv) {
     hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
   }
 
+  auto syncHudSettingsFromRuntime = [&]() {
+    hudSettings.autoSaveOnExit = hudSettingsAutoSaveOnExit;
+
+    hudSettings.showRadarHud = showRadarHud;
+    hudSettings.objectiveHudEnabled = objectiveHudEnabled;
+    hudSettings.threatHudEnabled = hudThreatOverlayEnabled;
+    hudSettings.jumpHudEnabled = hudJumpOverlay;
+
+    hudSettings.radarRangeKm = radarRangeKm;
+    hudSettings.radarMaxBlips = radarMaxBlips;
+
+    hudSettings.offscreenTargetIndicator = hudOffscreenTargetIndicator;
+
+    hudSettings.combatHudEnabled = hudCombatHud;
+    hudSettings.useProceduralReticle = hudUseProceduralReticle;
+    hudSettings.showWeaponRings = hudShowWeaponRings;
+    hudSettings.showHeatRing = hudShowHeatRing;
+    hudSettings.showDistributorRings = hudShowDistributorRings;
+    hudSettings.reticleSizePx = hudReticleSizePx;
+    hudSettings.reticleAlpha = hudReticleAlpha;
+
+    hudSettings.showLeadIndicator = hudShowLeadIndicator;
+    hudSettings.leadUseLastFiredWeapon = hudLeadUseLastFiredWeapon;
+    hudSettings.leadSizePx = hudLeadSizePx;
+    hudSettings.leadMaxTimeSec = hudLeadMaxTimeSec;
+
+    hudSettings.showFlightPathMarker = hudShowFlightPathMarker;
+    hudSettings.flightMarkerUseLocalFrame = hudFlightMarkerUseLocalFrame;
+    hudSettings.flightMarkerClampToEdge = hudFlightMarkerClampToEdge;
+    hudSettings.flightMarkerSizePx = hudFlightMarkerSizePx;
+
+    hudSettings.tacticalOverlayEnabled = showTacticalOverlay;
+    hudSettings.tacticalShowLabels = tacticalShowLabels;
+    hudSettings.tacticalRangeKm = tacticalRangeKm;
+    hudSettings.tacticalMaxMarkers = tacticalMaxMarkers;
+    hudSettings.tacticalShowStations = tacticalShowStations;
+    hudSettings.tacticalShowPlanets = tacticalShowPlanets;
+    hudSettings.tacticalShowContacts = tacticalShowContacts;
+    hudSettings.tacticalShowCargo = tacticalShowCargo;
+    hudSettings.tacticalShowAsteroids = tacticalShowAsteroids;
+    hudSettings.tacticalShowSignals = tacticalShowSignals;
+  };
+
+  auto applyHudSettingsToRuntime = [&](const ui::HudSettings& s) {
+    hudSettingsAutoSaveOnExit = s.autoSaveOnExit;
+
+    showRadarHud = s.showRadarHud;
+    objectiveHudEnabled = s.objectiveHudEnabled;
+    hudThreatOverlayEnabled = s.threatHudEnabled;
+    hudJumpOverlay = s.jumpHudEnabled;
+
+    radarRangeKm = s.radarRangeKm;
+    radarMaxBlips = s.radarMaxBlips;
+
+    hudOffscreenTargetIndicator = s.offscreenTargetIndicator;
+
+    hudCombatHud = s.combatHudEnabled;
+    hudUseProceduralReticle = s.useProceduralReticle;
+    hudShowWeaponRings = s.showWeaponRings;
+    hudShowHeatRing = s.showHeatRing;
+    hudShowDistributorRings = s.showDistributorRings;
+    hudReticleSizePx = s.reticleSizePx;
+    hudReticleAlpha = s.reticleAlpha;
+
+    hudShowLeadIndicator = s.showLeadIndicator;
+    hudLeadUseLastFiredWeapon = s.leadUseLastFiredWeapon;
+    hudLeadSizePx = s.leadSizePx;
+    hudLeadMaxTimeSec = s.leadMaxTimeSec;
+
+    hudShowFlightPathMarker = s.showFlightPathMarker;
+    hudFlightMarkerUseLocalFrame = s.flightMarkerUseLocalFrame;
+    hudFlightMarkerClampToEdge = s.flightMarkerClampToEdge;
+    hudFlightMarkerSizePx = s.flightMarkerSizePx;
+
+    showTacticalOverlay = s.tacticalOverlayEnabled;
+    tacticalShowLabels = s.tacticalShowLabels;
+    tacticalRangeKm = s.tacticalRangeKm;
+    tacticalMaxMarkers = s.tacticalMaxMarkers;
+    tacticalShowStations = s.tacticalShowStations;
+    tacticalShowPlanets = s.tacticalShowPlanets;
+    tacticalShowContacts = s.tacticalShowContacts;
+    tacticalShowCargo = s.tacticalShowCargo;
+    tacticalShowAsteroids = s.tacticalShowAsteroids;
+    tacticalShowSignals = s.tacticalShowSignals;
+  };
+
+  auto hudSettingsEquivalent = [&](const ui::HudSettings& a, const ui::HudSettings& b) -> bool {
+    auto deq = [](double x, double y, double eps = 1e-6) { return std::fabs(x - y) <= eps; };
+    auto feq = [](float x, float y, float eps = 1e-4f) { return std::fabs(x - y) <= eps; };
+    return a.autoSaveOnExit == b.autoSaveOnExit
+        && a.showRadarHud == b.showRadarHud
+        && a.objectiveHudEnabled == b.objectiveHudEnabled
+        && a.threatHudEnabled == b.threatHudEnabled
+        && a.jumpHudEnabled == b.jumpHudEnabled
+        && deq(a.radarRangeKm, b.radarRangeKm)
+        && a.radarMaxBlips == b.radarMaxBlips
+        && a.offscreenTargetIndicator == b.offscreenTargetIndicator
+        && a.combatHudEnabled == b.combatHudEnabled
+        && a.useProceduralReticle == b.useProceduralReticle
+        && a.showWeaponRings == b.showWeaponRings
+        && a.showHeatRing == b.showHeatRing
+        && a.showDistributorRings == b.showDistributorRings
+        && feq(a.reticleSizePx, b.reticleSizePx)
+        && feq(a.reticleAlpha, b.reticleAlpha)
+        && a.showLeadIndicator == b.showLeadIndicator
+        && a.leadUseLastFiredWeapon == b.leadUseLastFiredWeapon
+        && feq(a.leadSizePx, b.leadSizePx)
+        && deq(a.leadMaxTimeSec, b.leadMaxTimeSec)
+        && a.showFlightPathMarker == b.showFlightPathMarker
+        && a.flightMarkerUseLocalFrame == b.flightMarkerUseLocalFrame
+        && a.flightMarkerClampToEdge == b.flightMarkerClampToEdge
+        && feq(a.flightMarkerSizePx, b.flightMarkerSizePx)
+        && a.tacticalOverlayEnabled == b.tacticalOverlayEnabled
+        && a.tacticalShowLabels == b.tacticalShowLabels
+        && deq(a.tacticalRangeKm, b.tacticalRangeKm)
+        && a.tacticalMaxMarkers == b.tacticalMaxMarkers
+        && a.tacticalShowStations == b.tacticalShowStations
+        && a.tacticalShowPlanets == b.tacticalShowPlanets
+        && a.tacticalShowContacts == b.tacticalShowContacts
+        && a.tacticalShowCargo == b.tacticalShowCargo
+        && a.tacticalShowAsteroids == b.tacticalShowAsteroids
+        && a.tacticalShowSignals == b.tacticalShowSignals;
+  };
+
+  // Load HUD settings (if present). Missing file -> keep runtime defaults/layout-driven toggles.
+  {
+    ui::HudSettings loaded = ui::makeDefaultHudSettings();
+    if (ui::loadHudSettingsFromFile(hudSettingsPath, loaded)) {
+      hudSettings = loaded;
+      applyHudSettingsToRuntime(hudSettings);
+    } else {
+      syncHudSettingsFromRuntime();
+    }
+    hudSettingsSaved = hudSettings;
+    hudSettingsDirty = false;
+  }
+
   // Load controls (if present). Missing file -> defaults.
   {
     game::loadFromFile(controlsPath, controls);
+  }
+
+  // Load bookmarks (if present). Missing file -> empty.
+  {
+    ui::Bookmarks loaded = ui::makeDefaultBookmarks();
+    if (ui::loadBookmarksFromFile(bookmarksPath, loaded)) {
+      bookmarks = std::move(loaded);
+    }
   }
 
   // Optional mouse steering (relative mouse mode). Toggle with M.
@@ -1653,6 +1973,13 @@ int main(int argc, char** argv) {
   // Optional helper: when arriving in a system, auto-target a specific station (e.g. from a mission/trade suggestion).
   sim::StationId pendingArrivalTargetStationId = 0;
 
+  // Bookmarks: persistent navigation shortcuts (systems + stations).
+  const std::string bookmarksPath = ui::defaultBookmarksPath();
+  ui::Bookmarks bookmarks = ui::makeDefaultBookmarks();
+  bool showBookmarksWindow = false;
+  bool bookmarksDirty = false;
+  bool bookmarksAutoSaveOnExit = true;
+
   // Mission Board: cached route preview for offers (computed when offers/settings change)
   struct MissionOfferRoutePreview {
     bool ok{false};
@@ -1682,6 +2009,24 @@ int main(int argc, char** argv) {
   Target target{};
 
   std::vector<ToastMsg> toasts;
+
+  // Persistent notification history (auto-filled via the `toast()` helper).
+  std::deque<ToastHistoryEntry> toastHistory;
+  bool showNotifications = false;
+  int notificationsSelected = -1;
+  char notificationsFilter[128]{};
+
+  // UI: command palette (Ctrl+P by default)
+  game::CommandPaletteState commandPalette;
+  std::vector<game::PaletteItem> commandPaletteItems;
+
+  // Wire the toast history sink now that timeDays + storage exist.
+  setToastHistorySink(&toastHistory, &timeDays);
+
+  // Console: hook core logging + built-in commands.
+  consoleWindow.simTimeDaysPtr = &timeDays;
+  game::consoleAddBuiltins(consoleWindow);
+  game::consoleInstallCoreLogSink(consoleWindow);
 
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
     if (sys.stations.empty()) {
@@ -1921,7 +2266,7 @@ auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalt
 
   // Higher heat = faster reinforcements.
   const double respSec = std::clamp(7.0 - 0.65 * policeHeat, 2.0, 7.0);
-  nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (respSec / 86400.0));
+  encounterDirector.nextPoliceSpawnDays = std::min(encounterDirector.nextPoliceSpawnDays, timeDays + (respSec / 86400.0));
   if (showToast) {
     toast(toasts, "Crime (" + factionName(factionId) + "): " + reason, 3.0);
   }
@@ -1987,7 +2332,7 @@ auto enforceContraband = [&](core::u32 jurisdiction,
 
   // Heightened police attention for a short window.
   policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (res.policeAlertSeconds / 86400.0));
-  nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (res.nextPoliceSpawnDelaySeconds / 86400.0));
+  encounterDirector.nextPoliceSpawnDays = std::min(encounterDirector.nextPoliceSpawnDays, timeDays + (res.nextPoliceSpawnDelaySeconds / 86400.0));
 
   // Raise local security alert (affects patrol spawn rate / response).
   policeHeat = std::clamp(policeHeat + res.policeHeatDelta, 0.0, 6.0);
@@ -2185,6 +2530,111 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     if (showToast) toast(toasts, "No route found (try refueling or upgrading your FSD).", 2.6);
     return false;
   };
+
+  // Console: game commands (stateful helpers).
+  // These are registered once at startup and can be invoked from the Console window.
+  game::consoleAddCommand(consoleWindow, "pause", "Pause simulation time.",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>&) {
+      paused = true;
+      game::consolePrint(c, core::LogLevel::Info, "Paused.");
+    });
+
+  game::consoleAddCommand(consoleWindow, "unpause", "Resume simulation time.",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>&) {
+      paused = false;
+      game::consolePrint(c, core::LogLevel::Info, "Unpaused.");
+    });
+
+  game::consoleAddCommand(consoleWindow, "timescale", "Set time scale. Usage: timescale <multiplier>",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      if (args.empty()) {
+        game::consolePrint(c, core::LogLevel::Info, "Usage: timescale <multiplier>");
+        return;
+      }
+      try {
+        const double v = std::stod(std::string(args[0]));
+        timeScale = std::clamp(v, 0.0, 200.0);
+        paused = (timeScale <= 0.0);
+        game::consolePrint(c, core::LogLevel::Info, "Time scale set.");
+      } catch (...) {
+        game::consolePrint(c, core::LogLevel::Warn, "Invalid number.");
+      }
+    });
+
+  game::consoleAddCommand(consoleWindow, "credits", "Set credits. Usage: credits <amount>",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      if (args.empty()) {
+        game::consolePrint(c, core::LogLevel::Info, "Usage: credits <amount>");
+        return;
+      }
+      try {
+        const double v = std::stod(std::string(args[0]));
+        credits = std::max(0.0, v);
+        game::consolePrint(c, core::LogLevel::Info, "Credits updated.");
+      } catch (...) {
+        game::consolePrint(c, core::LogLevel::Warn, "Invalid number.");
+      }
+    });
+
+  game::consoleAddCommand(consoleWindow, "window", "Toggle UI windows. Usage: window <name> [on|off|toggle]",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      if (args.empty()) {
+        game::consolePrint(c, core::LogLevel::Info, "Usage: window <name> [on|off|toggle]");
+        game::consolePrint(c, core::LogLevel::Info, "Names: galaxy ship market contacts missions scanner trade guide hangar visuals notifications bookmarks console");
+        return;
+      }
+      auto lower = [&](std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) out.push_back((char)std::tolower((unsigned char)ch));
+        return out;
+      };
+      const std::string name = lower(args[0]);
+      const std::string mode = args.size() >= 2 ? lower(args[1]) : std::string("toggle");
+      auto apply = [&](bool& flag) {
+        if (mode == "on" || mode == "1" || mode == "true") flag = true;
+        else if (mode == "off" || mode == "0" || mode == "false") flag = false;
+        else flag = !flag;
+      };
+
+      if (name == "galaxy") apply(showGalaxy);
+      else if (name == "ship") apply(showShip);
+      else if (name == "market") apply(showEconomy);
+      else if (name == "contacts") apply(showContacts);
+      else if (name == "missions") apply(showMissions);
+      else if (name == "scanner") apply(showScanner);
+      else if (name == "trade") apply(showTrade);
+      else if (name == "guide") apply(showGuide);
+      else if (name == "hangar") apply(showHangar);
+      else if (name == "visuals" || name == "world" || name == "worldvisuals") apply(showWorldVisuals);
+      else if (name == "notifications") apply(showNotifications);
+      else if (name == "bookmarks") apply(showBookmarksWindow);
+      else if (name == "console") { apply(consoleWindow.open); if (consoleWindow.open) consoleWindow.focusInput = true; }
+      else {
+        game::consolePrint(c, core::LogLevel::Warn, "Unknown window name.");
+        return;
+      }
+      game::consolePrint(c, core::LogLevel::Info, "OK.");
+    });
+
+  game::consoleAddCommand(consoleWindow, "route", "Plot a route to a system id. Usage: route <system_id>",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      if (args.empty()) {
+        game::consolePrint(c, core::LogLevel::Info, "Usage: route <system_id>");
+        return;
+      }
+      try {
+        const auto id = (sim::SystemId)std::stoull(std::string(args[0]));
+        if (plotRouteToSystem(id, /*showToast=*/true)) {
+          game::consolePrint(c, core::LogLevel::Info, "Route plotted.");
+        } else {
+          game::consolePrint(c, core::LogLevel::Warn, "Route failed.");
+        }
+      } catch (...) {
+        game::consolePrint(c, core::LogLevel::Warn, "Invalid system id.");
+      }
+    });
+
 
   auto isMassLocked = [&]() -> bool {
     if (!currentSystem) return false;
@@ -2545,53 +2995,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         const auto key = [&](const game::KeyChord& chord) { return game::chordMatchesEvent(chord, event.key); };
 
         // If we're rebinding a control, capture this key press and don't also trigger gameplay actions.
-        if (rebind.kind != RebindKind::None) {
-          const SDL_Scancode sc = event.key.keysym.scancode;
-          const SDL_Keymod mods = game::normalizeMods((SDL_Keymod)event.key.keysym.mod);
-
-          // ESC cancels the capture (bind Escape via file-edit if you really want it).
-          if (sc == SDL_SCANCODE_ESCAPE && mods == KMOD_NONE) {
-            toast(toasts, "Keybind capture canceled.", 1.2);
-            rebind = RebindRequest{};
-            continue;
-          }
-
-          // Backspace/Delete clears the binding.
-          if (sc == SDL_SCANCODE_BACKSPACE || sc == SDL_SCANCODE_DELETE) {
-            if (rebind.kind == RebindKind::Action && rebind.chord) {
-              *rebind.chord = game::KeyChord{};
-            } else if (rebind.kind == RebindKind::Hold && rebind.hold) {
-              *rebind.hold = SDL_SCANCODE_UNKNOWN;
-            } else if (rebind.kind == RebindKind::AxisPositive && rebind.axis) {
-              rebind.axis->positive = SDL_SCANCODE_UNKNOWN;
-            } else if (rebind.kind == RebindKind::AxisNegative && rebind.axis) {
-              rebind.axis->negative = SDL_SCANCODE_UNKNOWN;
-            }
-
-            controlsDirty = true;
-            toast(toasts, "Unbound: " + rebind.label, 1.6);
-            rebind = RebindRequest{};
-            continue;
-          }
-
-          // Apply new binding.
-          if (rebind.kind == RebindKind::Action && rebind.chord) {
-            *rebind.chord = game::KeyChord{sc, mods};
-            toast(toasts, "Bound " + rebind.label + " -> " + game::chordLabel(*rebind.chord), 1.8);
-          } else if (rebind.kind == RebindKind::Hold && rebind.hold) {
-            *rebind.hold = sc;
-            toast(toasts, "Bound " + rebind.label + " -> " + game::scancodeLabel(sc), 1.8);
-          } else if (rebind.kind == RebindKind::AxisPositive && rebind.axis) {
-            rebind.axis->positive = sc;
-            toast(toasts, "Bound " + rebind.label + " (+) -> " + game::scancodeLabel(sc), 1.8);
-          } else if (rebind.kind == RebindKind::AxisNegative && rebind.axis) {
-            rebind.axis->negative = sc;
-            toast(toasts, "Bound " + rebind.label + " (-) -> " + game::scancodeLabel(sc), 1.8);
-          }
-
-          controlsDirty = true;
-          rebind = RebindRequest{};
+        if (game::handleControlsRebindKeydown(
+                controlsWindow, event.key, controls, controlsDirty,
+                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
           continue;
+        }
+
+        if (key(controls.actions.commandPalette) && !io.WantCaptureKeyboard) {
+          game::openCommandPalette(commandPalette);
         }
 
         if (key(controls.actions.quit)) running = false;
@@ -2807,6 +3218,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             playerHull = std::clamp(s.hull, 0.0, 1.0) * playerHullMax;
             playerShield = std::clamp(s.shield, 0.0, 1.0) * playerShieldMax;
             heat = std::clamp(s.heat, 0.0, 200.0);
+            heatImpulse = 0.0;
 
             // Power distributor
             distributorPips.eng = std::clamp(s.pipsEng, 0, 4);
@@ -2893,9 +3305,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             cargoScoopDeployed = true;
             cargoFullToastCooldownUntilDays = 0.0;
 
-            nextPirateSpawnDays = timeDays + (rng.range(25.0, 55.0) / 86400.0);
-            nextTraderSpawnDays = timeDays + (rng.range(15.0, 35.0) / 86400.0);
-            nextPoliceSpawnDays = timeDays + (rng.range(10.0, 25.0) / 86400.0);
+            // Reset local-space encounter scheduling after load.
+            // (Contacts are transient, so this is purely cadence/QA convenience.)
+            encounterDirector = sim::makeEncounterDirector(seed, timeDays);
+            encounterDirector.nextPirateSpawnDays = timeDays + (encounterDirector.rng.range(25.0, 55.0) / 86400.0);
+            encounterDirector.nextTraderSpawnDays = timeDays + (encounterDirector.rng.range(15.0, 35.0) / 86400.0);
+            encounterDirector.nextPoliceSpawnDays = timeDays + (encounterDirector.rng.range(10.0, 25.0) / 86400.0);
             autopilot = false;
             supercruiseState = SupercruiseState::Idle;
             supercruiseChargeRemainingSec = 0.0;
@@ -3118,7 +3533,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         if (key(controls.actions.toggleSpriteLab) && !io.WantCaptureKeyboard) showSprites = !showSprites;
         if (key(controls.actions.toggleVfxLab) && !io.WantCaptureKeyboard) showVfx = !showVfx;
         if (key(controls.actions.togglePostFx) && !io.WantCaptureKeyboard) showPostFx = !showPostFx;
-        if (key(controls.actions.toggleControlsWindow) && !io.WantCaptureKeyboard) showControls = !showControls;
+        if (key(controls.actions.toggleControlsWindow) && !io.WantCaptureKeyboard) {
+          controlsWindow.open = !controlsWindow.open;
+          if (controlsWindow.open) controlsWindow.focusFilter = true;
+        }
 
         // HUD layout editor shortcuts
         if (key(controls.actions.hudLayoutToggleEdit) && !io.WantCaptureKeyboard) {
@@ -3580,22 +3998,28 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
             auto& cs = clearances[st.id];
 
-            if (dist > st.commsRangeKm) {
+            const bool hadValid = sim::dockingClearanceValid(cs, timeDays);
+
+            // Optional congestion hint: count nearby ships in comms range (excluding the player).
+            int nearby = 0;
+            for (const auto& c : contacts) {
+              if (!c.alive) continue;
+              if ((c.ship.positionKm() - stPos).length() <= st.commsRangeKm) ++nearby;
+            }
+
+            const double traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearby);
+            const auto dec = sim::requestDockingClearance(seed, st, timeDays, dist, cs, traffic01);
+
+            if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
+              toast(toasts, "Docking clearance already granted.", 2.0);
+            } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
               toast(toasts, "Out of comms range for clearance.", 2.5);
-            } else if (timeDays < cs.cooldownUntilDays) {
+            } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
               toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
+            } else if (dec.status == sim::DockingClearanceStatus::Granted) {
+              toast(toasts, "Docking clearance GRANTED.", 3.0);
             } else {
-              // Simple logic: usually granted; sometimes denied (simulate traffic / capacity).
-              cs.lastRequestDays = timeDays;
-              const double pGrant = 0.82;
-              cs.granted = rng.chance(pGrant);
-              if (cs.granted) {
-                cs.expiresDays = timeDays + (12.0 * 60.0) / 86400.0; // 12 minutes
-                toast(toasts, "Docking clearance GRANTED.", 3.0);
-              } else {
-                cs.cooldownUntilDays = timeDays + (90.0) / 86400.0; // 90 seconds
-                toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
-              }
+              toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
             }
           } else {
             toast(toasts, "No station targeted for clearance.", 2.0);
@@ -3783,7 +4207,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
               const auto& st = currentSystem->stations[target.index];
               auto& cs = clearances[st.id];
-              const bool clearanceValid = cs.granted && (timeDays <= cs.expiresDays);
+              const bool clearanceValid = sim::dockingClearanceValid(cs, timeDays);
 
               const math::Vec3d stPos = stationPosKm(st, timeDays);
               const math::Quatd stQ = stationOrient(st, stPos, timeDays);
@@ -3925,7 +4349,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               // Track last fired weapon for HUD lead indicator.
               hudLastFiredPrimary = primary;
 
-              heat = std::min(120.0, heat + fr.heatDelta);
+              heatImpulse += fr.heatDelta;
 
               if (fr.hasBeam) {
                 beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
@@ -4035,28 +4459,28 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         const math::Vec3d stV = stationVelKmS(st, timeDays);
 
         auto& cs = clearances[st.id];
-        const bool clearanceValid = cs.granted && (timeDays <= cs.expiresDays);
+        const bool clearanceValid = sim::dockingClearanceValid(cs, timeDays);
         const double distKm = (ship.positionKm() - stPos).length();
 
         // If we don't have clearance yet, try to request it automatically when in comms range.
         if (!clearanceValid) {
-          const double retryDays = (6.0 / 86400.0); // 6 seconds
-          if (distKm <= st.commsRangeKm && timeDays >= cs.cooldownUntilDays && (timeDays - cs.lastRequestDays) >= retryDays) {
-            cs.lastRequestDays = timeDays;
+          int nearby = 0;
+          for (const auto& c : contacts) {
+            if (!c.alive) continue;
+            if ((c.ship.positionKm() - stPos).length() <= st.commsRangeKm) ++nearby;
+          }
 
-            const double pGrant = 0.82;
-            cs.granted = rng.chance(pGrant);
-            if (cs.granted) {
-              cs.expiresDays = timeDays + (12.0 * 60.0) / 86400.0; // 12 minutes
-              toast(toasts, "Docking clearance GRANTED.", 2.2);
-            } else {
-              cs.cooldownUntilDays = timeDays + (90.0) / 86400.0; // 90 seconds
-              toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
-            }
+          const double traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearby);
+          const auto dec = sim::autoRequestDockingClearance(seed, st, timeDays, distKm, cs, traffic01);
+
+          if (dec.status == sim::DockingClearanceStatus::Granted) {
+            toast(toasts, "Docking clearance GRANTED.", 2.2);
+          } else if (dec.status == sim::DockingClearanceStatus::Denied) {
+            toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
           }
         }
 
-        const bool clearanceNow = cs.granted && (timeDays <= cs.expiresDays);
+        const bool clearanceNow = sim::dockingClearanceValid(cs, timeDays);
 
         const auto dcOut = dockingComputer.update(ship, st, stPos, stQ, stV, clearanceNow);
         input.thrustLocal = dcOut.input.thrustLocal;
@@ -4176,7 +4600,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	      }
 
       if (emergency) {
-        heat = std::min(120.0, heat + 25.0);
+        heatImpulse += 25.0;
         playerShield = std::max(0.0, playerShield - playerShieldMax * 0.12);
         playerHull = std::max(0.0, playerHull - playerHullMax * 0.04);
         ship.setAngularVelocityRadS({rng.range(-0.6, 0.6), rng.range(-0.6, 0.6), rng.range(-0.4, 0.4)});
@@ -4458,70 +4882,44 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           }
         }
 
-        // Compute safe-drop window ("7-second rule")
-        const math::Vec3d rel = destPosKm - ship.positionKm();
-        const double dist = rel.length();
-        supercruiseDistKm = dist;
+        // Supercruise guidance (safe-drop heuristic + braking-distance-aware speed profile).
+        // This extracts the math/control logic from the game loop so it's testable and reusable.
+        const bool interdicted = (interdictionState != InterdictionState::None);
 
-        if (dist < 1e-6) {
-          endSupercruise(false, destVelKmS, dirToDest, "Supercruise drop.");
+        sim::SupercruiseParams scParams{};
+        scParams.safeTtaSec = kSupercruiseSafeTtaSec;
+        scParams.safeWindowSlackSec = 2.0;
+        scParams.minClosingKmS = 0.05;
+        scParams.maxSpeedKmS = supercruiseMaxSpeedKmS;
+        scParams.accelCapKmS2 = 6.0;
+        scParams.angularCapRadS2 = 1.2;
+        scParams.useBrakingDistanceLimit = true;
+
+        const auto sc = sim::guideSupercruise(ship, destPosKm, destVelKmS, dropKm,
+                                              /*navAssistEnabled=*/supercruiseAssist,
+                                              /*dropRequested=*/supercruiseDropRequested,
+                                              /*interdicted=*/interdicted,
+                                              scParams);
+
+        supercruiseSafeDropReady = sc.hud.safeDropReady;
+        supercruiseTtaSec = sc.hud.ttaSec;
+        supercruiseDistKm = sc.hud.distKm;
+        supercruiseClosingKmS = sc.hud.closingKmS;
+
+        if (sc.dropNow) {
+          if (sc.emergencyDrop) endSupercruise(true, destVelKmS, sc.dirToDest, "EMERGENCY DROP!");
+          else endSupercruise(false, destVelKmS, sc.dirToDest, "Supercruise drop.");
         } else {
-          const math::Vec3d dir = rel / dist;
-          const math::Vec3d vRel = ship.velocityKmS() - destVelKmS;
-          const double closing = math::dot(vRel, dir);
-          supercruiseClosingKmS = closing;
-
-          const double tta = (closing > 1e-3) ? (dist / closing) : 1e9;
-          supercruiseTtaSec = tta;
-
-          const double safeMin = kSupercruiseSafeTtaSec - 2.0;
-          const double safeMax = kSupercruiseSafeTtaSec + 2.0;
-          const bool safeWindow = (dist < dropKm) && (tta > safeMin) && (tta < safeMax) && (closing > 0.05);
-          supercruiseSafeDropReady = safeWindow;
-
-          const bool interdicted = (interdictionState != InterdictionState::None);
-
-          // Manual drop request (H while in supercruise)
-          if (!interdicted && supercruiseDropRequested) {
-            if (safeWindow) endSupercruise(false, destVelKmS, dir, "Supercruise drop.");
-            else endSupercruise(true, destVelKmS, dir, "EMERGENCY DROP!");
-          } else if (!interdicted && supercruiseAssist && safeWindow) {
-            // Nav assist auto-drop when safe
-            endSupercruise(false, destVelKmS, dir, "Supercruise drop.");
-          } else {
-            // Follow a speed profile toward the target
-            const double desiredSpeed =
-              supercruiseAssist ? std::clamp(dist / kSupercruiseSafeTtaSec, 60.0, supercruiseMaxSpeedKmS)
-                               : std::clamp(dist * 0.0008, 90.0, supercruiseMaxSpeedKmS);
-
-            const math::Vec3d desiredVel = destVelKmS + dir * desiredSpeed;
-            const math::Vec3d dv = desiredVel - ship.velocityKmS();
-
-            if (dv.lengthSq() > 1e-12) {
-              const math::Vec3d accelDir = dv.normalized();
-              input.thrustLocal = ship.orientation().conjugate().rotate(accelDir);
-            } else {
-              input.thrustLocal = {0,0,0};
-            }
-
-            // Face travel direction in normal supercruise. During interdiction, we let the player steer.
-            if (!interdicted) {
-              const math::Vec3d desiredFwdLocal = ship.orientation().conjugate().rotate(dir);
-              const double yawErr = std::atan2(desiredFwdLocal.x, desiredFwdLocal.z);
-              const double pitchErr = -std::atan2(desiredFwdLocal.y, desiredFwdLocal.z);
-
-              input.torqueLocal.x = (float)std::clamp(pitchErr * 1.6, -1.0, 1.0);
-              input.torqueLocal.y = (float)std::clamp(yawErr * 1.6, -1.0, 1.0);
-              input.torqueLocal.z = 0.0f;
-            }
-
-            input.dampers = true;
-            input.brake = false;
-            input.boost = false;
-
-            ship.setMaxLinearAccelKmS2(6.0);
-            ship.setMaxAngularAccelRadS2(1.2);
+          input.thrustLocal = sc.input.thrustLocal;
+          if (!interdicted) {
+            input.torqueLocal = sc.input.torqueLocal;
           }
+          input.dampers = sc.input.dampers;
+          input.brake = sc.input.brake;
+          input.boost = sc.input.boost;
+
+          ship.setMaxLinearAccelKmS2(sc.recommendedMaxLinearAccelKmS2);
+          ship.setMaxAngularAccelRadS2(sc.recommendedMaxAngularAccelRadS2);
         }
       }
     }
@@ -4788,7 +5186,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           supercruiseCooldownTotalSec = supercruiseCooldownRemainingSec;
           supercruiseDropRequested = false;
 
-          heat = std::min(120.0, heat + 25.0);
+          heatImpulse += 25.0;
           playerShield = std::max(0.0, playerShield - 10.0);
           playerHull = std::max(0.0, playerHull - 3.0);
           ship.setVelocityKmS(localFrameVelKmS + ship.forward().normalized() * 0.45);
@@ -5157,50 +5555,53 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   return count;
 };
 
+  // --- Encounter scheduling (refactored into core) ---
+  // The app still owns *how* contacts are instantiated; the core module only
+  // decides *when* to request spawns.
+  sim::EncounterDirectorCounts ec{};
+  ec.alivePirates = alivePirates;
+  ec.aliveTraders = aliveTraders;
+  ec.alivePolice = alivePolice;
+  ec.aliveTotal = aliveTotal;
+
+  sim::EncounterDirectorContext ectx{};
+  ectx.timeDays = timeDays;
+  ectx.combatSimEnabled = combatSimEnabled;
+  ectx.stationCount = (currentSystem && !currentSystem->stations.empty()) ? (int)currentSystem->stations.size() : 0;
+  ectx.localFactionId = localFaction;
+  ectx.localRep = localRep;
+  ectx.localBountyCr = localBounty;
+  ectx.policeHeat = policeHeat;
+  ectx.policeAlert = (policeAlertUntilDays > timeDays);
+  ectx.playerWantedHere = playerWantedHere;
+
   // Pirates occasionally (baseline threat).
-  if (timeDays >= nextPirateSpawnDays && alivePirates < 4 && aliveTotal < 14) {
-    nextPirateSpawnDays = timeDays + (rng.range(120.0, 220.0) / 86400.0); // every ~2-4 minutes
-    const int cap = std::max(1, std::min({14 - aliveTotal, 4 - alivePirates, 3}));
+  if (const int cap = sim::planPirateSpawn(encounterDirector, ectx, ec); cap > 0) {
     const int spawned = spawnPiratePack(cap);
     alivePirates += spawned;
     aliveTotal += spawned;
+    ec.alivePirates += spawned;
+    ec.aliveTotal += spawned;
   }
 
   // Traders / traffic: gives you something to pirate (but doing so triggers police).
-  if (timeDays >= nextTraderSpawnDays && aliveTraders < 3 && currentSystem && !currentSystem->stations.empty() && aliveTotal < 14) {
-    nextTraderSpawnDays = timeDays + (rng.range(70.0, 140.0) / 86400.0);
+  if (sim::planTraderSpawn(encounterDirector, ectx, ec) > 0) {
     spawnTrader();
     ++aliveTraders;
     ++aliveTotal;
+    ++ec.aliveTraders;
+    ++ec.aliveTotal;
   }
 
   // Police / patrols: scale with threat + your legal status.
   if (localFaction != 0) {
-    int desiredPolice = 1;
-    if (playerWantedHere) desiredPolice += 2;
-    if (localBounty > 1200.0) desiredPolice += 1;
-    if (localBounty > 4500.0) desiredPolice += 1;
-    if (policeHeat > 3.0) desiredPolice += 1;
-    if (alivePirates > 0) desiredPolice += 1;
-    if (localRep < -25.0) desiredPolice += 1;
-    desiredPolice = std::clamp(desiredPolice, 0, 7);
-
-    // If recently alerted by a crime, tighten the spawn interval.
-    const bool alert = (policeAlertUntilDays > timeDays);
-    const double heat = policeHeat;
-    const double baseMinSec = alert ? 12.0 : 55.0;
-    const double baseMaxSec = alert ? 24.0 : 95.0;
-
-    // As heat rises, response gets a bit quicker (but stays bounded).
-    const double spawnMinSec = std::clamp(baseMinSec - heat * (alert ? 1.1 : 1.8), 4.0, baseMinSec);
-    const double spawnMaxSec = std::clamp(baseMaxSec - heat * (alert ? 1.6 : 2.4), 10.0, baseMaxSec);
-
-    if (timeDays >= nextPoliceSpawnDays && alivePolice < desiredPolice && aliveTotal < 16) {
-      nextPoliceSpawnDays = timeDays + (rng.range(spawnMinSec, spawnMaxSec) / 86400.0);
-      const int cap = std::max(1, std::min({16 - aliveTotal, desiredPolice - alivePolice, 3}));
-      const int spawned = spawnPolicePack(cap);
+    const sim::PoliceSpawnPlan p = sim::planPoliceSpawn(encounterDirector, ectx, ec);
+    if (p.spawnMaxCount > 0) {
+      const int spawned = spawnPolicePack(p.spawnMaxCount);
       alivePolice += spawned;
       aliveTotal += spawned;
+      ec.alivePolice += spawned;
+      ec.aliveTotal += spawned;
     }
   }
 
@@ -6142,10 +6543,10 @@ auto spawnPolicePack = [&](int maxCount) -> int {
             policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (res.policeAlertSeconds / 86400.0));
           }
           if (res.nextPoliceSpawnDelaySeconds > 1e-9) {
-            nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (res.nextPoliceSpawnDelaySeconds / 86400.0));
+            encounterDirector.nextPoliceSpawnDays = std::min(encounterDirector.nextPoliceSpawnDays, timeDays + (res.nextPoliceSpawnDelaySeconds / 86400.0));
           }
 
-          heat = std::min(100.0, heat + res.shipHeatDelta);
+          heatImpulse += res.shipHeatDelta;
 
           const std::string src = bribeOffer.sourceName.empty() ? std::string("Security") : bribeOffer.sourceName;
           toast(toasts,
@@ -6336,7 +6737,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
                     // Keep some local pressure while you're deciding.
                     policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (90.0 / 86400.0));
-                    nextPoliceSpawnDays = std::min(nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
+                    encounterDirector.nextPoliceSpawnDays = std::min(encounterDirector.nextPoliceSpawnDays, timeDays + (6.0 / 86400.0));
 
                     toast(toasts,
                           bribeOffer.sourceName + ": contraband detected (" + (detail.empty() ? std::string("illegal cargo") : detail)
@@ -6939,24 +7340,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	      // --- Heat model (real-time) ---
       {
-        double heatIn = 0.0;
-        if (!docked) {
-          heatIn += 18.0 * boostAppliedFrac;
-          if (supercruiseState == SupercruiseState::Active) heatIn += 6.0;
-          if (fsdState == FsdState::Charging) heatIn += 12.0;
-          if (fsdState == FsdState::Jumping) heatIn += 16.0;
+        sim::ThermalInputs tin{};
+        tin.dtReal = dtReal;
+        tin.docked = docked;
+        tin.supercruiseActive = (supercruiseState == SupercruiseState::Active);
+        if (fsdState == FsdState::Charging) tin.fsd = sim::ThermalFsdState::Charging;
+        else if (fsdState == FsdState::Jumping) tin.fsd = sim::ThermalFsdState::Jumping;
+        else tin.fsd = sim::ThermalFsdState::Idle;
+        tin.boostAppliedFrac = boostAppliedFrac;
+        tin.heatImpulse = heatImpulse;
+        tin.heatCoolRate = playerHeatCoolRate;
+        tin.hullMax = playerHullMax;
+
+        const auto tr = sim::stepThermal(heat, tin);
+        heat = tr.heat;
+
+        // Apply overheat hull damage.
+        if (tr.hullDamage > 0.0) {
+          playerHull = std::max(0.0, playerHull - tr.hullDamage);
         }
 
-        const double baseCool = docked ? 20.0 : 10.0;
-        const double coolRate = baseCool * (playerHeatCoolRate / 10.0);
-        heat += (heatIn - coolRate) * dtReal;
-        heat = std::clamp(heat, 0.0, 120.0);
-
-        // Very simple overheat consequence for now: take slow hull damage.
-        if (heat > 100.0) {
-          const double over = heat - 100.0;
-          playerHull = std::max(0.0, playerHull - over * 0.0008 * playerHullMax * dtReal);
-        }
+        // Consume per-frame impulse.
+        heatImpulse = 0.0;
       }
 
       timeDays += dtSim / 86400.0;
@@ -7869,7 +8274,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         bool clearanceGranted = false;
         if (auto it = clearances.find(st.id); it != clearances.end()) {
-          clearanceGranted = it->second.granted && (timeDays <= it->second.expiresDays);
+          clearanceGranted = sim::dockingClearanceValid(it->second, timeDays);
         }
 
         const float cr = clearanceGranted ? 0.35f : 0.85f;
@@ -8222,6 +8627,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
     hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
 
+    // Keep HUD settings synced so manual save / auto-save always matches runtime.
+    syncHudSettingsFromRuntime();
+    hudSettingsDirty = !hudSettingsEquivalent(hudSettings, hudSettingsSaved);
+
     // Menu bar + (optional) DockSpace layout.
     // When built against Dear ImGui's docking branch/tag, we create a fullscreen dockspace and
     // seed a sensible default layout. Without docking support, windows simply float as before.
@@ -8235,6 +8644,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (ImGui::BeginMenu("Windows")) {
         ImGui::MenuItem(withKey("Galaxy", controls.actions.toggleGalaxy).c_str(), nullptr, &showGalaxy);
+        ImGui::MenuItem("Bookmarks", nullptr, &showBookmarksWindow);
         ImGui::MenuItem(withKey("Ship/Status", controls.actions.toggleShip).c_str(), nullptr, &showShip);
         ImGui::MenuItem(withKey("Market", controls.actions.toggleMarket).c_str(), nullptr, &showEconomy);
         ImGui::MenuItem(withKey("Contacts", controls.actions.toggleContacts).c_str(), nullptr, &showContacts);
@@ -8249,7 +8659,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::MenuItem(withKey("VFX Lab", controls.actions.toggleVfxLab).c_str(), nullptr, &showVfx);
         ImGui::MenuItem(withKey("Post FX", controls.actions.togglePostFx).c_str(), nullptr, &showPostFx);
         ImGui::Separator();
-        ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &showControls);
+        ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
+        ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
         ImGui::EndMenu();
       }
 
@@ -8263,9 +8675,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::Separator();
         ImGui::MenuItem(withKey("Edit HUD layout", controls.actions.hudLayoutToggleEdit).c_str(), nullptr, &hudLayoutEditMode);
         ImGui::MenuItem("HUD layout window", nullptr, &showHudLayoutWindow);
+        ImGui::MenuItem("HUD settings window", nullptr, &showHudSettingsWindow);
         ImGui::Separator();
 
-        ImGui::SliderFloat("Radar range (km)", &radarRangeKm, 500.0f, 50000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+        const double minRadarKm = 25000.0;
+        const double maxRadarKm = 1200000.0;
+        ImGui::SliderScalar("Radar range (km)", ImGuiDataType_Double, &radarRangeKm,
+                            &minRadarKm, &maxRadarKm, "%.0f", ImGuiSliderFlags_Logarithmic);
 
         float safePx = (float)hudLayout.safeMarginPx;
         if (ImGui::SliderFloat("Safe margin (px)", &safePx, 0.0f, 80.0f, "%.0f")) {
@@ -8305,11 +8721,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
 
       if (ImGui::BeginMenu("Controls")) {
-        ImGui::MenuItem(withKey("Controls window", controls.actions.toggleControlsWindow).c_str(), nullptr, &showControls);
+        ImGui::MenuItem(withKey("Controls window", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
         ImGui::Separator();
         if (ImGui::MenuItem("Save controls")) {
           const bool ok = game::saveToFile(controls, controlsPath);
-          controlsDirty = !ok;
+          if (ok) controlsDirty = false;
           toast(toasts, ok ? "Saved controls." : "Failed to save controls.", 1.8);
         }
         if (ImGui::MenuItem("Load controls")) {
@@ -8336,44 +8752,91 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
 
       if (ImGui::BeginMenu("UI")) {
+        if (ImGui::MenuItem(withKey("Command Palette...", controls.actions.commandPalette).c_str())) {
+          game::openCommandPalette(commandPalette);
+        }
+        ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
+        ImGui::MenuItem("Bookmarks", nullptr, &showBookmarksWindow);
+        ImGui::MenuItem("UI Settings...", nullptr, &showUiSettingsWindow);
+        ImGui::Separator();
+
         ImGui::MenuItem("ImGui Demo Window", nullptr, &showImGuiDemo);
         ImGui::MenuItem("ImGui Metrics Window", nullptr, &showImGuiMetrics);
 
         ImGui::Separator();
+        if (ImGui::BeginMenu("Theme")) {
+          const auto setTheme = [&](ui::UiTheme t) {
+            if (uiTheme == t) return;
+            uiTheme = t;
+            rebuildUiStyle(uiTheme, uiScale);
+            io.FontGlobalScale = uiScale;
+            uiScaleApplied = uiScale;
+            uiSettingsDirty = true;
+          };
+
+          if (ImGui::MenuItem("Dark", nullptr, uiTheme == ui::UiTheme::Dark)) setTheme(ui::UiTheme::Dark);
+          if (ImGui::MenuItem("Light", nullptr, uiTheme == ui::UiTheme::Light)) setTheme(ui::UiTheme::Light);
+          if (ImGui::MenuItem("Classic", nullptr, uiTheme == ui::UiTheme::Classic)) setTheme(ui::UiTheme::Classic);
+          if (ImGui::MenuItem("High Contrast", nullptr, uiTheme == ui::UiTheme::HighContrast)) setTheme(ui::UiTheme::HighContrast);
+          ImGui::EndMenu();
+        }
+
+        ImGui::Separator();
         if (ImGui::Checkbox("Auto scale from DPI", &uiAutoScaleFromDpi)) {
-          if (uiAutoScaleFromDpi) {
-            float ddpi = 0.0f;
-            if (SDL_GetDisplayDPI(0, &ddpi, nullptr, nullptr) == 0 && ddpi > 0.0f) {
-              uiScale = std::clamp(ddpi / 96.0f, 0.75f, 1.75f);
-            }
-          }
-          // Apply immediately.
-          ImGui::GetStyle().ScaleAllSizes(uiScale / uiScaleApplied);
-          io.FontGlobalScale = uiScale;
-          uiScaleApplied = uiScale;
+          recomputeUiDpiScale();
+          applyUiScaleNow();
+          uiSettingsDirty = true;
         }
 
         ImGui::SetNextItemWidth(180.0f);
-        if (ImGui::SliderFloat("Global scale", &uiScale, 0.75f, 1.75f, "%.2fx")) {
-          ImGui::GetStyle().ScaleAllSizes(uiScale / uiScaleApplied);
-          io.FontGlobalScale = uiScale;
-          uiScaleApplied = uiScale;
+        if (ImGui::SliderFloat("User scale", &uiScaleUser, 0.50f, 2.50f, "%.2fx")) {
+          applyUiScaleNow();
+          uiSettingsDirty = true;
+        }
+
+        ImGui::TextDisabled("Effective: %.2fx", uiScale);
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Save UI settings")) {
+          syncUiSettingsFromRuntime();
+          const bool ok = ui::saveUiSettingsToFile(uiSettings, uiSettingsPath);
+          uiSettingsDirty = uiSettingsDirty && !ok;
+          if (ok) uiSettingsDirty = false;
+          toast(toasts, ok ? "Saved UI settings." : "Failed to save UI settings.", 1.8);
+        }
+        if (ImGui::MenuItem("Load UI settings")) {
+          ui::UiSettings loaded = ui::makeDefaultUiSettings();
+          if (ui::loadUiSettingsFromFile(uiSettingsPath, loaded)) {
+            uiSettings = loaded;
+            applyUiSettingsToRuntime(uiSettings, /*loadImGuiIni=*/true);
+            uiSettingsDirty = false;
+            toast(toasts, "Loaded UI settings.", 1.8);
+          } else {
+            toast(toasts, "No UI settings file found.", 1.8);
+          }
+        }
+        if (ImGui::MenuItem("Auto-save UI settings on exit", nullptr, &uiSettingsAutoSaveOnExit)) {
+          uiSettingsDirty = true;
+        }
+        if (uiSettingsDirty) {
+          ImGui::TextDisabled("(unsaved changes)");
         }
 
 #ifdef IMGUI_HAS_DOCK
         ImGui::Separator();
         ImGui::TextDisabled("Docking");
-        ImGui::Checkbox("Enable DockSpace", &uiDockingEnabled);
+        if (ImGui::Checkbox("Enable DockSpace", &uiDockingEnabled)) uiSettingsDirty = true;
         if (ImGui::MenuItem("Reset dock layout")) uiDockResetLayout = true;
-        if (ImGui::Checkbox("Passthrough central view", &uiDockPassthruCentral)) uiDockResetLayout = true;
-        if (ImGui::Checkbox("Lock central view", &uiDockLockCentralView)) uiDockResetLayout = true;
+        if (ImGui::Checkbox("Passthrough central view", &uiDockPassthruCentral)) { uiDockResetLayout = true; uiSettingsDirty = true; }
+        if (ImGui::Checkbox("Lock central view", &uiDockLockCentralView)) { uiDockResetLayout = true; uiSettingsDirty = true; }
 
         ImGui::SetNextItemWidth(180.0f);
-        if (ImGui::SliderFloat("Left width", &uiDockLeftRatio, 0.10f, 0.45f, "%.2f")) uiDockResetLayout = true;
+        if (ImGui::SliderFloat("Left width", &uiDockLeftRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
         ImGui::SetNextItemWidth(180.0f);
-        if (ImGui::SliderFloat("Right width", &uiDockRightRatio, 0.10f, 0.45f, "%.2f")) uiDockResetLayout = true;
+        if (ImGui::SliderFloat("Right width", &uiDockRightRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
         ImGui::SetNextItemWidth(180.0f);
-        if (ImGui::SliderFloat("Bottom height", &uiDockBottomRatio, 0.10f, 0.45f, "%.2f")) uiDockResetLayout = true;
+        if (ImGui::SliderFloat("Bottom height", &uiDockBottomRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
 
         ImGui::TextDisabled("Tip: drag window tab bars to rearrange panels.");
 #endif
@@ -8402,6 +8865,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       status += " fps";
 
       if (controlsDirty) status += " | controls*";
+	      if (uiSettingsDirty) status += " | ui*";
+	      if (bookmarksDirty) status += " | bm*";
 
       const float wText = ImGui::CalcTextSize(status.c_str()).x;
       ImGui::SameLine(ImGui::GetWindowWidth() - wText - 14.0f);
@@ -8668,248 +9133,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // Controls (keybinds) window
-    if (showControls) {
-      ImGui::SetNextWindowSize(ImVec2(680.0f, 560.0f), ImGuiCond_FirstUseEver);
-      ImGui::Begin("Controls", &showControls);
+    game::drawControlsWindow(controlsWindow, controls, controlsDefaults, controlsDirty, controlsAutoSaveOnExit, controlsPath,
+                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
-      ImGui::TextDisabled(
-          "Rebind controls & keybinds. Click Rebind, then press a key. Esc cancels capture; Backspace/Delete clears.");
-
-      if (rebind.kind != RebindKind::None) {
-        ImGui::Separator();
-        ImGui::Text("Capturing: %s", rebind.label.c_str());
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel capture")) {
-          rebind = RebindRequest{};
-        }
-      }
-
-      ImGui::Separator();
-      if (ImGui::Button("Save to file")) {
-        if (game::saveToFile(controls, controlsPath)) {
-          controlsDirty = false;
-          toast(toasts, "Saved controls to " + controlsPath, 2.0);
-        } else {
-          toast(toasts, "Failed to save controls.", 2.0);
-        }
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Load from file")) {
-        game::ControlsConfig loaded = game::makeDefaultControls();
-        if (game::loadFromFile(controlsPath, loaded)) {
-          controls = loaded;
-          controlsDirty = false;
-          toast(toasts, "Loaded controls from " + controlsPath, 2.0);
-        } else {
-          toast(toasts, "Controls file not found (using defaults).", 2.0);
-        }
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Restore defaults")) {
-        controls = game::makeDefaultControls();
-        controlsDirty = true;
-        toast(toasts, "Controls reset to defaults (not saved yet).", 2.0);
-      }
-      ImGui::SameLine();
-      ImGui::Checkbox("Auto-save on exit", &controlsAutoSaveOnExit);
-
-      if (controlsDirty) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("* unsaved");
-      }
-
-      ImGui::Separator();
-
-      auto requestActionRebind = [&](const char* label, game::KeyChord& chord) {
-        rebind.kind = RebindKind::Action;
-        rebind.chord = &chord;
-        rebind.hold = nullptr;
-        rebind.axis = nullptr;
-        rebind.label = label;
-      };
-
-      auto requestHoldRebind = [&](const char* label, SDL_Scancode& sc) {
-        rebind.kind = RebindKind::Hold;
-        rebind.chord = nullptr;
-        rebind.hold = &sc;
-        rebind.axis = nullptr;
-        rebind.label = label;
-      };
-
-      auto requestAxisRebind = [&](const char* label, game::AxisPair& axis, bool positive) {
-        rebind.kind = positive ? RebindKind::AxisPositive : RebindKind::AxisNegative;
-        rebind.chord = nullptr;
-        rebind.hold = nullptr;
-        rebind.axis = &axis;
-        rebind.label = label;
-      };
-
-      auto actionRow = [&](const char* label, game::KeyChord& chord) {
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextUnformatted(label);
-
-        ImGui::TableSetColumnIndex(1);
-        const std::string k = game::chordLabel(chord);
-        ImGui::TextUnformatted(k.c_str());
-
-        ImGui::TableSetColumnIndex(2);
-        if (ImGui::SmallButton((std::string("Rebind##") + label).c_str())) {
-          requestActionRebind(label, chord);
-        }
-
-        ImGui::TableSetColumnIndex(3);
-        if (ImGui::SmallButton((std::string("Clear##") + label).c_str())) {
-          chord = game::KeyChord{};
-          controlsDirty = true;
-          toast(toasts, std::string("Unbound: ") + label, 1.6);
-        }
-      };
-
-      auto holdRow = [&](const char* label, SDL_Scancode& sc) {
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextUnformatted(label);
-
-        ImGui::TableSetColumnIndex(1);
-        const std::string k = game::scancodeLabel(sc);
-        ImGui::TextUnformatted(k.c_str());
-
-        ImGui::TableSetColumnIndex(2);
-        if (ImGui::SmallButton((std::string("Rebind##") + label).c_str())) {
-          requestHoldRebind(label, sc);
-        }
-
-        ImGui::TableSetColumnIndex(3);
-        if (ImGui::SmallButton((std::string("Clear##") + label).c_str())) {
-          sc = SDL_SCANCODE_UNKNOWN;
-          controlsDirty = true;
-          toast(toasts, std::string("Unbound: ") + label, 1.6);
-        }
-      };
-
-      auto axisRow = [&](const char* label, game::AxisPair& axis) {
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextUnformatted(label);
-
-        ImGui::TableSetColumnIndex(1);
-        ImGui::Text("%s / %s", game::scancodeLabel(axis.positive).c_str(), game::scancodeLabel(axis.negative).c_str());
-
-        ImGui::TableSetColumnIndex(2);
-        if (ImGui::SmallButton((std::string("Rebind +##") + label).c_str())) {
-          requestAxisRebind(label, axis, true);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton((std::string("Rebind -##") + label).c_str())) {
-          requestAxisRebind(label, axis, false);
-        }
-
-        ImGui::TableSetColumnIndex(3);
-        if (ImGui::SmallButton((std::string("Clear##") + label).c_str())) {
-          axis.positive = SDL_SCANCODE_UNKNOWN;
-          axis.negative = SDL_SCANCODE_UNKNOWN;
-          controlsDirty = true;
-          toast(toasts, std::string("Unbound: ") + label, 1.6);
-        }
-      };
-
-      if (ImGui::CollapsingHeader("Flight Axes", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::BeginTable("##controls_axes", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-          ImGui::TableSetupColumn("Axis");
-          ImGui::TableSetupColumn("Keys");
-          ImGui::TableSetupColumn("Rebind");
-          ImGui::TableSetupColumn("Clear");
-          ImGui::TableHeadersRow();
-
-          axisRow("Thrust forward", controls.axes.thrustForward);
-          axisRow("Thrust right", controls.axes.thrustRight);
-          axisRow("Thrust up", controls.axes.thrustUp);
-          axisRow("Pitch", controls.axes.pitch);
-          axisRow("Yaw", controls.axes.yaw);
-          axisRow("Roll", controls.axes.roll);
-
-          ImGui::EndTable();
-        }
-      }
-
-      if (ImGui::CollapsingHeader("Flight Holds", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::BeginTable("##controls_holds", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-          ImGui::TableSetupColumn("Hold");
-          ImGui::TableSetupColumn("Key");
-          ImGui::TableSetupColumn("Rebind");
-          ImGui::TableSetupColumn("Clear");
-          ImGui::TableHeadersRow();
-
-          holdRow("Boost", controls.holds.boost);
-          holdRow("Brake", controls.holds.brake);
-          holdRow("Dampers enable", controls.holds.dampersEnable);
-          holdRow("Dampers disable", controls.holds.dampersDisable);
-
-          ImGui::EndTable();
-        }
-      }
-
-      if (ImGui::CollapsingHeader("Actions", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::BeginTable("##controls_actions", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-          ImGui::TableSetupColumn("Action");
-          ImGui::TableSetupColumn("Key");
-          ImGui::TableSetupColumn("Rebind");
-          ImGui::TableSetupColumn("Clear");
-          ImGui::TableHeadersRow();
-
-          actionRow("Quit", controls.actions.quit);
-          actionRow("Quick save", controls.actions.quicksave);
-          actionRow("Quick load", controls.actions.quickload);
-
-          actionRow("Toggle Galaxy window", controls.actions.toggleGalaxy);
-          actionRow("Toggle Ship window", controls.actions.toggleShip);
-          actionRow("Toggle Market window", controls.actions.toggleMarket);
-          actionRow("Toggle Contacts window", controls.actions.toggleContacts);
-          actionRow("Toggle Missions window", controls.actions.toggleMissions);
-          actionRow("Toggle Scanner window", controls.actions.toggleScanner);
-          actionRow("Toggle Trade window", controls.actions.toggleTrade);
-          actionRow("Toggle Guide window", controls.actions.toggleGuide);
-          actionRow("Toggle Hangar window", controls.actions.toggleHangar);
-          actionRow("Toggle World Visuals window", controls.actions.toggleWorldVisuals);
-          actionRow("Toggle Sprite Lab", controls.actions.toggleSpriteLab);
-          actionRow("Toggle VFX Lab", controls.actions.toggleVfxLab);
-          actionRow("Toggle Post FX", controls.actions.togglePostFx);
-          actionRow("Toggle Controls window", controls.actions.toggleControlsWindow);
-
-          actionRow("Toggle Radar HUD", controls.actions.toggleRadarHud);
-          actionRow("Toggle Tactical overlay", controls.actions.toggleTacticalOverlay);
-          actionRow("HUD Layout: edit mode", controls.actions.hudLayoutToggleEdit);
-          actionRow("HUD Layout: save", controls.actions.hudLayoutSave);
-          actionRow("HUD Layout: load", controls.actions.hudLayoutLoad);
-          actionRow("HUD Layout: reset", controls.actions.hudLayoutReset);
-
-          actionRow("Pause", controls.actions.pause);
-          actionRow("Toggle Autopilot", controls.actions.toggleAutopilot);
-          actionRow("Toggle Cargo Scoop", controls.actions.toggleCargoScoop);
-          actionRow("Docking clearance", controls.actions.requestDockingClearance);
-          actionRow("Dock/Undock", controls.actions.dockOrUndock);
-
-          actionRow("Cycle targets", controls.actions.cycleTargets);
-          actionRow("Target: station", controls.actions.targetStationCycle);
-          actionRow("Target: planet", controls.actions.targetPlanetCycle);
-          actionRow("Target: contact", controls.actions.targetContactCycle);
-          actionRow("Target: star", controls.actions.targetStar);
-          actionRow("Clear target", controls.actions.clearTarget);
-
-          actionRow("Comply / submit", controls.actions.complyOrSubmit);
-          actionRow("Bribe", controls.actions.bribe);
-          actionRow("Scanner action", controls.actions.scannerAction);
-          actionRow("Mouse steer", controls.actions.toggleMouseSteer);
-          actionRow("Supercruise", controls.actions.supercruise);
-          actionRow("FSD Jump", controls.actions.fsdJump);
-
-          ImGui::EndTable();
-        }
-      }
-
-      ImGui::End();
-    }
+    // Console window (log + commands)
+    game::drawConsoleWindow(consoleWindow);
 
     // HUD overlay: combat symbology + target marker + toasts
     {
@@ -9318,7 +9546,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         bool clearanceGranted = false;
         if (auto it = clearances.find(st.id); it != clearances.end()) {
-          clearanceGranted = it->second.granted && (timeDays <= it->second.expiresDays);
+          clearanceGranted = sim::dockingClearanceValid(it->second, timeDays);
         }
 
         const math::Vec3d axisOut = stQ.rotate({0,0,1});
@@ -9560,9 +9788,25 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // Toasts
       float y = 18.0f;
+      const float x = 18.0f;
+      const ImVec2 pad(8.0f, 4.0f);
+
       for (const auto& t : toasts) {
-        draw->AddText({18.0f, y}, IM_COL32(240,240,240,220), t.text.c_str());
-        y += 18.0f;
+        const float denom = (float)std::max(0.001, t.ttlTotal);
+        const float a = std::clamp((float)(t.ttl / denom), 0.0f, 1.0f);
+
+        const ImVec2 textSz = ImGui::CalcTextSize(t.text.c_str());
+        const ImVec2 p0(x, y);
+        const ImVec2 r0(p0.x - pad.x, p0.y - pad.y);
+        const ImVec2 r1(p0.x + textSz.x + pad.x, p0.y + textSz.y + pad.y);
+
+        const int bgA = (int)std::llround(150.0f * a);
+        const int fgA = (int)std::llround(230.0f * a);
+        draw->AddRectFilled(r0, r1, IM_COL32(12, 12, 16, bgA), 4.0f);
+        draw->AddRect(r0, r1, IM_COL32(255, 255, 255, (int)std::llround(42.0f * a)), 4.0f);
+        draw->AddText(p0, IM_COL32(240, 240, 240, fgA), t.text.c_str());
+
+        y += textSz.y + pad.y * 2.0f + 4.0f;
       }
     }
 
@@ -11096,6 +11340,10 @@ if (showGuide) {
   if (ImGui::Button(openMissionsLabel.c_str())) showMissions = true;
   ImGui::SameLine();
   if (ImGui::Button(openTradeLabel.c_str())) showTrade = true;
+
+  ImGui::TextDisabled("Tip: %s opens the Command Palette (search actions, systems, stations, missions).",
+                      game::chordLabel(controls.actions.commandPalette).c_str());
+  ImGui::TextDisabled("Tip: Windows > Notifications keeps a history of HUD toasts.");
 
   ImGui::Separator();
   ImGui::Text("Status");
@@ -12947,34 +13195,31 @@ if (showScanner) {
                 if (ready) {
                   ImGui::BeginDisabled(o.outputUnits <= 0.01);
                   if (ImGui::SmallButton("Claim")) {
-                    const double outMassKg = econ::commodityDef(o.output).massKg;
-                    const double freeKg = std::max(0.0, cargoCapacityKg - cargoMassKg(cargo));
-                    const double maxUnitsByMass = (outMassKg > 1e-9) ? (freeKg / outMassKg) : o.outputUnits;
-                    const double claimUnits = std::min(o.outputUnits, maxUnitsByMass);
-                    if (claimUnits <= 0.01) {
-                      toast(toasts, "Not enough free cargo capacity.", 2.0);
+                    const auto r = sim::claimIndustryOrderToCargo(o, station, timeDays, cargo, cargoCapacityKg);
+                    if (!r.ok) {
+                      const std::string why = r.reason ? r.reason : "";
+                      if (why == "cargo_full") {
+                        toast(toasts, "Not enough free cargo capacity.", 2.0);
+                      } else {
+                        toast(toasts, "Unable to claim order.", 2.0);
+                      }
                     } else {
-                      cargo[(int)o.output] += claimUnits;
-                      o.outputUnits -= claimUnits;
-                      if (o.outputUnits <= 0.01) {
-                        o.claimed = true;
+                      if (r.completed) {
                         toast(toasts, "Order claimed.", 2.0);
                       } else {
-                        toast(toasts, "Claimed " + std::to_string((int)std::round(claimUnits)) + " units (cargo full).", 2.0);
+                        toast(toasts, "Claimed " + std::to_string((int)std::round(r.unitsMoved)) + " units (cargo full).", 2.0);
                       }
                     }
                   }
 
                   ImGui::SameLine();
                   if (ImGui::SmallButton("Store")) {
-                    // Move remaining output directly into station storage.
-                    // Useful when your cargo hold is full, and keeps long-running orders tidy.
-                    auto& stStore = sim::getOrCreateStorage(stationStorage, station, timeDays);
-                    sim::accrueStorageFees(stStore, timeDays, rep);
-                    stStore.cargo[(int)o.output] += std::max(0.0, o.outputUnits);
-                    o.outputUnits = 0.0;
-                    o.claimed = true;
-                    toast(toasts, "Order output moved to warehouse storage.", 2.0);
+                    const auto r = sim::moveIndustryOrderOutputToWarehouse(o, station, timeDays, rep, stationStorage);
+                    if (!r.ok) {
+                      toast(toasts, "Unable to move output to warehouse.", 2.0);
+                    } else {
+                      toast(toasts, "Order output moved to warehouse storage.", 2.0);
+                    }
                   }
                   ImGui::EndDisabled();
                 } else {
@@ -12987,10 +13232,7 @@ if (showScanner) {
               // Cleanup
               if (activeHere + activeElsewhere > 0) {
                 if (ImGui::SmallButton("Clear completed")) {
-                  industryOrders.erase(
-                    std::remove_if(industryOrders.begin(), industryOrders.end(),
-                                   [](const sim::IndustryOrder& o) { return o.claimed; }),
-                    industryOrders.end());
+                  sim::pruneClaimedIndustryOrders(industryOrders);
                   toast(toasts, "Cleared completed orders.", 1.6);
                 }
               }
@@ -13058,29 +13300,21 @@ if (showScanner) {
               const bool canAfford = (credits + 1e-6 >= q.serviceFeeCr);
               ImGui::BeginDisabled(!(hasInputs && canAfford));
               if (ImGui::Button("Submit order")) {
-                // Deduct inputs + fee immediately.
-                cargo[(int)q.inputA] = std::max(0.0, cargo[(int)q.inputA] - q.inputAUnits);
-                if (q.inputBUnits > 0.0) {
-                  cargo[(int)q.inputB] = std::max(0.0, cargo[(int)q.inputB] - q.inputBUnits);
+                const auto res = sim::submitIndustryOrder(nextIndustryOrderId,
+                                                          industryOrders,
+                                                          cargo,
+                                                          credits,
+                                                          station,
+                                                          timeDays,
+                                                          rep,
+                                                          *r,
+                                                          batchCount,
+                                                          feeEff);
+                if (res.ok) {
+                  toast(toasts, "Industry order submitted.", 2.0);
+                } else {
+                  toast(toasts, "Unable to submit industry order.", 2.0);
                 }
-                credits -= q.serviceFeeCr;
-
-                sim::IndustryOrder o{};
-                o.id = nextIndustryOrderId++;
-                o.recipe = r->id;
-                o.stationId = station.id;
-                o.inputA = q.inputA;
-                o.inputAUnits = q.inputAUnits;
-                o.inputB = q.inputB;
-                o.inputBUnits = q.inputBUnits;
-                o.output = q.output;
-                o.outputUnits = q.outputUnits;
-                o.submittedDay = timeDays;
-                o.readyDay = timeDays + q.timeDays;
-                o.claimed = false;
-                industryOrders.push_back(o);
-
-                toast(toasts, "Industry order submitted.", 2.0);
               }
               ImGui::EndDisabled();
 
@@ -15278,6 +15512,53 @@ if (showContacts) {
                 mapViewCenterLy = sys.stub.posLy;
               }
 
+              ImGui::SeparatorText("Bookmarks");
+              {
+                const bool hasSysBm = ui::findSystemBookmarkIndex(bookmarks, mapContextId).has_value();
+                if (ImGui::MenuItem(hasSysBm ? "Unbookmark system" : "Bookmark system")) {
+                  if (hasSysBm) {
+                    if (ui::removeSystemBookmark(bookmarks, mapContextId)) {
+                      bookmarksDirty = true;
+                      toast(toasts, "Removed bookmark.", 1.4);
+                    }
+                  } else {
+                    ui::addOrUpdateSystemBookmark(bookmarks, mapContextId, sys.stub.name);
+                    bookmarksDirty = true;
+                    toast(toasts, "Bookmarked system.", 1.4);
+                  }
+                }
+
+                if (ImGui::BeginMenu("Stations")) {
+                  for (const auto& st : sys.stations) {
+                    const bool hasSt = ui::findStationBookmarkIndex(bookmarks, mapContextId, st.id).has_value();
+                    std::string label = st.name;
+                    if (hasSt) label += "  (bookmarked)";
+                    if (ImGui::MenuItem(label.c_str())) {
+                      if (hasSt) {
+                        if (ui::removeStationBookmark(bookmarks, mapContextId, st.id)) {
+                          bookmarksDirty = true;
+                          toast(toasts, "Removed station bookmark.", 1.4);
+                        }
+                      } else {
+                        ui::addOrUpdateStationBookmark(bookmarks, mapContextId, st.id, sys.stub.name + " / " + st.name);
+                        bookmarksDirty = true;
+                        toast(toasts, "Bookmarked station.", 1.4);
+                      }
+                    }
+                  }
+                  ImGui::EndMenu();
+                }
+
+                if (ui::hasAnyInSystem(bookmarks, mapContextId)) {
+                  if (ImGui::MenuItem("Remove all in system")) {
+                    if (ui::removeAllInSystem(bookmarks, mapContextId)) {
+                      bookmarksDirty = true;
+                      toast(toasts, "Removed all bookmarks in system.", 1.6);
+                    }
+                  }
+                }
+              }
+
               ImGui::Separator();
 
               if (ImGui::MenuItem("Plot route")) {
@@ -15332,6 +15613,14 @@ if (showContacts) {
             const ImVec2 i0(p.x - iconSz * 0.5f, p.y - iconSz * 0.5f);
             const ImVec2 i1(p.x + iconSz * 0.5f, p.y + iconSz * 0.5f);
             draw->AddImage(atlasId, i0, i1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), starTint(s.primaryClass, alpha));
+
+            // Bookmark marker: a small warm dot offset from the system icon.
+            if (ui::hasAnyInSystem(bookmarks, s.id)) {
+              const float rB = std::max(2.5f, iconSz * 0.18f);
+              const ImVec2 bp(p.x - iconSz * 0.55f, p.y - iconSz * 0.55f);
+              draw->AddCircleFilled(bp, rB, IM_COL32(255, 210, 90, (int)(alpha * 220.0f)), 12);
+              draw->AddCircle(bp, rB, IM_COL32(20, 18, 10, (int)(alpha * 180.0f)), 12, 1.0f);
+            }
 
             // Faction marker (small overlay glyph)
             if (mapShowFactions && s.factionId != 0) {
@@ -15467,7 +15756,9 @@ if (showContacts) {
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);
               const bool isSel = (r.s->id == galaxySelectedSystemId);
-              if (ImGui::Selectable(r.s->name.c_str(), isSel)) {
+              std::string rowLabel = r.s->name;
+              if (ui::hasAnyInSystem(bookmarks, r.s->id)) rowLabel += "  [B]";
+              if (ImGui::Selectable(rowLabel.c_str(), isSel)) {
                 galaxySelectedSystemId = r.s->id;
               }
 
@@ -15518,6 +15809,70 @@ if (showContacts) {
           ImGui::Text("Distance: %.1f ly", distLy);
           ImGui::Text("Stations: %d  |  Planets: %d", selSys.stub.stationCount, selSys.stub.planetCount);
           ImGui::Text("Faction: %s", factionName(selSys.stub.factionId).c_str());
+
+          ImGui::SeparatorText("Bookmarks");
+          {
+            const bool hasSysBm = ui::findSystemBookmarkIndex(bookmarks, galaxySelectedSystemId).has_value();
+            if (ImGui::Button(hasSysBm ? "Unbookmark system" : "Bookmark system")) {
+              if (hasSysBm) {
+                if (ui::removeSystemBookmark(bookmarks, galaxySelectedSystemId)) {
+                  bookmarksDirty = true;
+                  toast(toasts, "Removed bookmark.", 1.4);
+                }
+              } else {
+                ui::addOrUpdateSystemBookmark(bookmarks, galaxySelectedSystemId, selSys.stub.name);
+                bookmarksDirty = true;
+                toast(toasts, "Bookmarked system.", 1.4);
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Open Bookmarks")) {
+              showBookmarksWindow = true;
+            }
+
+            if (!selSys.stations.empty()) {
+              // Station bookmark quick-toggle.
+              static sim::SystemId lastSysForBm = 0;
+              static int stationPick = 0;
+              if (lastSysForBm != galaxySelectedSystemId) {
+                lastSysForBm = galaxySelectedSystemId;
+                stationPick = 0;
+              }
+
+              if (stationPick < 0) stationPick = 0;
+              if (stationPick >= (int)selSys.stations.size()) stationPick = (int)selSys.stations.size() - 1;
+
+              ImGui::SetNextItemWidth(-FLT_MIN);
+              const char* preview = selSys.stations[(std::size_t)stationPick].name.c_str();
+              if (ImGui::BeginCombo("Station", preview)) {
+                for (int i = 0; i < (int)selSys.stations.size(); ++i) {
+                  const auto& st = selSys.stations[(std::size_t)i];
+                  const bool isSel = (stationPick == i);
+                  const bool isBm = ui::findStationBookmarkIndex(bookmarks, galaxySelectedSystemId, st.id).has_value();
+                  std::string label = st.name;
+                  if (isBm) label += "  (bookmarked)";
+                  if (ImGui::Selectable(label.c_str(), isSel)) stationPick = i;
+                }
+                ImGui::EndCombo();
+              }
+
+              const auto& st = selSys.stations[(std::size_t)stationPick];
+              const bool hasSt = ui::findStationBookmarkIndex(bookmarks, galaxySelectedSystemId, st.id).has_value();
+              if (ImGui::Button(hasSt ? "Unbookmark station" : "Bookmark station")) {
+                if (hasSt) {
+                  if (ui::removeStationBookmark(bookmarks, galaxySelectedSystemId, st.id)) {
+                    bookmarksDirty = true;
+                    toast(toasts, "Removed station bookmark.", 1.4);
+                  }
+                } else {
+                  ui::addOrUpdateStationBookmark(bookmarks, galaxySelectedSystemId, st.id, selSys.stub.name + " / " + st.name);
+                  bookmarksDirty = true;
+                  toast(toasts, "Bookmarked station.", 1.4);
+                }
+              }
+            }
+          }
+
           ImGui::Separator();
 
           ImGui::Text("Jump range: %.1f ly max, %.1f ly current-fuel", jrMaxLySel, jrNowLySel);
@@ -15644,6 +15999,1019 @@ if (showContacts) {
       ImGui::End();
     }
 
+    // ---- Bookmarks ----
+    if (showBookmarksWindow) {
+      ImGui::SetNextWindowSize(ImVec2(760, 520), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Bookmarks", &showBookmarksWindow)) {
+        ImGui::TextDisabled("Saved to %s", bookmarksPath.c_str());
+        ImGui::SameLine();
+        if (bookmarksDirty) {
+          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "(unsaved changes)");
+        }
+
+        if (ImGui::Button("Save")) {
+          const bool ok = ui::saveBookmarksToFile(bookmarks, bookmarksPath);
+          if (ok) {
+            bookmarksDirty = false;
+            toast(toasts, "Saved bookmarks.", 1.4);
+          } else {
+            toast(toasts, "Failed to save bookmarks.", 1.8);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+          ui::Bookmarks loaded = ui::makeDefaultBookmarks();
+          if (ui::loadBookmarksFromFile(bookmarksPath, loaded)) {
+            bookmarks = std::move(loaded);
+            bookmarksDirty = false;
+            toast(toasts, "Loaded bookmarks.", 1.4);
+          } else {
+            toast(toasts, "No bookmarks file found.", 1.6);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear all")) {
+          bookmarks.items.clear();
+          bookmarksDirty = true;
+          toast(toasts, "Cleared all bookmarks.", 1.4);
+        }
+
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-save on exit", &bookmarksAutoSaveOnExit);
+
+        ImGui::Separator();
+
+        static char bmFilter[96] = "";
+        ImGui::InputTextWithHint("##bm_filter", "Filter (name)...", bmFilter, sizeof(bmFilter));
+
+        auto anyNonSpaceLocal = [&](const char* s) {
+          if (!s) return false;
+          for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+            if (std::isspace(*p) == 0) return true;
+          }
+          return false;
+        };
+
+        auto drawHighlighted = [&](std::string_view text, const std::vector<int>& positions, ImU32 colText) {
+          if (positions.empty()) {
+            ImGui::TextUnformatted(text.data(), text.data() + text.size());
+            return;
+          }
+
+          std::vector<unsigned char> mark(text.size(), 0);
+          for (int p : positions) {
+            if (p >= 0 && (std::size_t)p < text.size()) mark[(std::size_t)p] = 1;
+          }
+
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          ImVec2 cur = ImGui::GetCursorScreenPos();
+          const ImU32 colHi = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+          const float lineH = ImGui::GetTextLineHeight();
+
+          const char* base = text.data();
+          std::size_t i = 0;
+          while (i < text.size()) {
+            const bool hi = mark[i] != 0;
+            std::size_t j = i + 1;
+            while (j < text.size() && (mark[j] != 0) == hi) ++j;
+            const char* segB = base + i;
+            const char* segE = base + j;
+            dl->AddText(cur, hi ? colHi : colText, segB, segE);
+            const ImVec2 sz = ImGui::CalcTextSize(segB, segE);
+            cur.x += sz.x;
+            i = j;
+          }
+
+          ImGui::Dummy(ImVec2(cur.x - ImGui::GetCursorScreenPos().x, lineH));
+        };
+
+        // Build a filtered+sorted list with fuzzy scores + highlight positions.
+        struct BmRow {
+          std::size_t idx;
+          int score;
+          std::vector<int> labelPos;
+          std::vector<int> sysPos;
+        };
+        std::vector<BmRow> rows;
+        rows.reserve(bookmarks.items.size());
+
+        const bool hasFilter = anyNonSpaceLocal(bmFilter);
+        for (std::size_t i = 0; i < bookmarks.items.size(); ++i) {
+          const auto& bm = bookmarks.items[i];
+          const std::string sysName = uiSystemNameById(bm.systemId);
+
+          if (!hasFilter) {
+            rows.push_back({i, 0, {}, {}});
+            continue;
+          }
+
+          std::string hay;
+          hay.reserve(bm.label.size() + sysName.size() + 2);
+          hay += bm.label;
+          hay.push_back(' ');
+          hay += sysName;
+
+          const auto r = ui::fuzzyMatch(bmFilter, hay);
+          if (r.score < 0) continue;
+
+          BmRow row{ i, r.score, {}, {} };
+          const int split = (int)bm.label.size();
+          for (int p : r.positions) {
+            if (p < 0) continue;
+            if (p < split) {
+              row.labelPos.push_back(p);
+            } else if (p > split) {
+              row.sysPos.push_back(p - split - 1);
+            }
+          }
+          rows.push_back(std::move(row));
+        }
+
+        std::sort(rows.begin(), rows.end(), [&](const BmRow& a, const BmRow& b) {
+          if (hasFilter && a.score != b.score) return a.score > b.score;
+          const auto& A = bookmarks.items[a.idx].label;
+          const auto& B = bookmarks.items[b.idx].label;
+          return A < B;
+        });
+
+        if (ImGui::BeginTable("##bm_table", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                              ImVec2(0.0f, 320.0f))) {
+          ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+          ImGui::TableSetupColumn("Label");
+          ImGui::TableSetupColumn("System", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+          ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+          ImGui::TableHeadersRow();
+
+          for (std::size_t n = 0; n < rows.size(); ++n) {
+            const BmRow& row = rows[n];
+            const std::size_t i = row.idx;
+            const auto& bm = bookmarks.items[i];
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(bm.kind == ui::BookmarkKind::Station ? "Station" : "System");
+
+            ImGui::TableSetColumnIndex(1);
+            if (hasFilter) {
+              drawHighlighted(bm.label, row.labelPos, ImGui::GetColorU32(ImGuiCol_Text));
+            } else {
+              ImGui::TextUnformatted(bm.label.c_str());
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            {
+              const std::string sysName = uiSystemNameById(bm.systemId);
+              if (hasFilter) {
+                drawHighlighted(sysName, row.sysPos, ImGui::GetColorU32(ImGuiCol_Text));
+              } else {
+                ImGui::TextUnformatted(sysName.c_str());
+              }
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            const std::string bGo = "Go##" + std::to_string((unsigned long long)i);
+            const std::string bDel = "Remove##" + std::to_string((unsigned long long)i);
+            if (ImGui::SmallButton(bGo.c_str())) {
+              galaxySelectedSystemId = bm.systemId;
+              showGalaxy = true;
+              if (currentSystem) {
+                plotRouteToSystem(bm.systemId);
+                if (bm.kind == ui::BookmarkKind::Station) {
+                  pendingArrivalTargetStationId = bm.stationId;
+                }
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(bDel.c_str())) {
+              bool removed = false;
+              if (bm.kind == ui::BookmarkKind::System) {
+                removed = ui::removeSystemBookmark(bookmarks, bm.systemId);
+              } else {
+                removed = ui::removeStationBookmark(bookmarks, bm.systemId, bm.stationId);
+              }
+              if (removed) {
+                bookmarksDirty = true;
+                toast(toasts, "Removed bookmark.", 1.2);
+              }
+            }
+          }
+
+          ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+
+        // Quick add helpers.
+        if (currentSystem) {
+          const bool hasCur = ui::findSystemBookmarkIndex(bookmarks, currentSystem->stub.id).has_value();
+          if (ImGui::Button(hasCur ? "Unbookmark current system" : "Bookmark current system")) {
+            if (hasCur) {
+              ui::removeSystemBookmark(bookmarks, currentSystem->stub.id);
+              toast(toasts, "Removed bookmark.", 1.2);
+            } else {
+              ui::addOrUpdateSystemBookmark(bookmarks, currentSystem->stub.id, currentSystem->stub.name);
+              toast(toasts, "Bookmarked current system.", 1.2);
+            }
+            bookmarksDirty = true;
+          }
+        }
+        ImGui::SameLine();
+        if (galaxySelectedSystemId != 0) {
+          const bool hasSel = ui::findSystemBookmarkIndex(bookmarks, galaxySelectedSystemId).has_value();
+          const auto& sys = universe.getSystem(galaxySelectedSystemId);
+          if (ImGui::Button(hasSel ? "Unbookmark selected system" : "Bookmark selected system")) {
+            if (hasSel) {
+              ui::removeSystemBookmark(bookmarks, galaxySelectedSystemId);
+              toast(toasts, "Removed bookmark.", 1.2);
+            } else {
+              ui::addOrUpdateSystemBookmark(bookmarks, galaxySelectedSystemId, sys.stub.name);
+              toast(toasts, "Bookmarked selected system.", 1.2);
+            }
+            bookmarksDirty = true;
+          }
+        } else {
+          ImGui::BeginDisabled();
+          ImGui::Button("Bookmark selected system");
+          ImGui::EndDisabled();
+        }
+      }
+      ImGui::End();
+    }
+
+    // ---- Notifications (toast history) ----
+    if (showNotifications) {
+      ImGui::SetNextWindowSize(ImVec2(820, 420), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Notifications", &showNotifications)) {
+        ImGui::TextUnformatted("On-screen toasts are automatically recorded here.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu entries)", toastHistory.size());
+
+        ImGui::InputTextWithHint("##notif_filter", "Filter...", notificationsFilter, sizeof(notificationsFilter));
+
+        if (ImGui::Button("Clear")) {
+          toastHistory.clear();
+          notificationsSelected = -1;
+          toast(toasts, "Notifications cleared.", 1.4);
+        }
+        ImGui::SameLine();
+        const bool hasSelection = (notificationsSelected >= 0 && (std::size_t)notificationsSelected < toastHistory.size());
+        if (!hasSelection) {
+          ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Copy selected") && hasSelection) {
+          ImGui::SetClipboardText(toastHistory[(std::size_t)notificationsSelected].text.c_str());
+          toast(toasts, "Copied notification to clipboard.", 1.2);
+        }
+        if (!hasSelection) {
+          ImGui::EndDisabled();
+        }
+
+        ImGui::Separator();
+
+        auto anyNonSpaceLocal = [&](const char* s) {
+          if (!s) return false;
+          for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+            if (std::isspace(*p) == 0) return true;
+          }
+          return false;
+        };
+
+        auto drawHighlighted = [&](std::string_view text, const std::vector<int>& positions, ImU32 colText) {
+          if (positions.empty()) {
+            ImGui::TextUnformatted(text.data(), text.data() + text.size());
+            return;
+          }
+
+          std::vector<unsigned char> mark(text.size(), 0);
+          for (int p : positions) {
+            if (p >= 0 && (std::size_t)p < text.size()) mark[(std::size_t)p] = 1;
+          }
+
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          ImVec2 cur = ImGui::GetCursorScreenPos();
+          const ImU32 colHi = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+          const float lineH = ImGui::GetTextLineHeight();
+
+          const char* base = text.data();
+          std::size_t i = 0;
+          while (i < text.size()) {
+            const bool hi = mark[i] != 0;
+            std::size_t j = i + 1;
+            while (j < text.size() && (mark[j] != 0) == hi) ++j;
+            const char* segB = base + i;
+            const char* segE = base + j;
+            dl->AddText(cur, hi ? colHi : colText, segB, segE);
+            const ImVec2 sz = ImGui::CalcTextSize(segB, segE);
+            cur.x += sz.x;
+            i = j;
+          }
+
+          ImGui::Dummy(ImVec2(cur.x - ImGui::GetCursorScreenPos().x, lineH));
+        };
+
+        const bool hasFilter = anyNonSpaceLocal(notificationsFilter);
+        static bool notifSortByRelevance = false;
+        if (hasFilter) {
+          ImGui::SameLine();
+          ImGui::Checkbox("Sort by relevance", &notifSortByRelevance);
+        }
+
+        struct NotifRow {
+          int idx;
+          int score;
+          std::vector<int> pos;
+        };
+        std::vector<NotifRow> notifRows;
+        notifRows.reserve(toastHistory.size());
+
+        for (int i = 0; i < (int)toastHistory.size(); ++i) {
+          const auto& e = toastHistory[(std::size_t)i];
+          if (!hasFilter) {
+            notifRows.push_back({i, 0, {}});
+            continue;
+          }
+          const auto r = ui::fuzzyMatch(notificationsFilter, e.text);
+          if (r.score < 0) continue;
+          notifRows.push_back({i, r.score, r.positions});
+        }
+
+        if (hasFilter && notifSortByRelevance) {
+          std::stable_sort(notifRows.begin(), notifRows.end(), [&](const NotifRow& a, const NotifRow& b) {
+            if (a.score != b.score) return a.score > b.score;
+            return a.idx > b.idx; // prefer newer when scores tie
+          });
+        }
+
+        auto fmtSimTime = [&](double tDays) -> std::string {
+          const long long totalSec = (long long)std::llround(tDays * 86400.0);
+          const long long day = totalSec / 86400;
+          const int secInDay = (int)(totalSec - day * 86400);
+          const int hh = secInDay / 3600;
+          const int mm = (secInDay / 60) % 60;
+          const int ss = secInDay % 60;
+          char buf[64];
+          if (day > 0) {
+            std::snprintf(buf, sizeof(buf), "D%lld %02d:%02d:%02d", day, hh, mm, ss);
+          } else {
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mm, ss);
+          }
+          return std::string(buf);
+        };
+
+        if (ImGui::BeginTable("##notif_table", 2,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY
+                              | ImGuiTableFlags_SizingStretchProp)) {
+          ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+          ImGui::TableSetupColumn("Message", ImGuiTableColumnFlags_WidthStretch);
+          ImGui::TableHeadersRow();
+
+          for (int n = 0; n < (int)notifRows.size(); ++n) {
+            const NotifRow& row = notifRows[(std::size_t)n];
+            const int i = row.idx;
+            const auto& e = toastHistory[(std::size_t)i];
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextDisabled("%s", fmtSimTime(e.timeDays).c_str());
+            ImGui::TableSetColumnIndex(1);
+
+            const bool sel = (notificationsSelected == i);
+            const std::string selId = "##notif_sel_" + std::to_string(i);
+            const ImVec2 startPos = ImGui::GetCursorScreenPos();
+            const bool clicked = ImGui::Selectable(selId.c_str(), sel,
+                                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+            const ImVec2 afterPos = ImGui::GetCursorScreenPos();
+
+            ImGui::SetCursorScreenPos(startPos);
+            if (hasFilter) {
+              drawHighlighted(e.text, row.pos, ImGui::GetColorU32(ImGuiCol_Text));
+            } else {
+              ImGui::TextUnformatted(e.text.c_str());
+            }
+            ImGui::SetCursorScreenPos(afterPos);
+
+            if (clicked) notificationsSelected = i;
+          }
+
+          ImGui::EndTable();
+        }
+      }
+      ImGui::End();
+    }
+
+    // ---- UI Settings ----
+    if (showUiSettingsWindow) {
+      ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("UI Settings", &showUiSettingsWindow)) {
+        ImGui::TextDisabled("Saved to %s", uiSettingsPath.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("| Layout: %s", (io.IniFilename ? io.IniFilename : "(none)"));
+
+        if (uiSettingsDirty) {
+          ImGui::SameLine();
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "*unsaved*");
+        }
+
+        ImGui::Separator();
+
+        // Top actions.
+        if (ImGui::Button("Save")) {
+          syncUiSettingsFromRuntime();
+          const bool ok = ui::saveUiSettingsToFile(uiSettings, uiSettingsPath);
+          if (ok) {
+            uiSettingsDirty = false;
+          }
+          toast(toasts, ok ? "Saved UI settings." : "Failed to save UI settings.", 1.8);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+          ui::UiSettings loaded = ui::makeDefaultUiSettings();
+          if (ui::loadUiSettingsFromFile(uiSettingsPath, loaded)) {
+            uiSettings = loaded;
+            applyUiSettingsToRuntime(uiSettings, /*loadImGuiIni=*/true);
+            uiSettingsDirty = false;
+            toast(toasts, "Loaded UI settings.", 1.8);
+          } else {
+            toast(toasts, "No UI settings file found.", 1.8);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Restore defaults")) {
+          uiSettings = ui::makeDefaultUiSettings();
+          applyUiSettingsToRuntime(uiSettings, /*loadImGuiIni=*/false);
+          uiSettingsDirty = true;
+          toast(toasts, "Restored default UI settings (not saved).", 2.2);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Auto-save on exit", &uiSettingsAutoSaveOnExit)) {
+          uiSettingsDirty = true;
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
+          const char* themeNames[] = {"Dark", "Light", "Classic", "High Contrast"};
+          int themeIdx = (int)uiTheme;
+          if (ImGui::Combo("Theme", &themeIdx, themeNames, IM_ARRAYSIZE(themeNames))) {
+            uiTheme = (ui::UiTheme)themeIdx;
+            rebuildUiStyle(uiTheme, uiScale);
+            io.FontGlobalScale = uiScale;
+            uiScaleApplied = uiScale;
+            uiSettingsDirty = true;
+          }
+
+          if (uiTheme == ui::UiTheme::HighContrast) {
+            ImGui::TextDisabled("High contrast mode targets readability on dark backgrounds.");
+          }
+        }
+
+        if (ImGui::CollapsingHeader("Scaling", ImGuiTreeNodeFlags_DefaultOpen)) {
+          if (ImGui::Checkbox("Auto scale from DPI", &uiAutoScaleFromDpi)) {
+            recomputeUiDpiScale();
+            applyUiScaleNow();
+            uiSettingsDirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Recompute DPI")) {
+            recomputeUiDpiScale();
+            applyUiScaleNow();
+            uiSettingsDirty = true;
+          }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("User scale", &uiScaleUser, 0.50f, 2.50f, "%.2fx")) {
+            applyUiScaleNow();
+            uiSettingsDirty = true;
+          }
+          ImGui::TextDisabled("Effective: %.2fx (DPI %.2fx × User %.2fx)", uiScale, uiScaleDpi, uiScaleUser);
+        }
+
+        if (ImGui::CollapsingHeader("Layout profiles", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::TextUnformatted("Dear ImGui stores window positions/docking in an ini file.");
+          ImGui::TextUnformatted("Profiles let you keep multiple layouts (e.g. combat vs. trading)."
+                                " Use Save/Load to persist high-level UI preferences.");
+
+          namespace fs = std::filesystem;
+          const fs::path dir("ui_layouts");
+
+          struct LayoutProfile { std::string name; std::string path; bool isDefault; };
+          std::vector<LayoutProfile> profiles;
+          profiles.push_back(LayoutProfile{"Default", "imgui.ini", true});
+          if (fs::exists(dir) && fs::is_directory(dir)) {
+            for (const auto& ent : fs::directory_iterator(dir)) {
+              if (!ent.is_regular_file()) continue;
+              const fs::path p = ent.path();
+              if (p.extension() != ".ini") continue;
+              const std::string name = p.stem().string();
+              profiles.push_back(LayoutProfile{name, p.string(), false});
+            }
+          }
+          std::sort(profiles.begin() + 1, profiles.end(), [](const LayoutProfile& a, const LayoutProfile& b) {
+            return a.name < b.name;
+          });
+
+          // Pick current index by matching the active ini filename.
+          int currentProfile = 0;
+          for (int i = 0; i < (int)profiles.size(); ++i) {
+            if (profiles[(std::size_t)i].path == uiIniFilename) {
+              currentProfile = i;
+              break;
+            }
+          }
+
+          static int selectedProfile = 0;
+          if (selectedProfile < 0 || selectedProfile >= (int)profiles.size()) selectedProfile = currentProfile;
+
+          if (ImGui::BeginListBox("Profiles", ImVec2(-FLT_MIN, 160.0f))) {
+            for (int i = 0; i < (int)profiles.size(); ++i) {
+              const bool sel = (selectedProfile == i);
+              std::string label = profiles[(std::size_t)i].name;
+              if (profiles[(std::size_t)i].path == uiIniFilename) label += "  (active)";
+              if (ImGui::Selectable(label.c_str(), sel)) selectedProfile = i;
+            }
+            ImGui::EndListBox();
+          }
+
+          const bool canActivate = (selectedProfile >= 0 && selectedProfile < (int)profiles.size());
+          if (!canActivate) ImGui::BeginDisabled();
+          if (ImGui::Button("Activate selected") && canActivate) {
+            uiIniFilename = profiles[(std::size_t)selectedProfile].path;
+            io.IniFilename = uiIniFilename.c_str();
+            if (io.IniFilename && io.IniFilename[0] != '\0') {
+              ImGui::LoadIniSettingsFromDisk(io.IniFilename);
+            }
+            uiSettingsDirty = true;
+            toast(toasts, "Activated layout profile.", 1.6);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Save layout now")) {
+            if (io.IniFilename && io.IniFilename[0] != '\0') {
+              ImGui::SaveIniSettingsToDisk(io.IniFilename);
+              toast(toasts, "Saved layout ini.", 1.4);
+            }
+          }
+          if (!canActivate) ImGui::EndDisabled();
+
+          // Save-as workflow.
+          static char newProfileName[64] = "combat";
+          ImGui::Separator();
+          ImGui::InputTextWithHint("##new_profile", "New profile name (letters/numbers/-/_)", newProfileName, sizeof(newProfileName));
+          ImGui::SameLine();
+          if (ImGui::Button("Save As")) {
+            auto sanitize = [](const char* in) {
+              std::string out;
+              for (const unsigned char* p = (const unsigned char*)in; *p; ++p) {
+                const char c = (char)*p;
+                if (std::isalnum(*p) || c == '_' || c == '-') out.push_back(c);
+              }
+              if (out.empty()) out = "profile";
+              return out;
+            };
+
+            const std::string safe = sanitize(newProfileName);
+            fs::create_directories(dir);
+            const fs::path p = dir / (safe + ".ini");
+            ImGui::SaveIniSettingsToDisk(p.string().c_str());
+            uiIniFilename = p.string();
+            io.IniFilename = uiIniFilename.c_str();
+            uiSettingsDirty = true;
+            toast(toasts, "Saved new layout profile.", 1.8);
+          }
+
+          // Deleting is optional but handy.
+          const bool selectedIsDefault = canActivate ? profiles[(std::size_t)selectedProfile].isDefault : true;
+          if (selectedIsDefault) ImGui::BeginDisabled();
+          if (ImGui::Button("Delete selected") && canActivate && !selectedIsDefault) {
+            const std::string path = profiles[(std::size_t)selectedProfile].path;
+            // Safety: only delete files inside ui_layouts.
+            if (path.rfind("ui_layouts", 0) == 0) {
+              std::error_code ec;
+              fs::remove(fs::path(path), ec);
+              if (!ec) {
+                toast(toasts, "Deleted layout profile.", 1.6);
+                if (uiIniFilename == path) {
+                  uiIniFilename = "imgui.ini";
+                  io.IniFilename = uiIniFilename.c_str();
+                  uiSettingsDirty = true;
+                }
+              } else {
+                toast(toasts, "Failed to delete profile.", 1.6);
+              }
+            } else {
+              toast(toasts, "Refusing to delete outside ui_layouts/", 2.0);
+            }
+          }
+          if (selectedIsDefault) ImGui::EndDisabled();
+        }
+
+#ifdef IMGUI_HAS_DOCK
+        if (ImGui::CollapsingHeader("Docking", ImGuiTreeNodeFlags_DefaultOpen)) {
+          if (ImGui::Checkbox("Enable DockSpace", &uiDockingEnabled)) uiSettingsDirty = true;
+          if (ImGui::Checkbox("Passthrough central view", &uiDockPassthruCentral)) { uiDockResetLayout = true; uiSettingsDirty = true; }
+          if (ImGui::Checkbox("Lock central view", &uiDockLockCentralView)) { uiDockResetLayout = true; uiSettingsDirty = true; }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Left width", &uiDockLeftRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Right width", &uiDockRightRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Bottom height", &uiDockBottomRatio, 0.10f, 0.45f, "%.2f")) { uiDockResetLayout = true; uiSettingsDirty = true; }
+
+          if (ImGui::Button("Reset dock layout")) {
+            uiDockResetLayout = true;
+            toast(toasts, "Rebuilding default dock layout...", 1.4);
+          }
+          ImGui::TextDisabled("Tip: ImGui also autosaves window positions/layout to the active .ini.");
+        }
+#endif
+      }
+      ImGui::End();
+    }
+
+    // ---- HUD Settings ----
+    if (showHudSettingsWindow) {
+      ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("HUD Settings", &showHudSettingsWindow)) {
+        ImGui::TextDisabled("Saved to %s", hudSettingsPath.c_str());
+
+        if (hudSettingsDirty) {
+          ImGui::SameLine();
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "*unsaved*");
+        }
+
+        ImGui::Separator();
+
+        // Top actions.
+        if (ImGui::Button("Save")) {
+          syncHudSettingsFromRuntime();
+          const bool ok = ui::saveHudSettingsToFile(hudSettings, hudSettingsPath);
+          if (ok) {
+            hudSettingsSaved = hudSettings;
+            hudSettingsDirty = false;
+          }
+          toast(toasts, ok ? "Saved HUD settings." : "Failed to save HUD settings.", 1.8);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+          ui::HudSettings loaded = ui::makeDefaultHudSettings();
+          if (ui::loadHudSettingsFromFile(hudSettingsPath, loaded)) {
+            hudSettings = loaded;
+            applyHudSettingsToRuntime(hudSettings);
+            hudSettingsSaved = hudSettings;
+            hudSettingsDirty = false;
+            toast(toasts, "Loaded HUD settings.", 1.8);
+          } else {
+            toast(toasts, "No HUD settings file found.", 1.8);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Restore defaults")) {
+          hudSettings = ui::makeDefaultHudSettings();
+          applyHudSettingsToRuntime(hudSettings);
+          // Keep 'saved' snapshot so this shows as unsaved until the user saves.
+          toast(toasts, "Restored default HUD settings (not saved).", 2.2);
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-save on exit", &hudSettingsAutoSaveOnExit);
+
+        ImGui::Separator();
+
+        // Presets
+        ImGui::TextDisabled("Presets (applied immediately; click Save to persist):");
+        if (ImGui::Button("Combat")) {
+          showRadarHud = true;
+          objectiveHudEnabled = true;
+          hudThreatOverlayEnabled = true;
+          hudJumpOverlay = true;
+          showTacticalOverlay = true;
+          tacticalShowLabels = true;
+          hudOffscreenTargetIndicator = true;
+          hudCombatHud = true;
+          hudUseProceduralReticle = true;
+          hudShowWeaponRings = true;
+          hudShowHeatRing = true;
+          hudShowDistributorRings = true;
+          hudShowLeadIndicator = true;
+          hudShowFlightPathMarker = true;
+          toast(toasts, "Applied Combat HUD preset.", 1.6);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Exploration")) {
+          showRadarHud = true;
+          objectiveHudEnabled = true;
+          hudThreatOverlayEnabled = true;
+          hudJumpOverlay = true;
+          showTacticalOverlay = true;
+          tacticalShowLabels = true;
+          hudOffscreenTargetIndicator = true;
+          hudCombatHud = true;
+          hudUseProceduralReticle = true;
+          hudShowWeaponRings = false;
+          hudShowHeatRing = false;
+          hudShowDistributorRings = false;
+          hudShowLeadIndicator = false;
+          hudShowFlightPathMarker = true;
+          toast(toasts, "Applied Exploration HUD preset.", 1.6);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cinematic")) {
+          showRadarHud = false;
+          objectiveHudEnabled = false;
+          hudThreatOverlayEnabled = false;
+          hudJumpOverlay = false;
+          showTacticalOverlay = false;
+          hudOffscreenTargetIndicator = false;
+          hudCombatHud = false;
+          toast(toasts, "Applied Cinematic HUD preset.", 1.6);
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("Overlays", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Checkbox("Radar HUD", &showRadarHud);
+          ImGui::SameLine();
+          ImGui::Checkbox("Objective", &objectiveHudEnabled);
+          ImGui::SameLine();
+          ImGui::Checkbox("Threat", &hudThreatOverlayEnabled);
+          ImGui::SameLine();
+          ImGui::Checkbox("Jump", &hudJumpOverlay);
+
+          ImGui::Checkbox("Tactical overlay", &showTacticalOverlay);
+          ImGui::SameLine();
+          ImGui::Checkbox("Show tactical labels", &tacticalShowLabels);
+
+          ImGui::Separator();
+          ImGui::Checkbox("Offscreen target indicator", &hudOffscreenTargetIndicator);
+
+          if (ImGui::Button("Open HUD layout editor")) {
+            showHudLayoutWindow = true;
+            hudLayoutEditMode = true;
+          }
+          ImGui::SameLine();
+          ImGui::TextDisabled("(drag overlays; right-click radar for quick tweaks)");
+        }
+
+        if (ImGui::CollapsingHeader("Radar", ImGuiTreeNodeFlags_DefaultOpen)) {
+          const double minKm = 25000.0;
+          const double maxKm = 1200000.0;
+          ImGui::SliderScalar("Range (km)", ImGuiDataType_Double, &radarRangeKm, &minKm, &maxKm, "%.0f", ImGuiSliderFlags_Logarithmic);
+          ImGui::SliderInt("Max blips", &radarMaxBlips, 16, 160);
+        }
+
+        if (ImGui::CollapsingHeader("Combat symbology", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Checkbox("Enable combat HUD", &hudCombatHud);
+          if (!hudCombatHud) ImGui::BeginDisabled();
+
+          ImGui::Checkbox("Procedural reticle", &hudUseProceduralReticle);
+          ImGui::Checkbox("Weapon rings", &hudShowWeaponRings);
+          ImGui::Checkbox("Heat ring", &hudShowHeatRing);
+          ImGui::Checkbox("Distributor rings", &hudShowDistributorRings);
+
+          ImGui::SetNextItemWidth(260.0f);
+          ImGui::SliderFloat("Reticle size (px)", &hudReticleSizePx, 10.0f, 120.0f, "%.0f");
+          ImGui::SetNextItemWidth(260.0f);
+          ImGui::SliderFloat("Reticle alpha", &hudReticleAlpha, 0.05f, 1.0f, "%.2f");
+
+          ImGui::Separator();
+          ImGui::Checkbox("Lead indicator", &hudShowLeadIndicator);
+          if (hudShowLeadIndicator) {
+            ImGui::Indent();
+            ImGui::Checkbox("Use last fired weapon", &hudLeadUseLastFiredWeapon);
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("Lead size (px)", &hudLeadSizePx, 8.0f, 80.0f, "%.0f");
+            ImGui::SetNextItemWidth(260.0f);
+            const double minSec = 1.0;
+            const double maxSec = 120.0;
+            ImGui::SliderScalar("Max lead time (sec)", ImGuiDataType_Double, &hudLeadMaxTimeSec, &minSec, &maxSec, "%.1f");
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::Checkbox("Flight path marker", &hudShowFlightPathMarker);
+          if (hudShowFlightPathMarker) {
+            ImGui::Indent();
+            ImGui::Checkbox("Local frame", &hudFlightMarkerUseLocalFrame);
+            ImGui::Checkbox("Clamp to screen", &hudFlightMarkerClampToEdge);
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("Marker size (px)", &hudFlightMarkerSizePx, 8.0f, 80.0f, "%.0f");
+            ImGui::Unindent();
+          }
+
+          if (!hudCombatHud) ImGui::EndDisabled();
+        }
+
+        if (ImGui::CollapsingHeader("Tactical overlay", ImGuiTreeNodeFlags_DefaultOpen)) {
+          const double minKm = 20000.0;
+          const double maxKm = 2000000.0;
+          ImGui::SliderScalar("Range (km)", ImGuiDataType_Double, &tacticalRangeKm, &minKm, &maxKm, "%.0f", ImGuiSliderFlags_Logarithmic);
+          ImGui::SliderInt("Max markers", &tacticalMaxMarkers, 16, 256);
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Filters");
+          ImGui::Checkbox("Stations", &tacticalShowStations);
+          ImGui::SameLine();
+          ImGui::Checkbox("Planets", &tacticalShowPlanets);
+          ImGui::SameLine();
+          ImGui::Checkbox("Contacts", &tacticalShowContacts);
+
+          ImGui::Checkbox("Cargo", &tacticalShowCargo);
+          ImGui::SameLine();
+          ImGui::Checkbox("Asteroids", &tacticalShowAsteroids);
+          ImGui::SameLine();
+          ImGui::Checkbox("Signals", &tacticalShowSignals);
+        }
+      }
+      ImGui::End();
+    }
+
+    // ---- Command Palette ----
+    if (commandPalette.open) {
+      // Rebuild the item list only while the palette is open.
+      commandPaletteItems.clear();
+      commandPaletteItems.reserve(512);
+
+      auto onOff = [](bool v) { return v ? "ON" : "OFF"; };
+      auto addItem = [&](std::string label, std::string detail, std::string shortcut, int priority,
+                         std::function<void()> fn) {
+        commandPaletteItems.push_back(game::PaletteItem{std::move(label), std::move(detail), std::move(shortcut), priority, std::move(fn)});
+      };
+
+      // UI / windows
+      addItem("Toggle Galaxy window", std::string("Window • ") + onOff(showGalaxy), game::chordLabel(controls.actions.toggleGalaxy), 100, [&]() { showGalaxy = !showGalaxy; });
+      addItem("Toggle Ship/Status window", std::string("Window • ") + onOff(showShip), game::chordLabel(controls.actions.toggleShip), 100, [&]() { showShip = !showShip; });
+      addItem("Toggle Market window", std::string("Window • ") + onOff(showEconomy), game::chordLabel(controls.actions.toggleMarket), 100, [&]() { showEconomy = !showEconomy; });
+      addItem("Toggle Contacts window", std::string("Window • ") + onOff(showContacts), game::chordLabel(controls.actions.toggleContacts), 100, [&]() { showContacts = !showContacts; });
+      addItem("Toggle Missions window", std::string("Window • ") + onOff(showMissions), game::chordLabel(controls.actions.toggleMissions), 100, [&]() { showMissions = !showMissions; });
+      addItem("Toggle Scanner window", std::string("Window • ") + onOff(showScanner), game::chordLabel(controls.actions.toggleScanner), 100, [&]() { showScanner = !showScanner; });
+      addItem("Toggle Trade Finder", std::string("Window • ") + onOff(showTrade), game::chordLabel(controls.actions.toggleTrade), 100, [&]() { showTrade = !showTrade; });
+      addItem("Toggle Pilot Guide", std::string("Window • ") + onOff(showGuide), game::chordLabel(controls.actions.toggleGuide), 90, [&]() { showGuide = !showGuide; });
+      addItem("Toggle Hangar", std::string("Window • ") + onOff(showHangar), game::chordLabel(controls.actions.toggleHangar), 90, [&]() { showHangar = !showHangar; });
+      addItem("Toggle World Visuals", std::string("Window • ") + onOff(showWorldVisuals), game::chordLabel(controls.actions.toggleWorldVisuals), 80, [&]() { showWorldVisuals = !showWorldVisuals; });
+      addItem("Toggle Controls window", std::string("Window • ") + onOff(controlsWindow.open), game::chordLabel(controls.actions.toggleControlsWindow), 80,
+              [&]() {
+                controlsWindow.open = !controlsWindow.open;
+                if (controlsWindow.open) controlsWindow.focusFilter = true;
+              });
+      addItem("Toggle Notifications window", std::string("Window • ") + onOff(showNotifications), std::string(), 80, [&]() { showNotifications = !showNotifications; });
+      addItem("Toggle Console window", std::string("Window • ") + onOff(consoleWindow.open), std::string(), 80, [&]() { consoleWindow.open = !consoleWindow.open; if (consoleWindow.open) consoleWindow.focusInput = true; });
+      addItem("Toggle Bookmarks window", std::string("Window • ") + onOff(showBookmarksWindow), std::string(), 80, [&]() { showBookmarksWindow = !showBookmarksWindow; });
+      addItem("Toggle UI Settings window", std::string("Window • ") + onOff(showUiSettingsWindow), std::string(), 80, [&]() { showUiSettingsWindow = !showUiSettingsWindow; });
+      addItem("Toggle HUD Settings window", std::string("Window • ") + onOff(showHudSettingsWindow), std::string(), 80, [&]() { showHudSettingsWindow = !showHudSettingsWindow; });
+
+      // HUD
+      addItem("Toggle Radar HUD", std::string("HUD • ") + onOff(showRadarHud), game::chordLabel(controls.actions.toggleRadarHud), 70, [&]() { showRadarHud = !showRadarHud; });
+      addItem("Toggle Tactical overlay", std::string("HUD • ") + onOff(showTacticalOverlay), game::chordLabel(controls.actions.toggleTacticalOverlay), 70, [&]() { showTacticalOverlay = !showTacticalOverlay; });
+      addItem("Toggle HUD edit mode", std::string("HUD • ") + onOff(hudLayoutEditMode), game::chordLabel(controls.actions.hudLayoutToggleEdit), 60, [&]() { hudLayoutEditMode = !hudLayoutEditMode; });
+
+      // Gameplay
+      addItem(paused ? "Unpause" : "Pause", "Gameplay", game::chordLabel(controls.actions.pause), 60, [&]() { paused = !paused; });
+      addItem("Set time scale: 1x", "Time", std::string(), 40, [&]() { timeScale = 1.0; paused = false; });
+      addItem("Set time scale: 10x", "Time", std::string(), 40, [&]() { timeScale = 10.0; paused = false; });
+      addItem("Set time scale: 60x", "Time", std::string(), 40, [&]() { timeScale = 60.0; paused = false; });
+      addItem("Set time scale: 600x", "Time", std::string(), 40, [&]() { timeScale = 600.0; paused = false; });
+
+      // Missions (quick tracking)
+      if (trackedMissionId != 0) {
+        addItem("Untrack current mission", "Missions", std::string(), 55, [&]() {
+          trackedMissionId = 0;
+          toast(toasts, "Mission tracking cleared.", 1.6);
+        });
+      }
+      for (const auto& m : missions) {
+        if (m.failed || m.completed) continue;
+        const core::u64 id = m.id;
+        const auto [nextSys, nextSt] = uiMissionNextStop(m);
+        const std::string label = uiDescribeMission(m);
+
+        addItem(label, "Missions • Track", std::string(), 20, [&, id, nextSys, nextSt]() {
+          trackedMissionId = id;
+          objectiveHudEnabled = true;
+          showMissions = true;
+          if (nextSys != 0) {
+            plotRouteToSystem(nextSys);
+            pendingArrivalTargetStationId = nextSt;
+          }
+          toast(toasts, "Tracking mission.", 1.6);
+        });
+      }
+
+      // Bookmarks
+      if (currentSystem) {
+        const bool hasCur = ui::findSystemBookmarkIndex(bookmarks, currentSystem->stub.id).has_value();
+        addItem(hasCur ? "Remove bookmark: current system" : "Bookmark current system",
+                "Bookmarks", std::string(), 58, [&, hasCur]() {
+                  if (!currentSystem) return;
+                  if (hasCur) {
+                    if (ui::removeSystemBookmark(bookmarks, currentSystem->stub.id)) {
+                      bookmarksDirty = true;
+                      toast(toasts, "Removed bookmark.", 1.4);
+                    }
+                  } else {
+                    ui::addOrUpdateSystemBookmark(bookmarks, currentSystem->stub.id, currentSystem->stub.name);
+                    bookmarksDirty = true;
+                    toast(toasts, "Bookmarked current system.", 1.4);
+                  }
+                });
+      }
+      if (galaxySelectedSystemId != 0) {
+        const bool hasSel = ui::findSystemBookmarkIndex(bookmarks, galaxySelectedSystemId).has_value();
+        addItem(hasSel ? "Remove bookmark: selected system" : "Bookmark selected system",
+                "Bookmarks", std::string(), 48, [&, hasSel]() {
+                  if (galaxySelectedSystemId == 0) return;
+                  const auto& sys = universe.getSystem(galaxySelectedSystemId);
+                  if (hasSel) {
+                    if (ui::removeSystemBookmark(bookmarks, galaxySelectedSystemId)) {
+                      bookmarksDirty = true;
+                      toast(toasts, "Removed bookmark.", 1.4);
+                    }
+                  } else {
+                    ui::addOrUpdateSystemBookmark(bookmarks, galaxySelectedSystemId, sys.stub.name);
+                    bookmarksDirty = true;
+                    toast(toasts, "Bookmarked selected system.", 1.4);
+                  }
+                });
+      }
+
+      for (const auto& bm : bookmarks.items) {
+        if (bm.systemId == 0) continue;
+        const sim::SystemId sysId = bm.systemId;
+        const sim::StationId stId = bm.stationId;
+
+        std::string label = bm.label;
+        if (label.empty()) label = (bm.kind == ui::BookmarkKind::Station) ? "Station" : "System";
+
+        if (bm.kind == ui::BookmarkKind::System) {
+          addItem(label, "Bookmarks • Route", std::string(), 30, [&, sysId]() {
+            galaxySelectedSystemId = sysId;
+            showGalaxy = true;
+            plotRouteToSystem(sysId);
+          });
+        } else {
+          addItem(label, "Bookmarks • Route (station)", std::string(), 30, [&, sysId, stId]() {
+            galaxySelectedSystemId = sysId;
+            showGalaxy = true;
+            plotRouteToSystem(sysId);
+            pendingArrivalTargetStationId = stId;
+          });
+        }
+      }
+
+      // Systems (nearby search radius scales with jump range)
+      if (currentSystem) {
+        const double radiusLy = std::clamp(fsdRangeLy * 90.0, 600.0, 3500.0);
+        const auto stubs = universe.queryNearby(currentSystem->stub.posLy, radiusLy, 512);
+        for (const auto& s : stubs) {
+          if (s.id == currentSystem->stub.id) continue;
+          const double d = (s.posLy - currentSystem->stub.posLy).length();
+          const core::u64 sysId = s.id;
+          std::string detail = std::string("System • ") + starClassName(s.primaryClass) + " • " + std::to_string((int)std::llround(d)) + " ly";
+          if (s.stationCount > 0) {
+            detail += " • ";
+            detail += std::to_string(s.stationCount);
+            detail += " st";
+          }
+
+          addItem(s.name, std::move(detail), std::string(), 10, [&, sysId]() {
+            galaxySelectedSystemId = (sim::SystemId)sysId;
+            showGalaxy = true;
+            plotRouteToSystem((sim::SystemId)sysId);
+          });
+        }
+      }
+
+      // Stations (in current system)
+      if (currentSystem) {
+        for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+          const auto& st = currentSystem->stations[i];
+          const std::size_t idx = i;
+          addItem(st.name, "Station • Target", std::string(), 15, [&, idx]() {
+            target.kind = TargetKind::Station;
+            target.index = idx;
+            selectedStationIndex = (int)idx;
+            showShip = true;
+          });
+        }
+      }
+
+      // Contacts (local space)
+      for (std::size_t i = 0; i < contacts.size(); ++i) {
+        const std::size_t idx = i;
+        const auto& c = contacts[i];
+        if (!c.alive) continue;
+        const double dKm = (c.ship.positionKm() - ship.positionKm()).length();
+        std::string detail = std::string("Contact • ") + contactRoleName(c.role) + " • " + std::to_string((int)std::llround(dKm)) + " km";
+        addItem(c.name, std::move(detail), std::string(), 5, [&, idx]() {
+          target.kind = TargetKind::Contact;
+          target.index = idx;
+          toast(toasts, "Target set.", 1.0);
+        });
+      }
+    }
+
+    // Draw palette last so it appears above other windows.
+    (void)game::drawCommandPalette(commandPalette, commandPaletteItems);
+
     // ---- Offscreen hangar preview render (render-to-texture -> ImGui) ----
     // Render AFTER building UI so the preview uses the latest yaw/pitch/zoom (drag UI)
     // but BEFORE ImGui::Render, so ImGui draws the up-to-date texture.
@@ -15716,10 +17084,33 @@ if (showContacts) {
     ui::saveToFile(hudLayout, hudLayoutPath);
   }
 
+  // Persist HUD settings on exit.
+  {
+    syncHudSettingsFromRuntime();
+    const bool autoSavePrefChanged = (hudSettingsSaved.autoSaveOnExit != hudSettingsAutoSaveOnExit);
+    if ((hudSettingsAutoSaveOnExit || autoSavePrefChanged) && !hudSettingsEquivalent(hudSettings, hudSettingsSaved)) {
+      (void)ui::saveHudSettingsToFile(hudSettings, hudSettingsPath);
+    }
+  }
+
   // Persist controls on exit (optional).
   if (controlsAutoSaveOnExit && controlsDirty) {
     game::saveToFile(controls, controlsPath);
   }
+
+  // Persist bookmarks on exit (optional).
+  if (bookmarksAutoSaveOnExit && bookmarksDirty) {
+    (void)ui::saveBookmarksToFile(bookmarks, bookmarksPath);
+  }
+
+  // Persist UI settings on exit (optional).
+  if (uiSettingsAutoSaveOnExit && uiSettingsDirty) {
+    syncUiSettingsFromRuntime();
+    (void)ui::saveUiSettingsToFile(uiSettings, uiSettingsPath);
+  }
+
+  // Unhook core log forwarding before shutdown.
+  game::consoleRemoveCoreLogSink(consoleWindow);
 
   // Cleanup
   spriteCache.clear();

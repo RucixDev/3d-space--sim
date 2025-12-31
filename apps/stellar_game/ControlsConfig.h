@@ -63,6 +63,7 @@ struct ActionBinds {
   KeyChord quickload;
 
   // Primary UI windows
+  KeyChord commandPalette;
   KeyChord toggleGalaxy;
   KeyChord toggleShip;
   KeyChord toggleMarket;
@@ -266,6 +267,10 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.quicksave = {SDL_SCANCODE_F5, KMOD_NONE};
   c.actions.quickload = {SDL_SCANCODE_F9, KMOD_NONE};
 
+  // UI helpers
+  c.actions.commandPalette = {SDL_SCANCODE_P, KMOD_CTRL};
+
+  c.actions.commandPalette = {SDL_SCANCODE_P, KMOD_CTRL};
   c.actions.toggleGalaxy   = {SDL_SCANCODE_TAB, KMOD_NONE};
   c.actions.toggleShip     = {SDL_SCANCODE_F1, KMOD_NONE};
   c.actions.toggleMarket   = {SDL_SCANCODE_F2, KMOD_NONE};
@@ -357,6 +362,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "Quit", a.quit);
   saveKeyChord(f, "QuickSave", a.quicksave);
   saveKeyChord(f, "QuickLoad", a.quickload);
+  saveKeyChord(f, "CommandPalette", a.commandPalette);
   saveKeyChord(f, "ToggleGalaxy", a.toggleGalaxy);
   saveKeyChord(f, "ToggleShip", a.toggleShip);
   saveKeyChord(f, "ToggleMarket", a.toggleMarket);
@@ -420,6 +426,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("Quit", &a.quit);
     addB("QuickSave", &a.quicksave);
     addB("QuickLoad", &a.quickload);
+    addB("CommandPalette", &a.commandPalette);
     addB("ToggleGalaxy", &a.toggleGalaxy);
     addB("ToggleShip", &a.toggleShip);
     addB("ToggleMarket", &a.toggleMarket);

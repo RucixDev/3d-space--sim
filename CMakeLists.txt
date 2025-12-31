@@ -101,8 +101,12 @@ set(STELLAR_CORE_SOURCES
   src/core/Hash.cpp
   src/core/Log.cpp
 
+  src/ui/Bookmarks.cpp
+  src/ui/FuzzySearch.cpp
   src/ui/HudLayout.cpp
+  src/ui/HudSettings.cpp
   src/ui/Livery.cpp
+  src/ui/UiSettings.cpp
 
   src/proc/Noise.cpp
   src/proc/NameGenerator.cpp
@@ -115,12 +119,17 @@ set(STELLAR_CORE_SOURCES
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
   src/sim/FlightController.cpp
+  src/sim/SupercruiseComputer.cpp
+  src/sim/EncounterDirector.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
+  src/sim/DockingClearanceService.cpp
+  src/sim/ThermalSystem.cpp
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
   src/sim/Industry.cpp
+  src/sim/IndustryService.cpp
   src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
   src/sim/SaveGame.cpp
@@ -187,7 +196,12 @@ set_target_properties(stellar_sandbox PROPERTIES
 )
 
 if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
-  add_executable(stellar_game apps/stellar_game/main.cpp)
+  add_executable(stellar_game
+    apps/stellar_game/main.cpp
+    apps/stellar_game/CommandPalette.cpp
+    apps/stellar_game/ControlsWindow.cpp
+  apps/stellar_game/ConsoleWindow.cpp
+  )
   target_link_libraries(stellar_game PRIVATE stellar::stellar ${IMGUI_TARGET})
   set_target_properties(stellar_game PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/apps

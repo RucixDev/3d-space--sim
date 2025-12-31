@@ -14,10 +14,13 @@ add_executable(stellar_tests
   test_law.cpp
   test_police_scan.cpp
   test_docking.cpp
+  test_docking_clearance.cpp
+  test_thermal.cpp
   test_nav.cpp
   test_args.cpp
   test_signature.cpp
   test_industry.cpp
+  test_industry_service.cpp
   test_industry_scanner.cpp
   test_warehouse.cpp
   test_trade_scanner.cpp
@@ -28,6 +31,13 @@ add_executable(stellar_tests
   test_intercept_course.cpp
   test_combat.cpp
   test_ballistics.cpp
+  test_supercruise.cpp
+  test_encounter_director.cpp
+  test_bookmarks.cpp
+  test_fuzzy_search.cpp
+  test_log_sinks.cpp
+  test_ui_settings.cpp
+  test_hud_settings.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)
