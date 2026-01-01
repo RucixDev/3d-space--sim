@@ -4875,7 +4875,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	        // and the on-drop content doesn't change if the player loops back.
 	        if (t == SignalType::Distress) {
 	          s.hasDistressPlan = true;
-	          s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	          s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, currentSystem->stub.factionId);
 	        }
 	        signals.push_back(s);
 
@@ -7190,7 +7190,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                if (!s.hasDistressPlan) {
 	                  const core::u32 jurisdiction = currentSystem->stub.factionId;
 	                  s.hasDistressPlan = true;
-	                  s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	                  s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, currentSystem->stub.factionId);
 	                }
 	                if (s.hasDistressPlan) {
 	                  if (s.distress.hasVictim && !s.distressCompleted) {
@@ -7482,7 +7482,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              if (!s.hasDistressPlan && currentSystem) {
 	                const core::u32 jurisdiction = currentSystem->stub.factionId;
 	                s.hasDistressPlan = true;
-	                s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	                s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, currentSystem->stub.factionId);
 	              }
 
 	              const sim::DistressPlan plan = s.distress;
@@ -10154,7 +10154,7 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
           + (m.scanned ? "report in" : "protect convoy")
           + " ";
     if (m.units > 0.0) {
-      out += econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units)) + " -> ";
+      out += std::string(econ::commodityDef(m.commodity).name) + " x" + std::to_string((int)std::round(m.units)) + " -> ";
     }
     out += uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
     if (!m.scanned) out += " [stay close]";
@@ -13493,15 +13493,15 @@ if (showScanner) {
                   ImGui::Text("%s #%llu: %s %.1f + %s %.1f -> %s %.1f",
                              code,
                              (unsigned long long)o.id,
-                             econ::commodityCode(o.inputA), o.inputAUnits,
-                             econ::commodityCode(o.inputB), o.inputBUnits,
-                             econ::commodityCode(o.output), o.outputUnits);
+                             econ::commodityDef(o.inputA).code, o.inputAUnits,
+                             econ::commodityDef(o.inputB).code, o.inputBUnits,
+                             econ::commodityDef(o.output).code, o.outputUnits);
                 } else {
                   ImGui::Text("%s #%llu: %s %.1f -> %s %.1f",
                              code,
                              (unsigned long long)o.id,
-                             econ::commodityCode(o.inputA), o.inputAUnits,
-                             econ::commodityCode(o.output), o.outputUnits);
+                             econ::commodityDef(o.inputA).code, o.inputAUnits,
+                             econ::commodityDef(o.output).code, o.outputUnits);
                 }
 
                 ImGui::SameLine();
@@ -13597,11 +13597,11 @@ if (showScanner) {
               const double batches = (maxBatches <= 0) ? 0.0 : (double)batchCount;
               const auto q = sim::quoteIndustryOrder(*r, station.id, station.type, batches, feeEff, rep);
 
-              ImGui::Text("Input: %s %.1f", econ::commodityCode(q.inputA), q.inputAUnits);
+              ImGui::Text("Input: %s %.1f", econ::commodityDef(q.inputA).code, q.inputAUnits);
               if (q.inputBUnits > 0.0) {
-                ImGui::Text("       %s %.1f", econ::commodityCode(q.inputB), q.inputBUnits);
+                ImGui::Text("       %s %.1f", econ::commodityDef(q.inputB).code, q.inputBUnits);
               }
-              ImGui::Text("Output: %s %.1f", econ::commodityCode(q.output), q.outputUnits);
+              ImGui::Text("Output: %s %.1f", econ::commodityDef(q.output).code, q.outputUnits);
               ImGui::TextDisabled("Time: %.1f h   Fee: %.0f cr", q.timeDays * 24.0, q.serviceFeeCr);
               ImGui::TextDisabled("Station mods: yield x%.3f  speed x%.3f  fee x%.3f",
                                   q.mods.yieldMul, q.mods.speedMul, q.mods.feeMul);
@@ -14448,7 +14448,7 @@ if (canTrade) {
                 const char* curFilter = "Any";
                 if (tradeCommodityFilter >= 0) {
                   const auto id = (econ::CommodityId)tradeCommodityFilter;
-                  curFilter = econ::commodityCode(id);
+                  curFilter = econ::commodityDef(id).code;
                 }
 
                 if (ImGui::BeginCombo("Commodity filter", curFilter)) {
@@ -14499,7 +14499,7 @@ if (canTrade) {
 
                 if (tradeCommodityFilter >= 0) {
                   scan.commodityFilterEnabled = true;
-                  scan.commodityFilter = static_cast<core::u32>(tradeCommodityFilter);
+                  scan.commodityFilter = static_cast<econ::CommodityId>(tradeCommodityFilter);
                 }
 
                 const auto results = sim::scanTradeOpportunities(universe,
@@ -14603,8 +14603,8 @@ if (canTrade) {
                     ImGui::TextDisabled("%.1f ly (%.1f jumps)", t.distanceLy, jumps);
 
                     ImGui::TableSetColumnIndex(1);
-                    ImGui::Text("%s", econ::commodityDef(t.commodity).name.c_str());
-                    ImGui::TextDisabled("%s", econ::commodityCode(t.commodity));
+                    ImGui::Text("%s", econ::commodityDef(t.commodity).name);
+                    ImGui::TextDisabled("%s", econ::commodityDef(t.commodity).code);
 
                     ImGui::TableSetColumnIndex(2);
                     ImGui::Text("%.1f", t.buyPrice);
@@ -14653,7 +14653,7 @@ if (canTrade) {
                           tradeIdeasDayStamp = -1;
                           tradeMixDayStamp = -1;
                         } else {
-                          toast(toasts, ("Can't buy: " + tr.reason));
+                          toast(toasts, std::string("Can't buy: ") + (tr.reason ? tr.reason : "unknown"), 2.0);
                         }
                       }
                     }
@@ -14703,7 +14703,7 @@ if (canTrade) {
                     const int take = std::min<int>(std::max(1, tradeMixLinesShown), (int)t.lines.size());
                     for (int li = 0; li < take; ++li) {
                       const auto& ln = t.lines[(std::size_t)li];
-                      ImGui::Text("%s  %.1fu", econ::commodityCode(ln.commodity), ln.units);
+                      ImGui::Text("%s  %.1fu", econ::commodityDef(ln.commodity).code, ln.units);
                       ImGui::TextDisabled("+%.0f (%.0f/kg)", ln.netProfitCr, ln.netProfitPerKg);
                     }
                     if ((int)t.lines.size() > take) {
@@ -14717,7 +14717,7 @@ if (canTrade) {
                       ImGui::Separator();
                       for (const auto& ln : t.lines) {
                         ImGui::Text("%s  units=%.2f  mass=%.1fkg  net=%.0f",
-                                    econ::commodityCode(ln.commodity),
+                                    econ::commodityDef(ln.commodity).code,
                                     ln.units,
                                     ln.massKg,
                                     ln.netProfitCr);
@@ -17432,6 +17432,8 @@ if (showContacts) {
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();
+
+  } // end GL scope
 
   SDL_GL_DeleteContext(glContext);
   SDL_DestroyWindow(window);

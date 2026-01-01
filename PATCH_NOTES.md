@@ -1,3 +1,15 @@
+## 2026-01-01 (Patch) - Remaining MSVC Compile Fixes + SaveGame/Nav Sync
+
+This round completes the set of MSVC compile fixes you reported and syncs code with the existing patch notes:
+
+- **SaveGame nav persistence implemented**: `SaveGame` now actually contains the nav persistence fields (`navRoute`, hop, mode, auto-run, fuel-range constraint, pending arrival station) and `SaveGame.cpp` serializes/deserializes them (robust against stale route counts).
+- **Tests updated**: `test_savegame` now exercises nav persistence and includes a stale-count robustness case for `navRoute`.
+- **Math QoL**: added `Quatd * Vec3d` convenience operator (rotates the vector), matching usage in `stellar_game`.
+- **UI string/pointer fixes**: resolved several `const char*` vs `std::string_view` / pointer-concatenation issues in `stellar_game` (commodity codes, trade error toasts, mission text).
+- **Supercruise distress**: fixed a missing `jurisdiction` identifier by passing the system faction id directly into distress planning.
+- **SDL/GL lifetime**: restored the intended GL-scope closing brace so GL resources are destroyed before `SDL_GL_DeleteContext`.
+
+
 ## 2026-01-01 (Patch) - stellar_game Build Fixes (ImGui 1.91.2 + MSVC)
 
 This round focuses on resolving a large batch of compile errors in `apps/stellar_game`:

@@ -68,6 +68,14 @@ int test_savegame() {
   s.fuelMax = 20.0;
   s.cargoCapacityKg = 240.0;
   s.passengerSeats = 6;
+  // Navigation UI persistence (route plotting + auto-run).
+  s.navAutoRun = true;
+  s.navRouteMode = 2;
+  s.navConstrainToCurrentFuelRange = false;
+  s.navRouteHop = 1;
+  s.pendingArrivalStation = 424242;
+  s.navRoute = {1001, 1002, 1003, 1004};
+
   s.smuggleHoldMk = 2;
   s.hull = 0.75;
   s.shield = 0.15;
@@ -210,6 +218,32 @@ int test_savegame() {
 
   if (l.passengerSeats != s.passengerSeats) {
     std::cerr << "[test_savegame] passengerSeats mismatch\n";
+    ++fails;
+  }
+
+  // Navigation UI state.
+  if (l.navAutoRun != s.navAutoRun) {
+    std::cerr << "[test_savegame] navAutoRun mismatch\n";
+    ++fails;
+  }
+  if (l.navRouteHop != s.navRouteHop) {
+    std::cerr << "[test_savegame] navRouteHop mismatch\n";
+    ++fails;
+  }
+  if (l.navRouteMode != s.navRouteMode) {
+    std::cerr << "[test_savegame] navRouteMode mismatch\n";
+    ++fails;
+  }
+  if (l.navConstrainToCurrentFuelRange != s.navConstrainToCurrentFuelRange) {
+    std::cerr << "[test_savegame] navConstrainToCurrentFuelRange mismatch\n";
+    ++fails;
+  }
+  if (l.pendingArrivalStation != s.pendingArrivalStation) {
+    std::cerr << "[test_savegame] pendingArrivalStation mismatch\n";
+    ++fails;
+  }
+  if (l.navRoute != s.navRoute) {
+    std::cerr << "[test_savegame] navRoute mismatch\n";
     ++fails;
   }
 
@@ -365,6 +399,34 @@ int test_savegame() {
       std::cerr << "[test_savegame] failed to read back saved file for robustness tests\n";
       ++fails;
     } else {
+      // If the navRoute count is wrong, the loader should stop when it no longer sees "nav"
+      // and continue parsing later keys (e.g. shipHull / trackedMissionId).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "navRoute", s.navRoute.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_navroute.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt navRoute save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale navRoute count\n";
+            ++fails;
+          } else {
+            if (x.navRoute.size() != s.navRoute.size()) {
+              std::cerr << "[test_savegame] stale navRoute count changed parsed navRoute count\n";
+              ++fails;
+            }
+            if (x.trackedMissionId != s.trackedMissionId) {
+              std::cerr << "[test_savegame] stale navRoute count broke trackedMissionId parsing\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
       // If the missions count is wrong, the loader should stop when it no longer sees "mission"
       // and continue parsing top-level keys like trackedMissionId.
       {

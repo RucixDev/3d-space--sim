@@ -57,6 +57,10 @@ struct Quatd {
     return {r.x, r.y, r.z};
   }
 
+  // Convenience: rotate a vector by this quaternion.
+  // Enables syntax like: Vec3d world = q * local;
+  Vec3d operator*(const Vec3d& v) const { return rotate(v); }
+
   // Integrate by angular velocity (rad/day or rad/sec depending on caller units)
   Quatd integrateAngular(const Vec3d& omega, double dt) const {
     // dq/dt = 0.5 * q * (0, omega)

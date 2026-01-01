@@ -49,6 +49,18 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "passengerSeats " << s.passengerSeats << "\n";
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
 
+  // Navigation UI state (quality-of-life).
+  f << "navAutoRun " << (s.navAutoRun ? 1 : 0) << "\n";
+  f << "navRouteHop " << s.navRouteHop << "\n";
+  f << "navRouteMode " << (int)s.navRouteMode << "\n";
+  f << "navConstrainToCurrentFuelRange " << (s.navConstrainToCurrentFuelRange ? 1 : 0) << "\n";
+  f << "pendingArrivalStation " << s.pendingArrivalStation << "\n";
+
+  f << "navRoute " << s.navRoute.size() << "\n";
+  for (auto sysId : s.navRoute) {
+    f << "nav " << sysId << "\n";
+  }
+
   // Loadout / progression
   f << "shipHull " << (int)s.shipHull << "\n";
   f << "thrusterMk " << (int)s.thrusterMk << "\n";
@@ -336,6 +348,40 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.passengerSeats;
     } else if (key == "fsdReadyDay") {
       f >> out.fsdReadyDay;
+    } else if (key == "navAutoRun") {
+      int v = 0;
+      f >> v;
+      out.navAutoRun = (v != 0);
+    } else if (key == "navRouteHop") {
+      f >> out.navRouteHop;
+    } else if (key == "navRouteMode") {
+      int v = 0;
+      f >> v;
+      out.navRouteMode = static_cast<core::u8>(std::clamp(v, 0, 2));
+    } else if (key == "navConstrainToCurrentFuelRange") {
+      int v = 0;
+      f >> v;
+      out.navConstrainToCurrentFuelRange = (v != 0);
+    } else if (key == "pendingArrivalStation") {
+      f >> out.pendingArrivalStation;
+    } else if (key == "navRoute") {
+      std::size_t n = 0;
+      f >> n;
+      out.navRoute.clear();
+      out.navRoute.reserve(std::min<std::size_t>(n, 100000));
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "nav") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        SystemId id = 0;
+        if (!(f >> id)) break;
+        out.navRoute.push_back(id);
+      }
     } else if (key == "shipHull") {
       int v = 0;
       f >> v;

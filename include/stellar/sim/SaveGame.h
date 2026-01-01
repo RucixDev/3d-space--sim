@@ -193,7 +193,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{20};
+  int version{21};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -244,6 +244,17 @@ struct SaveGame {
   // Kept intentionally simple for the prototype loop.
   int passengerSeats{2};
   double fsdReadyDay{0.0}; // timeDays when the next hyperspace jump is allowed
+
+  // Navigation UI state (quality-of-life).
+  //
+  // This is persisted so plotted routes + auto-run preferences survive save/load.
+  std::vector<SystemId> navRoute{};
+  core::u32 navRouteHop{0};
+  bool navAutoRun{false};
+  core::u8 navRouteMode{0};
+  bool navConstrainToCurrentFuelRange{true};
+  StationId pendingArrivalStation{0};
+
 
   // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).
   // These are *not* physics-critical; they tune HUD/combat feel and basic progression loops.
