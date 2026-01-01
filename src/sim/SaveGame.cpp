@@ -1,5 +1,6 @@
 #include "stellar/sim/SaveGame.h"
 
+#include "stellar/core/Clamp.h"
 #include "stellar/core/Log.h"
 
 #include <algorithm>
@@ -357,7 +358,7 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
     } else if (key == "navRouteMode") {
       int v = 0;
       f >> v;
-      out.navRouteMode = static_cast<core::u8>(std::clamp(v, 0, 2));
+      out.navRouteMode = core::clampCast<core::u8>(v, 0, 2);
     } else if (key == "navConstrainToCurrentFuelRange") {
       int v = 0;
       f >> v;

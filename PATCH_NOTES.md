@@ -1,3 +1,18 @@
+## 2026-01-01 (Patch) - Clamp Utilities + UI/String Safety Pass
+
+This round hardens the MSVC build further by removing a few remaining "gotcha" patterns
+that can trigger overload-resolution and pointer-arithmetic errors on Windows toolchains.
+
+- **New core utility:** `stellar/core/Clamp.h` with `core::clamp(...)` and `core::clampCast(...)`.
+  - Used to clamp nav route mode + commodity filter indices in `stellar_game`.
+  - Used by SaveGame parsing for `navRouteMode`.
+- **Navigation persistence:** replaced the last `std::clamp` usage in nav-route save/load with `core::clamp*`.
+- **Quaternion/vector rotation:** switched one remaining `Quatd * Vec3d` call site to `Quatd::rotate(...)`
+  for portability (and clearer intent).
+- **Trade UI:** combo preview now uses a local `std::string` buffer (avoids `std::string_view` → `const char*`).
+- **Trade toasts:** rebuilt buy toasts with explicit `std::string` assembly to avoid any `const char* + const char*`
+  pitfalls on MSVC.
+
 ## 2026-01-01 (Patch) - Remaining MSVC Compile Fixes + SaveGame/Nav Sync
 
 This round completes the set of MSVC compile fixes you reported and syncs code with the existing patch notes:

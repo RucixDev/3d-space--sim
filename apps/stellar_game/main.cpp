@@ -10,6 +10,7 @@
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
+#include "stellar/core/Clamp.h"
 #include "stellar/math/Vec2.h"
 #include "stellar/proc/Noise.h"
 #include "stellar/econ/Market.h"
@@ -3066,7 +3067,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.navRoute = navRoute;
           s.navRouteHop = (core::u32)std::min<std::size_t>(navRouteHop, 1000000ull);
           s.navAutoRun = navAutoRun;
-          s.navRouteMode = (core::u8)std::clamp((int)navRouteMode, 0, 2);
+	          s.navRouteMode = core::clampCast<core::u8>((int)navRouteMode, 0, 2);
           s.navConstrainToCurrentFuelRange = navConstrainToCurrentFuelRange;
           s.pendingArrivalStation = pendingArrivalTargetStationId;
 
@@ -3359,7 +3360,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             navRoute = s.navRoute;
             navRouteHop = (std::size_t)std::min<std::size_t>(s.navRouteHop, navRoute.empty() ? 0 : (navRoute.size() - 1));
             navAutoRun = s.navAutoRun;
-            navRouteMode = (NavRouteMode)std::clamp((int)s.navRouteMode, 0, 2);
+	            navRouteMode = (NavRouteMode)core::clamp((int)s.navRouteMode, 0, 2);
             navConstrainToCurrentFuelRange = s.navConstrainToCurrentFuelRange;
             pendingArrivalTargetStationId = s.pendingArrivalStation;
 
@@ -4871,12 +4872,13 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	        s.resolved = false;
 	        s.fieldSpawned = false;
 
-	        // Generate a stable plan for distress calls so scans can reveal useful info
-	        // and the on-drop content doesn't change if the player loops back.
-	        if (t == SignalType::Distress) {
-	          s.hasDistressPlan = true;
-	          s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, currentSystem->stub.factionId);
-	        }
+		        // Generate a stable plan for distress calls so scans can reveal useful info
+		        // and the on-drop content doesn't change if the player loops back.
+		        const core::u32 jurisdiction = currentSystem ? currentSystem->stub.factionId : 0;
+		        if (t == SignalType::Distress) {
+		          s.hasDistressPlan = true;
+		          s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+		        }
 	        signals.push_back(s);
 
 	        toast(toasts, std::string("Signal detected: ") + signalTypeName(t), 3.0);
@@ -7805,8 +7807,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                   -rng.range(200000.0, 260000.0),
               };
 
-              const math::Quatd q = ship.orientation();
-              const math::Vec3d worldOff = q * p.shadowOffsetLocalKm;
+	              const math::Quatd q = ship.orientation();
+	              const math::Vec3d worldOff = q.rotate(p.shadowOffsetLocalKm);
               p.ship.setPositionKm(ship.positionKm() + worldOff);
               p.ship.setVelocityKmS(ship.velocityKmS());
             } else {
@@ -10134,7 +10136,8 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
   std::string out;
 
   if (m.type == sim::MissionType::Courier) {
-    out = "Courier: Deliver data to " + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
+    out = std::string("Courier: Deliver data to ")
+          + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
   } else if (m.type == sim::MissionType::Delivery) {
     out = std::string("Delivery: ")
           + econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units))
@@ -10166,16 +10169,16 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
     }
     out += " -> " + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
   } else if (m.type == sim::MissionType::Passenger) {
-    out = "Passengers: deliver party of "
+    out = std::string("Passengers: deliver party of ")
           + std::to_string((int)std::round(m.units)) + " to "
           + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
   } else if (m.type == sim::MissionType::BountyScan) {
-    out = "Bounty Scan: find & scan target in " + uiSystemNameById(m.toSystem);
+    out = std::string("Bounty Scan: find & scan target in ") + uiSystemNameById(m.toSystem);
     if (m.toStation != 0) {
       out += " (near " + uiStationNameById(m.toSystem, m.toStation) + ")";
     }
   } else if (m.type == sim::MissionType::BountyKill) {
-    out = "Bounty Hunt: eliminate target in " + uiSystemNameById(m.toSystem);
+    out = std::string("Bounty Hunt: eliminate target in ") + uiSystemNameById(m.toSystem);
     if (m.toStation != 0) {
       out += " (near " + uiStationNameById(m.toSystem, m.toStation) + ")";
     }
@@ -14445,13 +14448,15 @@ if (canTrade) {
                   tradeIdeasDayStamp = -1;
                 }
 
-                const char* curFilter = "Any";
-                if (tradeCommodityFilter >= 0) {
-                  const auto id = (econ::CommodityId)tradeCommodityFilter;
-                  curFilter = econ::commodityDef(id).code;
-                }
+	                // ImGui combo preview strings must be null-terminated. Some helpers return
+	                // std::string_view, so keep a local std::string buffer here.
+	                std::string curFilterStr = "Any";
+	                if (tradeCommodityFilter >= 0) {
+	                  const auto id = static_cast<econ::CommodityId>(tradeCommodityFilter);
+	                  curFilterStr = std::string(econ::commodityCode(id));
+	                }
 
-                if (ImGui::BeginCombo("Commodity filter", curFilter)) {
+	                if (ImGui::BeginCombo("Commodity filter", curFilterStr.c_str())) {
                   const bool anySelected = tradeCommodityFilter < 0;
                   if (ImGui::Selectable("Any", anySelected)) {
                     tradeCommodityFilter = -1;
@@ -14499,7 +14504,10 @@ if (canTrade) {
 
                 if (tradeCommodityFilter >= 0) {
                   scan.commodityFilterEnabled = true;
-                  scan.commodityFilter = static_cast<econ::CommodityId>(tradeCommodityFilter);
+	                  // Clamp before casting so we never end up with an invalid enum value even if
+	                  // the UI state gets corrupted.
+	                  const int idx = core::clamp(tradeCommodityFilter, 0, (int)econ::kCommodityCount - 1);
+	                  scan.commodityFilter = static_cast<econ::CommodityId>(idx);
                 }
 
                 const auto results = sim::scanTradeOpportunities(universe,
@@ -14647,9 +14655,14 @@ if (canTrade) {
 
                         if (tr.ok && tr.unitsDelta > 1e-9) {
                           cargo[(std::size_t)t.commodity] += tr.unitsDelta;
-                          toast(toasts, ("Bought " + std::to_string((int)std::round(tr.unitsDelta)) + " " +
-                                         econ::commodityDef(t.commodity).name + " (" +
-                                         std::to_string((int)std::round(-tr.creditsDelta)) + " cr)"));
+	                          std::string msg = "Bought ";
+	                          msg += std::to_string((int)std::round(tr.unitsDelta));
+	                          msg += " ";
+	                          msg += econ::commodityDef(t.commodity).name;
+	                          msg += " (";
+	                          msg += std::to_string((int)std::round(-tr.creditsDelta));
+	                          msg += " cr)";
+	                          toast(toasts, msg);
                           tradeIdeasDayStamp = -1;
                           tradeMixDayStamp = -1;
                         } else {
