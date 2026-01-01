@@ -1,5 +1,5 @@
 #include "stellar/core/Log.h"
-#include "tests/test_harness.h"
+#include "test_harness.h"
 
 #include <atomic>
 #include <string>

@@ -41,7 +41,10 @@
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/Law.h"
 #include "stellar/sim/PoliceScan.h"
+#include "stellar/sim/Distress.h"
+#include "stellar/sim/ResourceField.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/WorldIds.h"
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/IndustryService.h"
 #include "stellar/sim/TradeScanner.h"
@@ -52,6 +55,7 @@
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
 #include "stellar/sim/SupercruiseComputer.h"
+#include "stellar/sim/Interdiction.h"
 #include "stellar/sim/EncounterDirector.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
@@ -648,6 +652,17 @@ struct Contact {
   // Escort-mission convoy marker (leader ship). Used only for UI/logic; not saved.
   bool escortConvoy{false};
 
+  // --- Distress / rescue (signal encounters) ---
+  // Distressed civilian ship that can be helped by delivering cargo.
+  // Triggered via a normal contact scan (scanner action).
+  bool distressVictim{false};
+  core::u64 distressSignalId{0};
+  econ::CommodityId distressNeedCommodity{econ::CommodityId::Food};
+  double distressNeedUnits{0.0};
+  double distressRewardCr{0.0};
+  double distressRepReward{0.0};
+  core::u32 distressPayerFactionId{0};
+
   // --- Trader economy simulation (local-system hauling) ---
   // Traders move a small amount of real station inventory between stations.
   // This makes markets feel "alive" and creates/relieves shortages.
@@ -718,11 +733,23 @@ struct SignalSource {
   math::Vec3d posKm{0,0,0};
   double expireDay{0.0};
 
+  // Deterministic plan for distress calls (victim request + optional ambush parameters).
+  // Filled at spawn time so scan / resolution UI can display stable info.
+  bool hasDistressPlan{false};
+  sim::DistressPlan distress{};
+  core::u64 distressVictimId{0};
+  bool distressCompleted{false};
+
   // Whether the player has "resolved" this site (i.e., we have fired its one-shot content).
   bool resolved{false};
 
   // Some sites (resource fields) need a second one-shot flag even after 'resolved' for clarity / future expansion.
   bool fieldSpawned{false};
+
+  // Deterministic plan for resource fields (composition/richness).
+  // Filled at seed time so scanner / UI can show stable hints.
+  bool hasResourcePlan{false};
+  sim::ResourceFieldPlan resource{};
 };
 
 static void applyDamage(double dmg, double& shield, double& hull) {
@@ -1622,8 +1649,8 @@ int main(int argc, char** argv) {
   std::unordered_map<core::u64, double> asteroidRemainingById;
 
   // Tag bit for deterministically-generated world objects.
-  // We keep this separate from mission ids (which already use their own high-bit tags).
-  constexpr core::u64 kDeterministicWorldIdBit = 0x2000000000000000ull;
+  // Shared constant lives in sim/WorldIds.h so ids remain stable across apps/tools.
+  constexpr core::u64 kDeterministicWorldIdBit = sim::kDeterministicWorldIdBit;
 
   core::u64 nextWorldObjectId = 1;
   double nextSignalSpawnDays = 0.01;
@@ -1926,15 +1953,12 @@ int main(int argc, char** argv) {
   double supercruiseDistKm = 0.0;
   double supercruiseClosingKmS = 0.0;
 
-  // Interdiction (very early minigame while in supercruise)
-  enum class InterdictionState { None, Warning, Active };
-  InterdictionState interdictionState = InterdictionState::None;
-  double interdictionWarningRemainingSec = 0.0;
-  double interdictionActiveRemainingSec = 0.0;
-  double interdictionEscapeMeter = 0.0; // 0..1
-  math::Vec3d interdictionEscapeDir{0,0,1};
-  core::u64 interdictionPirateId = 0;
+  // Interdiction (supercruise tether minigame)
+  sim::InterdictionState interdiction;
+  sim::InterdictionParams interdictionParams;
+  sim::InterdictionTriggerParams interdictionTriggerParams;
   std::string interdictionPirateName;
+  double interdictionPirateStrength = 1.0;
   bool interdictionSubmitRequested = false;
   double interdictionCooldownUntilDays = 0.0;
 
@@ -2100,34 +2124,37 @@ int main(int argc, char** argv) {
       return {x/len, y/len, z/len};
     };
 
-    // A persistent resource field (mining). Never expires; depletion is persisted by asteroid id.
-    {
+    // Persistent resource fields (mining). Never expire; depletion is persisted by asteroid id.
+    //
+    // Generated in the core sim so the math can be unit tested.
+    for (int fieldIdx = 0; fieldIdx < sim::kDefaultResourceFieldCount; ++fieldIdx) {
+      const auto gen = sim::generateResourceField(seed,
+                                                  sys.stub.id,
+                                                  anchor.id,
+                                                  anchorPos,
+                                                  anchor.commsRangeKm,
+                                                  timeDays,
+                                                  fieldIdx);
+
       SignalSource s{};
-      s.id = detId(/*typeCode=*/1, /*salt=*/0);
+      s.id = gen.field.signalId;
       s.type = SignalType::Resource;
       s.expireDay = 0.0;
       s.resolved = false;
       s.fieldSpawned = true;
-
-      core::SplitMix64 srng(core::hashCombine(s.id, 0xA11CE5EEDull));
-      const math::Vec3d dir = randUnitDet(srng);
-      const double distKm = anchor.commsRangeKm * 1.3 + 120000.0;
-      s.posKm = anchorPos + dir * distKm;
+      s.posKm = gen.field.posKm;
+      s.hasResourcePlan = true;
+      s.resource = gen.field;
       signals.push_back(s);
 
-      const int count = 28;
-      for (int i = 0; i < count; ++i) {
+      for (const auto& ap : gen.asteroids) {
         AsteroidNode a{};
-        a.id = (core::hashCombine(s.id, (core::u64)i) | kDeterministicWorldIdBit);
+        a.id = ap.asteroidId;
+        a.posKm = ap.posKm;
+        a.radiusKm = ap.radiusKm;
+        a.yield = ap.yield;
 
-        core::SplitMix64 arng(core::hashCombine(s.id, (core::u64)i));
-        a.posKm = s.posKm + randUnitDet(arng) * arng.range(15000.0, 75000.0);
-        a.radiusKm = arng.range(2500.0, 7500.0);
-        a.yield = (arng.nextUnit() < 0.18) ? econ::CommodityId::Metals : econ::CommodityId::Ore;
-
-        double baseUnits = arng.range(90.0, 260.0) * (a.radiusKm / 5000.0);
-        if (a.yield == econ::CommodityId::Metals) baseUnits *= 0.65;
-
+        const double baseUnits = std::max(0.0, ap.baseUnits);
         auto it = asteroidRemainingById.find(a.id);
         a.remainingUnits = (it != asteroidRemainingById.end()) ? std::clamp(it->second, 0.0, baseUnits)
                                                                : baseUnits;
@@ -3039,6 +3066,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
           s.fsdReadyDay = fsdReadyDay;
 
+          // Navigation state (plotted route / auto-run).
+          s.navRoute = navRoute;
+          s.navRouteHop = (core::u32)std::min<std::size_t>(navRouteHop, (std::size_t)std::numeric_limits<core::u32>::max());
+          s.navAutoRun = navAutoRun;
+          s.pendingArrivalStation = pendingArrivalTargetStationId;
+
           // Loadout
           s.shipHull = (core::u8)std::clamp((int)shipHullClass, 0, 2);
           s.thrusterMk = (core::u8)std::clamp(thrusterMk, 1, 3);
@@ -3323,9 +3356,41 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             supercruiseClosingKmS = 0.0;
             fsdState = FsdState::Idle;
             fsdTargetSystem = 0;
-            navRoute.clear();
-            navRouteHop = 0;
-            navAutoRun = false;
+            // Navigation state (plotted route / auto-run / pending arrival target).
+            navRoute = s.navRoute;
+            navRouteHop = (std::size_t)s.navRouteHop;
+            navAutoRun = s.navAutoRun;
+            pendingArrivalTargetStationId = s.pendingArrivalStation;
+
+            // Validate/repair route cursor so it matches the loaded current system.
+            if (currentSystem) {
+              if (navRoute.size() >= 2) {
+                std::size_t idx = navRoute.size();
+                for (std::size_t i = 0; i < navRoute.size(); ++i) {
+                  if (navRoute[i] == currentSystem->stub.id) { idx = i; break; }
+                }
+                if (idx == navRoute.size()) {
+                  navRoute.clear();
+                  navRouteHop = 0;
+                  navAutoRun = false;
+                } else {
+                  navRouteHop = idx;
+                }
+              } else {
+                navRoute.clear();
+                navRouteHop = 0;
+                navAutoRun = false;
+              }
+
+              if (!navRoute.empty() && navRouteHop + 1 >= navRoute.size()) {
+                navAutoRun = false;
+              }
+            } else {
+              navRoute.clear();
+              navRouteHop = 0;
+              navAutoRun = false;
+            }
+
             scanning = false;
             scanProgressSec = 0.0;
             scanLockedId = 0;
@@ -3334,7 +3399,25 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             clearances.clear();
             target = Target{};
 
-            galaxySelectedSystemId = currentSystem->stub.id;
+            if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
+              galaxySelectedSystemId = navRoute[navRouteHop + 1];
+            } else {
+              galaxySelectedSystemId = currentSystem->stub.id;
+            }
+
+            // If we already are in the system for a pending arrival station, target it immediately.
+            if (pendingArrivalTargetStationId != 0 && currentSystem) {
+              for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+                if (currentSystem->stations[i].id == pendingArrivalTargetStationId) {
+                  target.kind = TargetKind::Station;
+                  target.index = i;
+                  selectedStationIndex = (int)i;
+                  pendingArrivalTargetStationId = 0;
+                  break;
+                }
+              }
+            }
+
 
             // Re-seed deterministic in-system objects so signals/asteroids are present after load.
             seedSystemSpaceObjects(*currentSystem);
@@ -3783,11 +3866,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                 supercruiseState = SupercruiseState::Charging;
                 supercruiseChargeRemainingSec = kSupercruiseChargeSec;
                 supercruiseDropRequested = false;
-                interdictionState = InterdictionState::None;
-                interdictionWarningRemainingSec = 0.0;
-                interdictionActiveRemainingSec = 0.0;
-                interdictionEscapeMeter = 0.0;
+                interdiction = sim::InterdictionState{};
                 interdictionSubmitRequested = false;
+                interdictionPirateName.clear();
+                interdictionPirateStrength = 1.0;
                 autopilot = false;
                 dockingComputer.reset();
                 scanning = false;
@@ -3800,11 +3882,13 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             } else if (supercruiseState == SupercruiseState::Charging) {
               supercruiseState = SupercruiseState::Idle;
               supercruiseChargeRemainingSec = 0.0;
-              interdictionState = InterdictionState::None;
+              interdiction = sim::InterdictionState{};
               interdictionSubmitRequested = false;
+              interdictionPirateName.clear();
+              interdictionPirateStrength = 1.0;
               toast(toasts, "Supercruise canceled.", 1.4);
             } else if (supercruiseState == SupercruiseState::Active) {
-              if (interdictionState != InterdictionState::None) {
+              if (sim::interdictionInProgress(interdiction)) {
                 interdictionSubmitRequested = true;
                 toast(toasts, "Submitted to interdiction.", 1.4);
               } else {
@@ -3887,9 +3971,13 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	                } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
 	                  const auto& s = signals[target.index];
 	                  scanLockedId = s.id;
-	                  scanDurationSec = 4.0;
-	                  scanRangeKm = 120000.0;
-	                  scanLabel = std::string("Signal scan: ") + signalTypeName(s.type);
+	                  scanDurationSec = (s.type == SignalType::Resource) ? 3.5 : 4.0;
+	                  scanRangeKm = 200000.0;
+	                  const char* base = signalTypeName(s.type);
+	                  if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	                    base = sim::resourceFieldKindName(s.resource.kind);
+	                  }
+	                  scanLabel = std::string("Signal scan: ") + base;
 	                  ok = true;
 	                } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
 	                  const auto& a = asteroids[target.index];
@@ -4549,13 +4637,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         supercruiseState = SupercruiseState::Active;
         supercruiseDropRequested = false;
         // Small grace window before interdictions can trigger.
-        interdictionState = InterdictionState::None;
-        interdictionWarningRemainingSec = 0.0;
-        interdictionActiveRemainingSec = 0.0;
-        interdictionEscapeMeter = 0.0;
+        interdiction = sim::InterdictionState{};
         interdictionSubmitRequested = false;
-        interdictionPirateId = 0;
         interdictionPirateName.clear();
+        interdictionPirateStrength = 1.0;
         interdictionCooldownUntilDays = std::max(interdictionCooldownUntilDays, timeDays + (12.0 / 86400.0));
         toast(toasts, "Supercruise engaged.", 1.6);
       }
@@ -4579,13 +4664,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       supercruiseDropRequested = false;
 
       // Clear any ongoing interdiction state.
-      interdictionState = InterdictionState::None;
-      interdictionWarningRemainingSec = 0.0;
-      interdictionActiveRemainingSec = 0.0;
-      interdictionEscapeMeter = 0.0;
+      interdiction = sim::InterdictionState{};
       interdictionSubmitRequested = false;
-      interdictionPirateId = 0;
       interdictionPirateName.clear();
+      interdictionPirateStrength = 1.0;
 
       const double approachSpeed = emergency ? 0.45 : 0.16;
       ship.setVelocityKmS(destVelKmS + dirToDest * approachSpeed);
@@ -4797,15 +4879,35 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	        s.expireDay = timeDays + rng.range(0.010, 0.030); // ~14-43 minutes (sim-days)
 	        s.resolved = false;
 	        s.fieldSpawned = false;
+
+	        // Generate a stable plan for distress calls so scans can reveal useful info
+	        // and the on-drop content doesn't change if the player loops back.
+	        if (t == SignalType::Distress) {
+	          s.hasDistressPlan = true;
+	          s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	        }
 	        signals.push_back(s);
 
 	        toast(toasts, std::string("Signal detected: ") + signalTypeName(t), 3.0);
 	      }
 
-	      // Interdiction (very early, but clearer + playable than the old "instant drop")
+	      // Interdiction (supercruise tether minigame)
       double nearestPirateKm = 1e99;
       core::u64 nearestPirateId = 0;
       std::string nearestPirateName;
+      double nearestPirateStrength = 1.0;
+
+      auto pirateStrengthFrom = [&](const Contact& c) -> double {
+        // Rough difficulty scaling for the interdiction tether.
+        // Keep it stable and inexpensive; the detailed combat sim starts after drop.
+        double s = 0.85 + 0.70 * std::clamp(c.aiSkill, 0.0, 1.0);
+        if (c.hullClass == ShipHullClass::Fighter) s += 0.20;
+        s += 0.05 * std::max(0, c.thrusterMk - 1);
+        s += 0.03 * std::max(0, c.shieldMk - 1);
+        s += 0.02 * std::max(0, c.distributorMk - 1);
+        return std::clamp(s, 0.60, 1.80);
+      };
+
       for (const auto& c : contacts) {
         if (!c.alive || c.role != ContactRole::Pirate) continue;
         const double d = (c.ship.positionKm() - ship.positionKm()).length();
@@ -4813,70 +4915,69 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           nearestPirateKm = d;
           nearestPirateId = c.id;
           nearestPirateName = c.name;
+          nearestPirateStrength = pirateStrengthFrom(c);
         }
       }
+
       const bool pirateThreat = (nearestPirateKm < 240000.0);
 
+      // Compute closeness for the active interdictor (if any), otherwise nearest pirate.
+      double interdictorKm = nearestPirateKm;
+      if (sim::interdictionInProgress(interdiction) && interdiction.pirateId != 0) {
+        for (const auto& c : contacts) {
+          if (!c.alive || c.id != interdiction.pirateId) continue;
+          interdictorKm = (c.ship.positionKm() - ship.positionKm()).length();
+          break;
+        }
+      }
+      const double interdictorCloseness = sim::interdictionCloseness01(interdictorKm, 240000.0);
+
       // "Submit" (H) while the interdiction is ongoing: safe-ish drop with short cooldown.
-      if (interdictionSubmitRequested && interdictionState != InterdictionState::None) {
+      if (interdictionSubmitRequested && sim::interdictionInProgress(interdiction)) {
         interdictionSubmitRequested = false;
+
+        // End the minigame (submitted) and drop without emergency effects.
+        (void)sim::stepInterdiction(interdiction, 0.0, ship.forward().normalized(), interdictorCloseness,
+                                    interdictionPirateStrength, /*submit=*/true, interdictionParams);
+
         interdictionCooldownUntilDays = timeDays + (90.0 / 86400.0);
         endSupercruise(false, destVelKmS, dirToDest, "Submitted: dropped from supercruise.");
       } else if (!hasDest) {
         endSupercruise(true, localFrameVelKmS, dirToDest, "Supercruise lost target. Emergency drop.");
       } else {
-        // Start interdiction warning (random-ish cadence based on proximity)
-        if (interdictionState == InterdictionState::None && pirateThreat && timeDays >= interdictionCooldownUntilDays) {
-          const double closeness = std::clamp(1.0 - (nearestPirateKm / 240000.0), 0.0, 1.0);
-          const double ratePerSec = 0.12 + 0.75 * (closeness * closeness); // events / real second
-          const double chance = 1.0 - std::exp(-ratePerSec * dtReal);
-          if (rng.chance(std::clamp(chance, 0.0, 0.85))) {
-            interdictionState = InterdictionState::Warning;
-            interdictionWarningRemainingSec = 2.2;
-            interdictionActiveRemainingSec = 0.0;
-            interdictionEscapeMeter = 0.42;
-            interdictionPirateId = nearestPirateId;
-            interdictionPirateName = nearestPirateName;
+        const double cargoV = cargoValueEstimateCr();
 
-            // Pick an escape direction that isn't trivially "forward".
-            const math::Vec3d fwd = ship.forward().normalized();
-            math::Vec3d jitter{rng.range(-1.0, 1.0), rng.range(-0.35, 0.35), rng.range(-1.0, 1.0)};
-            if (jitter.lengthSq() < 1e-9) jitter = {0.2, 0.0, 0.8};
-            jitter = jitter.normalized();
-            interdictionEscapeDir = (fwd * 0.35 + jitter * 0.65).normalized();
+        // Start interdiction warning (random-ish cadence based on proximity + cargo value)
+        if (!sim::interdictionInProgress(interdiction) && pirateThreat && timeDays >= interdictionCooldownUntilDays) {
+          if (sim::rollInterdictionStart(rng, dtReal, interdictorCloseness, cargoV, nearestPirateStrength, interdictionTriggerParams)) {
+            interdiction = sim::beginInterdiction(universe.seed(), nearestPirateId, timeDays,
+                                                 ship.forward().normalized(), ship.up().normalized(),
+                                                 interdictorCloseness, nearestPirateStrength,
+                                                 interdictionParams);
+            interdictionPirateName = nearestPirateName;
+            interdictionPirateStrength = nearestPirateStrength;
 
             supercruiseDropRequested = false; // disable manual drop while interdicted
-            toast(toasts, "INTERDICTION WARNING! Align and hold to evade (H to submit).", 2.6);
+            toast(toasts, "INTERDICTION WARNING! Keep the escape vector centered (H to submit).", 2.6);
           }
         }
 
-        // Update interdiction states
-        if (interdictionState == InterdictionState::Warning) {
-          interdictionWarningRemainingSec = std::max(0.0, interdictionWarningRemainingSec - dtReal);
-          if (interdictionWarningRemainingSec <= 0.0) {
-            interdictionState = InterdictionState::Active;
-            interdictionActiveRemainingSec = 11.0;
-            toast(toasts, "Interdiction engaged! Keep the escape vector aligned.", 2.2);
+        // Step the minigame.
+        if (sim::interdictionInProgress(interdiction)) {
+          const auto out = sim::stepInterdiction(interdiction, dtReal, ship.forward().normalized(),
+                                                 interdictorCloseness, interdictionPirateStrength,
+                                                 /*submit=*/false, interdictionParams);
+
+          if (out.beganActive) {
+            toast(toasts, "Interdiction engaged! Follow the escape vector.", 2.2);
           }
-        }
 
-        if (interdictionState == InterdictionState::Active) {
-          interdictionActiveRemainingSec = std::max(0.0, interdictionActiveRemainingSec - dtReal);
-
-          const math::Vec3d fwd = ship.forward().normalized();
-          const math::Vec3d esc = interdictionEscapeDir.normalized();
-          const double align = math::dot(fwd, esc); // -1..1
-
-          const double gain = std::clamp((align - 0.72) / 0.28, 0.0, 1.0);
-          const double pull = 0.26 + (pirateThreat ? std::clamp((240000.0 - nearestPirateKm) / 240000.0, 0.0, 1.0) * 0.22 : 0.0);
-
-          interdictionEscapeMeter = std::clamp(interdictionEscapeMeter + (gain * 0.78 - pull) * dtReal, 0.0, 1.0);
-
-          if (interdictionEscapeMeter >= 1.0) {
-            interdictionState = InterdictionState::None;
+          if (out.evaded) {
             interdictionCooldownUntilDays = timeDays + (150.0 / 86400.0);
+            interdictionPirateName.clear();
+            interdictionPirateStrength = 1.0;
             toast(toasts, "Interdiction evaded.", 2.0);
-          } else if (interdictionEscapeMeter <= 0.0 || interdictionActiveRemainingSec <= 0.0) {
+          } else if (out.failed) {
             interdictionCooldownUntilDays = timeDays + (180.0 / 86400.0);
             endSupercruise(true, destVelKmS, dirToDest, "Interdicted! Emergency drop.");
           }
@@ -4884,7 +4985,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
         // Supercruise guidance (safe-drop heuristic + braking-distance-aware speed profile).
         // This extracts the math/control logic from the game loop so it's testable and reusable.
-        const bool interdicted = (interdictionState != InterdictionState::None);
+        const bool interdicted = sim::interdictionInProgress(interdiction);
 
         sim::SupercruiseParams scParams{};
         scParams.safeTtaSec = kSupercruiseSafeTtaSec;
@@ -5054,23 +5155,68 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       }
 
       // Auto-run route (hands-free multi-jump). We only auto-trigger when safe.
-      // Also: avoid spamming toasts if the next hop is currently impossible.
+      // QoL: if cargo/loadout changes make the next hop invalid, attempt a one-shot replot to the
+      // final destination instead of immediately disabling auto-run.
       if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && !docked && supercruiseState == SupercruiseState::Idle) {
-        if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && !isMassLocked()) {
-          const auto& nextSys = universe.getSystem(navRoute[navRouteHop + 1]);
-          const double hopDistLy = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
+        if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && !isMassLocked() && currentSystem) {
+
+          auto targetNearestStationForRefuel = [&]() -> bool {
+            if (currentSystem->stations.empty()) return false;
+            const math::Vec3d p = ship.positionKm();
+            double bestD = 1e30;
+            std::size_t bestIdx = 0;
+            for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+              const auto& st = currentSystem->stations[i];
+              const math::Vec3d sp = stationPosKm(st, timeDays);
+              const double d = (sp - p).length();
+              if (d < bestD) { bestD = d; bestIdx = i; }
+            }
+            target.kind = TargetKind::Station;
+            target.index = bestIdx;
+            selectedStationIndex = (int)bestIdx;
+            return true;
+          };
+
+          sim::SystemId nextHopId = navRoute[navRouteHop + 1];
+          double hopDistLy = (universe.getSystem(nextHopId).stub.posLy - currentSystem->stub.posLy).length();
 
           const double rangeLy = fsdBaseRangeLy();
           if (hopDistLy > rangeLy + 1e-9) {
-            navAutoRun = false;
-            toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
-          } else {
+            const sim::SystemId destSys = navRoute.back();
+            const bool wantAuto = navAutoRun;
+
+            // Try to replot the route to the final destination. This can happen if the player
+            // changed cargo/loadout after plotting, reducing jump range.
+            if (destSys != 0 && destSys != currentSystem->stub.id
+                && plotRouteToSystem(destSys, false)
+                && !navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
+
+              // plotRouteToSystem resets navAutoRun; restore it.
+              navAutoRun = wantAuto;
+              nextHopId = navRoute[navRouteHop + 1];
+              hopDistLy = (universe.getSystem(nextHopId).stub.posLy - currentSystem->stub.posLy).length();
+              toast(toasts, "Auto-run: route replotted (range changed).", 2.4);
+            } else {
+              navAutoRun = false;
+              toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+            }
+          }
+
+          if (navAutoRun) {
             const double hopFuel = fsdFuelCostFor(hopDistLy);
             if (fuel + 1e-6 < hopFuel) {
               navAutoRun = false;
-              toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+              if (targetNearestStationForRefuel()) {
+                toast(toasts, "Auto-run stopped: refuel needed (target set).", 2.8);
+              } else {
+                toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+              }
+            } else if (hopDistLy > fsdBaseRangeLy() + 1e-9) {
+              // Safety net (should be extremely rare).
+              navAutoRun = false;
+              toast(toasts, "Auto-run stopped: next hop is out of range.", 2.8);
             } else {
-              startFsdJumpTo(navRoute[navRouteHop + 1]);
+              startFsdJumpTo(nextHopId);
             }
           }
         }
@@ -6117,6 +6263,12 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       sim::ShipInput ai{};
       ai.dampers = true;
 
+      // Distress victims are "disabled": keep them stationary until the player helps.
+      if (c.distressVictim && c.distressNeedUnits > 1e-6) {
+        c.ship.step(dtSim, ai);
+        continue;
+      }
+
       double dtStep = dtSim;
 
       const bool fleeing = (timeDays < c.fleeUntilDays);
@@ -6854,6 +7006,66 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           scanProgressSec += dtReal;
 
           if (scanProgressSec >= scanDurationSec) {
+	            // Distress victims: use a normal contact scan as a "comms handshake" and
+	            // optionally transfer requested cargo for a small reward.
+	            if (c.distressVictim && c.distressNeedUnits > 1e-6) {
+	              const double kTransferRangeKm = 15000.0;
+	              if (dist > kTransferRangeKm) {
+	                completeScan("Too far for transfer. Close to within 15,000 km and scan again.", 2.8);
+	                continue;
+	              }
+
+	              const econ::CommodityId needCid = c.distressNeedCommodity;
+	              const auto def = econ::commodityDef(needCid);
+	              const double have = cargo[(int)needCid];
+	              const double need = std::max(0.0, c.distressNeedUnits);
+	              const double moved = std::clamp(std::min(have, need), 0.0, have);
+
+	              if (moved <= 1e-6) {
+	                completeScan(std::string("Distress: no ") + def.name + " in cargo. Bring supplies and scan again.", 3.2);
+	                continue;
+	              }
+
+	              cargo[(int)needCid] = std::max(0.0, cargo[(int)needCid] - moved);
+	              c.distressNeedUnits = std::max(0.0, c.distressNeedUnits - moved);
+	              const int movedI = std::max(1, (int)std::llround(moved));
+
+	              if (c.distressNeedUnits <= 1e-6) {
+	                // Complete rescue: pay out once.
+	                const int rewardI = std::max(0, (int)std::llround(std::max(0.0, c.distressRewardCr)));
+	                if (rewardI > 0) credits += (double)rewardI;
+	
+	                if (c.distressPayerFactionId != 0 && c.distressRepReward != 0.0) {
+	                  repByFaction[c.distressPayerFactionId] = repByFaction[c.distressPayerFactionId] + c.distressRepReward;
+	                }
+
+	                // Mark the parent signal (if any) as completed for UI.
+	                for (auto& sig : signals) {
+	                  if (sig.id == c.distressSignalId) {
+	                    sig.distressCompleted = true;
+	                    break;
+	                  }
+	                }
+
+	                c.distressVictim = false;
+	                c.tradeCooldownUntilDays = timeDays; // allow normal trader behavior again
+	
+	                const std::string repStr = (c.distressPayerFactionId != 0 && c.distressRepReward != 0.0)
+	                  ? (" | rep +" + std::to_string((int)std::llround(c.distressRepReward)))
+	                  : std::string{};
+	
+	                completeScan(std::string("Rescue complete: transferred ") + std::to_string(movedI) + " " + def.name +
+	                              " | +" + std::to_string(rewardI) + " cr" + repStr,
+	                            4.0);
+	              } else {
+	                const int remainingI = std::max(1, (int)std::llround(c.distressNeedUnits));
+	                completeScan(std::string("Aid delivered: transferred ") + std::to_string(movedI) + " " + def.name +
+	                              " (remaining " + std::to_string(remainingI) + ").",
+	                            3.2);
+	              }
+	              continue;
+	            }
+
             // Complete bounty-scan missions via the shared mission logic (keeps prototype + tests consistent).
             sim::SaveGame tmp{};
             tmp.credits = credits;
@@ -6967,7 +7179,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	    // --- SIGNAL SCAN (distress / derelicts / resource sites) ---
 	    if (!valid && scanLockedTarget.kind == TargetKind::Signal && scanLockedTarget.index < signals.size()) {
-	      const auto& s = signals[scanLockedTarget.index];
+	      auto& s = signals[scanLockedTarget.index];
 	      if (s.id == scanLockedId) {
 	        const double dist = (s.posKm - ship.positionKm()).length();
 	        if (dist <= scanRangeKm) {
@@ -6990,6 +7202,48 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              }
 
 	              completeScan(std::string("Signal scan logged (+data ") + std::to_string((int)value) + " cr).", 2.5);
+
+	              // Distress scans can reveal what the call is likely asking for.
+	              if (s.type == SignalType::Distress && currentSystem) {
+	                if (!s.hasDistressPlan) {
+	                  const core::u32 jurisdiction = currentSystem->stub.factionId;
+	                  s.hasDistressPlan = true;
+	                  s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	                }
+	                if (s.hasDistressPlan) {
+	                  if (s.distress.hasVictim && !s.distressCompleted) {
+	                    const auto def = econ::commodityDef(s.distress.needCommodity);
+	                    const int needUnits = std::max(1, (int)std::llround(s.distress.needUnits));
+	                    toast(toasts,
+	                          std::string("Distress analysis: request ") + std::to_string(needUnits) + " " + def.name +
+	                            " | reward ~" + std::to_string((int)std::llround(s.distress.rewardCr)) + " cr",
+	                          3.6);
+	                  }
+	                  if (s.distress.ambush) {
+	                    toast(toasts, "Warning: hostile activity suspected.", 3.2);
+	                  }
+	                }
+	              }
+
+	              // Resource field scans can reveal composition and richness.
+	              if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	                const auto& p = s.resource;
+	                const auto& a = econ::commodityDef(p.primaryYield);
+	                const auto& b = econ::commodityDef(p.secondaryYield);
+	                const int pa = (int)std::lround(std::clamp(p.primaryChance, 0.0, 1.0) * 100.0);
+	                const int pb = 100 - pa;
+	                const int rich = (int)std::lround(std::clamp(p.richness01, 0.0, 1.0) * 100.0);
+	                char buf[256];
+	                std::snprintf(buf, sizeof(buf),
+	                              "Resource analysis: %s | Richness %d%% | %s ~%d%% / %s ~%d%%",
+	                              sim::resourceFieldKindName(p.kind),
+	                              rich,
+	                              a.name,
+	                              pa,
+	                              b.name,
+	                              pb);
+	                toast(toasts, buf, 3.8);
+	              }
 	            } else {
 	              completeScan("Signal already scanned.", 1.8);
 	            }
@@ -7015,7 +7269,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              const double value = 45.0;
 	              explorationDataCr += value;
 	              const std::string cname = econ::commodityDef(a.yield).name;
-	              completeScan(std::string("Asteroid prospected: ") + cname + " (+data " + std::to_string((int)value) + " cr).", 2.5);
+	              const int rem = (int)std::lround(std::max(0.0, a.remainingUnits));
+	              completeScan(std::string("Asteroid prospected: ") + cname + " | Remaining ~" + std::to_string(rem) + " u (+data " + std::to_string((int)value) + " cr).", 2.8);
 	            } else {
 	              completeScan("Asteroid already prospected.", 1.8);
 	            }
@@ -7215,7 +7470,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                  asteroids.push_back(a);
 	                }
 	              }
-	              toast(toasts, "Arrived at Resource Site: asteroid fragments detected.", 3.0);
+	              if (s.hasResourcePlan) {
+	                toast(toasts,
+	                      std::string("Arrived at ") + sim::resourceFieldKindName(s.resource.kind) + ": asteroid fragments detected.",
+	                      3.0);
+	              } else {
+	                toast(toasts, "Arrived at Resource Site: asteroid fragments detected.", 3.0);
+	              }
 	            } else if (s.type == SignalType::Derelict) {
 	              // Check if this derelict is a Salvage mission site (mission stores the signal id in targetNpcId).
 	              sim::Mission* salvageM = nullptr;
@@ -7262,12 +7523,82 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                spawnCargoPod(cid, units, s.posKm + randUnit() * rng.range(1500.0, 9000.0), {0,0,0}, 0.35);
 	              }
 	            } else if (s.type == SignalType::Distress) {
+	              // Ensure a deterministic plan exists (older save runs / modded spawners may not fill it).
+	              if (!s.hasDistressPlan && currentSystem) {
+	                const core::u32 jurisdiction = currentSystem->stub.factionId;
+	                s.hasDistressPlan = true;
+	                s.distress = sim::planDistressEncounter(universe.seed(), currentSystem->stub.id, s.id, timeDays, jurisdiction);
+	              }
+
+	              const sim::DistressPlan plan = s.distress;
 	              toast(toasts, "Distress beacon acquired. Approach with caution.", 3.0);
-	              // Some supplies may be drifting...
-	              spawnCargoPod(econ::CommodityId::Food, rng.range(3.0, 12.0), s.posKm + randUnit() * rng.range(1500.0, 7000.0), {0,0,0}, 0.35);
+
+	              // Some cargo may be drifting at the site (either spilled supplies or bait).
+	              const econ::CommodityId driftCid = plan.hasVictim ? plan.needCommodity : econ::CommodityId::Food;
+	              spawnCargoPod(driftCid,
+	                            rng.range(2.0, 9.0),
+	                            s.posKm + randUnit() * rng.range(1500.0, 8000.0),
+	                            {0,0,0},
+	                            0.35);
+
+	              // Legit distress calls can spawn a stranded ship that requests supplies.
+	              if (plan.hasVictim) {
+	                Contact v{};
+	                v.id = allocWorldId();
+	                v.role = ContactRole::Trader;
+	                v.factionId = currentSystem ? currentSystem->stub.factionId : 0;
+	                v.name = "Distress Vessel";
+	                v.hostileToPlayer = false;
+	
+	                v.ship = sim::Ship{};
+	                v.ship.setPositionKm(s.posKm + randUnit() * rng.range(4000.0, 9000.0));
+	                v.ship.setVelocityKmS({0,0,0});
+	                v.ship.setOrientation(ship.orientation());
+	                v.ship.setAngularVelocityRadS({0,0,0});
+
+	                // A weak hauler archetype; the distress flag disables trader AI until rescued.
+	                configureContactLoadout(v,
+	                                        ShipHullClass::Hauler,
+	                                        /*thrMk=*/1,
+	                                        /*shieldMk=*/1,
+	                                        /*distMk=*/1,
+	                                        /*weapon=*/WeaponType::PulseLaser,
+	                                        /*hullMul=*/0.80,
+	                                        /*shieldMul=*/0.45,
+	                                        /*regenMul=*/0.60,
+	                                        /*accelMul=*/0.55,
+	                                        /*aiSkill=*/0.35);
+	                v.pips = sim::Pips{3,2,1};
+	                sim::normalizePips(v.pips);
+
+	                v.distressVictim = true;
+	                v.distressSignalId = s.id;
+	                v.distressNeedCommodity = plan.needCommodity;
+	                v.distressNeedUnits = plan.needUnits;
+	                v.distressRewardCr = plan.rewardCr;
+	                v.distressRepReward = plan.repReward;
+	                v.distressPayerFactionId = plan.payerFactionId;
+
+	                // Keep them from affecting station inventories while disabled.
+	                v.tradeUnits = 0.0;
+	                v.tradeCooldownUntilDays = timeDays + 9999.0;
+	                v.cargoValueCr = 0.0;
+	                v.tradeCargoValueCr = 0.0;
+
+	                contacts.push_back(v);
+	                s.distressVictimId = v.id;
+
+	                const auto def = econ::commodityDef(plan.needCommodity);
+	                const int needUnits = std::max(1, (int)std::llround(plan.needUnits));
+	                toast(toasts,
+	                      std::string("Distress vessel requests ") + std::to_string(needUnits) + " " + def.name +
+	                        " (reward " + std::to_string((int)std::llround(plan.rewardCr)) + " cr). Scan the ship to transfer supplies.",
+	                      4.2);
+	              }
+
 	              // ...and sometimes it's an ambush.
-	              if (rng.nextUnit() < 0.55) {
-	                const int pirates = 1 + rng.range(0, 2);
+	              if (plan.ambush && plan.pirateCount > 0) {
+	                const int pirates = std::clamp(plan.pirateCount, 1, 4);
 	                for (int i = 0; i < pirates; ++i) {
 	                  Contact p;
 	                  p.id = allocWorldId();
@@ -7953,13 +8284,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       supercruiseChargeRemainingSec = 0.0;
       supercruiseCooldownRemainingSec = 0.0;
       supercruiseDropRequested = false;
-      interdictionState = InterdictionState::None;
-      interdictionWarningRemainingSec = 0.0;
-      interdictionActiveRemainingSec = 0.0;
-      interdictionEscapeMeter = 0.0;
+      interdiction = sim::InterdictionState{};
       interdictionSubmitRequested = false;
-      interdictionPirateId = 0;
       interdictionPirateName.clear();
+      interdictionPirateStrength = 1.0;
       scanning = false;
       scanProgressSec = 0.0;
       fsdState = FsdState::Idle;
@@ -9292,6 +9620,39 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           drawSeg(2, sysFrac, IM_COL32(110, 255, 150, (int)(190.0f * retA))); // SYS
         }
 
+        // Interdiction HUD: escape vector marker + tug-of-war meter (supercruise only).
+        if (supercruiseState == SupercruiseState::Active && sim::interdictionInProgress(interdiction)) {
+          const float meter = (float)std::clamp(interdiction.meter, 0.0, 1.0);
+          const float ringR = baseR + 22.0f;
+          const ImU32 bg = IM_COL32(40, 32, 28, (int)(95.0f * retA));
+          const ImU32 fg = IM_COL32(255, 150, 100, (int)(205.0f * retA));
+          drawArc(ringR, start, start + full, bg, 3.0f);
+          drawArc(ringR, start, start + full * meter, fg, 3.0f);
+
+          // Escape marker projected in ship-local space (forward is +Z).
+          const math::Vec3d escW = interdiction.escapeDir.normalized();
+          const math::Vec3d escL = ship.orientation().conjugate().rotate(escW);
+          const double z = std::max(0.18, escL.z);
+          double px = escL.x / z;
+          double py = escL.y / z;
+          const double mag = std::sqrt(px * px + py * py);
+          if (mag > 1.0) {
+            px /= mag;
+            py /= mag;
+          }
+
+          const float markerR = ringR - 6.0f;
+          const ImVec2 mpos(center.x + (float)px * markerR, center.y - (float)py * markerR);
+          const ImU32 stroke = IM_COL32(0, 0, 0, (int)(140.0f * retA));
+          draw->AddCircleFilled(mpos, 3.2f, fg);
+          draw->AddCircle(mpos, 7.0f, stroke, 0, 1.0f);
+
+          // Brief label during warning to make it obvious *why* the ring appeared.
+          if (interdiction.phase == sim::InterdictionPhase::Warning) {
+            draw->AddText(ImVec2(center.x + ringR + 10.0f, center.y - 6.0f), fg, "WARNING");
+          }
+        }
+
       } else {
         // Minimal crosshair if the combat HUD is disabled.
         draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
@@ -9367,7 +9728,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	      } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
 	        const auto& s = signals[target.index];
 	        tgtKm = s.posKm;
-	        tgtLabel = std::string(signalTypeName(s.type)) + " Signal";
+	        const char* base = signalTypeName(s.type);
+	        if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	          base = sim::resourceFieldKindName(s.resource.kind);
+	        }
+	        tgtLabel = std::string(base) + " Signal";
 	        tgtIcon = {render::SpriteKind::Signal,
 	                   core::hashCombine(core::hashCombine(core::fnv1a64("signal"), s.id), (core::u64)(int)s.type)};
 	      } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
@@ -9678,12 +10043,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           for (std::size_t i = 0; i < signals.size(); ++i) {
             const auto& s = signals[i];
             if (timeDays > s.expireDay) continue;
+	        const char* name = signalTypeName(s.type);
+	        if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	          name = sim::resourceFieldKindName(s.resource.kind);
+	        }
             addMarker(TargetKind::Signal,
                       i,
                       s.posKm,
                       render::SpriteKind::Signal,
                       core::hashCombine(core::hashCombine(core::fnv1a64("signal"), s.id), (core::u64)(int)s.type),
-                      std::string(signalTypeName(s.type)) + " Signal");
+	                  std::string(name) + " Signal");
           }
         }
 
@@ -11173,6 +11542,46 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
   } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
     const auto& c = contacts[target.index];
     ImGui::Text("Target: %s [%s] (%.0f km)", c.name.c_str(), contactRoleName(c.role), (c.ship.positionKm() - ship.positionKm()).length());
+    if (c.distressVictim && c.distressNeedUnits > 1e-6) {
+      const auto def = econ::commodityDef(c.distressNeedCommodity);
+      const int needUnits = std::max(1, (int)std::llround(c.distressNeedUnits));
+      ImGui::TextDisabled("Distress request: %d %s", needUnits, def.name);
+      ImGui::TextDisabled("Reward: ~%d cr | Rep: +%.1f",
+                          (int)std::llround(c.distressRewardCr),
+                          c.distressRepReward);
+      const std::string kScan = game::chordLabel(controls.actions.scannerAction);
+      ImGui::TextDisabled("Scan (%s) to transfer supplies.", kScan.c_str());
+    }
+  } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
+    const auto& s = signals[target.index];
+    const double distKm = (s.posKm - ship.positionKm()).length();
+    const char* base = signalTypeName(s.type);
+    if (s.type == SignalType::Resource && s.hasResourcePlan) {
+      base = sim::resourceFieldKindName(s.resource.kind);
+    }
+    ImGui::Text("Target: %s Signal (%.0f km)", base, distKm);
+    if (s.type == SignalType::Resource && s.hasResourcePlan) {
+      const auto& p = s.resource;
+      const auto& a = econ::commodityDef(p.primaryYield);
+      const auto& b = econ::commodityDef(p.secondaryYield);
+      const int pa = (int)std::lround(std::clamp(p.primaryChance, 0.0, 1.0) * 100.0);
+      const int pb = 100 - pa;
+      const int rich = (int)std::lround(std::clamp(p.richness01, 0.0, 1.0) * 100.0);
+      ImGui::TextDisabled("Richness: %d%% | %s ~%d%% / %s ~%d%%", rich, a.name, pa, b.name, pb);
+    }
+    if (s.type == SignalType::Distress && s.hasDistressPlan && !s.distressCompleted) {
+      if (s.distress.hasVictim) {
+        const auto def = econ::commodityDef(s.distress.needCommodity);
+        const int needUnits = std::max(1, (int)std::llround(s.distress.needUnits));
+        ImGui::TextDisabled("Request: %d %s | reward ~%d cr",
+                            needUnits,
+                            def.name,
+                            (int)std::llround(s.distress.rewardCr));
+      }
+      if (s.distress.ambush) {
+        ImGui::TextDisabled("Warning: hostile activity suspected.");
+      }
+    }
   } else if (target.kind == TargetKind::Star) {
     ImGui::Text("Target: Star (%s)", starClassName(currentSystem->star.cls));
   } else {
@@ -11366,7 +11775,7 @@ if (showGuide) {
     }
   }
 
-  if (supercruiseState == SupercruiseState::Active && interdictionState != InterdictionState::None) {
+  if (supercruiseState == SupercruiseState::Active && sim::interdictionInProgress(interdiction)) {
     ImGui::Separator();
     ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "Interdiction in progress!");
     ImGui::TextDisabled("Point your ship toward the escape vector and keep it aligned.");
@@ -11847,9 +12256,13 @@ if (showScanner) {
 	    } else if (kind == TargetKind::Signal && idx < signals.size()) {
 	      const auto& s = signals[idx];
 	      scanLockedId = s.id;
-	      scanDurationSec = 4.0;
+	      scanDurationSec = (s.type == SignalType::Resource) ? 3.5 : 4.0;
 	      scanRangeKm = 200000.0;
-	      scanLabel = std::string("Signal scan: ") + signalTypeName(s.type);
+	      const char* base = signalTypeName(s.type);
+	      if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	        base = sim::resourceFieldKindName(s.resource.kind);
+	      }
+	      scanLabel = std::string("Signal scan: ") + base;
 	      ok = true;
 	    } else if (kind == TargetKind::Asteroid && idx < asteroids.size()) {
 	      const auto& a = asteroids[idx];
@@ -12035,14 +12448,33 @@ if (showScanner) {
         if (ImGui::IsItemHovered()) {
           const auto& big = spriteCache.get(render::SpriteKind::Signal, sigSeed, 96);
           ImGui::BeginTooltip();
-          ImGui::Text("%s Signal", signalTypeName(s.type));
+	          const char* name = signalTypeName(s.type);
+	          if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	            name = sim::resourceFieldKindName(s.resource.kind);
+	          }
+	          ImGui::Text("%s Signal", name);
           ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
+	          if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	            const auto& p = s.resource;
+	            const auto& a = econ::commodityDef(p.primaryYield);
+	            const auto& b = econ::commodityDef(p.secondaryYield);
+	            const int pa = (int)std::lround(std::clamp(p.primaryChance, 0.0, 1.0) * 100.0);
+	            const int pb = 100 - pa;
+	            const int rich = (int)std::lround(std::clamp(p.richness01, 0.0, 1.0) * 100.0);
+	            ImGui::Separator();
+	            ImGui::TextDisabled("Richness %d%%", rich);
+	            ImGui::TextDisabled("%s ~%d%% / %s ~%d%%", a.name, pa, b.name, pb);
+	          }
           ImGui::EndTooltip();
         }
         ImGui::SameLine();
       }
 
-	      ImGui::Text("%s%s%s | %.0f km%s", signalTypeName(s.type), s.resolved ? " (resolved)" : "", mtag, distKm,
+	      const char* name = signalTypeName(s.type);
+	      if (s.type == SignalType::Resource && s.hasResourcePlan) {
+	        name = sim::resourceFieldKindName(s.resource.kind);
+	      }
+	      ImGui::Text("%s%s%s | %.0f km%s", name, s.resolved ? " (resolved)" : "", mtag, distKm,
 	                  (s.expireDay > 0.0) ? (std::string(" | ") + std::to_string((int)std::round(std::max(0.0, minsLeft)))
 	                                        + " min").c_str()
 	                                     : "");
@@ -12223,11 +12655,10 @@ if (showScanner) {
           supercruiseState = SupercruiseState::Charging;
           supercruiseChargeRemainingSec = kSupercruiseChargeSec;
           supercruiseDropRequested = false;
-          interdictionState = InterdictionState::None;
-          interdictionWarningRemainingSec = 0.0;
-          interdictionActiveRemainingSec = 0.0;
-          interdictionEscapeMeter = 0.0;
+          interdiction = sim::InterdictionState{};
           interdictionSubmitRequested = false;
+          interdictionPirateName.clear();
+          interdictionPirateStrength = 1.0;
           autopilot = false;
           dockingComputer.reset();
           scanning = false;
@@ -12240,11 +12671,13 @@ if (showScanner) {
         } else if (supercruiseState == SupercruiseState::Charging) {
           supercruiseState = SupercruiseState::Idle;
           supercruiseChargeRemainingSec = 0.0;
-          interdictionState = InterdictionState::None;
+          interdiction = sim::InterdictionState{};
           interdictionSubmitRequested = false;
+          interdictionPirateName.clear();
+          interdictionPirateStrength = 1.0;
           toast(toasts, "Supercruise canceled.", 1.4);
         } else if (supercruiseState == SupercruiseState::Active) {
-          if (interdictionState != InterdictionState::None) {
+          if (sim::interdictionInProgress(interdiction)) {
             interdictionSubmitRequested = true;
             toast(toasts, "Submitted to interdiction.", 1.4);
           } else {

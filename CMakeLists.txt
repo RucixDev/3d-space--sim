@@ -120,6 +120,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Combat.cpp
   src/sim/FlightController.cpp
   src/sim/SupercruiseComputer.cpp
+  src/sim/Interdiction.cpp
   src/sim/EncounterDirector.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
@@ -128,6 +129,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
+  src/sim/Distress.cpp
+  src/sim/ResourceField.cpp
   src/sim/Industry.cpp
   src/sim/IndustryService.cpp
   src/sim/IndustryScanner.cpp

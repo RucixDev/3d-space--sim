@@ -1,3 +1,69 @@
+## 2026-01-01 (Patch) - Supercruise Interdiction 2.0 (Core module + HUD escape vector)
+
+This round refactors the supercruise interdiction minigame into a reusable **core sim module**, adds deterministic drift, and finally exposes a clear HUD indicator (escape vector + tug-of-war meter).
+
+- **New core module**: `stellar::sim::Interdiction` (`include/stellar/sim/Interdiction.h` + `src/sim/Interdiction.cpp`)
+  - Deterministic start plan (escape vector) seeded from universe + pirate + time.
+  - Optional drift/jitter so the escape vector isn't static.
+  - Difficulty scaling hooks: pirate strength + closeness factor.
+  - Helper for roll-based interdiction trigger chance.
+- **Game**:
+  - Replaced the old ad-hoc interdiction logic in `apps/stellar_game/main.cpp` with the core module.
+  - Added an in-flight interdiction HUD ring and escape-vector marker (center reticle overlay).
+  - Pirate tether strength now scales gently with NPC loadout/skill.
+- **Tests**:
+  - Added `test_interdiction` for determinism and expected outcomes (evade/fail/submit).
+
+## 2026-01-01 (Patch) - Resource Fields 2.0 (Core generator + Multi-belt spawn + Rich scanner info)
+
+This round upgrades mining exploration with a deterministic **core** resource-field generator and richer in-game scan/target UI.
+
+- **New core module**: `stellar::sim::ResourceField` (`include/stellar/sim/ResourceField.h` + `src/sim/ResourceField.cpp`)
+  - Deterministic generation of resource-field signals and asteroid nodes per-system.
+  - Adds field metadata: **kind** (Ore Belt / Metal Pocket / Ice Field), **richness**, and primary/secondary yield composition.
+- **New shared utility**: `stellar::sim::WorldIds` (`include/stellar/sim/WorldIds.h`)
+  - Centralizes `kDeterministicWorldIdBit` and a helper for stable deterministic ids.
+- **Game**:
+  - Systems now seed multiple persistent resource fields near the anchor station (instead of a single belt).
+  - HUD target labels and tactical overlay labels show **specific belt type** (e.g., "Ore Belt") when available.
+  - Scanner signal list tooltips + target panel show richness + composition.
+  - Scanning a resource field toasts a quick analysis readout.
+  - Asteroid prospect scan now includes remaining units.
+- **Tests**:
+  - Added `test_resource_field` to lock down determinism, id tagging, and basic yield distributions.
+
+## 2025-12-31 (Patch) - Navigation State Persistence + Smarter Auto-run Route
+
+This round focuses on **navigation quality-of-life** and long-session usability: plotted routes and auto-run state now survive save/load, and auto-run can recover when your ship's jump range changes.
+
+- **Save game** (version bumped to 21):
+  - Persisted navigation state: `navRoute`, `navRouteHop`, `navAutoRun`, and `pendingArrivalStation`.
+- **Game**:
+  - Quicksave/Quickload now restores your plotted route and hop cursor (and repairs the cursor to match the loaded system).
+  - Galaxy UI selection now defaults to the **next hop** after loading a save when a route is active.
+  - **Auto-run route** improvements:
+    - If the next hop becomes out-of-range (cargo/loadout changes), auto-run attempts a **one-shot replot** to the final destination and continues if successful.
+    - If fuel is insufficient for the next hop, auto-run stops and **targets the nearest station** for refuel when available.
+- **Tests**:
+  - Extended `test_savegame` to validate navigation persistence + added robustness coverage for stale `navRoute` counts.
+
+
+## 2025-12-31 (Patch) - Distress Encounters 2.0 (Rescue Requests + Deterministic Plans)
+
+This round expands supercruise distress signals into an interactive rescue loop:
+scanning a distressed ship can now transfer requested supplies and pay out a small
+reward (+ optional rep), while still preserving the chance of pirate ambush.
+
+- **New core module**: `stellar::sim::Distress` (`include/stellar/sim/Distress.h` + `src/sim/Distress.cpp`)
+  - Deterministic distress plan generation (victim request, reward, ambush params).
+- **Game**:
+  - Distress signals now generate a stable plan at spawn time (so scans show consistent info).
+  - Distress sites can spawn a **"Distress Vessel"** contact that requests a commodity.
+  - Completing a normal contact scan within 15,000 km transfers cargo toward the request.
+  - Upon completion: grants credits + optional faction reputation and marks the signal "completed" for UI.
+  - Target HUD now shows additional detail for distress signals and distress victims.
+- **Tests**: added `test_distress`.
+
 ## 2025-12-30 (Patch) - Ballistics Lead Solver + NPC Weapons/Loadouts (Combat Integration)
 
 This round pushes combat toward a more unified, systems-driven model: NPCs now use real weapons (beams/projectiles), loadout-derived stats, and the same power distributor mechanics as the player.
