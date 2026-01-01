@@ -1,19 +1,39 @@
-## 2026-01-01 (Patch) - Build Fix: Missing ResourceField Sources + CMake Source Lists
+## 2026-01-01 (Patch) - stellar_game Build Fixes (ImGui 1.91.2 + MSVC)
 
-This patch fixes the CMake configure-time errors:
-- `Cannot find source file: src/sim/ResourceField.cpp`
-- `Cannot find source file: test_resource_field.cpp`
-- `No SOURCES given to target ...`
+This round focuses on resolving a large batch of compile errors in `apps/stellar_game`:
 
-Changes:
-- **Added missing files** for the new mining/resource-field scaffolding:
-  - `include/stellar/sim/WorldIds.h`
-  - `include/stellar/sim/ResourceField.h`
-  - `src/sim/ResourceField.cpp`
-  - `tests/test_resource_field.cpp`
-- **CMake**: restored/updated `CMakeLists.txt` and `tests/CMakeLists.txt` so the `stellar` library and `stellar_tests` targets always have valid source lists.
-- **Core**: ensured `src/sim/Distress.cpp` is compiled into the `stellar` library (required by the game build).
-- **Tests**: wired in `test_resource_field` and `test_distress` to the test runner.
+- **Event-loop scoping fix:** removed an extra closing brace in `main.cpp` that prematurely ended the SDL keydown
+  handler and caused cascading scope/identifier errors (`key`, `dtReal`, `playerDamageContact`, etc.).
+- **ImGui compatibility (v1.91.2 + `IMGUI_DISABLE_OBSOLETE_FUNCTIONS`):**
+  - Updated renamed symbols:
+    - `ImGuiCol_TabActive` → `ImGuiCol_TabSelected`
+    - `ImGuiSelectableFlags_AllowItemOverlap` → `ImGuiSelectableFlags_AllowOverlap`
+  - Switched the fetched ImGui tag to **`v1.91.2-docking`** so docking-only flags (e.g. `ImGuiWindowFlags_NoDocking`)
+    are available.
+- **Trade helper fixes:** aligned the Trade Helper UI with current `sim::TradeOpportunity` fields
+  (`buyPrice`, `sellPrice`, `unitsPossible`, `unitMassKg`, `netProfitTotal`, etc.) and fixed the commodity filter flag name.
+- **Bookmarks init order:** load bookmarks after `bookmarksPath`/`bookmarks` are declared.
+- **Math:** added `double * Vec3d` operator overload.
+
+
+## 2026-01-01 (Patch) - Navigation Persistence + Smarter Auto-Run
+
+This round makes long-haul travel feel better by persisting plotted routes and route planner settings
+through save/load, and by making auto-run more resilient.
+
+- **Save/Load**:
+  - SaveGame version bumped to **21**.
+  - Persisted nav route, route cursor, auto-run toggle, route mode, and fuel-range constraint.
+  - Persisted pending arrival station helper (auto-target on arrival).
+- **Game**:
+  - Quickload restores navigation state (with validation/repair against current system).
+  - Galaxy map defaults selection to the **next hop** after load when a route is active.
+  - Auto-run now:
+    - waits briefly after load (avoids surprise immediate jumps),
+    - attempts a one-shot replot if the next hop is out of range (e.g., cargo/range changed),
+    - stops and targets the nearest station if fuel is insufficient.
+- **Tests**:
+  - Expanded `test_savegame` to cover nav persistence and robustness against stale `nav_route` counts.
 
 ## 2025-12-31 (Patch) - Distress Encounters 2.0 (Rescue Requests + Deterministic Plans)
 

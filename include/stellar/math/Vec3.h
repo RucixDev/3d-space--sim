@@ -30,6 +30,9 @@ struct Vec3d {
   }
 };
 
+// Allow scalar * vector (Vec3d already supports vector * scalar).
+inline Vec3d operator*(double s, const Vec3d& v) { return v * s; }
+
 inline double dot(const Vec3d& a, const Vec3d& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 inline Vec3d cross(const Vec3d& a, const Vec3d& b) {
   return {

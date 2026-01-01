@@ -931,7 +931,7 @@ int main(int argc, char** argv) {
 
         c[ImGuiCol_Tab] = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
         c[ImGuiCol_TabHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-        c[ImGuiCol_TabActive] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
+        c[ImGuiCol_TabSelected] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
       } break;
       default: ImGui::StyleColorsDark(&st); break;
     }
@@ -1589,8 +1589,9 @@ int main(int argc, char** argv) {
     double unitsFrom{0.0};
     double unitsToSpace{0.0};
     double unitsPossible{0.0};
+    double unitMassKg{0.0};
     double netProfitPerUnit{0.0};
-    double netTripProfit{0.0};
+    double netProfitTotal{0.0};
     double profitPerKg{0.0};
     double distanceLy{0.0};
   };
@@ -1902,13 +1903,6 @@ int main(int argc, char** argv) {
     game::loadFromFile(controlsPath, controls);
   }
 
-  // Load bookmarks (if present). Missing file -> empty.
-  {
-    ui::Bookmarks loaded = ui::makeDefaultBookmarks();
-    if (ui::loadBookmarksFromFile(bookmarksPath, loaded)) {
-      bookmarks = std::move(loaded);
-    }
-  }
 
   // Optional mouse steering (relative mouse mode). Toggle with M.
   bool mouseSteer = false;
@@ -1972,6 +1966,8 @@ int main(int argc, char** argv) {
   std::vector<sim::SystemId> navRoute;
   std::size_t navRouteHop = 0;
   bool navAutoRun = false;
+  // Prevents surprise immediate jumps after a quickload (or other nav state restoration).
+  double navAutoRunHoldUntilDays = 0.0;
 
   // Route planner settings
   enum class NavRouteMode { Hops = 0, Distance = 1, Fuel = 2 };
@@ -1998,6 +1994,14 @@ int main(int argc, char** argv) {
   bool showBookmarksWindow = false;
   bool bookmarksDirty = false;
   bool bookmarksAutoSaveOnExit = true;
+
+  // Load bookmarks (if present). Missing file -> empty.
+  {
+    ui::Bookmarks loaded = ui::makeDefaultBookmarks();
+    if (ui::loadBookmarksFromFile(bookmarksPath, loaded)) {
+      bookmarks = std::move(loaded);
+    }
+  }
 
   // Mission Board: cached route preview for offers (computed when offers/settings change)
   struct MissionOfferRoutePreview {
@@ -3058,6 +3062,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
           s.fsdReadyDay = fsdReadyDay;
 
+          // Navigation / route planner state (QoL: persists plotted routes + auto-run)
+          s.navRoute = navRoute;
+          s.navRouteHop = (core::u32)std::min<std::size_t>(navRouteHop, 1000000ull);
+          s.navAutoRun = navAutoRun;
+          s.navRouteMode = (core::u8)std::clamp((int)navRouteMode, 0, 2);
+          s.navConstrainToCurrentFuelRange = navConstrainToCurrentFuelRange;
+          s.pendingArrivalStation = pendingArrivalTargetStationId;
+
           // Loadout
           s.shipHull = (core::u8)std::clamp((int)shipHullClass, 0, 2);
           s.thrusterMk = (core::u8)std::clamp(thrusterMk, 1, 3);
@@ -3342,9 +3354,49 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             supercruiseClosingKmS = 0.0;
             fsdState = FsdState::Idle;
             fsdTargetSystem = 0;
-            navRoute.clear();
-            navRouteHop = 0;
-            navAutoRun = false;
+
+            // Navigation / route planner state (persisted)
+            navRoute = s.navRoute;
+            navRouteHop = (std::size_t)std::min<std::size_t>(s.navRouteHop, navRoute.empty() ? 0 : (navRoute.size() - 1));
+            navAutoRun = s.navAutoRun;
+            navRouteMode = (NavRouteMode)std::clamp((int)s.navRouteMode, 0, 2);
+            navConstrainToCurrentFuelRange = s.navConstrainToCurrentFuelRange;
+            pendingArrivalTargetStationId = s.pendingArrivalStation;
+
+            // Planner diagnostics are derived; invalidate on load (will refresh when plotting).
+            navRoutePlanStats = sim::RoutePlanStats{};
+            navRoutePlanStatsValid = false;
+            navRoutePlannedMode = navRouteMode;
+            navRoutePlannedUsedCurrentFuelRange = navConstrainToCurrentFuelRange;
+            navRoutePlanMaxJumpLy = 0.0;
+            navRoutePlanCostPerJump = 0.0;
+            navRoutePlanCostPerLy = 0.0;
+
+            // Validate hop index against the loaded current system. If the route no longer matches,
+            // attempt to re-sync the cursor; otherwise clear the route.
+            if (!navRoute.empty()) {
+              if (navRouteHop >= navRoute.size()) navRouteHop = 0;
+              if (navRoute[navRouteHop] != currentSystem->stub.id) {
+                auto it = std::find(navRoute.begin(), navRoute.end(), currentSystem->stub.id);
+                if (it != navRoute.end()) {
+                  navRouteHop = (std::size_t)std::distance(navRoute.begin(), it);
+                } else {
+                  navRoute.clear();
+                  navRouteHop = 0;
+                  navAutoRun = false;
+                }
+              }
+              if (!navRoute.empty() && navRouteHop + 1 >= navRoute.size()) {
+                navAutoRun = false;
+              }
+            } else {
+              navRouteHop = 0;
+              navAutoRun = false;
+            }
+
+            // Prevent surprise immediate jumps right after load.
+            navAutoRunHoldUntilDays = navAutoRun ? (timeDays + (2.0 / 86400.0)) : 0.0;
+
             scanning = false;
             scanProgressSec = 0.0;
             scanLockedId = 0;
@@ -3353,7 +3405,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             clearances.clear();
             target = Target{};
 
-            galaxySelectedSystemId = currentSystem->stub.id;
+            // QoL: default galaxy selection to the *next hop* when a route is active.
+            galaxySelectedSystemId = (!navRoute.empty() && navRouteHop + 1 < navRoute.size())
+              ? navRoute[navRouteHop + 1]
+              : currentSystem->stub.id;
 
             // Re-seed deterministic in-system objects so signals/asteroids are present after load.
             seedSystemSpaceObjects(*currentSystem);
@@ -3688,7 +3743,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	              target.index = cands[pick].idx;
 	            }
 	          }
-	        }
 
 	        if (key(controls.actions.complyOrSubmit)) {
           if (!io.WantCaptureKeyboard && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
@@ -5080,24 +5134,72 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       }
 
       // Auto-run route (hands-free multi-jump). We only auto-trigger when safe.
-      // Also: avoid spamming toasts if the next hop is currently impossible.
-      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && !docked && supercruiseState == SupercruiseState::Idle) {
-        if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && !isMassLocked()) {
-          const auto& nextSys = universe.getSystem(navRoute[navRouteHop + 1]);
-          const double hopDistLy = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
+      // If the next hop becomes invalid (e.g., jump range changes), attempt a one-shot replot
+      // to the final destination. If fuel is insufficient, stop and target the nearest station.
+      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && timeDays >= navAutoRunHoldUntilDays &&
+          !docked && supercruiseState == SupercruiseState::Idle) {
+        if (navRoute.empty() || navRouteHop + 1 >= navRoute.size()) {
+          navAutoRun = false;
+        } else if (!isMassLocked()) {
+          bool replotted = false;
+          for (int attempt = 0; attempt < 2; ++attempt) {
+            if (navRoute.empty() || navRouteHop + 1 >= navRoute.size()) break;
+            const sim::SystemId nextId = navRoute[navRouteHop + 1];
+            const auto& nextSys = universe.getSystem(nextId);
+            const double hopDistLy = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
 
-          const double rangeLy = fsdBaseRangeLy();
-          if (hopDistLy > rangeLy + 1e-9) {
-            navAutoRun = false;
-            toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
-          } else {
+            const double rangeLy = fsdBaseRangeLy();
+            if (hopDistLy > rangeLy + 1e-9) {
+              // Try a one-shot replot to the final destination using the current planner settings.
+              if (replotted || navRoute.size() < 2) {
+                navAutoRun = false;
+                toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                break;
+              }
+              const sim::SystemId finalDest = navRoute.back();
+              const bool ok = plotRouteToSystem(finalDest, /*showToast=*/false);
+              if (!ok) {
+                navAutoRun = false;
+                toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                break;
+              }
+              // plotRouteToSystem() disarms auto-run; re-arm and retry once.
+              navAutoRun = true;
+              replotted = true;
+              toast(toasts, "Auto-run: replotted route (jump range changed).", 2.6);
+              continue;
+            }
+
             const double hopFuel = fsdFuelCostFor(hopDistLy);
             if (fuel + 1e-6 < hopFuel) {
               navAutoRun = false;
-              toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
-            } else {
-              startFsdJumpTo(navRoute[navRouteHop + 1]);
+              // Best-effort: target the nearest station so the player can refuel.
+              if (currentSystem && !currentSystem->stations.empty()) {
+                const math::Vec3d p = ship.positionKm();
+                std::size_t bestIdx = 0;
+                double bestD2 = 1e300;
+                for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+                  const auto& st = currentSystem->stations[i];
+                  const math::Vec3d sp = stationPosKm(st, timeDays);
+                  const double d2 = (sp - p).lengthSq();
+                  if (d2 < bestD2) {
+                    bestD2 = d2;
+                    bestIdx = i;
+                  }
+                }
+                target.kind = TargetKind::Station;
+                target.index = bestIdx;
+                selectedStationIndex = (int)bestIdx;
+                toast(toasts, "Auto-run stopped: not enough fuel (target set to " + currentSystem->stations[bestIdx].name + ").", 3.0);
+              } else {
+                toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+              }
+              break;
             }
+
+            startFsdJumpTo(nextId);
+            navAutoRunHoldUntilDays = 0.0;
+            break;
           }
         }
       }
@@ -14396,8 +14498,8 @@ if (canTrade) {
                 scan.includeSameSystem = tradeIncludeSameSystem;
 
                 if (tradeCommodityFilter >= 0) {
-                  scan.hasCommodityFilter = true;
-                  scan.commodityFilter = (econ::CommodityId)tradeCommodityFilter;
+                  scan.commodityFilterEnabled = true;
+                  scan.commodityFilter = static_cast<core::u32>(tradeCommodityFilter);
                 }
 
                 const auto results = sim::scanTradeOpportunities(universe,
@@ -14414,14 +14516,16 @@ if (canTrade) {
                   t.toSystemName = r.toSystemName;
                   t.toStationName = r.toStationName;
                   t.commodity = r.commodity;
-                  t.buy = r.buy;
-                  t.sell = r.sell;
-                  t.units = r.units;
-                  t.massKg = r.massKg;
-                  t.netProfit = r.netProfit;
-                  t.netProfitPerKg = r.netProfitPerKg;
-                  t.netTripProfit = r.netTripProfit;
-                  t.distanceLy = r.distanceLy;
+                  t.buyPrice = r.buyPrice;
+        t.sellPrice = r.sellPrice;
+        t.unitsFrom = r.unitsFrom;
+        t.unitsToSpace = r.unitsToSpace;
+        t.unitsPossible = r.unitsPossible;
+        t.unitMassKg = r.unitMassKg;
+        t.netProfitPerUnit = r.netProfitPerUnit;
+        t.netProfitTotal = r.netProfitTotal;
+        t.profitPerKg = (r.unitMassKg > 0.0) ? (r.netProfitPerUnit / r.unitMassKg) : 0.0;
+        t.distanceLy = r.distanceLy;
                   tradeIdeas.push_back(std::move(t));
                 }
               }
@@ -14503,15 +14607,15 @@ if (canTrade) {
                     ImGui::TextDisabled("%s", econ::commodityCode(t.commodity));
 
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%.1f", t.buy);
-                    ImGui::TextDisabled("x%.1f", t.units);
+                    ImGui::Text("%.1f", t.buyPrice);
+                    ImGui::TextDisabled("x%.1f", t.unitsPossible);
 
                     ImGui::TableSetColumnIndex(3);
-                    ImGui::Text("%.1f", t.sell);
+                    ImGui::Text("%.1f", t.sellPrice);
 
                     ImGui::TableSetColumnIndex(4);
-                    ImGui::Text("+%.0f", t.netTripProfit);
-                    ImGui::TextDisabled("+%.1f/kg", t.netProfitPerKg);
+                    ImGui::Text("+%.0f", t.netProfitTotal);
+                    ImGui::TextDisabled("+%.1f/kg", t.profitPerKg);
 
                     ImGui::TableSetColumnIndex(5);
                     ImGui::PushID((int)i);
@@ -14531,7 +14635,7 @@ if (canTrade) {
                         const double maxUnitsHold = freeNowKg / unitMass;
 
                         // unitsPossible already accounts for fees/spread and station caps, but may exceed free hold.
-                        const double unitsToBuy = std::min({t.units, maxUnitsHold, fromEcon.inventory[(std::size_t)t.commodity]});
+                        const double unitsToBuy = std::min({t.unitsPossible, maxUnitsHold, fromEcon.inventory[(std::size_t)t.commodity]});
 
                         const auto tr = econ::buy(fromEcon,
                                                   fromSt->economyModel,
@@ -16591,7 +16695,7 @@ if (showContacts) {
             const std::string selId = "##notif_sel_" + std::to_string(i);
             const ImVec2 startPos = ImGui::GetCursorScreenPos();
             const bool clicked = ImGui::Selectable(selId.c_str(), sel,
-                                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap);
             const ImVec2 afterPos = ImGui::GetCursorScreenPos();
 
             ImGui::SetCursorScreenPos(startPos);

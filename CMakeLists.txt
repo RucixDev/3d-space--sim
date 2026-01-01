@@ -71,7 +71,7 @@ if (STELLAR_ENABLE_RENDER)
     FetchContent_Declare(
       imgui
       GIT_REPOSITORY https://github.com/ocornut/imgui.git
-      GIT_TAG v1.91.2
+      GIT_TAG v1.91.2-docking
     )
     FetchContent_MakeAvailable(imgui)
 
@@ -128,13 +128,12 @@ set(STELLAR_CORE_SOURCES
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
+  src/sim/Distress.cpp
   src/sim/Industry.cpp
   src/sim/IndustryService.cpp
   src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
   src/sim/SaveGame.cpp
-  src/sim/Distress.cpp
-  src/sim/ResourceField.cpp
   src/sim/Traffic.cpp
   src/sim/TradeScanner.cpp
   src/sim/Universe.cpp

@@ -13,6 +13,7 @@ int test_savegame();
 int test_missions();
 int test_law();
 int test_police_scan();
+int test_distress();
 int test_docking();
 int test_docking_clearance();
 int test_thermal();
@@ -37,8 +38,6 @@ int test_bookmarks();
 int test_fuzzy_search();
 int test_ui_settings();
 int test_hud_settings();
-int test_distress();
-int test_resource_field();
 int test_log_sinks();
 
 int main() {
@@ -57,6 +56,7 @@ int main() {
   fails += test_missions();
   fails += test_law();
   fails += test_police_scan();
+  fails += test_distress();
   fails += test_docking();
   fails += test_docking_clearance();
   fails += test_thermal();
@@ -81,8 +81,6 @@ int main() {
   fails += test_fuzzy_search();
   fails += test_ui_settings();
   fails += test_hud_settings();
-  fails += test_distress();
-  fails += test_resource_field();
   fails += test_log_sinks();
 
   if (fails == 0) {

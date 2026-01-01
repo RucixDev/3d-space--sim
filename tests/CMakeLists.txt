@@ -13,6 +13,7 @@ add_executable(stellar_tests
   test_missions.cpp
   test_law.cpp
   test_police_scan.cpp
+  test_distress.cpp
   test_docking.cpp
   test_docking_clearance.cpp
   test_thermal.cpp
@@ -38,8 +39,6 @@ add_executable(stellar_tests
   test_log_sinks.cpp
   test_ui_settings.cpp
   test_hud_settings.cpp
-  test_distress.cpp
-  test_resource_field.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)

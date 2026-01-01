@@ -219,7 +219,7 @@ bool drawCommandPalette(CommandPaletteState& st, const std::vector<PaletteItem>&
           const std::string selId = "##pal_sel_" + std::to_string(row);
           const ImVec2 startPos = ImGui::GetCursorScreenPos();
           const bool clicked = ImGui::Selectable(selId.c_str(), sel,
-                                                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                                                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap);
           const ImVec2 afterPos = ImGui::GetCursorScreenPos();
 
           // Draw highlighted label on top of the selectable.
