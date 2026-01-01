@@ -129,6 +129,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
   src/sim/Distress.cpp
+  src/sim/ResourceField.cpp
+  src/sim/Signals.cpp
   src/sim/Industry.cpp
   src/sim/IndustryService.cpp
   src/sim/IndustryScanner.cpp
@@ -136,6 +138,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
   src/sim/TradeScanner.cpp
+  src/sim/TradeLoopScanner.cpp
+  src/sim/TradeRunPlanner.cpp
   src/sim/Universe.cpp
   src/sim/NavRoute.cpp
   src/sim/MissionLogic.cpp

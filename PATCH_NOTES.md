@@ -1,3 +1,62 @@
+## 2026-01-01 (Patch) - Multi-Leg Trade Run Planner (Beam Search) + Sandbox --tradeRun
+
+This round adds a **multi-leg trade run planner** that can suggest profitable chains like
+`A -> B -> C -> ...` (not necessarily closed loops). It uses the existing cargo-manifest
+planner per leg and (optionally) constrains each leg by jump-range reachability.
+
+- **New core module:** `stellar/sim/TradeRunPlanner.*`
+  - Beam-search expansion of the best outgoing trade legs at each stop (tunable width + fanout).
+  - Supports ranking by **total profit**, **profit per ly**, **profit per hop**, or **profit per route cost**.
+  - Optional jump-range reachability using the existing A* route planner (per-leg hop routes stored).
+  - Deterministic ordering and tie-breaks for stable CLI + test behavior.
+- **Sandbox upgrade:** `stellar_sandbox --tradeRun` prints (or emits JSON) for best trade runs from the chosen station.
+  - Knobs: `--runLegs`, `--runLimit`, `--runBeam`, `--runLegCandidates`, `--runMinLegProfit`, `--runMinProfit`, `--runScore`.
+  - By default, trade runs **do not** enforce `--jr` reachability unless `--jr` is explicitly provided.
+- **New tests:** `test_trade_runs` forces a profitable 2-leg chain (Food A→B, Ore B→C) and checks determinism.
+
+## 2026-01-01 (Patch) - K-Shortest Jump Routes (Yen) + Sandbox --kRoutes
+
+This round upgrades the galaxy jump route planner to support **multiple alternative loopless routes**
+(using Yen's K-shortest paths algorithm) rather than only the single best path.
+
+- **New NavRoute API:** `plotKRoutesAStarCost(...)` and `plotKRoutesAStarHops(...)` with a simple `KRoute` result.
+  - Returns up to **K** routes ordered by total cost (with deterministic tie-breaks).
+  - Uses the same underlying A* cost model as the existing single-route planner.
+- **Sandbox upgrade:** `stellar_sandbox --route --kRoutes <n>` prints (or emits JSON) for a ranked list of routes.
+  - Works with `--routeCost hops|dist|fuel` so you can explore alternatives for different navigation styles.
+- **New tests:** `test_k_routes` builds a small grid graph with 3 distinct loopless routes and checks ordering,
+  determinism, and route metric consistency.
+
+## 2026-01-01 (Patch) - Trade Loop Scanner + Sandbox --tradeLoop
+
+This round adds a multi-leg trade loop scanner to find profitable closed routes that start and end at an origin station.
+It expands the existing trade manifest planner into **2-leg** (A→B→A) and **3-leg** (A→B→C→A) loop search.
+
+- **New core module:** `stellar/sim/TradeLoopScanner.*`
+  - Builds per-leg cargo manifests via `econ::bestManifestForCargo(...)` (net-of-fees) without mutating economies.
+  - Deterministic ordering with tie-breaks on system/station ids.
+  - Tunable search fanout (`--loopLegCandidates`) and result cap (`--loopLimit`).
+- **Sandbox upgrade:** `stellar_sandbox --tradeLoop` prints (or emits JSON) for the best loops from the chosen station.
+  - New knobs: `--loopLegs`, `--loopLimit`, `--loopLegCandidates`, `--loopMinLegProfit`, `--loopMinProfit`.
+- **New tests:** `test_trade_loops` forces a profitable round-trip (Food outbound, Ore inbound) and checks determinism.
+
+## 2026-01-01 (Patch) - Headless Signals Planner + ResourceField Integration
+
+This round makes the in-system 'signal site' layer first-class in the core sim and sandbox tooling.
+The main goal is to have deterministic, test-covered generation of: resource fields, daily derelicts,
+distress calls, and mission salvage sites.
+
+- **New core module:** `stellar/sim/Signals.*` generates deterministic in-system signal sites.
+  - Supports resource fields (persistent), daily derelicts (1-day TTL), distress calls (configurable TTL),
+    and mission salvage sites derived from active `SaveGame` missions.
+  - Adds lightweight JSON- and text-friendly `SignalSite` structs and `signalKindName(...)` helper.
+- **New core helpers:** `stellar/sim/Units.h` centralizes AU↔km conversion and station/planet orbital helpers.
+- **Resource fields now built + tested:** wired `src/sim/ResourceField.cpp` into the core library and
+  enabled the existing `test_resource_field`.
+- **Sandbox upgrade:** `stellar_sandbox --signals` prints (or emits JSON) for the generated sites, with
+  knobs for field count and distress density.
+- **New tests:** `test_signals` covers determinism, resolved derelict marking, and mission salvage site surfacing.
+
 ## 2026-01-01 (Patch) - Clamp Utilities + UI/String Safety Pass
 
 This round hardens the MSVC build further by removing a few remaining "gotcha" patterns

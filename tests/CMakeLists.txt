@@ -14,10 +14,13 @@ add_executable(stellar_tests
   test_law.cpp
   test_police_scan.cpp
   test_distress.cpp
+  test_resource_field.cpp
+  test_signals.cpp
   test_docking.cpp
   test_docking_clearance.cpp
   test_thermal.cpp
   test_nav.cpp
+  test_k_routes.cpp
   test_args.cpp
   test_signature.cpp
   test_industry.cpp
@@ -25,6 +28,8 @@ add_executable(stellar_tests
   test_industry_scanner.cpp
   test_warehouse.cpp
   test_trade_scanner.cpp
+  test_trade_loops.cpp
+  test_trade_runs.cpp
   test_ship.cpp
   test_ship_loadout.cpp
   test_power_distributor.cpp

@@ -55,6 +55,38 @@ std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
                                         RoutePlanStats* outStats = nullptr,
                                         std::size_t maxExpansions = 250000);
 
+// Result for K-shortest route planning.
+struct KRoute {
+  std::vector<SystemId> path;
+  int hops{0};
+  double distanceLy{0.0};
+  double cost{0.0};
+};
+
+// K-shortest *loopless* routes between startId and goalId using Yen's algorithm.
+//
+// - Each route is a list of SystemId including start and goal.
+// - Results are ordered by increasing total cost, then deterministically by the
+//   path's SystemId sequence.
+// - For k=1, this behaves similarly to plotRouteAStarCost (but without returning
+//   detailed per-solve expansion diagnostics).
+std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
+                                        SystemId startId,
+                                        SystemId goalId,
+                                        double maxJumpLy,
+                                        double costPerJump,
+                                        double costPerLy,
+                                        std::size_t k,
+                                        std::size_t maxExpansionsPerSolve = 250000);
+
+// Convenience wrapper for hop-minimizing K-shortest paths.
+std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
+                                        SystemId startId,
+                                        SystemId goalId,
+                                        double maxJumpLy,
+                                        std::size_t k,
+                                        std::size_t maxExpansionsPerSolve = 250000);
+
 // Helper: total straight-line length of a route in ly.
 // Returns 0 for empty/single-node routes.
 double routeDistanceLy(const std::vector<SystemStub>& nodes,

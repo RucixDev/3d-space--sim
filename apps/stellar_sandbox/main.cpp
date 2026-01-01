@@ -12,10 +12,13 @@
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/Reputation.h"
 #include "stellar/sim/TradeScanner.h"
+#include "stellar/sim/TradeLoopScanner.h"
+#include "stellar/sim/TradeRunPlanner.h"
 #include "stellar/sim/IndustryScanner.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Signature.h"
+#include "stellar/sim/Signals.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -140,6 +143,20 @@ static void printHelp() {
             << "Trade scanning (headless route planner):\n"
             << "  --trade                Print best trade opportunities from a chosen station\n"
             << "  --tradeMix             Print best multi-commodity cargo manifests (trade mix)\n"
+            << "  --tradeLoop            Print best closed trade loops (2- or 3-leg) starting at the origin station\n"
+            << "  --tradeRun             Plan best multi-leg trade runs (A->B->C...) from the origin station\n"
+            << "  --loopLegs <n>         Loop leg count (2 or 3) (default: 2)\n"
+            << "  --loopLimit <n>        Max loops to print (default: 8)\n"
+            << "  --loopLegCandidates <n> Max outgoing leg candidates expanded per stop (default: 16)\n"
+            << "  --loopMinLegProfit <cr> Minimum net profit per leg (default: 0)\n"
+            << "  --loopMinProfit <cr>   Minimum total net profit for the loop (default: 0)\n"
+            << "  --runLegs <n>          Run leg count (1..4) (default: 2)\n"
+            << "  --runLimit <n>         Max runs to print (default: 8)\n"
+            << "  --runBeam <n>          Beam width (default: 32)\n"
+            << "  --runLegCandidates <n> Max outgoing leg candidates expanded per stop (default: 16)\n"
+            << "  --runMinLegProfit <cr> Minimum net profit per leg (default: 0)\n"
+            << "  --runMinProfit <cr>    Minimum total net profit for the run (default: 0)\n"
+            << "  --runScore <mode>      profit | profitLy | profitHop | profitCost (default: profit)\n"
             << "  --fromSys <idx>        Origin system index in the printed list (default: 0)\n"
             << "  --fromStation <idx>    Origin station index inside that system (default: 0)\n"
             << "  --cargoKg <kg>         Cargo capacity (kg) used for trip profit (default: 420)\n"
@@ -155,6 +172,7 @@ static void printHelp() {
             << "  --route                Plot a jump route between two systems in the printed list\n"
             << "  --toSys <idx>          Destination system index in the printed list (default: 0)\n"
             << "  --jr <ly>              Jump range in ly (default: 18)\n"
+            << "  --kRoutes <n>         Print up to n alternative routes (default: 1)\n"
             << "  --routeCost <mode>     Route cost: hops | dist | fuel (default: hops)\n"
             << "  --fuelBase <u>         Base cost per jump for --routeCost fuel (default: 2.0)\n"
             << "  --fuelPerLy <u>        Cost per ly for --routeCost fuel (default: 0.5)\n"
@@ -167,6 +185,14 @@ static void printHelp() {
             << "  --acceptOffer <idx>    Accept offer index and print resulting state\n"
             << "  --advanceDays <d>      Advance time by d days before auto-complete (default: 0)\n"
             << "  --autoComplete         After accepting, attempt to complete at destination\n"
+            << "\n"
+            << "Signals / space objects (headless):\n"
+            << "  --signals             Print in-system signal sites (resource fields, derelicts, distress, mission salvage)\n"
+            << "  --signalFields <n>    Number of persistent resource fields to generate (default: 1)\n"
+            << "  --signalDistress <n>  Distress calls per day (default: 1)\n"
+            << "  --signalDistressTtl <d> Distress time-to-live in days (default: 1.0)\n"
+            << "  --signalNoDistress    Disable distress call generation\n"
+            << "  --signalNoDerelict    Disable daily derelict generation\n"
             << "\n"
             << "Law / contraband (headless):\n"
             << "  --law                 Print law + contraband profile for the chosen station\n"
@@ -240,7 +266,10 @@ int main(int argc, char** argv) {
   const bool emitSysSig = args.hasFlag("sysSig");
 
   const bool doTrade = args.hasFlag("trade");
+  const bool doSignals = args.hasFlag("signals");
   const bool doTradeMix = args.hasFlag("tradeMix");
+  const bool doTradeLoop = args.hasFlag("tradeLoop");
+  const bool doTradeRun = args.hasFlag("tradeRun");
   const bool doIndustry = args.hasFlag("industry");
   const bool doIndustryTrade = args.hasFlag("industryTrade");
   const bool doWarehouse = args.hasFlag("warehouse");
@@ -251,6 +280,21 @@ int main(int argc, char** argv) {
     if (args.getU64("fromSys", v)) fromSysIdx = (std::size_t)v;
     if (args.getU64("fromStation", v)) fromStationIdx = (std::size_t)v;
   }
+
+  // Signal generator settings.
+  int signalFieldCount = 1;
+  int signalDistressPerDay = 1;
+  double signalDistressTtlDays = 1.0;
+  {
+    unsigned long long v = 0;
+    if (args.getU64("signalFields", v)) signalFieldCount = (int)v;
+    if (args.getU64("signalDistress", v)) signalDistressPerDay = (int)v;
+  }
+  (void)args.getDouble("signalDistressTtl", signalDistressTtlDays);
+  if (!std::isfinite(signalDistressTtlDays)) signalDistressTtlDays = 1.0;
+  signalDistressTtlDays = std::clamp(signalDistressTtlDays, 0.1, 10.0);
+  const bool signalNoDistress = args.hasFlag("signalNoDistress");
+  const bool signalNoDerelict = args.hasFlag("signalNoDerelict");
   double cargoCapacityKg = 420.0;
   (void)args.getDouble("cargoKg", cargoCapacityKg);
   std::size_t tradeLimit = 12;
@@ -258,6 +302,49 @@ int main(int argc, char** argv) {
     unsigned long long v = 0;
     if (args.getU64("tradeLimit", v)) tradeLimit = (std::size_t)v;
   }
+
+  // Trade-loop settings.
+  std::size_t loopLimit = 8;
+  std::size_t loopLegs = 2;
+  std::size_t loopLegCandidates = 16;
+  {
+    unsigned long long v = 0;
+    if (args.getU64("loopLimit", v)) loopLimit = (std::size_t)v;
+    if (args.getU64("loopLegs", v)) loopLegs = (std::size_t)v;
+    if (args.getU64("loopLegCandidates", v)) loopLegCandidates = (std::size_t)v;
+  }
+  double loopMinLegProfit = 0.0;
+  double loopMinProfit = 0.0;
+  (void)args.getDouble("loopMinLegProfit", loopMinLegProfit);
+  (void)args.getDouble("loopMinProfit", loopMinProfit);
+  if (!std::isfinite(loopMinLegProfit)) loopMinLegProfit = 0.0;
+  if (!std::isfinite(loopMinProfit)) loopMinProfit = 0.0;
+  loopMinLegProfit = std::max(0.0, loopMinLegProfit);
+  loopMinProfit = std::max(0.0, loopMinProfit);
+
+
+  // Trade-run settings.
+  std::size_t runLimit = 8;
+  std::size_t runLegs = 2;
+  std::size_t runBeam = 32;
+  std::size_t runLegCandidates = 16;
+  {
+    unsigned long long v = 0;
+    if (args.getU64("runLimit", v)) runLimit = (std::size_t)v;
+    if (args.getU64("runLegs", v)) runLegs = (std::size_t)v;
+    if (args.getU64("runBeam", v)) runBeam = (std::size_t)v;
+    if (args.getU64("runLegCandidates", v)) runLegCandidates = (std::size_t)v;
+  }
+  double runMinLegProfit = 0.0;
+  double runMinProfit = 0.0;
+  (void)args.getDouble("runMinLegProfit", runMinLegProfit);
+  (void)args.getDouble("runMinProfit", runMinProfit);
+  if (!std::isfinite(runMinLegProfit)) runMinLegProfit = 0.0;
+  if (!std::isfinite(runMinProfit)) runMinProfit = 0.0;
+  runMinLegProfit = std::max(0.0, runMinLegProfit);
+  runMinProfit = std::max(0.0, runMinProfit);
+  std::string runScore = "profit";
+  (void)args.getString("runScore", runScore);
 
 
   // Trade-mix planner settings.
@@ -310,6 +397,12 @@ int main(int argc, char** argv) {
   }
   double jumpRangeLy = 18.0;
   (void)args.getDouble("jr", jumpRangeLy);
+
+  std::size_t kRoutes = 1;
+  {
+    unsigned long long v = 1;
+    if (args.getU64("kRoutes", v)) kRoutes = (std::size_t)std::max<unsigned long long>(1ULL, v);
+  }
 
   std::string routeCost = "hops";
   (void)args.getString("routeCost", routeCost);
@@ -473,6 +566,139 @@ int main(int argc, char** argv) {
     std::cout << "Stations:\n";
     for (const auto& st : sys.stations) {
       std::cout << "  - " << st.name << " (fee=" << st.feeRate << ")\n";
+    }
+  }
+
+
+  if (doSignals && !systems.empty()) {
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+    const auto& stub = systems[fromSysIdx];
+    const auto& sys = u.getSystem(stub.id, &stub);
+
+    sim::SaveGame save{};
+    if (!loadPath.empty()) {
+      if (!sim::loadFromFile(loadPath, save)) {
+        std::cerr << "Failed to load save from: " << loadPath << "\n";
+        return 1;
+      }
+    }
+
+    // Tool overrides keep output deterministic for the requested inputs.
+    save.seed = seed;
+    save.timeDays = timeDays;
+
+    sim::SignalGenParams p{};
+    p.resourceFieldCount = std::max(0, signalFieldCount);
+    p.includeDailyDerelict = !signalNoDerelict;
+    p.includeDistress = !signalNoDistress;
+    p.distressPerDay = std::max(0, signalDistressPerDay);
+    p.distressTtlDays = signalDistressTtlDays;
+
+    const auto plan = sim::generateSystemSignals(seed, sys, timeDays, save.missions, save.resolvedSignalIds, p);
+
+    if (json) {
+      j.key("signals");
+      j.beginObject();
+      j.key("system");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)stub.id);
+      j.key("systemName"); j.value(stub.name);
+      j.key("day"); j.value(timeDays);
+      j.endObject();
+
+      j.key("params");
+      j.beginObject();
+      j.key("resourceFieldCount"); j.value((unsigned long long)p.resourceFieldCount);
+      j.key("includeDailyDerelict"); j.value(p.includeDailyDerelict);
+      j.key("includeDistress"); j.value(p.includeDistress);
+      j.key("distressPerDay"); j.value((unsigned long long)p.distressPerDay);
+      j.key("distressTtlDays"); j.value(p.distressTtlDays);
+      j.endObject();
+
+      j.key("resourceFields");
+      j.beginObject();
+      j.key("fieldCount"); j.value((unsigned long long)plan.resourceFields.fields.size());
+      j.key("asteroidCount"); j.value((unsigned long long)plan.resourceFields.asteroids.size());
+      j.endObject();
+
+      j.key("sites");
+      j.beginArray();
+      for (const auto& s : plan.sites) {
+        j.beginObject();
+        j.key("id"); j.value((unsigned long long)s.id);
+        j.key("kind"); j.value(sim::signalKindName(s.kind));
+        j.key("posKm");
+        j.beginArray();
+        j.value(s.posKm.x); j.value(s.posKm.y); j.value(s.posKm.z);
+        j.endArray();
+        j.key("expireDay"); j.value(s.expireDay);
+        j.key("resolved"); j.value(s.resolved);
+        if (s.kind == sim::SignalKind::ResourceField) {
+          j.key("fieldKind"); j.value(sim::resourceFieldKindName(s.fieldKind));
+        }
+        if (s.kind == sim::SignalKind::Distress && s.hasDistressPlan) {
+          j.key("distress");
+          j.beginObject();
+          j.key("scenario");
+          switch (s.distress.scenario) {
+            case sim::DistressScenario::Supplies: j.value("Supplies"); break;
+            case sim::DistressScenario::Fuel: j.value("Fuel"); break;
+            case sim::DistressScenario::Medical: j.value("Medical"); break;
+            case sim::DistressScenario::Mechanical: j.value("Mechanical"); break;
+            case sim::DistressScenario::Ambush: j.value("Ambush"); break;
+            default: j.value("Unknown"); break;
+          }
+          j.key("needCommodity"); j.value(econ::commodityDef(s.distress.needCommodity).code);
+          j.key("needUnits"); j.value(s.distress.needUnits);
+          j.key("rewardCr"); j.value(s.distress.rewardCr);
+          j.key("repReward"); j.value(s.distress.repReward);
+          j.key("ambush"); j.value(s.distress.ambush);
+          j.key("pirateCount"); j.value((unsigned long long)s.distress.pirateCount);
+          j.key("risk"); j.value(s.distress.risk);
+          j.endObject();
+        }
+        if (s.kind == sim::SignalKind::MissionSalvage) {
+          j.key("missionId"); j.value((unsigned long long)s.missionId);
+        }
+        j.endObject();
+      }
+      j.endArray();
+
+      j.endObject();
+    } else {
+      std::cout << "\n--- Signals @ " << stub.name << " (day=" << timeDays << ") ---\n";
+      std::cout << "Resource fields: " << plan.resourceFields.fields.size()
+                << " (asteroids=" << plan.resourceFields.asteroids.size() << ")\n";
+      for (const auto& s : plan.sites) {
+        std::cout << "  - [" << sim::signalKindName(s.kind) << "] id=" << (unsigned long long)s.id;
+        std::cout << " posKm=(" << std::fixed << std::setprecision(1)
+                  << s.posKm.x << "," << s.posKm.y << "," << s.posKm.z << ")";
+        if (s.expireDay > 0.0) {
+          std::cout << " expires@" << std::fixed << std::setprecision(2) << s.expireDay;
+        }
+        if (s.resolved) std::cout << " [resolved]";
+        if (s.kind == sim::SignalKind::ResourceField) {
+          std::cout << " kind=" << sim::resourceFieldKindName(s.fieldKind);
+        }
+        if (s.kind == sim::SignalKind::Distress && s.hasDistressPlan) {
+          std::cout << " distress=";
+          switch (s.distress.scenario) {
+            case sim::DistressScenario::Supplies: std::cout << "Supplies"; break;
+            case sim::DistressScenario::Fuel: std::cout << "Fuel"; break;
+            case sim::DistressScenario::Medical: std::cout << "Medical"; break;
+            case sim::DistressScenario::Mechanical: std::cout << "Mechanical"; break;
+            case sim::DistressScenario::Ambush: std::cout << "Ambush"; break;
+            default: std::cout << "Unknown"; break;
+          }
+          std::cout << " need=" << econ::commodityDef(s.distress.needCommodity).code << "x" << std::fixed << std::setprecision(0) << s.distress.needUnits;
+          std::cout << " reward=" << std::fixed << std::setprecision(0) << s.distress.rewardCr;
+          if (s.distress.ambush) std::cout << " ambush(pirates=" << s.distress.pirateCount << ")";
+        }
+        if (s.kind == sim::SignalKind::MissionSalvage) {
+          std::cout << " missionId=" << (unsigned long long)s.missionId;
+        }
+        std::cout << "\n";
+      }
     }
   }
 
@@ -953,6 +1179,383 @@ int main(int argc, char** argv) {
   }
 
 
+  if (doTradeLoop && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[tradeLoop] origin system has no stations\n";
+      return 1;
+    }
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& fromSt = fromSys.stations[fromStationIdx];
+
+    const auto feeEff = [&](const sim::Station& st) {
+      return sim::applyReputationToFeeRate(st.feeRate, rep);
+    };
+
+    sim::TradeLoopScanParams scan{};
+    scan.manifest.cargoCapacityKg = cargoCapacityKg;
+    scan.manifest.bidAskSpread = 0.10;
+    scan.manifest.stepKg = mixStepKg;
+    scan.manifest.maxBuyCreditsCr = mixMaxSpend;
+    scan.manifest.simulatePriceImpact = !mixNoImpact;
+
+    scan.minLegProfitCr = loopMinLegProfit;
+    scan.minLoopProfitCr = loopMinProfit;
+    scan.includeSameSystem = true;
+
+    scan.legs = std::clamp<std::size_t>(loopLegs, 2, 3);
+    scan.maxLegCandidates = std::max<std::size_t>(1, loopLegCandidates);
+    scan.maxResults = std::max<std::size_t>(1, loopLimit);
+    scan.maxStations = 256;
+
+    const auto loops = sim::scanTradeLoops(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+
+    if (json) {
+      j.key("tradeLoops");
+      j.beginObject();
+      j.key("day"); j.value(timeDays);
+      j.key("cargoKg"); j.value(cargoCapacityKg);
+      j.key("stepKg"); j.value(mixStepKg);
+      j.key("simulatePriceImpact"); j.value(!mixNoImpact);
+      j.key("maxBuyCreditsCr"); j.value(mixMaxSpend);
+
+      j.key("legs"); j.value((unsigned long long)scan.legs);
+      j.key("loopLimit"); j.value((unsigned long long)loopLimit);
+      j.key("legCandidates"); j.value((unsigned long long)loopLegCandidates);
+      j.key("minLegProfit"); j.value(loopMinLegProfit);
+      j.key("minLoopProfit"); j.value(loopMinProfit);
+
+      j.key("from");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationId"); j.value((unsigned long long)fromSt.id);
+      j.key("stationName"); j.value(fromSt.name);
+      j.key("feeRate"); j.value(fromSt.feeRate);
+      j.key("feeRateEff"); j.value(feeEff(fromSt));
+      j.endObject();
+
+      j.key("loops");
+      j.beginArray();
+      for (const auto& lp : loops) {
+        j.beginObject();
+        j.key("totalProfitCr"); j.value(lp.totalProfitCr);
+        j.key("totalDistanceLy"); j.value(lp.totalDistanceLy);
+        j.key("profitPerLy"); j.value(lp.profitPerLy);
+
+        j.key("legs");
+        j.beginArray();
+        for (const auto& lg : lp.legs) {
+          j.beginObject();
+          j.key("fromSystemId"); j.value((unsigned long long)lg.fromSystem);
+          j.key("fromStationId"); j.value((unsigned long long)lg.fromStation);
+          j.key("fromSystemName"); j.value(lg.fromSystemName);
+          j.key("fromStationName"); j.value(lg.fromStationName);
+
+          j.key("toSystemId"); j.value((unsigned long long)lg.toSystem);
+          j.key("toStationId"); j.value((unsigned long long)lg.toStation);
+          j.key("toSystemName"); j.value(lg.toSystemName);
+          j.key("toStationName"); j.value(lg.toStationName);
+
+          j.key("distanceLy"); j.value(lg.distanceLy);
+          j.key("feeFrom"); j.value(lg.feeFrom);
+          j.key("feeTo"); j.value(lg.feeTo);
+
+          j.key("cargoFilledKg"); j.value(lg.manifest.cargoFilledKg);
+          j.key("netBuyCr"); j.value(lg.manifest.netBuyCr);
+          j.key("netSellCr"); j.value(lg.manifest.netSellCr);
+          j.key("netProfitCr"); j.value(lg.manifest.netProfitCr);
+
+          j.key("lines");
+          j.beginArray();
+          for (const auto& ln : lg.manifest.lines) {
+            j.beginObject();
+            j.key("commodity"); j.value(econ::commodityCode(ln.commodity));
+            j.key("units"); j.value(ln.units);
+            j.key("massKg"); j.value(ln.massKg);
+            j.key("avgNetBuy"); j.value(ln.avgNetBuyPrice);
+            j.key("avgNetSell"); j.value(ln.avgNetSellPrice);
+            j.key("netProfit"); j.value(ln.netProfitCr);
+            j.key("netProfitPerKg"); j.value(ln.netProfitPerKg);
+            j.endObject();
+          }
+          j.endArray();
+
+          j.endObject();
+        }
+        j.endArray();
+
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Trade loops (day=" << timeDays
+                << ", cargoKg=" << cargoCapacityKg
+                << ", legs=" << scan.legs
+                << ", stepKg=" << mixStepKg
+                << ", impact=" << (!mixNoImpact ? "on" : "off")
+                << ") from " << fromStub.name << " / " << fromSt.name << " ---\n";
+
+      if (loops.empty()) {
+        std::cout << "No profitable loops found.\n";
+        std::cout << "Tip: increase --radius (or move --pos) to scan a larger area.\n";
+      } else {
+        std::size_t rank = 0;
+        for (const auto& lp : loops) {
+          ++rank;
+          std::cout << "\n[" << rank << "] totalProfit=" << std::fixed << std::setprecision(0) << lp.totalProfitCr
+                    << " cr  dist=" << std::fixed << std::setprecision(2) << lp.totalDistanceLy
+                    << " ly  profit/ly=" << std::fixed << std::setprecision(1) << lp.profitPerLy
+                    << "\n";
+
+          std::size_t legIdx = 0;
+          for (const auto& lg : lp.legs) {
+            ++legIdx;
+            std::cout << "  " << legIdx << ") " << lg.fromSystemName << " / " << lg.fromStationName
+                      << " -> " << lg.toSystemName << " / " << lg.toStationName
+                      << "  dist=" << std::fixed << std::setprecision(2) << lg.distanceLy
+                      << " ly  profit=" << std::fixed << std::setprecision(0) << lg.manifest.netProfitCr
+                      << " cr\n";
+
+            if (!lg.manifest.lines.empty()) {
+              std::cout << "     cargo=" << std::fixed << std::setprecision(1) << lg.manifest.cargoFilledKg << " kg"
+                        << "  buy=" << std::fixed << std::setprecision(0) << lg.manifest.netBuyCr << " cr"
+                        << "  sell=" << std::fixed << std::setprecision(0) << lg.manifest.netSellCr << " cr\n";
+              for (const auto& ln : lg.manifest.lines) {
+                std::cout << "     - " << econ::commodityCode(ln.commodity)
+                          << "  units=" << std::fixed << std::setprecision(0) << ln.units
+                          << "  mass=" << std::fixed << std::setprecision(1) << ln.massKg << " kg"
+                          << "  profit=" << std::fixed << std::setprecision(0) << ln.netProfitCr << " cr\n";
+              }
+            }
+          }
+        }
+        std::cout << "\nTip: use --loopLegs 3 for triangular loops, or raise --loopLegCandidates for deeper search.\n";
+      }
+    }
+  }
+
+
+  if (doTradeRun && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[tradeRun] origin system has no stations\n";
+      return 1;
+    }
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& fromSt = fromSys.stations[fromStationIdx];
+
+    const auto feeEff = [&](const sim::Station& st) {
+      return sim::applyReputationToFeeRate(st.feeRate, rep);
+    };
+
+    sim::TradeRunScanParams scan{};
+    scan.manifest.cargoCapacityKg = cargoCapacityKg;
+    scan.manifest.bidAskSpread = 0.10;
+    scan.manifest.stepKg = mixStepKg;
+    scan.manifest.maxBuyCreditsCr = mixMaxSpend;
+    scan.manifest.simulatePriceImpact = !mixNoImpact;
+
+    scan.minLegProfitCr = runMinLegProfit;
+    scan.minRunProfitCr = runMinProfit;
+    scan.includeSameSystem = true;
+    scan.loopless = true;
+
+    scan.legs = std::clamp<std::size_t>(runLegs, 1, 4);
+    scan.beamWidth = std::max<std::size_t>(1, runBeam);
+    scan.maxLegCandidates = std::max<std::size_t>(1, runLegCandidates);
+    scan.maxResults = std::max<std::size_t>(1, runLimit);
+    scan.maxStations = 256;
+
+    // By default, do NOT constrain trade runs by jump-range unless --jr was explicitly provided.
+    // (The sandbox's --jr has a default of 18 for the route tool, which would often yield no runs.)
+    scan.jumpRangeLy = args.has("jr") ? jumpRangeLy : 0.0;
+
+    // Reuse the route tool's cost params for ProfitPerCost ranking.
+    scan.routeCostPerJump = fuelBase;
+    scan.routeCostPerLy = fuelPerLy;
+
+    {
+      std::string rs = runScore;
+      std::transform(rs.begin(), rs.end(), rs.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+      if (rs == "profitly" || rs == "profit/ly" || rs == "ly") {
+        scan.scoreMode = sim::TradeRunScoreMode::ProfitPerLy;
+      } else if (rs == "profithop" || rs == "profit/hop" || rs == "hop") {
+        scan.scoreMode = sim::TradeRunScoreMode::ProfitPerHop;
+      } else if (rs == "profitcost" || rs == "profit/cost" || rs == "cost") {
+        scan.scoreMode = sim::TradeRunScoreMode::ProfitPerCost;
+      } else {
+        scan.scoreMode = sim::TradeRunScoreMode::TotalProfit;
+      }
+    }
+
+    const auto runs = sim::planTradeRuns(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+
+    if (json) {
+      j.key("tradeRuns");
+      j.beginObject();
+      j.key("day"); j.value(timeDays);
+      j.key("cargoKg"); j.value(cargoCapacityKg);
+      j.key("stepKg"); j.value(mixStepKg);
+      j.key("simulatePriceImpact"); j.value(!mixNoImpact);
+      j.key("maxBuyCreditsCr"); j.value(mixMaxSpend);
+
+      j.key("legs"); j.value((unsigned long long)scan.legs);
+      j.key("runLimit"); j.value((unsigned long long)runLimit);
+      j.key("beamWidth"); j.value((unsigned long long)runBeam);
+      j.key("legCandidates"); j.value((unsigned long long)runLegCandidates);
+      j.key("minLegProfit"); j.value(runMinLegProfit);
+      j.key("minRunProfit"); j.value(runMinProfit);
+      j.key("scoreMode"); j.value(runScore);
+      j.key("jumpRangeLy"); j.value(scan.jumpRangeLy);
+      j.key("routeCostPerJump"); j.value(scan.routeCostPerJump);
+      j.key("routeCostPerLy"); j.value(scan.routeCostPerLy);
+
+      j.key("from");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationId"); j.value((unsigned long long)fromSt.id);
+      j.key("stationName"); j.value(fromSt.name);
+      j.key("feeRate"); j.value(fromSt.feeRate);
+      j.key("feeRateEff"); j.value(feeEff(fromSt));
+      j.endObject();
+
+      j.key("runs");
+      j.beginArray();
+      for (const auto& run : runs) {
+        j.beginObject();
+        j.key("totalProfitCr"); j.value(run.totalProfitCr);
+        j.key("totalRouteDistanceLy"); j.value(run.totalRouteDistanceLy);
+        j.key("totalRouteCost"); j.value(run.totalRouteCost);
+        j.key("totalHops"); j.value((unsigned long long)run.totalHops);
+        j.key("profitPerLy"); j.value(run.profitPerLy);
+        j.key("profitPerHop"); j.value(run.profitPerHop);
+        j.key("profitPerCost"); j.value(run.profitPerCost);
+
+        j.key("legs");
+        j.beginArray();
+        for (const auto& lg : run.legs) {
+          j.beginObject();
+          j.key("fromSystemId"); j.value((unsigned long long)lg.fromSystem);
+          j.key("fromStationId"); j.value((unsigned long long)lg.fromStation);
+          j.key("fromSystemName"); j.value(lg.fromSystemName);
+          j.key("fromStationName"); j.value(lg.fromStationName);
+          j.key("toSystemId"); j.value((unsigned long long)lg.toSystem);
+          j.key("toStationId"); j.value((unsigned long long)lg.toStation);
+          j.key("toSystemName"); j.value(lg.toSystemName);
+          j.key("toStationName"); j.value(lg.toStationName);
+
+          j.key("routeHops"); j.value((unsigned long long)lg.routeHops);
+          j.key("routeDistanceLy"); j.value(lg.routeDistanceLy);
+          j.key("routeCost"); j.value(lg.routeCost);
+
+          j.key("route");
+          j.beginArray();
+          for (const auto sysId : lg.route) {
+            j.value((unsigned long long)sysId);
+          }
+          j.endArray();
+
+          j.key("feeFrom"); j.value(lg.feeFrom);
+          j.key("feeTo"); j.value(lg.feeTo);
+
+          j.key("cargoFilledKg"); j.value(lg.manifest.cargoFilledKg);
+          j.key("netBuyCr"); j.value(lg.manifest.netBuyCr);
+          j.key("netSellCr"); j.value(lg.manifest.netSellCr);
+          j.key("netProfitCr"); j.value(lg.manifest.netProfitCr);
+
+          j.key("lines");
+          j.beginArray();
+          for (const auto& ln : lg.manifest.lines) {
+            j.beginObject();
+            j.key("commodity"); j.value(econ::commodityCode(ln.commodity));
+            j.key("units"); j.value(ln.units);
+            j.key("massKg"); j.value(ln.massKg);
+            j.key("avgNetBuy"); j.value(ln.avgNetBuyPrice);
+            j.key("avgNetSell"); j.value(ln.avgNetSellPrice);
+            j.key("netProfit"); j.value(ln.netProfitCr);
+            j.key("netProfitPerKg"); j.value(ln.netProfitPerKg);
+            j.endObject();
+          }
+          j.endArray();
+
+          j.endObject();
+        }
+        j.endArray();
+
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Trade runs (day=" << timeDays
+                << ", cargoKg=" << cargoCapacityKg
+                << ", legs=" << scan.legs
+                << ", beam=" << scan.beamWidth
+                << ", legCandidates=" << scan.maxLegCandidates
+                << ", score=" << runScore
+                << ", jr=" << (scan.jumpRangeLy > 0.0 ? scan.jumpRangeLy : 0.0)
+                << ") from " << fromStub.name << " / " << fromSt.name << " ---\n";
+
+      if (runs.empty()) {
+        std::cout << "No profitable trade runs found.\n";
+        std::cout << "Tip: increase --radius, raise --runBeam, or relax --runMinLegProfit/--runMinProfit.\n";
+        std::cout << "Tip: add --jr <ly> to enforce jump-range reachability, or omit --jr to ignore it.\n";
+      } else {
+        std::size_t rank = 0;
+        for (const auto& run : runs) {
+          ++rank;
+          std::cout << "\n[" << rank << "] totalProfit=" << std::fixed << std::setprecision(0) << run.totalProfitCr
+                    << " cr  hops=" << run.totalHops
+                    << "  dist=" << std::fixed << std::setprecision(2) << run.totalRouteDistanceLy
+                    << " ly  cost=" << std::fixed << std::setprecision(2) << run.totalRouteCost
+                    << "  profit/ly=" << std::fixed << std::setprecision(1) << run.profitPerLy
+                    << "  profit/hop=" << std::fixed << std::setprecision(1) << run.profitPerHop
+                    << "  profit/cost=" << std::fixed << std::setprecision(1) << run.profitPerCost
+                    << "\n";
+
+          std::size_t legIdx = 0;
+          for (const auto& lg : run.legs) {
+            ++legIdx;
+            std::cout << "  " << legIdx << ") " << lg.fromSystemName << " / " << lg.fromStationName
+                      << " -> " << lg.toSystemName << " / " << lg.toStationName
+                      << "  hops=" << lg.routeHops
+                      << "  dist=" << std::fixed << std::setprecision(2) << lg.routeDistanceLy << " ly"
+                      << "  profit=" << std::fixed << std::setprecision(0) << lg.manifest.netProfitCr << " cr\n";
+
+            if (!lg.manifest.lines.empty()) {
+              std::cout << "     cargo=" << std::fixed << std::setprecision(1) << lg.manifest.cargoFilledKg << " kg"
+                        << "  buy=" << std::fixed << std::setprecision(0) << lg.manifest.netBuyCr << " cr"
+                        << "  sell=" << std::fixed << std::setprecision(0) << lg.manifest.netSellCr << " cr\n";
+
+              const int take = std::min<int>(mixLines, (int)lg.manifest.lines.size());
+              for (int i = 0; i < take; ++i) {
+                const auto& ln = lg.manifest.lines[(std::size_t)i];
+                std::cout << "     - " << econ::commodityCode(ln.commodity)
+                          << "  units=" << std::fixed << std::setprecision(0) << ln.units
+                          << "  mass=" << std::fixed << std::setprecision(1) << ln.massKg << " kg"
+                          << "  profit=" << std::fixed << std::setprecision(0) << ln.netProfitCr << " cr\n";
+              }
+            }
+          }
+        }
+        std::cout << "\nTip: use --runScore profitLy/profitHop/profitCost for more efficiency-oriented runs.\n";
+        std::cout << "Tip: raise --runLegCandidates for deeper search (slower).\n";
+      }
+    }
+  }
+
+
   if (doTradeMix && !systems.empty()) {
     // Clamp indices so the tool remains easy to use from scripts.
     fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
@@ -1089,24 +1692,60 @@ int main(int argc, char** argv) {
     const auto& fromStub = systems[fromSysIdx];
     const auto& toStub = systems[toSysIdx];
 
-    sim::RoutePlanStats stats{};
-    std::vector<sim::SystemId> route;
+    // Resolve cost model.
     std::string costModel = "hops";
+    double costPerJump = 1.0;
+    double costPerLy = 0.0;
     {
       std::string rc = routeCost;
       std::transform(rc.begin(), rc.end(), rc.begin(), [](unsigned char c) { return (char)std::tolower(c); });
       if (rc == "dist" || rc == "distance") {
         costModel = "dist";
-        route = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, 0.0, 1.0, &stats);
+        costPerJump = 0.0;
+        costPerLy = 1.0;
       } else if (rc == "fuel") {
         costModel = "fuel";
-        route = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, fuelBase, fuelPerLy, &stats);
+        costPerJump = fuelBase;
+        costPerLy = fuelPerLy;
       } else {
         costModel = "hops";
-        route = sim::plotRouteAStarHops(systems, fromStub.id, toStub.id, jumpRangeLy, &stats);
+        costPerJump = 1.0;
+        costPerLy = 0.0;
       }
     }
-    const double fuelEstimate = route.empty() ? 0.0 : (stats.hops * fuelBase + stats.distanceLy * fuelPerLy);
+
+    // Always solve the best route once (gives expansion diagnostics).
+    sim::RoutePlanStats bestStats{};
+    std::vector<sim::SystemId> bestRoute;
+    if (costModel == "dist") {
+      bestRoute = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, 0.0, 1.0, &bestStats);
+    } else if (costModel == "fuel") {
+      bestRoute = sim::plotRouteAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, fuelBase, fuelPerLy, &bestStats);
+    } else {
+      bestRoute = sim::plotRouteAStarHops(systems, fromStub.id, toStub.id, jumpRangeLy, &bestStats);
+    }
+
+    // If requested, also compute alternative loopless routes (Yen's algorithm).
+    std::vector<sim::KRoute> routes;
+    if (kRoutes <= 1) {
+      if (!bestRoute.empty()) {
+        routes.push_back(sim::KRoute{bestRoute, bestStats.hops, bestStats.distanceLy, bestStats.cost});
+      }
+    } else {
+      if (costModel == "hops") {
+        routes = sim::plotKRoutesAStarHops(systems, fromStub.id, toStub.id, jumpRangeLy, kRoutes);
+      } else {
+        routes = sim::plotKRoutesAStarCost(systems, fromStub.id, toStub.id, jumpRangeLy, costPerJump, costPerLy, kRoutes);
+      }
+
+      // In the unlikely event the k-shortest planner returns nothing but the best route exists,
+      // keep the tool usable.
+      if (routes.empty() && !bestRoute.empty()) {
+        routes.push_back(sim::KRoute{bestRoute, bestStats.hops, bestStats.distanceLy, bestStats.cost});
+      }
+    }
+
+    const double bestFuelEstimate = bestRoute.empty() ? 0.0 : (bestStats.hops * fuelBase + bestStats.distanceLy * fuelPerLy);
 
     if (json) {
       j.key("route");
@@ -1117,26 +1756,51 @@ int main(int argc, char** argv) {
       j.key("toSystemId"); j.value((unsigned long long)toStub.id);
       j.key("jumpRangeLy"); j.value(jumpRangeLy);
       j.key("costModel"); j.value(costModel);
-      j.key("cost"); j.value(stats.cost);
+      j.key("cost"); j.value(bestStats.cost);
+      j.key("kRoutes"); j.value((unsigned long long)kRoutes);
       j.key("fuelBase"); j.value(fuelBase);
       j.key("fuelPerLy"); j.value(fuelPerLy);
-      j.key("fuelEstimate"); j.value(fuelEstimate);
-      j.key("found"); j.value(!route.empty());
-      j.key("hops"); j.value((unsigned long long)(route.size() > 1 ? route.size() - 1 : 0));
-      j.key("distanceLy"); j.value(stats.distanceLy);
-      j.key("visited"); j.value((unsigned long long)stats.visited);
-      j.key("expansions"); j.value((unsigned long long)stats.expansions);
+      j.key("fuelEstimate"); j.value(bestFuelEstimate);
+      j.key("found"); j.value(!bestRoute.empty());
+      j.key("hops"); j.value((unsigned long long)(bestRoute.size() > 1 ? bestRoute.size() - 1 : 0));
+      j.key("distanceLy"); j.value(bestStats.distanceLy);
+      j.key("visited"); j.value((unsigned long long)bestStats.visited);
+      j.key("expansions"); j.value((unsigned long long)bestStats.expansions);
       j.key("path");
       j.beginArray();
-      for (const auto id : route) j.value((unsigned long long)id);
+      for (const auto id : bestRoute) j.value((unsigned long long)id);
       j.endArray();
+
+      // Ranked route list (best first). Each entry mirrors the chosen cost model.
+      j.key("routes");
+      j.beginArray();
+      for (std::size_t ri = 0; ri < routes.size(); ++ri) {
+        const auto& r = routes[ri];
+        const double fuelEst = r.path.empty() ? 0.0 : (r.hops * fuelBase + r.distanceLy * fuelPerLy);
+
+        j.beginObject();
+        j.key("rank"); j.value((unsigned long long)ri);
+        j.key("hops"); j.value((unsigned long long)r.hops);
+        j.key("distanceLy"); j.value(r.distanceLy);
+        j.key("cost"); j.value(r.cost);
+        j.key("fuelEstimate"); j.value(fuelEst);
+        j.key("path");
+        j.beginArray();
+        for (const auto id : r.path) j.value((unsigned long long)id);
+        j.endArray();
+        j.endObject();
+      }
+      j.endArray();
+
       j.endObject();
     } else {
-      std::cout << "\n--- Route plan (A*, cost=" << costModel << ", jr=" << std::fixed << std::setprecision(1) << jumpRangeLy << " ly) ---\n";
+      std::cout << "\n--- Route plan (A*, cost=" << costModel
+                << ", jr=" << std::fixed << std::setprecision(1) << jumpRangeLy
+                << " ly, k=" << kRoutes << ") ---\n";
       std::cout << "From: [" << fromSysIdx << "] " << fromStub.name << " (" << fromStub.id << ")\n";
       std::cout << "To:   [" << toSysIdx << "] " << toStub.name << " (" << toStub.id << ")\n";
 
-      if (route.empty()) {
+      if (bestRoute.empty()) {
         std::cout << "No route found inside the queried node set.\n";
         std::cout << "Tip: increase --radius (and/or --limit) so intermediate systems are available.\n";
       } else {
@@ -1144,34 +1808,58 @@ int main(int argc, char** argv) {
         stubById.reserve(systems.size());
         for (const auto& s : systems) stubById[s.id] = &s;
 
-        std::cout << "Hops: " << stats.hops
-                  << "  Dist: " << std::fixed << std::setprecision(2) << stats.distanceLy
+        std::cout << "Best: hops=" << bestStats.hops
+                  << "  dist=" << std::fixed << std::setprecision(2) << bestStats.distanceLy
                   << " ly"
-                  << "  Cost(" << costModel << "): " << std::fixed << std::setprecision(2) << stats.cost
-                  << "  FuelEst: " << std::fixed << std::setprecision(2) << fuelEstimate
-                  << "  (visited=" << stats.visited << ")\n";
+                  << "  cost(" << costModel << ")=" << std::fixed << std::setprecision(2) << bestStats.cost
+                  << "  fuelEst=" << std::fixed << std::setprecision(2) << bestFuelEstimate
+                  << "  (visited=" << bestStats.visited << ")\n";
 
-        for (std::size_t i = 0; i < route.size(); ++i) {
-          const auto id = route[i];
-          const auto it = stubById.find(id);
-          const auto* s = (it != stubById.end()) ? it->second : nullptr;
+        auto printPath = [&](const std::vector<sim::SystemId>& path) {
+          for (std::size_t i = 0; i < path.size(); ++i) {
+            const auto id = path[i];
+            const auto it = stubById.find(id);
+            const auto* s = (it != stubById.end()) ? it->second : nullptr;
 
-          std::cout << "  " << std::setw(2) << i << ": ";
-          if (s) {
-            std::cout << s->name << " (" << s->id << ")";
-          } else {
-            std::cout << "(unknown " << (unsigned long long)id << ")";
-          }
-
-          if (i > 0 && s) {
-            const auto itPrev = stubById.find(route[i - 1]);
-            const auto* p = (itPrev != stubById.end()) ? itPrev->second : nullptr;
-            if (p) {
-              const double d = (s->posLy - p->posLy).length();
-              std::cout << "  +" << std::fixed << std::setprecision(2) << d << " ly";
+            std::cout << "  " << std::setw(2) << i << ": ";
+            if (s) {
+              std::cout << s->name << " (" << s->id << ")";
+            } else {
+              std::cout << "(unknown " << (unsigned long long)id << ")";
             }
+
+            if (i > 0 && s) {
+              const auto itPrev = stubById.find(path[i - 1]);
+              const auto* p = (itPrev != stubById.end()) ? itPrev->second : nullptr;
+              if (p) {
+                const double d = (s->posLy - p->posLy).length();
+                std::cout << "  +" << std::fixed << std::setprecision(2) << d << " ly";
+              }
+            }
+            std::cout << "\n";
           }
-          std::cout << "\n";
+        };
+
+        // Print best path in full.
+        printPath(bestRoute);
+
+        if (kRoutes > 1) {
+          if (routes.size() <= 1) {
+            std::cout << "(No alternative loopless routes found.)\n";
+          } else {
+            std::cout << "\nAlternatives (ranked):\n";
+            for (std::size_t ri = 0; ri < routes.size(); ++ri) {
+              const auto& r = routes[ri];
+              const double fuelEst = r.path.empty() ? 0.0 : (r.hops * fuelBase + r.distanceLy * fuelPerLy);
+              std::cout << "#" << ri
+                        << " hops=" << r.hops
+                        << " dist=" << std::fixed << std::setprecision(2) << r.distanceLy << " ly"
+                        << " cost=" << std::fixed << std::setprecision(2) << r.cost
+                        << " fuelEst=" << std::fixed << std::setprecision(2) << fuelEst
+                        << "\n";
+            }
+            std::cout << "Tip: set --routeCost dist for shortest-distance alternatives, or fuel for fuel-like trade routes.\n";
+          }
         }
       }
     }

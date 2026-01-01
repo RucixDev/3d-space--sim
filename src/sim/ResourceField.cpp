@@ -80,7 +80,9 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
     const ResourceFieldKind kind = pickKind(prng);
     const auto prof = profileFor(kind);
 
-    const core::u64 typeCode = 0xF13D0000ull | static_cast<core::u64>(kind);
+    // Keep id scheme aligned with the game prototype (typeCode=1 for resource fields)
+    // so asteroid depletion state can be shared when the renderer integrates this module.
+    const core::u64 typeCode = 1ull;
     const core::u64 fieldId = makeDeterministicWorldId(core::hashCombine(sysKey, typeCode), static_cast<core::u64>(i));
 
     core::SplitMix64 frng(core::hashCombine(fieldId, 0xA11CE5EEDull));
