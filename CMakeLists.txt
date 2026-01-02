@@ -100,6 +100,7 @@ set(STELLAR_CORE_SOURCES
   src/core/Assert.cpp
   src/core/Hash.cpp
   src/core/Log.cpp
+  src/core/CVar.cpp
 
   src/ui/Bookmarks.cpp
   src/ui/FuzzySearch.cpp
@@ -114,13 +115,16 @@ set(STELLAR_CORE_SOURCES
   src/proc/SystemGenerator.cpp
 
   src/sim/Faction.cpp
+  src/sim/FactionProfile.cpp
   src/sim/Orbit.cpp
   src/sim/Ship.cpp
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
   src/sim/FlightController.cpp
   src/sim/SupercruiseComputer.cpp
+  src/sim/Interdiction.cpp
   src/sim/EncounterDirector.cpp
+  src/sim/SecurityModel.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
   src/sim/DockingClearanceService.cpp
@@ -135,6 +139,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/IndustryService.cpp
   src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
+  src/sim/ShipyardService.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
   src/sim/TradeScanner.cpp

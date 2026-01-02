@@ -1,4 +1,5 @@
 #include "stellar/sim/Universe.h"
+#include "stellar/core/JobSystem.h"
 #include "stellar/proc/GalaxyGenerator.h"
 
 #include <algorithm>
@@ -72,6 +73,9 @@ int test_query_nearby() {
   const stellar::core::u64 seed = 7777777;
   stellar::sim::Universe u(seed);
 
+  // Use a fixed-size pool for deterministic, cross-platform tests.
+  stellar::core::JobSystem jobs(4);
+
   struct Case {
     stellar::math::Vec3d pos{};
     double radiusLy{0.0};
@@ -90,24 +94,32 @@ int test_query_nearby() {
     const auto& c = cases[ci];
 
     const auto got = u.queryNearby(c.pos, c.radiusLy, c.maxResults);
+    const auto gotPar = u.queryNearbyParallel(jobs, c.pos, c.radiusLy, c.maxResults);
     const auto ref = bruteForceQueryNearby(u, c.pos, c.radiusLy, c.maxResults);
 
-    if (got.size() != ref.size()) {
-      std::cerr << "[test_query_nearby] size mismatch case=" << ci
-                << " got=" << got.size() << " ref=" << ref.size()
-                << " (radius=" << c.radiusLy << " maxResults=" << c.maxResults << ")\n";
-      ++fails;
-      continue;
-    }
-
-    for (std::size_t i = 0; i < got.size(); ++i) {
-      if (got[i].id != ref[i].id) {
-        std::cerr << "[test_query_nearby] id mismatch case=" << ci << " idx=" << i
-                  << " got=" << got[i].id << " ref=" << ref[i].id << "\n";
+    const auto checkList = [&](const char* label,
+                               const std::vector<stellar::sim::SystemStub>& list) {
+      if (list.size() != ref.size()) {
+        std::cerr << "[test_query_nearby] size mismatch " << label << " case=" << ci
+                  << " got=" << list.size() << " ref=" << ref.size()
+                  << " (radius=" << c.radiusLy << " maxResults=" << c.maxResults << ")\n";
         ++fails;
-        break;
+        return;
       }
-    }
+
+      for (std::size_t i = 0; i < list.size(); ++i) {
+        if (list[i].id != ref[i].id) {
+          std::cerr << "[test_query_nearby] id mismatch " << label << " case=" << ci << " idx=" << i
+                    << " got=" << list[i].id << " ref=" << ref[i].id << "\n";
+          ++fails;
+          break;
+        }
+      }
+    };
+
+    checkList("serial", got);
+    checkList("parallel", gotPar);
+
   }
 
   if (fails == 0) std::cout << "[test_query_nearby] pass\n";

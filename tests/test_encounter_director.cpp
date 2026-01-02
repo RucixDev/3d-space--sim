@@ -59,6 +59,112 @@ int test_encounter_director() {
     }
   }
 
+  // System-level knobs (piracy/security/traffic) influence cadence in the expected direction.
+  {
+    sim::EncounterDirectorCounts counts{};
+
+    // Pirates: higher piracy + lower security => tighter cadence.
+    {
+      sim::EncounterDirectorState hi = sim::makeEncounterDirector(4242u, 0.0);
+      sim::EncounterDirectorState lo = sim::makeEncounterDirector(4242u, 0.0);
+
+      sim::EncounterDirectorContext ctxHi{};
+      ctxHi.timeDays = 0.02;
+      ctxHi.combatSimEnabled = true;
+      ctxHi.stationCount = 2;
+      ctxHi.localFactionId = 42;
+      ctxHi.security01 = 0.0;
+      ctxHi.piracy01 = 1.0;
+      ctxHi.traffic01 = 0.5;
+
+      sim::EncounterDirectorContext ctxLo = ctxHi;
+      ctxLo.security01 = 1.0;
+      ctxLo.piracy01 = 0.0;
+
+      (void)sim::planPirateSpawn(hi, ctxHi, counts);
+      (void)sim::planPirateSpawn(lo, ctxLo, counts);
+
+      const double dtHi = hi.nextPirateSpawnDays - ctxHi.timeDays;
+      const double dtLo = lo.nextPirateSpawnDays - ctxLo.timeDays;
+      if (!(dtHi < dtLo)) {
+        std::cerr << "[test_encounter_director] expected higher piracy to shorten pirate cadence. dtHi="
+                  << dtHi << " dtLo=" << dtLo << "\n";
+        ++fails;
+      }
+    }
+
+    // Traders: higher traffic + lower piracy => tighter cadence.
+    {
+      sim::EncounterDirectorState hi = sim::makeEncounterDirector(1337u, 0.0);
+      sim::EncounterDirectorState lo = sim::makeEncounterDirector(1337u, 0.0);
+
+      sim::EncounterDirectorContext ctxHi{};
+      ctxHi.timeDays = 0.02;
+      ctxHi.combatSimEnabled = true;
+      ctxHi.stationCount = 2;
+      ctxHi.localFactionId = 42;
+      ctxHi.traffic01 = 1.0;
+      ctxHi.piracy01 = 0.0;
+
+      sim::EncounterDirectorContext ctxLo = ctxHi;
+      ctxLo.traffic01 = 0.0;
+      ctxLo.piracy01 = 1.0;
+
+      (void)sim::planTraderSpawn(hi, ctxHi, counts);
+      (void)sim::planTraderSpawn(lo, ctxLo, counts);
+
+      const double dtHi = hi.nextTraderSpawnDays - ctxHi.timeDays;
+      const double dtLo = lo.nextTraderSpawnDays - ctxLo.timeDays;
+      if (!(dtHi < dtLo)) {
+        std::cerr << "[test_encounter_director] expected higher traffic to shorten trader cadence. dtHi="
+                  << dtHi << " dtLo=" << dtLo << "\n";
+        ++fails;
+      }
+    }
+
+    // Police: higher security => tighter response times + higher desired presence.
+    {
+      sim::EncounterDirectorState hi = sim::makeEncounterDirector(9001u, 0.0);
+      sim::EncounterDirectorState lo = sim::makeEncounterDirector(9001u, 0.0);
+
+      sim::EncounterDirectorContext ctxHi{};
+      ctxHi.timeDays = 0.02;
+      ctxHi.combatSimEnabled = true;
+      ctxHi.localFactionId = 12;
+      ctxHi.playerWantedHere = false;
+      ctxHi.localBountyCr = 0.0;
+      ctxHi.policeHeat = 0.0;
+      ctxHi.policeAlert = false;
+      ctxHi.security01 = 1.0;
+      ctxHi.traffic01 = 1.0;
+
+      sim::EncounterDirectorContext ctxLo = ctxHi;
+      ctxLo.security01 = 0.0;
+      ctxLo.traffic01 = 0.0;
+
+      sim::EncounterDirectorCounts c{};
+      c.aliveTotal = 0;
+      c.alivePolice = 0;
+      c.alivePirates = 0;
+
+      const auto pHi = sim::planPoliceSpawn(hi, ctxHi, c);
+      const auto pLo = sim::planPoliceSpawn(lo, ctxLo, c);
+
+      const double dtHi = hi.nextPoliceSpawnDays - ctxHi.timeDays;
+      const double dtLo = lo.nextPoliceSpawnDays - ctxLo.timeDays;
+      if (!(dtHi < dtLo)) {
+        std::cerr << "[test_encounter_director] expected higher security to shorten police cadence. dtHi="
+                  << dtHi << " dtLo=" << dtLo << "\n";
+        ++fails;
+      }
+      if (!(pHi.desiredPolice >= pLo.desiredPolice)) {
+        std::cerr << "[test_encounter_director] expected higher security/traffic to not reduce desired police. hi="
+                  << pHi.desiredPolice << " lo=" << pLo.desiredPolice << "\n";
+        ++fails;
+      }
+    }
+  }
+
   // Desired police computation saturates/clamps.
   {
     sim::EncounterDirectorContext ctx{};

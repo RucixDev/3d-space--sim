@@ -64,6 +64,20 @@ int test_police_scan() {
 
         const auto res = scanIllegalCargo(seed, factionId, cargo, &mid);
 
+        const auto resMask = scanIllegalCargoMask(mask, cargo, &mid);
+        if (!nearly(resMask.illegalValueCr, res.illegalValueCr, 1e-9)) {
+          std::cerr << "[test_police_scan] scanIllegalCargoMask value mismatch\n";
+          ++fails;
+        }
+        for (std::size_t i = 0; i < kCommodityCount; ++i) {
+          if (!nearly(resMask.scannedIllegalUnits[i], res.scannedIllegalUnits[i], 1e-9)) {
+            std::cerr << "[test_police_scan] scanIllegalCargoMask units mismatch\n";
+            ++fails;
+            break;
+          }
+        }
+
+
         const double expected = 10.0 * 100.0 + ((i2 != kCommodityCount) ? 5.0 * 250.0 : 0.0);
         if (!nearly(res.illegalValueCr, expected, 1e-6)) {
           std::cerr << "[test_police_scan] illegalValueCr mismatch: got=" << res.illegalValueCr

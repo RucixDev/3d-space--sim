@@ -13,6 +13,8 @@ int test_savegame();
 int test_missions();
 int test_law();
 int test_police_scan();
+int test_faction_profile();
+int test_security_model();
 int test_distress();
 int test_resource_field();
 int test_signals();
@@ -29,12 +31,15 @@ int test_industry_scanner();
 int test_warehouse();
 int test_trade_scanner();
 int test_trade_loops();
+int test_trade_loops_parallel();
 int test_trade_runs();
 int test_ship();
 int test_ship_loadout();
+int test_shipyard_service();
 int test_power_distributor();
 int test_flight_controller();
 int test_intercept_course();
+int test_interdiction();
 int test_combat();
 int test_ballistics();
 int test_supercruise();
@@ -45,6 +50,8 @@ int test_ui_settings();
 int test_hud_settings();
 int test_log_sinks();
 
+int test_cvars();
+int test_jobs();
 int main() {
   int fails = 0;
 
@@ -61,6 +68,8 @@ int main() {
   fails += test_missions();
   fails += test_law();
   fails += test_police_scan();
+  fails += test_faction_profile();
+  fails += test_security_model();
   fails += test_distress();
   fails += test_resource_field();
   fails += test_signals();
@@ -77,12 +86,15 @@ int main() {
   fails += test_warehouse();
   fails += test_trade_scanner();
   fails += test_trade_loops();
+  fails += test_trade_loops_parallel();
   fails += test_trade_runs();
   fails += test_ship();
   fails += test_ship_loadout();
+  fails += test_shipyard_service();
   fails += test_power_distributor();
   fails += test_flight_controller();
   fails += test_intercept_course();
+  fails += test_interdiction();
   fails += test_combat();
   fails += test_ballistics();
   fails += test_supercruise();
@@ -91,6 +103,8 @@ int main() {
   fails += test_fuzzy_search();
   fails += test_ui_settings();
   fails += test_hud_settings();
+  fails += test_cvars();
+  fails += test_jobs();
   fails += test_log_sinks();
 
   if (fails == 0) {

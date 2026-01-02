@@ -13,6 +13,8 @@ add_executable(stellar_tests
   test_missions.cpp
   test_law.cpp
   test_police_scan.cpp
+  test_faction_profile.cpp
+  test_security_model.cpp
   test_distress.cpp
   test_resource_field.cpp
   test_signals.cpp
@@ -29,12 +31,15 @@ add_executable(stellar_tests
   test_warehouse.cpp
   test_trade_scanner.cpp
   test_trade_loops.cpp
+  test_trade_loops_parallel.cpp
   test_trade_runs.cpp
   test_ship.cpp
   test_ship_loadout.cpp
+  test_shipyard_service.cpp
   test_power_distributor.cpp
   test_flight_controller.cpp
   test_intercept_course.cpp
+  test_interdiction.cpp
   test_combat.cpp
   test_ballistics.cpp
   test_supercruise.cpp
@@ -42,6 +47,8 @@ add_executable(stellar_tests
   test_bookmarks.cpp
   test_fuzzy_search.cpp
   test_log_sinks.cpp
+  test_cvars.cpp
+  test_jobs.cpp
   test_ui_settings.cpp
   test_hud_settings.cpp
 )

@@ -48,16 +48,13 @@ double cargoScanDurationSecPolice(int smuggleHoldMk) {
   return baseDur * smuggleHoldScanDurationMult(smuggleHoldMk);
 }
 
-IllegalCargoScanResult scanIllegalCargo(core::u64 universeSeed,
-                                       core::u32 factionId,
-                                       const std::array<double, econ::kCommodityCount>& cargoUnits,
-                                       const std::array<double, econ::kCommodityCount>* midPriceOverrideCr) {
+IllegalCargoScanResult scanIllegalCargoMask(core::u32 illegalMask,
+                                           const std::array<double, econ::kCommodityCount>& cargoUnits,
+                                           const std::array<double, econ::kCommodityCount>* midPriceOverrideCr) {
   IllegalCargoScanResult r{};
   r.scannedIllegalUnits.fill(0.0);
 
-  if (factionId == 0) return r;
-
-  const core::u32 mask = illegalCommodityMask(universeSeed, factionId);
+  const core::u32 mask = illegalMask;
   if (mask == 0u) return r;
 
   for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
@@ -78,6 +75,16 @@ IllegalCargoScanResult scanIllegalCargo(core::u64 universeSeed,
   }
 
   return r;
+}
+
+IllegalCargoScanResult scanIllegalCargo(core::u64 universeSeed,
+                                       core::u32 factionId,
+                                       const std::array<double, econ::kCommodityCount>& cargoUnits,
+                                       const std::array<double, econ::kCommodityCount>* midPriceOverrideCr) {
+  if (factionId == 0) return IllegalCargoScanResult{};
+
+  const core::u32 mask = illegalCommodityMask(universeSeed, factionId);
+  return scanIllegalCargoMask(mask, cargoUnits, midPriceOverrideCr);
 }
 
 double bribeOfferChance(const LawProfile& law, double playerRep, double playerHeat, double illegalValueCr) {

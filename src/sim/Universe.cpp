@@ -1,5 +1,7 @@
 #include "stellar/sim/Universe.h"
 
+#include "stellar/core/JobSystem.h"
+
 #include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
@@ -248,6 +250,165 @@ std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
   }
 
   // Unheap + sort by the required stable order (distance, then id).
+  std::vector<Candidate> items;
+  items.reserve(best.size());
+  while (!best.empty()) {
+    items.push_back(best.top());
+    best.pop();
+  }
+
+  std::sort(items.begin(), items.end(), [&](const Candidate& a, const Candidate& b) {
+    return better(a, b);
+  });
+
+  out.reserve(items.size());
+  for (auto& it : items) out.push_back(std::move(it.stub));
+  return out;
+}
+
+std::vector<SystemStub> Universe::queryNearbyParallel(core::JobSystem& jobs,
+                                                      const math::Vec3d& posLy,
+                                                      double radiusLy,
+                                                      std::size_t maxResults) {
+  std::vector<SystemStub> out;
+  if (radiusLy <= 0.0 || maxResults == 0) return out;
+
+  const double r2 = radiusLy * radiusLy;
+  const double s = galaxyParams_.sectorSizeLy;
+
+  // Conservative bounds on sector coords that could intersect the query sphere.
+  const proc::SectorCoord minC{
+    static_cast<core::i32>(std::floor((posLy.x - radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.y - radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.z - radiusLy) / s)),
+  };
+  const proc::SectorCoord maxC{
+    static_cast<core::i32>(std::floor((posLy.x + radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.y + radiusLy) / s)),
+    static_cast<core::i32>(std::floor((posLy.z + radiusLy) / s)),
+  };
+
+  const auto axisDist = [](double v, double lo, double hi) {
+    if (v < lo) return lo - v;
+    if (v > hi) return v - hi;
+    return 0.0;
+  };
+
+  // Lower bound on distance from posLy to any point in a sector cube.
+  // Used to prune sectors that cannot possibly intersect the query sphere.
+  const auto minDist2ToSector = [&](const proc::SectorCoord& c) -> double {
+    const double x0 = static_cast<double>(c.x) * s;
+    const double y0 = static_cast<double>(c.y) * s;
+    const double z0 = static_cast<double>(c.z) * s;
+
+    const double x1 = x0 + s;
+    const double y1 = y0 + s;
+    const double z1 = z0 + s;
+
+    const double dx = axisDist(posLy.x, x0, x1);
+    const double dy = axisDist(posLy.y, y0, y1);
+    const double dz = axisDist(posLy.z, z0, z1);
+    return dx*dx + dy*dy + dz*dz;
+  };
+
+  // Enumerate the candidate sectors (AABB intersects sphere).
+  std::vector<proc::SectorCoord> coords;
+  {
+    const core::i64 dx = static_cast<core::i64>(maxC.x) - static_cast<core::i64>(minC.x) + 1;
+    const core::i64 dy = static_cast<core::i64>(maxC.y) - static_cast<core::i64>(minC.y) + 1;
+    const core::i64 dz = static_cast<core::i64>(maxC.z) - static_cast<core::i64>(minC.z) + 1;
+    const core::i64 vol = dx * dy * dz;
+    if (vol > 0 && vol < 10'000'000) coords.reserve(static_cast<std::size_t>(vol));
+  }
+
+  for (core::i32 x = minC.x; x <= maxC.x; ++x) {
+    for (core::i32 y = minC.y; y <= maxC.y; ++y) {
+      for (core::i32 z = minC.z; z <= maxC.z; ++z) {
+        const proc::SectorCoord c{x, y, z};
+        if (minDist2ToSector(c) <= r2) coords.push_back(c);
+      }
+    }
+  }
+
+  if (coords.empty()) return out;
+
+  struct Candidate {
+    SystemStub stub{};
+    double d2{0.0};
+  };
+
+  const auto better = [](const Candidate& a, const Candidate& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    return a.stub.id < b.stub.id;
+  };
+
+  // Max-heap by (d2,id) so top() is the current *worst* candidate.
+  struct CandidateLess {
+    bool operator()(const Candidate& a, const Candidate& b) const {
+      if (a.d2 != b.d2) return a.d2 < b.d2;
+      return a.stub.id < b.stub.id;
+    }
+  };
+
+  // Block the sector list to amortize job scheduling overhead.
+  // Each block keeps its own top-N heap, then we merge.
+  const std::size_t kBlockSize = 64;
+  const std::size_t blockCount = (coords.size() + kBlockSize - 1) / kBlockSize;
+  std::vector<std::vector<Candidate>> blockCandidates(blockCount);
+
+  jobs.parallelFor(blockCount, [&](std::size_t bi) {
+    const std::size_t start = bi * kBlockSize;
+    const std::size_t end = std::min(coords.size(), start + kBlockSize);
+
+    std::priority_queue<Candidate, std::vector<Candidate>, CandidateLess> best;
+
+    for (std::size_t i = start; i < end; ++i) {
+      const proc::SectorCoord& c = coords[i];
+      const proc::Sector sec = galaxyGen_.generateSector(c, factions_);
+      for (const auto& stub : sec.systems) {
+        const double dd = (stub.posLy - posLy).lengthSq();
+        if (dd > r2) continue;
+
+        Candidate cand{stub, dd};
+
+        if (best.size() < maxResults) {
+          best.push(std::move(cand));
+        } else {
+          const Candidate& worst = best.top();
+          if (better(cand, worst)) {
+            best.pop();
+            best.push(std::move(cand));
+          }
+        }
+      }
+    }
+
+    std::vector<Candidate> local;
+    local.reserve(best.size());
+    while (!best.empty()) {
+      local.push_back(best.top());
+      best.pop();
+    }
+    blockCandidates[bi] = std::move(local);
+  });
+
+  // Merge block-local candidates into a global top-N heap.
+  std::priority_queue<Candidate, std::vector<Candidate>, CandidateLess> best;
+  for (auto& blk : blockCandidates) {
+    for (auto& cand : blk) {
+      if (best.size() < maxResults) {
+        best.push(std::move(cand));
+      } else {
+        const Candidate& worst = best.top();
+        if (better(cand, worst)) {
+          best.pop();
+          best.push(std::move(cand));
+        }
+      }
+    }
+  }
+
+  // Unheap + sort by stable order (distance, then id).
   std::vector<Candidate> items;
   items.reserve(best.size());
   while (!best.empty()) {

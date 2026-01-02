@@ -42,6 +42,15 @@ struct EncounterDirectorContext {
   double policeHeat{0.0};     // soft pursuit intensity (prototype tuning: ~[0..6])
   bool policeAlert{false};    // short-term "crime response" alert window
   bool playerWantedHere{false};
+
+  // Optional system-level knobs (0..1). These let the app feed in a compact
+  // notion of "how dangerous" or "how secure" a system feels.
+  //
+  // Defaults are 0.5 so existing tuning remains unchanged unless a caller
+  // explicitly provides values.
+  double security01{0.5}; // higher => more effective security response
+  double piracy01{0.5};   // higher => pirates spawn more frequently
+  double traffic01{0.5};  // higher => trader traffic spawns more frequently
 };
 
 struct EncounterDirectorState {

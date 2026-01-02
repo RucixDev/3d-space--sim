@@ -1,5 +1,7 @@
 #include "ConsoleWindow.h"
 
+#include "stellar/core/CVar.h"
+
 #include "stellar/ui/FuzzySearch.h"
 
 #include <imgui.h>
@@ -254,6 +256,7 @@ void consoleRemoveCoreLogSink(ConsoleWindowState& st) {
 // ---- Builtins ----
 
 void consoleAddBuiltins(ConsoleWindowState& st) {
+  core::installDefaultCVars();
   // help
   consoleAddCommand(st, "help", "List commands. Usage: help [command]",
     [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
@@ -306,6 +309,160 @@ void consoleAddBuiltins(ConsoleWindowState& st) {
       core::setLogLevel(lvl);
       consolePrint(c, core::LogLevel::Info, "Log level updated.");
     });
+
+  // ---- CVars ----
+  // (Backed by stellar::core::CVarRegistry)
+  consoleAddCommand(st, "cvars", "List CVars. Usage: cvars [filter]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      const std::string filter = args.empty() ? std::string() : std::string(args[0]);
+      const auto vars = core::cvars().list(filter);
+
+      if (vars.empty()) {
+        consolePrint(c, core::LogLevel::Info, "No CVars.");
+        return;
+      }
+
+      consolePrint(c, core::LogLevel::Info, "CVars:");
+      for (const auto* v : vars) {
+        std::string flags;
+        if ((v->flags & core::CVar_Archive) != 0u) flags += 'A';
+        if ((v->flags & core::CVar_ReadOnly) != 0u) flags += 'R';
+        if ((v->flags & core::CVar_Cheat) != 0u) flags += 'C';
+
+        std::string line = "  " + v->name + " = " + core::CVarRegistry::valueToString(*v);
+        line += " (" + std::string(core::CVarRegistry::typeName(v->type)) + ")";
+        if (!flags.empty()) line += " [" + flags + "]";
+        if (!v->help.empty()) line += " - " + v->help;
+
+        consolePrint(c, core::LogLevel::Info, line);
+      }
+    });
+
+  consoleAddCommand(st, "cvar.get", "Get a CVar. Usage: cvar.get <name>",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      if (args.empty()) {
+        consolePrint(c, core::LogLevel::Warn, "Usage: cvar.get <name>");
+        return;
+      }
+
+      const core::CVar* v = core::cvars().find(args[0]);
+      if (!v) {
+        consolePrint(c, core::LogLevel::Warn, "Unknown cvar.");
+        const auto near = core::cvars().list(args[0]);
+        if (!near.empty()) {
+          consolePrint(c, core::LogLevel::Info, "Did you mean:");
+          for (std::size_t i = 0; i < near.size() && i < 8; ++i) {
+            consolePrint(c, core::LogLevel::Info, std::string("  ") + near[i]->name);
+          }
+        }
+        return;
+      }
+
+      core::CVar tmp = *v;
+      tmp.value = v->defaultValue;
+
+      std::string out = v->name + " = " + core::CVarRegistry::valueToString(*v);
+      out += " (" + std::string(core::CVarRegistry::typeName(v->type)) + ")";
+      out += "  [default=" + core::CVarRegistry::valueToString(tmp) + "]";
+      consolePrint(c, core::LogLevel::Info, out);
+      if (!v->help.empty()) consolePrint(c, core::LogLevel::Info, std::string("  ") + v->help);
+    });
+
+  consoleAddCommand(st, "cvar.set", "Set a CVar. Usage: cvar.set <name> <value...>",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      if (args.size() < 2) {
+        consolePrint(c, core::LogLevel::Warn, "Usage: cvar.set <name> <value...>");
+        return;
+      }
+
+      std::string value;
+      for (std::size_t i = 1; i < args.size(); ++i) {
+        if (i > 1) value.push_back(' ');
+        value += args[i];
+      }
+
+      std::string err;
+      if (!core::cvars().setFromString(args[0], value, &err)) {
+        consolePrint(c, core::LogLevel::Warn, err);
+        return;
+      }
+
+      const core::CVar* v = core::cvars().find(args[0]);
+      if (v) {
+        consolePrint(c, core::LogLevel::Info, v->name + " = " + core::CVarRegistry::valueToString(*v));
+      } else {
+        consolePrint(c, core::LogLevel::Info, "OK.");
+      }
+    });
+
+  consoleAddCommand(st, "cvar.toggle", "Toggle a bool CVar. Usage: cvar.toggle <name>",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      if (args.empty()) {
+        consolePrint(c, core::LogLevel::Warn, "Usage: cvar.toggle <name>");
+        return;
+      }
+      const core::CVar* v = core::cvars().find(args[0]);
+      if (!v) {
+        consolePrint(c, core::LogLevel::Warn, "Unknown cvar.");
+        return;
+      }
+      if (v->type != core::CVarType::Bool) {
+        consolePrint(c, core::LogLevel::Warn, "Not a bool cvar.");
+        return;
+      }
+      const bool cur = std::get<bool>(v->value);
+      std::string err;
+      if (!core::cvars().setBool(v->name, !cur, &err)) {
+        consolePrint(c, core::LogLevel::Warn, err);
+        return;
+      }
+      const core::CVar* v2 = core::cvars().find(args[0]);
+      if (v2) consolePrint(c, core::LogLevel::Info, v2->name + " = " + core::CVarRegistry::valueToString(*v2));
+    });
+
+  consoleAddCommand(st, "cvar.reset", "Reset a CVar to its default. Usage: cvar.reset <name>",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      if (args.empty()) {
+        consolePrint(c, core::LogLevel::Warn, "Usage: cvar.reset <name>");
+        return;
+      }
+      std::string err;
+      if (!core::cvars().reset(args[0], &err)) {
+        consolePrint(c, core::LogLevel::Warn, err);
+        return;
+      }
+      const core::CVar* v = core::cvars().find(args[0]);
+      if (v) consolePrint(c, core::LogLevel::Info, v->name + " = " + core::CVarRegistry::valueToString(*v));
+    });
+
+  consoleAddCommand(st, "cvar.save", "Save archived CVars. Usage: cvar.save [path]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      const std::string path = args.empty() ? std::string("cvars.cfg") : std::string(args[0]);
+      std::string err;
+      if (!core::cvars().saveFile(path, &err)) {
+        consolePrint(c, core::LogLevel::Warn, err);
+        return;
+      }
+      consolePrint(c, core::LogLevel::Info, std::string("Saved CVars to ") + path);
+    });
+
+  consoleAddCommand(st, "cvar.load", "Load CVars from a file. Usage: cvar.load [path]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      core::installDefaultCVars();
+      const std::string path = args.empty() ? std::string("cvars.cfg") : std::string(args[0]);
+      std::string err;
+      if (!core::cvars().loadFile(path, &err)) {
+        consolePrint(c, core::LogLevel::Warn, err.empty() ? "Failed to load." : err);
+        return;
+      }
+      consolePrint(c, core::LogLevel::Info, std::string("Loaded CVars from ") + path);
+    });
 }
 
 // ---- ImGui input callbacks ----
@@ -344,56 +501,98 @@ static int TextEditCallback(ImGuiInputTextCallbackData* data) {
         word_start--;
       }
 
-      // We only complete the first token (command name).
-      if (word_start != data->Buf) {
-        return 0;
+      // Determine which token we're completing (0 = command, 1 = first argument, ...).
+      int token_index = 0;
+      bool in_tok = false;
+      for (const char* p = data->Buf; p < word_start; ++p) {
+        const char c = *p;
+        const bool sep = (c == ' ' || c == '\t' || c == ',');
+        if (sep) {
+          if (in_tok) { in_tok = false; token_index++; }
+        } else {
+          in_tok = true;
+        }
       }
 
-      std::vector<const char*> candidates;
-      candidates.reserve(st->commands.size());
       const int len = (int)(word_end - word_start);
-      for (const auto& cmd : st->commands) {
-        if (Strnicmp(cmd.name.c_str(), word_start, len) == 0) {
-          candidates.push_back(cmd.name.c_str());
-        }
-      }
+      std::vector<const char*> candidates;
 
-      if (candidates.empty()) {
-        consolePrint(*st, core::LogLevel::Warn, "No match.");
-      } else if (candidates.size() == 1) {
-        // Single match: complete and add a space.
-        data->DeleteChars((int)(word_start - data->Buf), len);
-        data->InsertChars(data->CursorPos, candidates[0]);
-        data->InsertChars(data->CursorPos, " ");
-      } else {
-        // Multiple matches: complete as much as possible.
-        int match_len = len;
-        for (;;) {
-          int c = 0;
-          bool all_matches = true;
-          for (std::size_t i = 0; i < candidates.size() && all_matches; i++) {
-            if (i == 0)
-              c = std::tolower((unsigned char)candidates[i][match_len]);
-            else if (c == 0 || c != std::tolower((unsigned char)candidates[i][match_len]))
-              all_matches = false;
-          }
-          if (!all_matches)
-            break;
-          match_len++;
-        }
-
-        if (match_len > len) {
+      auto complete = [&](bool add_space) {
+        if (candidates.empty()) {
+          consolePrint(*st, core::LogLevel::Warn, "No match.");
+        } else if (candidates.size() == 1) {
+          // Single match: complete and optionally add a space.
           data->DeleteChars((int)(word_start - data->Buf), len);
-          data->InsertChars(data->CursorPos, candidates[0], candidates[0] + match_len);
-        }
+          data->InsertChars(data->CursorPos, candidates[0]);
+          if (add_space) data->InsertChars(data->CursorPos, " ");
+        } else {
+          // Multiple matches: complete as much as possible.
+          int match_len = len;
+          for (;;) {
+            int c = 0;
+            bool all_matches = true;
+            for (std::size_t i = 0; i < candidates.size() && all_matches; i++) {
+              if (i == 0)
+                c = std::tolower((unsigned char)candidates[i][match_len]);
+              else if (c == 0 || c != std::tolower((unsigned char)candidates[i][match_len]))
+                all_matches = false;
+            }
+            if (!all_matches)
+              break;
+            match_len++;
+          }
 
-        consolePrint(*st, core::LogLevel::Info, "Possible matches:");
-        std::vector<const char*> sorted = candidates;
-        std::sort(sorted.begin(), sorted.end(), [](const char* a, const char* b) { return Stricmp(a, b) < 0; });
-        for (const char* cand : sorted) {
-          consolePrint(*st, core::LogLevel::Info, std::string("  ") + cand);
+          if (match_len > len) {
+            data->DeleteChars((int)(word_start - data->Buf), len);
+            data->InsertChars(data->CursorPos, candidates[0], candidates[0] + match_len);
+          }
+
+          consolePrint(*st, core::LogLevel::Info, "Possible matches:");
+          std::vector<const char*> sorted = candidates;
+          std::sort(sorted.begin(), sorted.end(), [](const char* a, const char* b) { return Stricmp(a, b) < 0; });
+          for (const char* cand : sorted) {
+            consolePrint(*st, core::LogLevel::Info, std::string("  ") + cand);
+          }
+        }
+      };
+
+      if (token_index == 0) {
+        // Complete command name.
+        candidates.reserve(st->commands.size());
+        for (const auto& cmd : st->commands) {
+          if (Strnicmp(cmd.name.c_str(), word_start, len) == 0) {
+            candidates.push_back(cmd.name.c_str());
+          }
+        }
+        complete(true);
+      } else if (token_index == 1) {
+        // Complete CVar names for cvar.* commands.
+        const char* cmd_end = data->Buf;
+        while (cmd_end < word_start) {
+          const char c = *cmd_end;
+          if (c == ' ' || c == '\t' || c == ',') break;
+          ++cmd_end;
+        }
+        const std::string cmd_name(data->Buf, cmd_end);
+        const bool wants_cvar =
+          Stricmp(cmd_name.c_str(), "cvar.get") == 0 ||
+          Stricmp(cmd_name.c_str(), "cvar.set") == 0 ||
+          Stricmp(cmd_name.c_str(), "cvar.toggle") == 0 ||
+          Stricmp(cmd_name.c_str(), "cvar.reset") == 0;
+
+        if (wants_cvar) {
+          core::installDefaultCVars();
+          const auto vars = core::cvars().list();
+          candidates.reserve(vars.size());
+          for (const auto* v : vars) {
+            if (Strnicmp(v->name.c_str(), word_start, len) == 0) {
+              candidates.push_back(v->name.c_str());
+            }
+          }
+          complete(true);
         }
       }
+
       break;
     }
 

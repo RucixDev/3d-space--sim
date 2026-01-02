@@ -5,7 +5,9 @@
 #include "stellar/econ/Market.h"
 #include "stellar/sim/Reputation.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/Orbit.h"
+#include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -30,12 +32,11 @@ struct CargoMissionSpec {
 //  - Ensure the origin station has enough inventory for the chosen unit count.
 //  - Avoid generating missions that would be contradictory to contraband rules.
 static bool pickCargoMission(core::SplitMix64& rng,
-                             core::u64 universeSeed,
                              const econ::StationEconomyState& originState,
                              const econ::StationEconomyModel& originModel,
                              const econ::StationEconomyState& destState,
                              const econ::StationEconomyModel& destModel,
-                             core::u32 destFactionId,
+                             core::u32 destIllegalMask,
                              bool requireLegalAtDest,
                              bool cargoProvided,
                              double maxCargoKg,
@@ -63,7 +64,7 @@ static bool pickCargoMission(core::SplitMix64& rng,
   for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
     const auto cid = static_cast<econ::CommodityId>(i);
 
-    if (requireLegalAtDest && isIllegalCommodity(universeSeed, destFactionId, cid)) continue;
+    if (requireLegalAtDest && ((destIllegalMask & commodityBit(cid)) != 0u)) continue;
 
     const auto oq = econ::quote(originState, originModel, cid, 0.10);
     const auto dq = econ::quote(destState, destModel, cid, 0.10);
@@ -122,6 +123,77 @@ static core::u64 missionBoardSeed(StationId stationId, int dayStamp, core::u32 f
   return (core::u64)stationId * 1469598103934665603ull ^ (core::u64)dayStamp * 1099511628211ull ^ (core::u64)factionId;
 }
 
+MissionTypeWeights computeMissionTypeWeights(const MissionBoardParams& params,
+                                             const SystemSecurityProfile& local,
+                                             const FactionProfile& issuer,
+                                             double playerRep) {
+  (void)playerRep; // reserved for future tuning (e.g., "trust" gating)
+
+  MissionTypeWeights w{};
+  w.wCourier = params.wCourier;
+  w.wDelivery = params.wDelivery;
+  w.wMultiDelivery = params.wMultiDelivery;
+  w.wEscort = params.wEscort;
+  w.wSalvage = params.wSalvage;
+  w.wPassenger = params.wPassenger;
+  w.wSmuggle = params.wSmuggle;
+  w.wBountyScan = params.wBountyScan;
+
+  auto bias01 = [](double x) {
+    // Map [0,1] -> [-1,1] around baseline 0.5.
+    return std::clamp((x - 0.5) * 2.0, -1.0, 1.0);
+  };
+
+  const double piracyB = bias01(local.piracy01);
+  const double trafficB = bias01(local.traffic01);
+  const double securityB = bias01(local.security01);
+  const double contest = std::clamp(local.contest01, 0.0, 1.0);
+
+  const double authorityB = bias01(issuer.authority);
+  const double corruptionB = bias01(issuer.corruption);
+  const double wealthB = bias01(issuer.wealth);
+  const double stabilityB = bias01(issuer.stability);
+  const double techB = bias01(issuer.tech);
+  const double militarismB = bias01(issuer.militarism);
+
+  // Apply small, bounded multipliers. These are tuned so that defaults remain
+  // close to MissionBoardParams while still producing noticeable shifts for
+  // extreme systems/factions.
+  w.wCourier = std::max(0.0, w.wCourier * (1.0 + 0.22 * trafficB - 0.10 * piracyB));
+  w.wDelivery = std::max(0.0, w.wDelivery * (1.0 + 0.18 * trafficB + 0.10 * wealthB));
+  w.wMultiDelivery = std::max(0.0, w.wMultiDelivery * (1.0 + 0.25 * trafficB + 0.10 * techB));
+
+  // Escort/salvage/bounty scan become more common in contested, pirate-heavy space.
+  w.wEscort = std::max(0.0, w.wEscort * (1.0 + 0.55 * piracyB + 0.30 * contest + 0.18 * militarismB));
+  w.wSalvage = std::max(0.0, w.wSalvage * (1.0 + 0.25 * piracyB + 0.25 * contest - 0.10 * stabilityB));
+  w.wBountyScan = std::max(0.0, w.wBountyScan * (1.0 + 0.55 * piracyB + 0.35 * contest + 0.15 * militarismB));
+
+  // Passenger traffic is suppressed by piracy pressure.
+  w.wPassenger = std::max(0.0, w.wPassenger * (1.0 + 0.45 * trafficB - 0.25 * piracyB + 0.18 * wealthB));
+
+  // Smuggling boards skew towards authoritarian/corrupt contexts (more contraband,
+  // more opportunity, higher risk premiums).
+  w.wSmuggle = std::max(0.0, w.wSmuggle * (1.0 + 0.30 * securityB + 0.25 * authorityB + 0.35 * corruptionB));
+
+  // Keep the "remainder is BountyKill" semantic stable by capping the non-kill
+  // weights. This prevents extreme systems from starving out BountyKill offers.
+  const double cap = 0.92;
+  const double sum = w.sum();
+  if (sum > cap && sum > 1e-9) {
+    const double s = cap / sum;
+    w.wCourier *= s;
+    w.wDelivery *= s;
+    w.wMultiDelivery *= s;
+    w.wEscort *= s;
+    w.wSalvage *= s;
+    w.wPassenger *= s;
+    w.wSmuggle *= s;
+    w.wBountyScan *= s;
+  }
+
+  return w;
+}
+
 void refreshMissionOffers(Universe& universe,
                           const StarSystem& currentSystem,
                           const Station& dockedStation,
@@ -167,15 +239,161 @@ void refreshMissionOffers(Universe& universe,
   const double cargoCapKg = std::max(0.0, ioSave.cargoCapacityKg);
   const int freeSeats = std::max(0, ioSave.passengerSeats - activePassengerCount(ioSave));
 
+  // Context: local system security + issuing faction traits.
+  //
+  // This lets the board "feel" different in pirate-heavy frontier space vs.
+  // stable core systems, without requiring any non-deterministic simulation.
+  const SystemSecurityProfile localSec = systemSecurityProfile(universe.seed(), currentSystem);
+  const FactionProfile issuerTraits = factionProfile(universe.seed(), dockedStation.factionId);
+
   // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
-  const double tCourier = params.wCourier;
-  const double tDelivery = tCourier + params.wDelivery;
-  const double tMulti = tDelivery + params.wMultiDelivery;
-  const double tEscort = tMulti + params.wEscort;
-  const double tSalvage = tEscort + params.wSalvage;
-  const double tPassenger = tSalvage + params.wPassenger;
-  const double tSmuggle = tPassenger + params.wSmuggle;
-  const double tBountyScan = tSmuggle + params.wBountyScan;
+  const MissionTypeWeights w = computeMissionTypeWeights(params, localSec, issuerTraits, playerRep);
+  const double tCourier = w.wCourier;
+  const double tDelivery = tCourier + w.wDelivery;
+  const double tMulti = tDelivery + w.wMultiDelivery;
+  const double tEscort = tMulti + w.wEscort;
+  const double tSalvage = tEscort + w.wSalvage;
+  const double tPassenger = tSalvage + w.wPassenger;
+  const double tSmuggle = tPassenger + w.wSmuggle;
+  const double tBountyScan = tSmuggle + w.wBountyScan;
+
+  // Helpers for destination scoring/selection.
+  const auto& factions = universe.factions();
+
+  auto findFactionById = [&](core::u32 id) -> const Faction* {
+    if (id == 0) return nullptr;
+    for (const auto& f : factions) {
+      if (f.id == id) return &f;
+    }
+    return nullptr;
+  };
+
+  auto relationScore = [&](core::u32 aId, core::u32 bId) -> double {
+    if (aId == 0 || bId == 0) return 0.0;
+    if (aId == bId) return 1.0;
+    const Faction* a = findFactionById(aId);
+    const Faction* b = findFactionById(bId);
+    if (!a || !b) return 0.0;
+    return std::clamp(factionRelation(universe.seed(), *a, *b), -1.0, 1.0);
+  };
+
+  auto scoreDestination = [&](MissionType type,
+                              const SystemSecurityProfile& sp,
+                              const FactionProfile& destTraits,
+                              double rel,
+                              bool hasContraband,
+                              double distLy) -> double {
+    const double rel01 = (rel + 1.0) * 0.5;          // 0..1
+    const double hostility01 = std::max(0.0, -rel);  // 0..1
+    const double dist01 = params.searchRadiusLy > 1e-6 ? std::clamp(distLy / params.searchRadiusLy, 0.0, 1.0) : 0.0;
+
+    // "Legit" travel jobs prefer friendly/secure trade corridors.
+    if (type == MissionType::Courier || type == MissionType::Delivery || type == MissionType::MultiDelivery || type == MissionType::Passenger) {
+      double s = 0.58 * rel01
+               + 0.18 * sp.traffic01
+               + 0.10 * sp.security01
+               + 0.10 * destTraits.wealth
+               - 0.24 * sp.piracy01;
+
+      // Avoid deep-hostile destinations for standard jobs.
+      if (rel < -0.25 && sp.controllingFactionId != 0) s -= 0.45;
+
+      // Slight preference for leaving the local cluster so the board doesn't
+      // collapse into ultra-short hops.
+      s += 0.04 * dist01;
+      return s;
+    }
+
+    // Smuggling prefers strict, wealthy targets with actual contraband laws.
+    if (type == MissionType::Smuggle) {
+      if (!hasContraband) return -1e9;
+      const double strict01 = std::max(0.0, sp.security01 - 0.5) * 2.0;
+      double s = 0.28 * destTraits.wealth
+               + 0.26 * destTraits.authority
+               + 0.22 * strict01
+               + 0.14 * (1.0 - destTraits.corruption)
+               + 0.10 * hostility01
+               - 0.08 * sp.piracy01;
+      s += 0.03 * dist01;
+      return s;
+    }
+
+    // Bounties prefer pirate-heavy / contested destinations.
+    if (type == MissionType::BountyKill || type == MissionType::BountyScan) {
+      double s = 0.56 * sp.piracy01
+               + 0.25 * sp.contest01
+               + 0.12 * (1.0 - sp.security01)
+               + 0.07 * hostility01
+               + 0.05 * destTraits.militarism;
+      s += 0.03 * dist01;
+      return s;
+    }
+
+    return 0.0;
+  };
+
+  auto pickDestination = [&](MissionType type,
+                             SystemStub& outStub,
+                             const Station*& outSt,
+                             double& outDistLy,
+                             SystemSecurityProfile& outSysSec,
+                             double& outRel) -> bool {
+    if (dests.empty()) return false;
+
+    int tries = 14;
+    if (type == MissionType::Smuggle) tries = 22;
+    if (type == MissionType::BountyKill || type == MissionType::BountyScan) tries = 22;
+
+    bool found = false;
+    double bestScore = -1e9;
+    SystemStub bestStub{};
+    const Station* bestSt = nullptr;
+    double bestDist = 0.0;
+    SystemSecurityProfile bestSec{};
+    double bestRel = 0.0;
+
+    for (int t = 0; t < tries; ++t) {
+      const auto& stub = dests[(std::size_t)(mrng.nextU32() % (core::u32)dests.size())];
+      const auto& sys = universe.getSystem(stub.id, &stub);
+      if (sys.stations.empty()) continue;
+
+      const auto* st = &sys.stations[(std::size_t)(mrng.nextU32() % (core::u32)sys.stations.size())];
+      const double distLy = (stub.posLy - currentSystem.stub.posLy).length();
+
+      const SystemSecurityProfile sp = systemSecurityProfile(universe.seed(), sys);
+      const FactionProfile stTraits = factionProfile(universe.seed(), st->factionId);
+
+      const double rel = relationScore(dockedStation.factionId, st->factionId);
+
+      bool hasContraband = true;
+      if (type == MissionType::Smuggle) {
+        const core::u32 mask = illegalCommodityMaskForStation(universe.seed(), st->factionId, st->id, st->type);
+        hasContraband = (mask != 0u);
+      }
+
+      double score = scoreDestination(type, sp, stTraits, rel, hasContraband, distLy);
+      // Add a tiny bit of noise so repeated offers don't always pick the same "best".
+      score += mrng.range(-0.03, 0.03);
+
+      if (!found || score > bestScore) {
+        found = true;
+        bestScore = score;
+        bestStub = stub;
+        bestSt = st;
+        bestDist = distLy;
+        bestSec = sp;
+        bestRel = rel;
+      }
+    }
+
+    if (!found || !bestSt) return false;
+    outStub = bestStub;
+    outSt = bestSt;
+    outDistLy = bestDist;
+    outSysSec = bestSec;
+    outRel = bestRel;
+    return true;
+  };
 
   for (int i = 0; i < offerCount; ++i) {
     const double r = mrng.nextUnit();
@@ -218,23 +436,29 @@ void refreshMissionOffers(Universe& universe,
     const Station* destSt = nullptr;
     sim::SystemStub destStub{};
 
+    // When the mission targets another system, we also capture the destination system's
+    // security profile so rewards can incorporate risk/strictness.
+    SystemSecurityProfile destSysSec{};
+    double destRel = 0.0;
+    bool haveDestSysSec = false;
+
     if (type != MissionType::Salvage && type != MissionType::Escort) {
-      // Pick a random destination system/station from nearby candidates.
-      const int pick = (int)(mrng.nextU32() % (core::u32)dests.size());
-      destStub = dests[(std::size_t)pick];
-      const auto& destSys = universe.getSystem(destStub.id, &destStub);
-      if (destSys.stations.empty()) continue;
-      destSt = &destSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)destSys.stations.size())];
+      // Pick a destination that fits the mission "flavor" (trade corridors, pirate space, strict targets, ...).
+      if (!pickDestination(type, destStub, destSt, distLy, destSysSec, destRel)) {
+        // If we can't find any suitable destination, keep the board usable.
+        type = MissionType::Salvage;
+      } else {
+        m.toSystem = destStub.id;
+        m.toStation = destSt->id;
+        m.deadlineDay = timeDays + 1.0 + distLy / 20.0;
+        haveDestSysSec = true;
+      }
+    }
 
-      m.toSystem = destStub.id;
-      m.toStation = destSt->id;
-
-      distLy = (destStub.posLy - currentSystem.stub.posLy).length();
-      m.deadlineDay = timeDays + 1.0 + distLy / 20.0;
-    } else if (type == MissionType::Salvage) {
+    if (type == MissionType::Salvage) {
       // Salvage is a local in-system job: make it snappy.
       m.deadlineDay = timeDays + 0.35 + mrng.range(0.05, 0.20);
-    } else {
+    } else if (type == MissionType::Escort) {
       // Escort is a local in-system job that moves between *stations* in the current system.
       if (currentSystem.stations.size() < 2) {
         type = MissionType::Salvage;
@@ -268,6 +492,9 @@ void refreshMissionOffers(Universe& universe,
           m.deadlineDay = timeDays + 0.35 + std::clamp(distAU * 0.10, 0.0, 0.65) + mrng.range(0.02, 0.12);
         }
       }
+    } else {
+      // Cross-system mission should have a resolved destination station.
+      if (!destSt) continue;
     }
 
     if (type == MissionType::Courier) {
@@ -295,13 +522,14 @@ void refreshMissionOffers(Universe& universe,
         bool ok = false;
         if (destSt) {
           auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+          const core::u32 destIllegalMask =
+              illegalCommodityMaskForStation(universe.seed(), destSt->factionId, destSt->id, destSt->type);
           ok = pickCargoMission(mrng,
-                                universe.seed(),
                                 originEcon,
                                 dockedStation.economyModel,
                                 destEcon,
                                 destSt->economyModel,
-                                destSt->factionId,
+                                destIllegalMask,
                                 /*requireLegalAtDest=*/true,
                                 /*cargoProvided=*/m.cargoProvided,
                                 /*maxCargoKg=*/maxCargoKg,
@@ -351,13 +579,14 @@ void refreshMissionOffers(Universe& universe,
         bool ok = false;
         if (destSt) {
           auto& destEcon = universe.stationEconomy(*destSt, timeDays);
+          const core::u32 destIllegalMask =
+              illegalCommodityMaskForStation(universe.seed(), destSt->factionId, destSt->id, destSt->type);
           ok = pickCargoMission(mrng,
-                                universe.seed(),
                                 originEcon,
                                 dockedStation.economyModel,
                                 destEcon,
                                 destSt->economyModel,
-                                destSt->factionId,
+                                destIllegalMask,
                                 /*requireLegalAtDest=*/true,
                                 /*cargoProvided=*/m.cargoProvided,
                                 /*maxCargoKg=*/maxCargoKg,
@@ -461,13 +690,14 @@ void refreshMissionOffers(Universe& universe,
           const int minUnits = 6;
           const int maxUnitsHard = 220;
 
+          const core::u32 destIllegalMask =
+              illegalCommodityMaskForStation(universe.seed(), destSt->factionId, destSt->id, destSt->type);
           ok = pickCargoMission(mrng,
-                                universe.seed(),
                                 originEcon,
                                 dockedStation.economyModel,
                                 destEcon,
                                 destSt->economyModel,
-                                destSt->factionId,
+                                destIllegalMask,
                                 /*requireLegalAtDest=*/true,
                                 /*cargoProvided=*/true,
                                 /*maxCargoKg=*/maxCargoKg,
@@ -557,7 +787,8 @@ void refreshMissionOffers(Universe& universe,
 
       // Smuggling jobs should only exist where there is actual contraband.
       const core::u32 destFaction = destSt ? destSt->factionId : 0;
-      const core::u32 mask = illegalCommodityMask(universe.seed(), destFaction);
+      const core::u32 mask =
+          destSt ? illegalCommodityMaskForStation(universe.seed(), destSt->factionId, destSt->id, destSt->type) : 0u;
 
       std::vector<econ::CommodityId> illegal;
       illegal.reserve(econ::kCommodityCount);
@@ -623,6 +854,55 @@ void refreshMissionOffers(Universe& universe,
       m.targetNpcId = std::max<core::u64>(1, mrng.nextU64());
       m.reward = 1400.0 + distLy * 90.0;
       m.deadlineDay = timeDays + 1.8 + distLy / 20.0;
+    }
+
+    // Risk/strictness bonus: tie payout to the same security model used by
+    // destination selection, so "dangerous" or tightly policed space pays more.
+    {
+      const SystemSecurityProfile& sec = haveDestSysSec ? destSysSec : localSec;
+
+      const double piracyRisk01 = std::max(0.0, sec.piracy01 - 0.5) * 2.0; // 0..1
+      const double contest01 = std::clamp(sec.contest01, 0.0, 1.0);
+      const double strict01 = std::max(0.0, sec.security01 - 0.5) * 2.0; // 0..1
+
+      // Prefer destination faction traits when available.
+      const FactionProfile destTraits = destSt ? factionProfile(universe.seed(), destSt->factionId) : issuerTraits;
+
+      double mult = 1.0;
+      switch (m.type) {
+        case MissionType::Courier:
+          mult = 1.0 + 0.10 * piracyRisk01 + 0.08 * contest01;
+          break;
+        case MissionType::Passenger:
+          mult = 1.0 + 0.08 * piracyRisk01 + 0.06 * contest01;
+          break;
+        case MissionType::Delivery:
+        case MissionType::MultiDelivery:
+          mult = 1.0 + 0.12 * piracyRisk01 + 0.10 * contest01;
+          break;
+        case MissionType::Escort:
+          mult = 1.0 + 0.18 * piracyRisk01 + 0.14 * contest01;
+          break;
+        case MissionType::Salvage:
+          mult = 1.0 + 0.16 * piracyRisk01 + 0.18 * contest01;
+          break;
+        case MissionType::Smuggle:
+          // Smuggling pays mostly for strictness and authority, reduced by corruption.
+          mult = 1.0
+               + 0.22 * strict01
+               + 0.10 * std::clamp(destTraits.authority, 0.0, 1.0)
+               + 0.08 * (1.0 - std::clamp(destTraits.corruption, 0.0, 1.0));
+          break;
+        case MissionType::BountyScan:
+        case MissionType::BountyKill:
+          mult = 1.0
+               + 0.28 * piracyRisk01
+               + 0.20 * contest01
+               + 0.10 * (1.0 - std::clamp(sec.security01, 0.0, 1.0));
+          break;
+      }
+
+      m.reward *= std::clamp(mult, 1.0, 1.65);
     }
 
     m.reward *= repScale;

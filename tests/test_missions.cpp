@@ -3,7 +3,9 @@
 #include "stellar/econ/Cargo.h"
 #include "stellar/econ/Market.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/Reputation.h"
+#include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -122,7 +124,7 @@ int test_missions() {
         const auto& ds = u.getSystem(m.toSystem);
         const auto* dst = findStationById(ds, m.toStation);
         if (dst && dst->factionId != 0) {
-          if (!isIllegalCommodity(u.seed(), dst->factionId, m.commodity)) {
+          if (!isIllegalCommodityAtStation(u.seed(), dst->factionId, dst->id, dst->type, m.commodity)) {
             std::cerr << "[test_missions] smuggle mission commodity not illegal at destination\n";
             ++fails;
           }
@@ -133,7 +135,7 @@ int test_missions() {
         const auto& ds = u.getSystem(m.toSystem);
         const auto* dst = findStationById(ds, m.toStation);
         if (dst && dst->factionId != 0) {
-          if (isIllegalCommodity(u.seed(), dst->factionId, m.commodity)) {
+          if (isIllegalCommodityAtStation(u.seed(), dst->factionId, dst->id, dst->type, m.commodity)) {
             std::cerr << "[test_missions] delivery mission requests illegal cargo at destination\n";
             ++fails;
           }
@@ -148,6 +150,76 @@ int test_missions() {
           }
         }
       }
+    }
+  }
+
+  // Contextual mission weights: ensure tuning responds to security traits in the expected direction.
+  {
+    MissionBoardParams p{};
+
+    SystemSecurityProfile neutral{};
+    neutral.security01 = 0.5;
+    neutral.piracy01 = 0.5;
+    neutral.traffic01 = 0.5;
+    neutral.contest01 = 0.0;
+
+    FactionProfile generic{};
+    generic.authority = 0.5;
+    generic.corruption = 0.5;
+    generic.wealth = 0.5;
+    generic.stability = 0.5;
+    generic.tech = 0.5;
+    generic.militarism = 0.5;
+
+    const auto w0 = computeMissionTypeWeights(p, neutral, generic, /*rep*/0.0);
+    auto near = [](double a, double b, double eps) { return std::abs(a - b) <= eps; };
+
+    if (!near(w0.wCourier, p.wCourier, 1e-9) ||
+        !near(w0.wDelivery, p.wDelivery, 1e-9) ||
+        !near(w0.wMultiDelivery, p.wMultiDelivery, 1e-9) ||
+        !near(w0.wEscort, p.wEscort, 1e-9) ||
+        !near(w0.wSalvage, p.wSalvage, 1e-9) ||
+        !near(w0.wPassenger, p.wPassenger, 1e-9) ||
+        !near(w0.wSmuggle, p.wSmuggle, 1e-9) ||
+        !near(w0.wBountyScan, p.wBountyScan, 1e-9)) {
+      std::cerr << "[test_missions] neutral mission weights should match MissionBoardParams\n";
+      ++fails;
+    }
+
+    SystemSecurityProfile pirate = neutral;
+    pirate.piracy01 = 0.90;
+    pirate.contest01 = 0.85;
+    const auto wp = computeMissionTypeWeights(p, pirate, generic, /*rep*/0.0);
+    if (wp.wEscort <= w0.wEscort + 1e-12 || wp.wBountyScan <= w0.wBountyScan + 1e-12) {
+      std::cerr << "[test_missions] expected pirate space to increase escort/bounty-scan weights\n";
+      ++fails;
+    }
+    if (wp.wPassenger >= w0.wPassenger + 1e-12) {
+      std::cerr << "[test_missions] expected pirate space to suppress passenger weight\n";
+      ++fails;
+    }
+    if (wp.sum() > 0.9200001) {
+      std::cerr << "[test_missions] expected contextual weights sum to remain capped\n";
+      ++fails;
+    }
+
+    SystemSecurityProfile busy = neutral;
+    busy.traffic01 = 0.90;
+    const auto wb = computeMissionTypeWeights(p, busy, generic, /*rep*/0.0);
+    if (wb.wPassenger <= w0.wPassenger + 1e-12 || wb.wCourier <= w0.wCourier + 1e-12) {
+      std::cerr << "[test_missions] expected high-traffic space to increase passenger/courier weights\n";
+      ++fails;
+    }
+
+    FactionProfile crooked = generic;
+    crooked.authority = 0.90;
+    crooked.corruption = 0.92;
+    SystemSecurityProfile strict = neutral;
+    strict.security01 = 0.92;
+    const auto ws = computeMissionTypeWeights(p, strict, crooked, /*rep*/0.0);
+    if (ws.wSmuggle <= w0.wSmuggle + 1e-12) {
+      std::cerr << "[test_missions] expected strict/corrupt context to increase smuggle weight\n";
+      ++fails;
     }
   }
 

@@ -11,6 +11,8 @@
 #include <optional>
 #include <unordered_map>
 
+namespace stellar::core { class JobSystem; }
+
 namespace stellar::sim {
 
 // A streaming universe:
@@ -30,6 +32,19 @@ public:
   std::vector<SystemStub> queryNearby(const math::Vec3d& posLy,
                                       double radiusLy,
                                       std::size_t maxResults = 256);
+
+  // A parallelized, brute-force variant of queryNearby().
+  //
+  // This generates all potentially-intersecting sectors inside the query bounding
+  // box in parallel, filters stubs by distance, then returns the same deterministic
+  // ordering (distance, then id).
+  //
+  // It is intentionally conservative (no early-out), making it a good fit for
+  // bulk queries (route planning / scanning) where a thread pool is available.
+  std::vector<SystemStub> queryNearbyParallel(core::JobSystem& jobs,
+                                              const math::Vec3d& posLy,
+                                              double radiusLy,
+                                              std::size_t maxResults = 256);
 
   // Find closest system stub within `maxRadiusLy` (returns nullopt if none found).
   std::optional<SystemStub> findClosestSystem(const math::Vec3d& posLy, double maxRadiusLy);

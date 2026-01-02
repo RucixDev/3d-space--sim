@@ -63,6 +63,14 @@ struct IllegalCargoScanResult {
   std::array<double, econ::kCommodityCount> scannedIllegalUnits{}; // what the scanner "saw"
 };
 
+// Scan the given cargo array and compute the total illegal cargo value under a precomputed
+// illegality mask.
+//
+// This is useful when "illegal here" depends on station-specific rules rather than faction-wide rules.
+IllegalCargoScanResult scanIllegalCargoMask(core::u32 illegalMask,
+                                           const std::array<double, econ::kCommodityCount>& cargoUnits,
+                                           const std::array<double, econ::kCommodityCount>* midPriceOverrideCr = nullptr);
+
 // Scan the given cargo array and compute the total illegal cargo value under the
 // faction's deterministic contraband rules.
 //

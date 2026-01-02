@@ -24,8 +24,10 @@ struct MissionBoardParams {
   double repThreshold2{50.0};
 
   // Mission type weights (must sum <= 1.0; remainder goes to BountyKill).
-  double wCourier{0.265};
-  double wDelivery{0.265};
+  // Keep the default sum <= 0.92 so the "remainder goes to BountyKill" rule
+  // yields a meaningful baseline presence without requiring contextual capping.
+  double wCourier{0.24};
+  double wDelivery{0.24};
   double wMultiDelivery{0.12};
   double wEscort{0.05};
   double wSalvage{0.08};
@@ -36,6 +38,43 @@ struct MissionBoardParams {
   // Reward scaling (positive rep only): reward *= 1 + (rep/100)*repRewardBonus
   double repRewardBonus{0.10};
 };
+
+// Forward decls (keep MissionLogic.h light).
+struct SystemSecurityProfile;
+struct FactionProfile;
+
+// Contextual mission distribution weights.
+//
+// refreshMissionOffers() adapts mission frequencies based on the local system's
+// security profile and the issuing faction's traits. This struct exposes the
+// resulting weights for tools/tests/UI.
+//
+// NOTE: These weights follow the same semantics as MissionBoardParams:
+//  - They must sum to <= 1.0
+//  - The remainder is assigned to BountyKill
+struct MissionTypeWeights {
+  double wCourier{0.0};
+  double wDelivery{0.0};
+  double wMultiDelivery{0.0};
+  double wEscort{0.0};
+  double wSalvage{0.0};
+  double wPassenger{0.0};
+  double wSmuggle{0.0};
+  double wBountyScan{0.0};
+
+  double sum() const {
+    return wCourier + wDelivery + wMultiDelivery + wEscort + wSalvage + wPassenger + wSmuggle + wBountyScan;
+  }
+};
+
+// Compute contextual mission weights from base params.
+//
+// Deterministic: callers should feed deterministic inputs (SystemSecurityProfile,
+// FactionProfile). refreshMissionOffers() uses this internally.
+MissionTypeWeights computeMissionTypeWeights(const MissionBoardParams& params,
+                                             const SystemSecurityProfile& local,
+                                             const FactionProfile& issuer,
+                                             double playerRep = 0.0);
 
 struct MissionTickResult {
   int failed{0};

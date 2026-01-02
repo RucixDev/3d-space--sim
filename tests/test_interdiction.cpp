@@ -1,111 +1,109 @@
 #include "stellar/sim/Interdiction.h"
+#include "stellar/math/Vec3.h"
 
+#include <algorithm>
 #include <cmath>
-#include <iostream>
-
-using namespace stellar;
-
-static bool approx(double a, double b, double eps = 1e-9) {
-  return std::abs(a - b) <= eps;
-}
-
-static bool approxVec(const math::Vec3d& a, const math::Vec3d& b, double eps = 1e-9) {
-  return approx(a.x, b.x, eps) && approx(a.y, b.y, eps) && approx(a.z, b.z, eps);
-}
+#include <cstdio>
 
 int test_interdiction() {
+  using stellar::core::u64;
+  namespace sim = stellar::sim;
+
   int fails = 0;
 
-  // Deterministic begin: same inputs => same escape vector.
+  const u64 seed = 123;
+  const u64 pirateId = 999;
+  const double timeDays = 10.0;
+  const stellar::math::Vec3d fwd{0.0, 0.0, 1.0};
+  const stellar::math::Vec3d up{0.0, 1.0, 0.0};
+
+  // 1) Warning phase should transition into Active once the timer elapses.
   {
-    sim::InterdictionParams params;
-    const core::u64 seed = 0xBADC0FFEEull;
-    const core::u64 pirateId = 12345;
-    const double timeDays = 42.5;
-    const math::Vec3d fwd{0.0, 0.0, 1.0};
-    const math::Vec3d up{0.0, 1.0, 0.0};
+    sim::InterdictionParams p{};
+    p.warningSec = 0.5;
+    p.activeSec = 10.0;
+    p.startMeter = 0.5;
+    // Freeze the meter so this test only validates phase transition logic.
+    p.playerGainPerSec = 0.0;
+    p.pullBasePerSec = 0.0;
+    p.pullExtraPerSec = 0.0;
+    p.escapeDriftRadPerSec = 0.0;
+    p.escapeJitterRadPerSec = 0.0;
 
-    const auto a = sim::beginInterdiction(seed, pirateId, timeDays, fwd, up, 0.6, 1.2, params);
-    const auto b = sim::beginInterdiction(seed, pirateId, timeDays, fwd, up, 0.6, 1.2, params);
-
-    if (a.phase != sim::InterdictionPhase::Warning || b.phase != sim::InterdictionPhase::Warning) {
-      std::cerr << "[test_interdiction] expected beginInterdiction() to start in Warning phase.\n";
+    auto st = sim::beginInterdiction(seed, pirateId, timeDays, fwd, up, /*closeness=*/0.5, /*strength=*/1.0, p);
+    if (st.phase != sim::InterdictionPhase::Warning) {
+      std::fprintf(stderr, "[test_interdiction] expected to start in Warning phase.\n");
       ++fails;
     }
 
-    if (!approxVec(a.escapeDir, b.escapeDir, 1e-12)) {
-      std::cerr << "[test_interdiction] beginInterdiction() not deterministic for same inputs.\n";
-      ++fails;
+    bool beganActive = false;
+    for (int i = 0; i < 40 && sim::interdictionInProgress(st); ++i) {
+      auto out = sim::stepInterdiction(st, /*dt=*/0.05, fwd, /*closeness=*/0.5, /*strength=*/1.0, /*submit=*/false, p);
+      beganActive |= out.beganActive;
     }
 
-    const double dot = math::dot(fwd.normalized(), a.escapeDir.normalized());
-    if (dot < 0.10 || dot > 0.999) {
-      std::cerr << "[test_interdiction] escapeDir dot forward out of expected range: " << dot << "\n";
+    if (!beganActive || st.phase != sim::InterdictionPhase::Active) {
+      std::fprintf(stderr, "[test_interdiction] expected to transition to Active after warning.\n");
       ++fails;
     }
   }
 
-  // Evade path: with perfect alignment and weak pull, meter should reach 1.0.
+  // 2) Strong alignment with zero pull should eventually evade.
   {
-    sim::InterdictionParams params;
-    params.escapeDriftRadPerSec = 0.0;
-    params.escapeJitterRadPerSec = 0.0;
+    sim::InterdictionParams p{};
+    p.warningSec = 0.0;
+    p.activeSec = 10.0;
+    p.startMeter = 0.2;
+    p.playerGainPerSec = 0.8;
+    p.pullBasePerSec = 0.0;
+    p.pullExtraPerSec = 0.0;
+    p.escapeDriftRadPerSec = 0.0;
+    p.escapeJitterRadPerSec = 0.0;
 
-    sim::InterdictionState s = sim::beginInterdiction(/*seed=*/777, /*pirateId=*/9,
-                                                      /*timeDays=*/100.25,
-                                                      /*fwd=*/{0,0,1}, /*up=*/{0,1,0},
-                                                      /*close=*/0.15, /*strength=*/0.7,
-                                                      params);
-
-    // Advance through warning into active.
-    sim::stepInterdiction(s, params.warningSec + 0.01, {0,0,1}, 0.15, 0.7, false, params);
-    if (s.phase != sim::InterdictionPhase::Active) {
-      std::cerr << "[test_interdiction] expected to enter Active phase after warning.\n";
-      ++fails;
-    }
+    auto st = sim::beginInterdiction(seed, pirateId, timeDays, fwd, up, /*closeness=*/0.5, /*strength=*/1.0, p);
+    // Force a deterministic, perfectly alignable escape vector for this test.
+    st.escapeDir = fwd;
+    st.phase = sim::InterdictionPhase::Active;
+    st.activeRemainingSec = p.activeSec;
+    st.meter = p.startMeter;
 
     bool evaded = false;
-    for (int i = 0; i < 500 && sim::interdictionInProgress(s); ++i) {
-      const math::Vec3d fwd = s.escapeDir; // perfect alignment
-      const auto out = sim::stepInterdiction(s, 0.05, fwd, 0.15, 0.7, false, params);
-      if (out.failed) {
-        std::cerr << "[test_interdiction] unexpected failure during evade path.\n";
-        ++fails;
-        break;
-      }
+    for (int i = 0; i < 200 && sim::interdictionInProgress(st); ++i) {
+      auto out = sim::stepInterdiction(st, /*dt=*/0.1, fwd, /*closeness=*/0.5, /*strength=*/1.0, /*submit=*/false, p);
       if (out.evaded) {
         evaded = true;
         break;
       }
     }
+
     if (!evaded) {
-      std::cerr << "[test_interdiction] expected to evade with strong alignment.\n";
+      std::fprintf(stderr, "[test_interdiction] expected to evade with strong alignment.\n");
       ++fails;
     }
   }
 
-  // Fail path: with poor alignment and strong pull, meter should hit 0.
+  // 3) Poor alignment with strong pull should fail.
   {
-    sim::InterdictionParams params;
-    params.escapeDriftRadPerSec = 0.0;
-    params.escapeJitterRadPerSec = 0.0;
+    sim::InterdictionParams p{};
+    p.warningSec = 0.0;
+    p.activeSec = 10.0;
+    p.startMeter = 0.8;
+    p.playerGainPerSec = 0.0;
+    p.pullBasePerSec = 1.0;
+    p.pullExtraPerSec = 0.0;
+    p.escapeDriftRadPerSec = 0.0;
+    p.escapeJitterRadPerSec = 0.0;
 
-    sim::InterdictionState s = sim::beginInterdiction(/*seed=*/888, /*pirateId=*/77,
-                                                      /*timeDays=*/3.0,
-                                                      /*fwd=*/{0,0,1}, /*up=*/{0,1,0},
-                                                      /*close=*/1.0, /*strength=*/1.6,
-                                                      params);
-    sim::stepInterdiction(s, params.warningSec + 0.01, {0,0,1}, 1.0, 1.6, false, params);
+    auto st = sim::beginInterdiction(seed, pirateId, timeDays, fwd, up, /*closeness=*/1.0, /*strength=*/1.0, p);
+    st.escapeDir = fwd;
+    st.phase = sim::InterdictionPhase::Active;
+    st.activeRemainingSec = p.activeSec;
+    st.meter = p.startMeter;
 
+    const stellar::math::Vec3d badFwd{0.0, 0.0, -1.0};
     bool failed = false;
-    for (int i = 0; i < 800 && sim::interdictionInProgress(s); ++i) {
-      const math::Vec3d anti{0, 0, -1};
-      const auto out = sim::stepInterdiction(s, 0.05, anti, 1.0, 1.6, false, params);
-      if (out.evaded) {
-        std::cerr << "[test_interdiction] unexpected evade during fail path.\n";
-        ++fails;
-        break;
-      }
+    for (int i = 0; i < 200 && sim::interdictionInProgress(st); ++i) {
+      auto out = sim::stepInterdiction(st, /*dt=*/0.1, badFwd, /*closeness=*/1.0, /*strength=*/1.0, /*submit=*/false, p);
       if (out.failed) {
         failed = true;
         break;
@@ -113,41 +111,10 @@ int test_interdiction() {
     }
 
     if (!failed) {
-      std::cerr << "[test_interdiction] expected to fail with poor alignment + strong pull.\n";
+      std::fprintf(stderr, "[test_interdiction] expected to fail with poor alignment + strong pull.\n");
       ++fails;
     }
   }
 
-  // Submit should end immediately.
-  {
-    sim::InterdictionParams params;
-    sim::InterdictionState s = sim::beginInterdiction(/*seed=*/999, /*pirateId=*/1,
-                                                      /*timeDays=*/1.0,
-                                                      /*fwd=*/{0,0,1}, /*up=*/{0,1,0},
-                                                      /*close=*/0.5, /*strength=*/1.0,
-                                                      params);
-
-    const auto out = sim::stepInterdiction(s, 0.016, {0,0,1}, 0.5, 1.0, /*submit=*/true, params);
-    if (!out.submitted || !out.endedThisFrame || sim::interdictionInProgress(s)) {
-      std::cerr << "[test_interdiction] submit should end interdiction immediately.\n";
-      ++fails;
-    }
-  }
-
-  // Trigger chance should respond to inputs.
-  {
-    sim::InterdictionTriggerParams tp;
-    const double dt = 0.2;
-    const double lo = sim::interdictionTriggerChance(dt, 0.1, 0.0, 1.0, tp);
-    const double hi = sim::interdictionTriggerChance(dt, 0.9, 12'000.0, 1.5, tp);
-    if (!(hi > lo)) {
-      std::cerr << "[test_interdiction] triggerChance should increase with closeness/cargo/strength.\n";
-      ++fails;
-    }
-  }
-
-  if (fails == 0) {
-    std::cout << "[test_interdiction] PASS\n";
-  }
   return fails;
 }

@@ -107,7 +107,13 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
 
     // --- Asteroids ---
     const int baseCount = frng.range(22, 34);
-    const int count = std::clamp((int)std::round(baseCount * site.richness), 18, 42);
+    int count = (int)std::round(baseCount * site.richness);
+    count = std::clamp(count, 18, 42);
+
+    // Back-compat: the original renderer prototype spawned 28 asteroids per persistent field.
+    // Keep a minimum of 28 so older saves keyed by asteroid id don't "lose" mined rocks after
+    // generator tuning changes.
+    count = std::max(count, 28);
 
     plan.asteroids.reserve(plan.asteroids.size() + static_cast<std::size_t>(count));
 

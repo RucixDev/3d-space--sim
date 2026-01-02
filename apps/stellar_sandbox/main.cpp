@@ -1,4 +1,5 @@
 #include "stellar/core/Args.h"
+#include "stellar/core/JobSystem.h"
 #include "stellar/core/JsonWriter.h"
 #include "stellar/core/Log.h"
 #include "stellar/econ/Commodity.h"
@@ -7,7 +8,9 @@
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/Law.h"
+#include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/PoliceScan.h"
+#include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/Industry.h"
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/Reputation.h"
@@ -135,6 +138,7 @@ static void printHelp() {
             << "  --radius <ly>          Query radius in ly (default: 50)\n"
             << "  --limit <n>            Max systems (default: 32)\n"
             << "  --day <days>           Economy time (days) for trade quotes (default: 0)\n"
+            << "  --threads <n>          Use a thread pool for bulk queries (0=auto; default: disabled)\n"
             << "  --sig                  Include a stable signature per system stub (determinism)\n"
             << "  --sysSig               Include a deep signature of full generated systems (slower)\n"
             << "  --json                 Emit machine-readable JSON to stdout (also works with --out)\n"
@@ -202,6 +206,13 @@ static void printHelp() {
             << "  --illegalValue <cr>    Illegal cargo value used for fine/bribe examples (default: 5000)\n"
             << "  --smuggleHoldMk <mk>   Smuggle hold grade (0-3) for scan math (default: 0)\n"
             << "\n"
+            << "Factions / diplomacy (tooling):\n"
+            << "  --factions            Print all factions and their procedural profiles\n"
+            << "  --diplomacy           With --factions, print top allies/hostiles per faction\n"
+            << "\n"
+            << "System security (tooling):\n"
+            << "  --security            Include per-system security/piracy/traffic metrics\n"
+            << "\n"
             << "Save/load (tooling):\n"
             << "  --load <path>          Load a save file before running missions\n"
             << "  --save <path>          Save the resulting state to a save file\n"
@@ -258,6 +269,17 @@ int main(int argc, char** argv) {
   double timeDays = 0.0;
   (void)args.getDouble("day", timeDays);
 
+  // Optional parallelism for bulk queries.
+  bool wantThreads = false;
+  std::size_t threads = 0;
+  {
+    unsigned long long v = 0;
+    if (args.getU64("threads", v)) {
+      wantThreads = true;
+      threads = static_cast<std::size_t>(v);
+    }
+  }
+
   const bool json = args.hasFlag("json");
   std::string outPath;
   (void)args.getString("out", outPath);
@@ -273,6 +295,9 @@ int main(int argc, char** argv) {
   const bool doIndustry = args.hasFlag("industry");
   const bool doIndustryTrade = args.hasFlag("industryTrade");
   const bool doWarehouse = args.hasFlag("warehouse");
+  const bool doFactions = args.hasFlag("factions");
+  const bool doDiplomacy = args.hasFlag("diplomacy");
+  const bool doSecurity = args.hasFlag("security");
   std::size_t fromSysIdx = 0;
   std::size_t fromStationIdx = 0;
   {
@@ -467,9 +492,15 @@ int main(int argc, char** argv) {
   (void)args.getString("load", loadPath);
   (void)args.getString("save", savePath);
 
+  std::unique_ptr<core::JobSystem> jobs;
+  if (wantThreads && (threads == 0 || threads > 1)) {
+    jobs = std::make_unique<core::JobSystem>(threads);
+  }
+
   sim::Universe u(seed);
 
-  const auto systems = u.queryNearby(posLy, radiusLy, limit);
+  const auto systems = jobs ? u.queryNearbyParallel(*jobs, posLy, radiusLy, limit)
+                            : u.queryNearby(posLy, radiusLy, limit);
 
   // If JSON is requested, we build up a machine-readable object.
   // Otherwise, we keep the original human-readable console output.
@@ -497,6 +528,10 @@ int main(int argc, char** argv) {
     j.key("radiusLy"); j.value(radiusLy);
     j.key("limit"); j.value((unsigned long long)limit);
     j.key("day"); j.value(timeDays);
+    if (jobs) {
+      j.key("threads");
+      j.value((unsigned long long)jobs->threadCount());
+    }
     j.endObject();
     j.key("systems");
     j.beginArray();
@@ -514,18 +549,158 @@ int main(int argc, char** argv) {
         j.key("stubSig");
         j.value((unsigned long long)sim::signatureSystemStub(s));
       }
-      if (emitSysSig) {
-        const auto& sys = u.getSystem(s.id, &s);
+      const sim::StarSystem* sysPtr = nullptr;
+      if (emitSysSig || doSecurity) {
+        sysPtr = &u.getSystem(s.id, &s);
+      }
+      if (emitSysSig && sysPtr) {
         j.key("sysSig");
-        j.value((unsigned long long)sim::signatureStarSystem(sys));
+        j.value((unsigned long long)sim::signatureStarSystem(*sysPtr));
+      }
+      if (doSecurity && sysPtr) {
+        const auto sp = sim::systemSecurityProfile(seed, *sysPtr);
+
+        j.key("security");
+        j.beginObject();
+        j.key("controllingFactionId"); j.value((unsigned long long)sp.controllingFactionId);
+        j.key("controlFrac"); j.value(sp.controlFrac);
+        j.key("contest01"); j.value(sp.contest01);
+        j.key("security01"); j.value(sp.security01);
+        j.key("piracy01"); j.value(sp.piracy01);
+        j.key("traffic01"); j.value(sp.traffic01);
+
+        j.key("traits");
+        j.beginObject();
+        j.key("authority"); j.value(sp.traits.authority);
+        j.key("corruption"); j.value(sp.traits.corruption);
+        j.key("wealth"); j.value(sp.traits.wealth);
+        j.key("stability"); j.value(sp.traits.stability);
+        j.key("tech"); j.value(sp.traits.tech);
+        j.key("militarism"); j.value(sp.traits.militarism);
+        j.endObject();
+
+        j.endObject();
       }
       j.endObject();
     }
     j.endArray();
+
+    if (doFactions) {
+      const auto& facs = u.factions();
+
+      j.key("factions");
+      j.beginArray();
+      for (const auto& f : facs) {
+        const auto p = sim::factionProfile(seed, f.id);
+
+        j.beginObject();
+        j.key("id"); j.value((unsigned long long)f.id);
+        j.key("name"); j.value(f.name);
+        j.key("taxRate"); j.value(f.taxRate);
+        j.key("industryBias"); j.value(f.industryBias);
+        j.key("influenceRadiusLy"); j.value(f.influenceRadiusLy);
+        j.key("homePosLy");
+        j.beginArray();
+        j.value(f.homePosLy.x); j.value(f.homePosLy.y); j.value(f.homePosLy.z);
+        j.endArray();
+
+        j.key("profile");
+        j.beginObject();
+        j.key("authority"); j.value(p.authority);
+        j.key("corruption"); j.value(p.corruption);
+        j.key("wealth"); j.value(p.wealth);
+        j.key("stability"); j.value(p.stability);
+        j.key("tech"); j.value(p.tech);
+        j.key("militarism"); j.value(p.militarism);
+        j.endObject();
+
+        if (doDiplomacy) {
+          struct Rel { core::u32 id; double score; };
+          std::vector<Rel> rels;
+          rels.reserve(facs.size());
+          for (const auto& o : facs) {
+            if (o.id == f.id) continue;
+            rels.push_back(Rel{o.id, sim::factionRelation(seed, f, o)});
+          }
+          std::sort(rels.begin(), rels.end(), [](const Rel& a, const Rel& b) { return a.score > b.score; });
+
+          const auto writeTop = [&](const char* key, bool best) {
+            j.key(key);
+            j.beginArray();
+            const std::size_t n = std::min<std::size_t>(3, rels.size());
+            for (std::size_t i = 0; i < n; ++i) {
+              const auto& r = best ? rels[i] : rels[rels.size() - 1 - i];
+              j.beginObject();
+              j.key("factionId"); j.value((unsigned long long)r.id);
+              j.key("score"); j.value(r.score);
+              const auto k = sim::classifyFactionRelation(r.score);
+              j.key("kind"); j.value(sim::factionRelationKindName(k));
+              j.endObject();
+            }
+            j.endArray();
+          };
+
+          writeTop("topAllies", true);
+          writeTop("topHostiles", false);
+        }
+
+        j.endObject();
+      }
+      j.endArray();
+    }
   } else {
     std::cout << "Seed: " << seed << "\n";
     std::cout << "Query @ (" << posLy.x << "," << posLy.y << "," << posLy.z << ") radius=" << radiusLy << " ly\n";
     std::cout << "Found " << systems.size() << " systems\n\n";
+
+    if (doFactions) {
+      const auto& facs = u.factions();
+      std::cout << "Factions: " << facs.size() << "\n";
+      for (const auto& f : facs) {
+        const auto p = sim::factionProfile(seed, f.id);
+        std::cout << "  [" << std::setw(2) << f.id << "] " << std::setw(18) << f.name
+                  << "  tax=" << std::fixed << std::setprecision(3) << f.taxRate
+                  << "  bias=" << std::fixed << std::setprecision(2) << f.industryBias
+                  << "  infR=" << std::fixed << std::setprecision(0) << f.influenceRadiusLy
+                  << "  home=(" << std::fixed << std::setprecision(0)
+                  << f.homePosLy.x << "," << f.homePosLy.y << "," << f.homePosLy.z << ")"
+                  << "\n";
+        std::cout << "       profile: auth=" << std::fixed << std::setprecision(2) << p.authority
+                  << "  corr=" << p.corruption
+                  << "  wealth=" << p.wealth
+                  << "  stab=" << p.stability
+                  << "  tech=" << p.tech
+                  << "  mil=" << p.militarism
+                  << "\n";
+
+        if (doDiplomacy) {
+          struct Rel { core::u32 id; double score; };
+          std::vector<Rel> rels;
+          rels.reserve(facs.size());
+          for (const auto& o : facs) {
+            if (o.id == f.id) continue;
+            rels.push_back(Rel{o.id, sim::factionRelation(seed, f, o)});
+          }
+          std::sort(rels.begin(), rels.end(), [](const Rel& a, const Rel& b) { return a.score > b.score; });
+
+          const auto printTop = [&](const char* label, bool best) {
+            const std::size_t n = std::min<std::size_t>(3, rels.size());
+            std::cout << "       " << label << ":";
+            for (std::size_t i = 0; i < n; ++i) {
+              const auto& r = best ? rels[i] : rels[rels.size() - 1 - i];
+              const auto k = sim::classifyFactionRelation(r.score);
+              std::cout << "  " << r.id << "(" << std::fixed << std::setprecision(2) << r.score
+                        << "," << sim::factionRelationKindName(k) << ")";
+            }
+            std::cout << "\n";
+          };
+
+          printTop("allies", true);
+          printTop("hostiles", false);
+        }
+      }
+      std::cout << "\n";
+    }
 
     for (const auto& s : systems) {
       const math::Vec3d d = s.posLy - posLy;
@@ -543,10 +718,21 @@ int main(int argc, char** argv) {
         const auto sig = sim::signatureSystemStub(s);
         std::cout << "  stubSig=" << (unsigned long long)sig;
       }
-      if (emitSysSig) {
-        const auto& sys = u.getSystem(s.id, &s);
-        const auto sig = sim::signatureStarSystem(sys);
+      const sim::StarSystem* sysPtr = nullptr;
+      if (emitSysSig || doSecurity) {
+        sysPtr = &u.getSystem(s.id, &s);
+      }
+      if (emitSysSig && sysPtr) {
+        const auto sig = sim::signatureStarSystem(*sysPtr);
         std::cout << "  sysSig=" << (unsigned long long)sig;
+      }
+      if (doSecurity && sysPtr) {
+        const auto sp = sim::systemSecurityProfile(seed, *sysPtr);
+        std::cout << "  ctrl=" << sp.controllingFactionId
+                  << "  sec=" << std::fixed << std::setprecision(2) << sp.security01
+                  << "  piracy=" << sp.piracy01
+                  << "  traffic=" << sp.traffic01
+                  << "  contest=" << sp.contest01;
       }
       std::cout << "\n";
     }
@@ -565,7 +751,12 @@ int main(int argc, char** argv) {
     }
     std::cout << "Stations:\n";
     for (const auto& st : sys.stations) {
-      std::cout << "  - " << st.name << " (fee=" << st.feeRate << ")\n";
+      std::cout << "  - " << st.name
+                << " faction=" << st.factionId
+                << " fee=" << st.feeRate
+                << " illegal=["
+                << sim::illegalCommodityListStringForStation(u.seed(), st.factionId, st.id, st.type)
+                << "]\n";
     }
   }
 
@@ -1212,7 +1403,9 @@ int main(int argc, char** argv) {
     scan.maxResults = std::max<std::size_t>(1, loopLimit);
     scan.maxStations = 256;
 
-    const auto loops = sim::scanTradeLoops(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+    const auto loops = jobs
+      ? sim::scanTradeLoopsParallel(*jobs, u, fromStub, fromSt, timeDays, systems, scan, feeEff)
+      : sim::scanTradeLoops(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
 
     if (json) {
       j.key("tradeLoops");
@@ -1912,6 +2105,43 @@ int main(int argc, char** argv) {
         j.key("stationName"); j.value(dockedStation.name);
         j.key("rep"); j.value(rep);
         j.endObject();
+
+        // Expose the contextual tuning inputs that shape the mission board.
+        {
+          const auto sec = sim::systemSecurityProfile(u.seed(), fromSys);
+          const auto issuer = sim::factionProfile(u.seed(), dockedStation.factionId);
+          const auto w = sim::computeMissionTypeWeights(sim::MissionBoardParams{}, sec, issuer, rep);
+
+          j.key("context");
+          j.beginObject();
+          j.key("controllingFactionId"); j.value((unsigned long long)sec.controllingFactionId);
+          j.key("security01"); j.value(sec.security01);
+          j.key("piracy01"); j.value(sec.piracy01);
+          j.key("traffic01"); j.value(sec.traffic01);
+          j.key("contest01"); j.value(sec.contest01);
+          j.key("issuerTraits");
+          j.beginObject();
+          j.key("authority"); j.value(issuer.authority);
+          j.key("corruption"); j.value(issuer.corruption);
+          j.key("wealth"); j.value(issuer.wealth);
+          j.key("stability"); j.value(issuer.stability);
+          j.key("tech"); j.value(issuer.tech);
+          j.key("militarism"); j.value(issuer.militarism);
+          j.endObject();
+          j.endObject();
+
+          j.key("weights");
+          j.beginObject();
+          j.key("courier"); j.value(w.wCourier);
+          j.key("delivery"); j.value(w.wDelivery);
+          j.key("multiDelivery"); j.value(w.wMultiDelivery);
+          j.key("escort"); j.value(w.wEscort);
+          j.key("salvage"); j.value(w.wSalvage);
+          j.key("passenger"); j.value(w.wPassenger);
+          j.key("smuggle"); j.value(w.wSmuggle);
+          j.key("bountyScan"); j.value(w.wBountyScan);
+          j.endObject();
+        }
         j.key("offers");
         j.beginArray();
         for (const auto& m : save.missionOffers) writeMissionJson(j, m);
@@ -1919,6 +2149,28 @@ int main(int argc, char** argv) {
       } else {
         std::cout << "\n--- Mission board (day=" << timeDays << ", rep=" << rep << ") ---\n";
         std::cout << "At: " << fromStub.name << " / " << dockedStation.name << "\n";
+
+        {
+          const auto sec = sim::systemSecurityProfile(u.seed(), fromSys);
+          const auto issuer = sim::factionProfile(u.seed(), dockedStation.factionId);
+          const auto w = sim::computeMissionTypeWeights(sim::MissionBoardParams{}, sec, issuer, rep);
+
+          std::cout << "Local context: security=" << sec.security01
+                    << " piracy=" << sec.piracy01
+                    << " traffic=" << sec.traffic01
+                    << " contest=" << sec.contest01
+                    << " ctrlFaction=" << sec.controllingFactionId
+                    << "\n";
+          std::cout << "Weights: courier=" << w.wCourier
+                    << " delivery=" << w.wDelivery
+                    << " multi=" << w.wMultiDelivery
+                    << " escort=" << w.wEscort
+                    << " salvage=" << w.wSalvage
+                    << " passenger=" << w.wPassenger
+                    << " smuggle=" << w.wSmuggle
+                    << " bountyScan=" << w.wBountyScan
+                    << "\n";
+        }
         if (save.missionOffers.empty()) {
           std::cout << "No mission offers.\n";
         } else {

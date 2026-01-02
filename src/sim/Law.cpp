@@ -1,9 +1,9 @@
 #include "stellar/sim/Law.h"
 
-#include "stellar/core/Hash.h"
-#include "stellar/core/Random.h"
+#include "stellar/sim/FactionProfile.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace stellar::sim {
 
@@ -17,16 +17,13 @@ LawProfile lawProfile(core::u64 universeSeed, core::u32 factionId) {
     return p;
   }
 
-  // Seed per (universe, faction) and keep stable across versions.
-  core::u64 s = core::hashCombine(universeSeed, static_cast<core::u64>(factionId));
-  s = core::hashCombine(s, core::seedFromText("law_profile_v1"));
-  core::SplitMix64 rng(s);
-
-  // Authority: 0 = lax, 1 = strict.
-  const double authority = rng.nextDouble();
-
-  // Corruption raw: 0 = honest, 1 = very corrupt.
-  const double corruptionRaw = rng.nextDouble();
+  // Authority / corruption are sourced from the faction profile.
+  //
+  // The profile uses the same stable "law_profile_v1" seed that older versions
+  // used internally. This preserves existing LawProfile outputs while making the
+  // relationship explicit for other systems (diplomacy, economy weighting, etc.).
+  const FactionProfile fp = factionProfile(universeSeed, factionId);
+  const double authority = std::clamp(fp.authority, 0.0, 1.0);
 
   // Strictness scales scan frequency (used as a multiplier on scan start probability).
   // Keep this bounded so the smuggling loop remains playable.
@@ -34,8 +31,7 @@ LawProfile lawProfile(core::u64 universeSeed, core::u32 factionId) {
 
   // Corruption inversely correlates with authority, but has some variation.
   // (Strict factions are less likely to offer bribes.)
-  p.corruption = (0.25 + 0.75 * corruptionRaw) * (1.05 - 0.70 * authority);
-  p.corruption = std::clamp(p.corruption, 0.05, 1.0);
+  p.corruption = std::clamp(fp.corruption, 0.05, 1.0);
 
   // Fine schedule. Keep close to legacy defaults but allow meaningful variance.
   p.fineBaseCr = 140.0 + 280.0 * authority;   // [140, 420]
