@@ -225,6 +225,10 @@ void stepMissiles(std::vector<Missile>& missiles,
 
     math::Vec3d desiredDir = v.normalized();
     const SphereTarget* tgt = nullptr;
+
+    // "Lock" score used to compare against decoys (inverse-square falloff).
+    double targetScore = 0.0;
+
     if (m.hasTarget && targets && targetCount > 0) {
       for (std::size_t i = 0; i < targetCount; ++i) {
         const SphereTarget& t = targets[i];
@@ -249,8 +253,60 @@ void stepMissiles(std::vector<Missile>& missiles,
           const math::Vec3d to = tgt->centerKm - m.posKm;
           if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
         }
+
+        const math::Vec3d toTgt = tgt->centerKm - m.posKm;
+        targetScore = 1.0 / (toTgt.lengthSq() + 1.0e-9);
+      }
+
+      // --- Countermeasure / decoy attraction ---
+      const SphereTarget* bestDecoy = nullptr;
+      double bestDecoyScore = 0.0;
+
+      if (targetScore > 0.0) {
+        const math::Vec3d fwd = v.normalized();
+        const double fovCos = std::clamp(m.seekerFovCos, -1.0, 1.0);
+
+        for (std::size_t i = 0; i < targetCount; ++i) {
+          const SphereTarget& t = targets[i];
+          if (t.kind != CombatTargetKind::Decoy) continue;
+
+          const double strength = (m.seeker == MissileSeekerType::Radar) ? t.decoyRadar : t.decoyHeat;
+          if (strength <= 0.0) continue;
+
+          const math::Vec3d to = t.centerKm - m.posKm;
+          const double distSq = to.lengthSq();
+          if (distSq < 1e-12) continue;
+
+          const math::Vec3d toDir = to.normalized();
+          const double cosAng = math::dot(fwd, toDir);
+          if (cosAng < fovCos) continue;
+
+          const double score = (strength * std::max(0.0, cosAng)) / (distSq + 1.0e-9);
+          if (score > bestDecoyScore) {
+            bestDecoyScore = score;
+            bestDecoy = &t;
+          }
+        }
+      }
+
+      const double resist = std::max(0.0, m.decoyResistance);
+      if (bestDecoy && bestDecoyScore > targetScore * resist) {
+        const auto lead = solveProjectileLead(m.posKm,
+                                              /*shooterVelKmS=*/{0, 0, 0},
+                                              bestDecoy->centerKm,
+                                              bestDecoy->velKmS,
+                                              speed,
+                                              /*maxTimeSec=*/1.0e6,
+                                              /*minTimeSec=*/1.0e-3);
+        if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
+          desiredDir = lead->aimDirWorld;
+        } else {
+          const math::Vec3d to = bestDecoy->centerKm - m.posKm;
+          if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
+        }
       }
     }
+
 
     const double maxTurn = std::max(0.0, m.turnRateRadS) * dtSim;
     const math::Vec3d newDir = rotateTowards(v.normalized(), desiredDir, maxTurn);

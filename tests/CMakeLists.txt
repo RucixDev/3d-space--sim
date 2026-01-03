@@ -33,11 +33,13 @@ add_executable(stellar_tests
   test_trade_loops.cpp
   test_trade_loops_parallel.cpp
   test_trade_runs.cpp
+  test_trade_runs_parallel.cpp
   test_ship.cpp
   test_ship_loadout.cpp
   test_shipyard_service.cpp
   test_power_distributor.cpp
   test_flight_controller.cpp
+  test_nav_assist.cpp
   test_intercept_course.cpp
   test_interdiction.cpp
   test_combat.cpp

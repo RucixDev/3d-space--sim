@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+namespace stellar::core { class JobSystem; }
+
 namespace stellar::sim {
 
 class Universe;
@@ -132,5 +134,31 @@ std::vector<TradeRun> planTradeRuns(Universe& u,
                                     std::size_t maxSystems,
                                     const TradeRunScanParams& params,
                                     TradeRunFeeRateFn feeRate = {});
+
+
+// Parallel variant of planTradeRuns() using a caller-provided JobSystem.
+//
+// This pre-resolves station data and snapshots station economy states on the
+// calling thread (to avoid thread-safety issues with Universe caches), then
+// computes the heavy cargo-manifest legs in parallel.
+std::vector<TradeRun> planTradeRunsParallel(core::JobSystem& jobs,
+                                            Universe& u,
+                                            const SystemStub& originStub,
+                                            const Station& originStation,
+                                            double timeDays,
+                                            const std::vector<SystemStub>& candidates,
+                                            const TradeRunScanParams& params,
+                                            TradeRunFeeRateFn feeRate = {});
+
+// Convenience overload: performs a queryNearbyParallel() centered at originStub.posLy.
+std::vector<TradeRun> planTradeRunsParallel(core::JobSystem& jobs,
+                                            Universe& u,
+                                            const SystemStub& originStub,
+                                            const Station& originStation,
+                                            double timeDays,
+                                            double radiusLy,
+                                            std::size_t maxSystems,
+                                            const TradeRunScanParams& params,
+                                            TradeRunFeeRateFn feeRate = {});
 
 } // namespace stellar::sim

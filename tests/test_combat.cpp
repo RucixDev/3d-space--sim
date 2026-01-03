@@ -1,4 +1,5 @@
 #include "stellar/sim/Combat.h"
+#include "stellar/sim/Countermeasures.h"
 
 #include <cmath>
 #include <iostream>
@@ -148,6 +149,107 @@ int test_combat() {
       std::cerr << "[test_combat] missile should be consumed on detonation. ttl="
                 << (ms.empty() ? -1.0 : ms[0].ttlSimSec) << "\n";
       ++fails;
+    }
+  }
+
+
+  // --- Countermeasures integrate + expire ---
+  {
+    std::vector<sim::Countermeasure> cms;
+    sim::Countermeasure c{};
+    c.id = 1;
+    c.posKm = {0, 0, 0};
+    c.velKmS = {0, 0, 1};
+    c.radiusKm = 0.1;
+    c.ttlSimSec = 2.0;
+    c.ttlMaxSimSec = 2.0;
+    c.heatStrength = 10.0;
+    c.radarStrength = 0.0;
+    cms.push_back(c);
+
+    sim::stepCountermeasures(cms, 1.0);
+    if (cms.size() != 1 || !approx(cms[0].posKm.z, 1.0) || !approx(cms[0].ttlSimSec, 1.0)) {
+      std::cerr << "[test_combat] countermeasure integrate failed. size=" << cms.size()
+                << " z=" << (cms.empty() ? -1.0 : cms[0].posKm.z)
+                << " ttl=" << (cms.empty() ? -1.0 : cms[0].ttlSimSec) << "\n";
+      ++fails;
+    }
+
+    sim::stepCountermeasures(cms, 1.5);
+    if (!cms.empty()) {
+      std::cerr << "[test_combat] countermeasure should expire once ttl<=0. remaining=" << cms.size() << "\n";
+      ++fails;
+    }
+  }
+
+  // --- Missile seekers should prefer strong decoy targets (flares) ---
+  {
+    // Locked target (ship) is far.
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 1;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+
+    // A nearby flare-style decoy.
+    std::vector<sim::Countermeasure> cms;
+    sim::Countermeasure flare{};
+    flare.id = 100;
+    flare.type = sim::CountermeasureType::Flare;
+    flare.posKm = {10, 0, 10};
+    flare.velKmS = {0, 0, 0};
+    flare.radiusKm = 0.5;
+    flare.ttlSimSec = 10.0;
+    flare.ttlMaxSimSec = 10.0;
+    flare.heatStrength = 50.0; // strong
+    flare.radarStrength = 0.0;
+    cms.push_back(flare);
+
+    std::vector<sim::SphereTarget> targets;
+    targets.push_back(shipT);
+    sim::appendCountermeasureTargets(cms, targets);
+
+    // Missile starts pointing at the ship (positive Z), but should steer toward the decoy.
+    std::vector<sim::Missile> ms;
+    sim::Missile m{};
+    m.prevKm = {0, 0, 0};
+    m.posKm = {0, 0, 0};
+    m.velKmS = {0, 0, 10};
+    m.ttlSimSec = 30.0;
+    m.radiusKm = 0.1;
+    m.dmg = 1.0;
+    m.blastRadiusKm = 0.0;
+    m.turnRateRadS = 50.0; // allow aggressive steering
+
+    m.hasTarget = true;
+    m.targetKind = sim::CombatTargetKind::Ship;
+    m.targetId = 1;
+
+    m.seeker = sim::MissileSeekerType::Heat;
+    m.seekerFovCos = 0.0;
+    m.decoyResistance = 1.0;
+
+    const auto toDecoy = (flare.posKm - m.posKm).normalized();
+
+    ms.push_back(m);
+
+    std::vector<sim::MissileDetonation> dets;
+    std::vector<sim::MissileHit> hits;
+    sim::stepMissiles(ms, 0.1, targets.data(), targets.size(), dets, hits);
+
+    if (ms.empty()) {
+      std::cerr << "[test_combat] missile unexpectedly destroyed while testing decoy steering.\n";
+      ++fails;
+    } else {
+      const auto d = ms[0].velKmS.normalized();
+      const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+      if (dot < 0.95) {
+        std::cerr << "[test_combat] missile did not steer toward decoy. dot=" << dot
+                  << " vel=(" << d.x << "," << d.y << "," << d.z << ")" << "\n";
+        ++fails;
+      }
     }
   }
 

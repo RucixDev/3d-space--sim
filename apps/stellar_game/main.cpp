@@ -52,9 +52,11 @@
 #include "stellar/sim/Ship.h"
 #include "stellar/sim/ShipLoadout.h"
 #include "stellar/sim/Combat.h"
+#include "stellar/sim/Countermeasures.h"
 #include "stellar/sim/Ballistics.h"
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
+#include "stellar/sim/NavAssistComputer.h"
 #include "stellar/sim/SupercruiseComputer.h"
 #include "stellar/sim/Interdiction.h"
 #include "stellar/sim/EncounterDirector.h"
@@ -1665,6 +1667,11 @@ int main(int argc, char** argv) {
   // Guided projectiles (homing missiles)
   std::vector<sim::Missile> missiles;
 
+  // Countermeasures (flares/chaff) - exposed to missile seekers as decoy targets.
+  std::vector<sim::Countermeasure> countermeasures;
+  core::u64 nextCountermeasureId{1};
+  double countermeasureCooldownUntilDays{0.0};
+
   // Save/load
   const std::string savePath = "savegame.txt";
 
@@ -1920,6 +1927,12 @@ int main(int argc, char** argv) {
   sim::DockingComputer dockingComputer;
   bool dockingComputerDisengageOnManualInput = true;
   double dockingComputerManualDeadzone = 0.20;
+
+  // Normal-space navigation assist (approach / match velocity).
+  sim::NavAssistComputer navAssist;
+  sim::NavAssistResult navAssistLast{};
+  bool navAssistDisengageOnManualInput = true;
+  double navAssistManualDeadzone = 0.20;
 
   // Local reference frame ("space is local" feel near moving bodies)
   bool localFrameEnabled = true;
@@ -3652,12 +3665,179 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           }
         }
 
+        auto resolveNavAssistTarget = [&](math::Vec3d& outPosKm,
+                                          math::Vec3d& outVelKmS,
+                                          double& outSuggestedDistKm,
+                                          std::string& outName) -> bool {
+          if (!currentSystem) return false;
+          switch (target.kind) {
+            case TargetKind::Station: {
+              if (target.index >= currentSystem->stations.size()) return false;
+              const auto& st = currentSystem->stations[target.index];
+              outPosKm = stationPosKm(st, timeDays);
+              outVelKmS = stationVelKmS(st, timeDays);
+              outSuggestedDistKm = std::max(st.radiusKm * 12.0, st.approachRadiusKm * 1.2);
+              outName = st.name;
+              return true;
+            }
+            case TargetKind::Planet: {
+              if (target.index >= currentSystem->planets.size()) return false;
+              const auto& p = currentSystem->planets[target.index];
+              outPosKm = planetPosKm(p, timeDays);
+              outVelKmS = planetVelKmS(p, timeDays);
+              const double rKm = std::max(1.0, p.radiusEarth) * 6371.0;
+              outSuggestedDistKm = rKm * 1.5;
+              outName = p.name;
+              return true;
+            }
+            case TargetKind::Contact: {
+              if (target.index >= contacts.size()) return false;
+              const auto& c = contacts[target.index];
+              if (!c.alive) return false;
+              outPosKm = c.ship.positionKm();
+              outVelKmS = c.ship.velocityKmS();
+              outSuggestedDistKm = 3000.0;
+              outName = c.name;
+              return true;
+            }
+            case TargetKind::Cargo: {
+              if (target.index >= floatingCargo.size()) return false;
+              const auto& pod = floatingCargo[target.index];
+              outPosKm = pod.posKm;
+              outVelKmS = pod.velKmS;
+              outSuggestedDistKm = 1500.0;
+              outName = econ::commodityDef(pod.commodity).name;
+              return true;
+            }
+            case TargetKind::Asteroid: {
+              if (target.index >= asteroids.size()) return false;
+              const auto& a = asteroids[target.index];
+              if (a.remainingUnits <= 0.0) return false;
+              outPosKm = a.posKm;
+              outVelKmS = {0, 0, 0};
+              outSuggestedDistKm = std::max(a.radiusKm * 1.25, 2500.0);
+              outName = "Asteroid";
+              return true;
+            }
+            case TargetKind::Signal: {
+              if (target.index >= signals.size()) return false;
+              const auto& s = signals[target.index];
+              if (s.expireDay > 0.0 && timeDays > s.expireDay) return false;
+              outPosKm = s.posKm;
+              outVelKmS = {0, 0, 0};
+              outSuggestedDistKm = 3500.0;
+              outName = signalTypeName(s.type);
+              return true;
+            }
+            default:
+              return false;
+          }
+        };
+
+        if (key(controls.actions.navAssistApproach) && !io.WantCaptureKeyboard) {
+          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Approach) {
+            navAssist.disengage();
+            navAssistLast = {};
+            toast(toasts, "Nav assist (approach) disengaged.", 1.6);
+          } else {
+            if (docked) {
+              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+            } else {
+              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+              double standoffKm = 0.0;
+              std::string name;
+              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                toast(toasts, "No valid target for nav assist.", 1.8);
+              } else {
+                // Docking computer and nav assist fight for control; always disengage docking.
+                if (autopilot) {
+                  autopilot = false;
+                  dockingComputer.reset();
+                }
+                navAssist.engageApproach(standoffKm);
+                navAssistLast = {};
+                toast(toasts,
+                      std::string("Nav assist: approach ") + name + " (hold " +
+                        std::to_string((int)std::llround(standoffKm)) + " km) [" +
+                        game::chordLabel(controls.actions.navAssistApproach) + "]",
+                      2.2);
+              }
+            }
+          }
+        }
+
+        if (key(controls.actions.navAssistMatchVelocity) && !io.WantCaptureKeyboard) {
+          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::MatchVelocity) {
+            navAssist.disengage();
+            navAssistLast = {};
+            toast(toasts, "Nav assist (match velocity) disengaged.", 1.6);
+          } else {
+            if (docked) {
+              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+            } else {
+              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+              double standoffKm = 0.0;
+              std::string name;
+              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                toast(toasts, "No valid target for nav assist.", 1.8);
+              } else {
+                if (autopilot) {
+                  autopilot = false;
+                  dockingComputer.reset();
+                }
+                navAssist.engageMatchVelocity(ship, tPos);
+                navAssistLast = {};
+                toast(toasts,
+                      std::string("Nav assist: match velocity ") + name + " [" +
+                        game::chordLabel(controls.actions.navAssistMatchVelocity) + "]",
+                      2.2);
+              }
+            }
+          }
+        }
+
         if (key(controls.actions.toggleCargoScoop) && !io.WantCaptureKeyboard) {
           cargoScoopDeployed = !cargoScoopDeployed;
           toast(toasts,
                 std::string("Cargo scoop ") + (cargoScoopDeployed ? "DEPLOYED" : "RETRACTED") + " (" +
                   game::chordLabel(controls.actions.toggleCargoScoop) + ")",
                 1.8);
+        }
+
+        if (key(controls.actions.deployCountermeasure) && !io.WantCaptureKeyboard && !docked) {
+          // Simple flare burst (heat-seeker decoy). The sim is headless/deterministic;
+          // the game builds decoy SphereTargets and missiles may bias toward them.
+          const double cdDays = 1.2 / 86400.0;
+          if (timeDays >= countermeasureCooldownUntilDays) {
+            sim::CountermeasureBurstParams p{};
+            p.count = 10;
+            p.ttlSimSec = 7.0;
+            p.radiusKm = 0.18;
+            p.ejectSpeedKmS = 0.12;
+            p.spread = 0.45;
+            p.heatStrength = 10.0;
+
+            sim::spawnCountermeasureBurst(countermeasures,
+                                          nextCountermeasureId,
+                                          sim::CountermeasureType::Flare,
+                                          ship.positionKm(),
+                                          ship.velocityKmS(),
+                                          ship.right(),
+                                          ship.up(),
+                                          ship.forward(),
+                                          p);
+
+            countermeasureCooldownUntilDays = timeDays + cdDays;
+            toast(toasts,
+                  std::string("Flares deployed (") + game::chordLabel(controls.actions.deployCountermeasure) + ")",
+                  1.6);
+          } else {
+            toast(toasts, "Countermeasure launcher cooling down.", 1.0);
+          }
         }
 
         if (key(controls.actions.cycleTargets) && !io.WantCaptureKeyboard && !docked && currentSystem) {
@@ -4526,6 +4706,117 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           dockingComputer.reset();
 
           toast(toasts, "Docked at " + st.name + " (docking computer)", 2.5);
+        }
+      }
+    }
+
+    // Normal-space nav assist: approach / match velocity to the current target.
+    // (Automatically disengages if the simulation leaves normal-space.)
+    if (navAssist.active() && (docked || autopilot || fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle)) {
+      navAssist.disengage();
+      navAssistLast = {};
+    }
+
+    if (navAssist.active() && !docked && !autopilot && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle &&
+        currentSystem && !captureKeys) {
+
+      // Optional: disengage if the player provides a clear manual input signal.
+      if (navAssistDisengageOnManualInput) {
+        auto magMax = [](double a, double b, double c) {
+          return std::max(std::abs(a), std::max(std::abs(b), std::abs(c)));
+        };
+        const double thrustMag = magMax(input.thrustLocal.x, input.thrustLocal.y, input.thrustLocal.z);
+        const double torqueMag = magMax(input.torqueLocal.x, input.torqueLocal.y, input.torqueLocal.z);
+        if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone || input.boost || input.brake) {
+          navAssist.disengage();
+          navAssistLast = {};
+          toast(toasts, "Nav assist disengaged (manual override).", 1.6);
+        }
+      }
+
+      if (navAssist.active()) {
+        math::Vec3d tPosKm{0,0,0};
+        math::Vec3d tVelKmS{0,0,0};
+        bool ok = false;
+
+        switch (target.kind) {
+          case TargetKind::Station: {
+            if (target.index < currentSystem->stations.size()) {
+              const auto& st = currentSystem->stations[target.index];
+              tPosKm = stationPosKm(st, timeDays);
+              tVelKmS = stationVelKmS(st, timeDays);
+              ok = true;
+            }
+            break;
+          }
+          case TargetKind::Planet: {
+            if (target.index < currentSystem->planets.size()) {
+              const auto& p = currentSystem->planets[target.index];
+              tPosKm = planetPosKm(p, timeDays);
+              tVelKmS = planetVelKmS(p, timeDays);
+              ok = true;
+            }
+            break;
+          }
+          case TargetKind::Contact: {
+            if (target.index < contacts.size() && contacts[target.index].alive) {
+              const auto& c = contacts[target.index];
+              tPosKm = c.ship.positionKm();
+              tVelKmS = c.ship.velocityKmS();
+              ok = true;
+            }
+            break;
+          }
+          case TargetKind::Cargo: {
+            if (target.index < floatingCargo.size()) {
+              const auto& pod = floatingCargo[target.index];
+              tPosKm = pod.posKm;
+              tVelKmS = pod.velKmS;
+              ok = true;
+            }
+            break;
+          }
+          case TargetKind::Asteroid: {
+            if (target.index < asteroids.size() && asteroids[target.index].remainingUnits > 0.0) {
+              const auto& a = asteroids[target.index];
+              tPosKm = a.posKm;
+              tVelKmS = {0,0,0};
+              ok = true;
+            }
+            break;
+          }
+          case TargetKind::Signal: {
+            if (target.index < signals.size()) {
+              const auto& s = signals[target.index];
+              if (!(s.expireDay > 0.0 && timeDays > s.expireDay)) {
+                tPosKm = s.posKm;
+                tVelKmS = {0,0,0};
+                ok = true;
+              }
+            }
+            break;
+          }
+          default:
+            break;
+        }
+
+        if (!ok) {
+          navAssist.disengage();
+          navAssistLast = {};
+          toast(toasts, "Nav assist disengaged (lost target).", 1.6);
+        } else {
+          navAssistLast = navAssist.update(ship, tPosKm, tVelKmS, dtSim);
+
+          input.thrustLocal = navAssistLast.input.thrustLocal;
+          input.torqueLocal = navAssistLast.input.torqueLocal;
+          input.dampers = navAssistLast.input.dampers;
+          input.boost = navAssistLast.input.boost;
+          input.brake = navAssistLast.input.brake;
+
+          if (navAssistLast.arrived && navAssist.params().disengageOnArrive) {
+            navAssist.disengage();
+            toast(toasts, "Nav assist disengaged (arrived).", 1.6);
+          }
         }
       }
     }
@@ -7947,10 +8238,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // Projectiles + missiles update (ballistic slugs + guided explosives)
       {
+        // Drift + expire countermeasures (flares/chaff).
+        sim::stepCountermeasures(countermeasures, dtSim);
+
         // Build a light-weight target list for collision tests.
         // (We include the player so NPC projectiles can hit later; player shots ignore it.)
         std::vector<sim::SphereTarget> projTargets;
-        projTargets.reserve(1 + contacts.size() + asteroids.size());
+        projTargets.reserve(1 + contacts.size() + asteroids.size() + countermeasures.size());
 
         sim::SphereTarget playerT{};
         playerT.kind = sim::CombatTargetKind::Player;
@@ -7985,6 +8279,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           t.radiusKm = a.radiusKm;
           projTargets.push_back(t);
         }
+
+        // Countermeasure decoys (flares/chaff) — missiles may steer toward these.
+        sim::appendCountermeasureTargets(countermeasures, projTargets);
 
         std::vector<sim::ProjectileHit> hits;
         sim::stepProjectiles(

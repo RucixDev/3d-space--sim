@@ -1591,7 +1591,8 @@ int main(int argc, char** argv) {
       }
     }
 
-    const auto runs = sim::planTradeRuns(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
+    const auto runs = jobs ? sim::planTradeRunsParallel(*jobs, u, fromStub, fromSt, timeDays, systems, scan, feeEff)
+                            : sim::planTradeRuns(u, fromStub, fromSt, timeDays, systems, scan, feeEff);
 
     if (json) {
       j.key("tradeRuns");

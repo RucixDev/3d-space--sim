@@ -32,6 +32,14 @@ enum class CombatTargetKind : core::u8 {
   Ship = 0,
   Asteroid = 1,
   Player = 2,
+  Decoy = 3,
+};
+
+// Missile seeker channel for simple countermeasure logic.
+// Heat seekers are attracted to flares; Radar seekers are attracted to chaff/jammers.
+enum class MissileSeekerType : core::u8 {
+  Heat = 0,
+  Radar = 1,
 };
 
 struct SphereTarget {
@@ -50,7 +58,13 @@ struct SphereTarget {
   //   dot(rayDir, (center-origin).normalized()) >= minAimCos.
   // Use -1.0 to disable the filter.
   double minAimCos{-1.0};
+
+  // Optional decoy signatures for missile seekers.
+  // Only consulted when kind == CombatTargetKind::Decoy.
+  double decoyHeat{0.0};
+  double decoyRadar{0.0};
 };
+
 
 struct RaycastHit {
   bool hit{false};
@@ -140,6 +154,16 @@ struct Missile {
 
   // Max steering rate (rad/s) toward the desired aim direction.
   double turnRateRadS{0.0};
+
+  // Seeker tuning (optional): used for countermeasure / decoy attraction.
+  MissileSeekerType seeker{MissileSeekerType::Heat};
+  // Minimum aim cone cosine for decoy consideration (dot(velDir, toDecoyDir)).
+  // 1.0 = only straight ahead, 0.0 = 90 degrees, -1.0 = any direction.
+  double seekerFovCos{0.0};
+  // How resistant the missile is to decoys. A decoy must exceed
+  //   targetScore * decoyResistance
+  // to override guidance.
+  double decoyResistance{1.0};
 
   bool fromPlayer{false};
   core::u64 shooterId{0};

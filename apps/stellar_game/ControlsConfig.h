@@ -90,6 +90,8 @@ struct ActionBinds {
   // Flight/gameplay
   KeyChord pause;
   KeyChord toggleAutopilot;
+  KeyChord navAssistApproach;
+  KeyChord navAssistMatchVelocity;
   KeyChord toggleMouseSteer;
   KeyChord supercruise;
   KeyChord fsdJump;
@@ -108,6 +110,7 @@ struct ActionBinds {
   KeyChord complyOrSubmit;
   KeyChord bribe;
   KeyChord toggleCargoScoop;
+  KeyChord deployCountermeasure;
 };
 
 struct ControlsConfig {
@@ -295,6 +298,8 @@ inline ControlsConfig makeDefaultControls() {
 
   c.actions.pause = {SDL_SCANCODE_SPACE, KMOD_NONE};
   c.actions.toggleAutopilot = {SDL_SCANCODE_P, KMOD_NONE};
+  c.actions.navAssistApproach = {SDL_SCANCODE_PAGEUP, KMOD_NONE};
+  c.actions.navAssistMatchVelocity = {SDL_SCANCODE_PAGEDOWN, KMOD_NONE};
   c.actions.toggleMouseSteer = {SDL_SCANCODE_M, KMOD_NONE};
   c.actions.supercruise = {SDL_SCANCODE_H, KMOD_NONE};
   c.actions.fsdJump = {SDL_SCANCODE_J, KMOD_NONE};
@@ -313,6 +318,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.complyOrSubmit = {SDL_SCANCODE_I, KMOD_NONE};
   c.actions.bribe = {SDL_SCANCODE_C, KMOD_NONE};
   c.actions.toggleCargoScoop = {SDL_SCANCODE_O, KMOD_NONE};
+  c.actions.deployCountermeasure = {SDL_SCANCODE_BACKSPACE, KMOD_NONE};
 
   return c;
 }
@@ -385,6 +391,8 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "ToggleTacticalOverlay", a.toggleTacticalOverlay);
   saveKeyChord(f, "Pause", a.pause);
   saveKeyChord(f, "ToggleAutopilot", a.toggleAutopilot);
+  saveKeyChord(f, "NavAssistApproach", a.navAssistApproach);
+  saveKeyChord(f, "NavAssistMatchVelocity", a.navAssistMatchVelocity);
   saveKeyChord(f, "ToggleMouseSteer", a.toggleMouseSteer);
   saveKeyChord(f, "Supercruise", a.supercruise);
   saveKeyChord(f, "FsdJump", a.fsdJump);
@@ -400,6 +408,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "ComplyOrSubmit", a.complyOrSubmit);
   saveKeyChord(f, "Bribe", a.bribe);
   saveKeyChord(f, "ToggleCargoScoop", a.toggleCargoScoop);
+  saveKeyChord(f, "DeployCountermeasure", a.deployCountermeasure);
 
   return true;
 }
@@ -449,6 +458,8 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("ToggleTacticalOverlay", &a.toggleTacticalOverlay);
     addB("Pause", &a.pause);
     addB("ToggleAutopilot", &a.toggleAutopilot);
+    addB("NavAssistApproach", &a.navAssistApproach);
+    addB("NavAssistMatchVelocity", &a.navAssistMatchVelocity);
     addB("ToggleMouseSteer", &a.toggleMouseSteer);
     addB("Supercruise", &a.supercruise);
     addB("FsdJump", &a.fsdJump);
@@ -464,6 +475,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("ComplyOrSubmit", &a.complyOrSubmit);
     addB("Bribe", &a.bribe);
     addB("ToggleCargoScoop", &a.toggleCargoScoop);
+    addB("DeployCountermeasure", &a.deployCountermeasure);
 
     auto addA = [&](const char* n, AxisPair* p) { axisMap[lowerAscii(n)] = p; };
     addA("ThrustForward", &cfg.axes.thrustForward);

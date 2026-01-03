@@ -1,3 +1,55 @@
+## 2026-01-03 (Patch) - Normal-Space Nav Assist (Approach + Match Velocity)
+
+This round adds a **normal-space navigation assist computer** that sits between raw manual thrust and the
+full **DockingComputer**. It provides two practical modes aimed at moment-to-moment piloting:
+
+- **Nav Assist: Approach** — closes to a configurable standoff distance and stabilizes there.
+- **Nav Assist: Match Velocity** — matches a target's velocity and holds the current separation (great for rendezvous).
+
+Highlights:
+
+- **New core module:** `stellar/sim/NavAssistComputer.*`
+  - Deterministic, headless, testable guidance built on the existing `FlightController` (including lead/intercept).
+  - Two independent tuning profiles (approach vs. match velocity), plus optional auto-disengage on arrival.
+- **Game integration:** new keybinds in `stellar_game`
+  - **Nav Assist: Approach** (default: PageUp)
+  - **Nav Assist: Match Velocity** (default: PageDown)
+  - Safe behavior: disengages on strong manual input and automatically drops when leaving normal-space.
+- **Tests:** new `test_nav_assist` validates approach convergence and moving-target velocity matching.
+
+
+## 2026-01-03 (Patch) - Parallel Trade Run Planner + Sandbox Multi-threaded Scanning
+
+This round upgrades the **multi-leg trade run planner** with a **parallel execution path** backed by the engine
+`JobSystem`, making large station scans dramatically faster when `--threads` is enabled in `stellar_sandbox`.
+
+- **New planner API:** `stellar::sim::planTradeRunsParallel(JobSystem&, ...)`
+  - Snapshots station data + station economy states on the calling thread (avoids `Universe` cache thread-safety issues).
+  - Computes per-stop outgoing leg manifests in parallel (cargo-manifest planner is the hot path).
+  - Preserves deterministic ordering / tie-breaks so results match the serial planner.
+- **Trade run routing micro-optimization:** if two systems are within `jumpRangeLy`, the planner skips A* and emits the
+  direct 1-hop route (same result, less CPU).
+- **Sandbox upgrade:** `stellar_sandbox --tradeRun` automatically uses the parallel planner when `--threads` creates a pool.
+- **New tests:** `test_trade_runs_parallel` validates serial/parallel equivalence and determinism.
+
+
+## 2026-01-02 (Patch) - Missile Countermeasures (Flares/Chaff) + Decoy-aware Seeker Guidance
+
+This round adds a first-pass **countermeasure system** (flares/chaff) and upgrades missile guidance
+so seeker missiles can be **fooled by decoy targets** exposed as `CombatTargetKind::Decoy`.
+
+- **New sim module:** `stellar/sim/Countermeasures.*`
+  - Deterministic flare/chaff burst spawner + lifetime integration.
+  - Exposes decoys as `SphereTarget` entries with `decoyHeat` / `decoyRadar` signatures (strength decays with TTL).
+- **Combat upgrade:** decoy-aware missile seekers
+  - New `MissileSeekerType` + seeker params on `sim::Missile` (`seekerFovCos`, `decoyResistance`).
+  - `stepMissiles()` compares locked-target score vs best decoy score and biases steering accordingly.
+- **Game integration:** deploy flares in `stellar_game`
+  - New keybind action: **Deploy Countermeasure** (default: Backspace).
+  - Active countermeasures are appended to the projectile/missile target list so they can attract/hit.
+- **Tests:** extended `test_combat` for countermeasure integration and decoy steering.
+
+
 ## 2026-01-01 (Patch) - Multi-Leg Trade Run Planner (Beam Search) + Sandbox --tradeRun
 
 This round adds a **multi-leg trade run planner** that can suggest profitable chains like

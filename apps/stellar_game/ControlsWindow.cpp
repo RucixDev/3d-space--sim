@@ -383,6 +383,8 @@ void drawControlsWindow(ControlsWindowState& st,
 
   addAction("Pause", a.pause);
   addAction("Toggle Autopilot", a.toggleAutopilot);
+  addAction("Nav Assist: Approach", a.navAssistApproach);
+  addAction("Nav Assist: Match Velocity", a.navAssistMatchVelocity);
   addAction("Toggle Mouse steer", a.toggleMouseSteer);
   addAction("Supercruise", a.supercruise);
   addAction("FSD Jump", a.fsdJump);
@@ -398,6 +400,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Comply / submit", a.complyOrSubmit);
   addAction("Bribe", a.bribe);
   addAction("Toggle Cargo Scoop", a.toggleCargoScoop);
+  addAction("Deploy Countermeasure", a.deployCountermeasure);
 
   auto addHold = [&](const char* name, SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return;
@@ -761,6 +764,8 @@ void drawControlsWindow(ControlsWindowState& st,
 
     add("Pause", controls.actions.pause, ad.pause);
     add("Toggle Autopilot", controls.actions.toggleAutopilot, ad.toggleAutopilot);
+    add("Nav Assist: Approach", controls.actions.navAssistApproach, ad.navAssistApproach);
+    add("Nav Assist: Match Velocity", controls.actions.navAssistMatchVelocity, ad.navAssistMatchVelocity);
     add("Mouse steer", controls.actions.toggleMouseSteer, ad.toggleMouseSteer);
     add("Supercruise", controls.actions.supercruise, ad.supercruise);
     add("FSD Jump", controls.actions.fsdJump, ad.fsdJump);
@@ -779,6 +784,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Comply / submit", controls.actions.complyOrSubmit, ad.complyOrSubmit);
     add("Bribe", controls.actions.bribe, ad.bribe);
     add("Toggle Cargo Scoop", controls.actions.toggleCargoScoop, ad.toggleCargoScoop);
+    add("Deploy Countermeasure", controls.actions.deployCountermeasure, ad.deployCountermeasure);
 
     std::vector<ActionRow> filtered;
     filtered.reserve(rows.size());

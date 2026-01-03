@@ -120,7 +120,9 @@ set(STELLAR_CORE_SOURCES
   src/sim/Ship.cpp
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
+  src/sim/Countermeasures.cpp
   src/sim/FlightController.cpp
+  src/sim/NavAssistComputer.cpp
   src/sim/SupercruiseComputer.cpp
   src/sim/Interdiction.cpp
   src/sim/EncounterDirector.cpp
