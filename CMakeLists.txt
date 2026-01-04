@@ -108,6 +108,7 @@ set(STELLAR_CORE_SOURCES
   src/ui/HudSettings.cpp
   src/ui/Livery.cpp
   src/ui/UiSettings.cpp
+  src/ui/UiWorkspaces.cpp
 
   src/proc/Noise.cpp
   src/proc/NameGenerator.cpp
@@ -142,6 +143,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
   src/sim/ShipyardService.cpp
+  src/sim/Insurance.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
   src/sim/TradeScanner.cpp

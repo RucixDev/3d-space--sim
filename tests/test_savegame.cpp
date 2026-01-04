@@ -62,6 +62,7 @@ int test_savegame() {
   s.currentSystem = 999001;
   s.dockedStation = 1002003;
   s.credits = 9876.5;
+  s.insuranceDebtCr = 321.0;
   s.shipPosKm = {1.0, 2.0, 3.0};
   s.shipVelKmS = {0.1, 0.0, -0.2};
   s.fuel = 12.3;
@@ -213,6 +214,10 @@ int test_savegame() {
   }
   if (!nearly(l.credits, s.credits)) {
     std::cerr << "[test_savegame] credits mismatch\n";
+    ++fails;
+  }
+  if (!nearly(l.insuranceDebtCr, s.insuranceDebtCr)) {
+    std::cerr << "[test_savegame] insuranceDebtCr mismatch\n";
     ++fails;
   }
 

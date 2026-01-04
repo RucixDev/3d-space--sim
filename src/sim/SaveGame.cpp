@@ -31,6 +31,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "shipAngVel " << s.shipAngVelRadS.x << " " << s.shipAngVelRadS.y << " " << s.shipAngVelRadS.z << "\n";
 
   f << "credits " << s.credits << "\n";
+  f << "insuranceDebtCr " << s.insuranceDebtCr << "\n";
 
   // Ship meta / progression
   f << "fuel " << s.fuel << "\n";
@@ -312,6 +313,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.shipAngVelRadS.x >> out.shipAngVelRadS.y >> out.shipAngVelRadS.z;
     } else if (key == "credits") {
       f >> out.credits;
+    } else if (key == "insuranceDebtCr") {
+      f >> out.insuranceDebtCr;
     } else if (key == "fuel") {
       f >> out.fuel;
     } else if (key == "fuelMax") {

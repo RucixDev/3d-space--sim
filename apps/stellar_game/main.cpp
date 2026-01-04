@@ -35,6 +35,7 @@
 #include "stellar/ui/HudSettings.h"
 #include "stellar/ui/Livery.h"
 #include "stellar/ui/UiSettings.h"
+#include "stellar/ui/UiWorkspaces.h"
 #include "stellar/ui/Bookmarks.h"
 #include "stellar/ui/FuzzySearch.h"
 #include "stellar/sim/Orbit.h"
@@ -45,6 +46,7 @@
 #include "stellar/sim/Distress.h"
 #include "stellar/sim/Signals.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/Insurance.h"
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/IndustryService.h"
 #include "stellar/sim/ShipyardService.h"
@@ -872,11 +874,31 @@ int main(int argc, char** argv) {
 
   (void)ui::loadUiSettingsFromFile(uiSettingsPath, uiSettings);
 
+  // ---- UI workspaces (persistent) ----
+  // Workspaces let users quickly switch between different window sets and
+  // different Dear ImGui ini layouts.
+  const std::string uiWorkspacesPath = ui::defaultUiWorkspacesPath();
+  ui::UiWorkspaces uiWorkspaces = ui::makeDefaultUiWorkspaces();
+  bool uiWorkspacesDirty = false;
+  bool showUiWorkspacesWindow = false;
+
+  (void)ui::loadUiWorkspacesFromFile(uiWorkspacesPath, uiWorkspaces);
+  bool uiWorkspacesAutoSaveOnExit = uiWorkspaces.autoSaveOnExit;
+
   // Allow users to keep multiple ImGui layout profiles by pointing ImGui at a
   // different ini file.
   std::string uiIniFilename = uiSettings.imguiIniFile;
+  if (const ui::UiWorkspace* aws = ui::activeWorkspace(uiWorkspaces)) {
+    if (!aws->imguiIniFile.empty()) {
+      uiIniFilename = aws->imguiIniFile;
+    }
+  }
   if (uiIniFilename.empty()) uiIniFilename = "imgui.ini";
   io.IniFilename = uiIniFilename.c_str();
+
+  // Keep the UiSettings struct in sync with the active workspace selection
+  // (without marking the settings dirty).
+  uiSettings.imguiIniFile = uiIniFilename;
 
   ui::UiTheme uiTheme = uiSettings.theme;
 
@@ -1441,6 +1463,7 @@ int main(int argc, char** argv) {
 
   // Economy
   double credits = 2500.0;
+  double insuranceDebtCr = 0.0; // outstanding rebuy loan
   double explorationDataCr = 0.0; // sellable scan data
   std::array<double, econ::kCommodityCount> cargo{};
   double cargoCapacityKg = 420.0;
@@ -2062,6 +2085,113 @@ int main(int argc, char** argv) {
 
   // Wire the toast history sink now that timeDays + storage exist.
   setToastHistorySink(&toastHistory, &timeDays);
+
+  // ---- UI Workspaces: snapshot + apply window visibility + layout ini ----
+  // Keys are intentionally short/human-readable so the file remains editable.
+  auto captureWorkspaceFromRuntime = [&](ui::UiWorkspace& ws) {
+    ws.imguiIniFile = uiIniFilename;
+    ws.windows.clear();
+
+    ws.windows["Galaxy"] = showGalaxy;
+    ws.windows["Ship"] = showShip;
+    ws.windows["Market"] = showEconomy;
+    ws.windows["Missions"] = showMissions;
+    ws.windows["Contacts"] = showContacts;
+    ws.windows["Scanner"] = showScanner;
+    ws.windows["Trade"] = showTrade;
+    ws.windows["Guide"] = showGuide;
+    ws.windows["Hangar"] = showHangar;
+    ws.windows["WorldVisuals"] = showWorldVisuals;
+    ws.windows["SpriteLab"] = showSprites;
+    ws.windows["VfxLab"] = showVfx;
+    ws.windows["PostFx"] = showPostFx;
+
+    ws.windows["Controls"] = controlsWindow.open;
+    ws.windows["Console"] = consoleWindow.open;
+    ws.windows["Notifications"] = showNotifications;
+    ws.windows["Bookmarks"] = showBookmarksWindow;
+
+    ws.windows["UiSettings"] = showUiSettingsWindow;
+    ws.windows["HudSettings"] = showHudSettingsWindow;
+    ws.windows["Workspaces"] = showUiWorkspacesWindow;
+  };
+
+  auto applyWorkspaceWindowsToRuntime = [&](const ui::UiWorkspace& ws) {
+    auto apply = [&](const char* key, bool& v) {
+      const auto it = ws.windows.find(key);
+      if (it != ws.windows.end()) v = it->second;
+    };
+
+    apply("Galaxy", showGalaxy);
+    apply("Ship", showShip);
+    apply("Market", showEconomy);
+    apply("Missions", showMissions);
+    apply("Contacts", showContacts);
+    apply("Scanner", showScanner);
+    apply("Trade", showTrade);
+    apply("Guide", showGuide);
+    apply("Hangar", showHangar);
+    apply("WorldVisuals", showWorldVisuals);
+    apply("SpriteLab", showSprites);
+    apply("VfxLab", showVfx);
+    apply("PostFx", showPostFx);
+
+    {
+      const bool wasOpen = controlsWindow.open;
+      apply("Controls", controlsWindow.open);
+      if (!wasOpen && controlsWindow.open) controlsWindow.focusFilter = true;
+    }
+    {
+      const bool wasOpen = consoleWindow.open;
+      apply("Console", consoleWindow.open);
+      if (!wasOpen && consoleWindow.open) consoleWindow.focusInput = true;
+    }
+    apply("Notifications", showNotifications);
+    apply("Bookmarks", showBookmarksWindow);
+
+    apply("UiSettings", showUiSettingsWindow);
+    apply("HudSettings", showHudSettingsWindow);
+    apply("Workspaces", showUiWorkspacesWindow);
+  };
+
+  auto activateWorkspace = [&](const ui::UiWorkspace& ws, bool loadIni) {
+    if (!ws.imguiIniFile.empty() && ws.imguiIniFile != uiIniFilename) {
+      // Persist current layout before switching away.
+      if (io.IniFilename && io.IniFilename[0] != '\0') {
+        ImGui::SaveIniSettingsToDisk(io.IniFilename);
+      }
+
+      uiIniFilename = ws.imguiIniFile;
+      io.IniFilename = uiIniFilename.c_str();
+      uiSettingsDirty = true; // ini file selection is part of UiSettings
+
+      if (loadIni && io.IniFilename && io.IniFilename[0] != '\0') {
+        ImGui::LoadIniSettingsFromDisk(io.IniFilename);
+      }
+    }
+
+    applyWorkspaceWindowsToRuntime(ws);
+  };
+
+  auto ensureWorkspaceBootstrap = [&]() {
+    if (uiWorkspaces.items.empty()) {
+      ui::UiWorkspace ws;
+      ws.name = "Default";
+      captureWorkspaceFromRuntime(ws);
+      uiWorkspaces.items.push_back(std::move(ws));
+      uiWorkspaces.active = "Default";
+      uiWorkspacesDirty = true;
+    }
+    if (uiWorkspaces.active.empty() && !uiWorkspaces.items.empty()) {
+      uiWorkspaces.active = uiWorkspaces.items.front().name;
+      uiWorkspacesDirty = true;
+    }
+  };
+
+  ensureWorkspaceBootstrap();
+  if (const ui::UiWorkspace* aws = ui::activeWorkspace(uiWorkspaces)) {
+    applyWorkspaceWindowsToRuntime(*aws);
+  }
 
   // Console: hook core logging + built-in commands.
   consoleWindow.simTimeDaysPtr = &timeDays;
@@ -3009,6 +3139,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.shipAngVelRadS = ship.angularVelocityRadS();
 
           s.credits = credits;
+          s.insuranceDebtCr = insuranceDebtCr;
           s.cargo = cargo;
           s.cargoCapacityKg = cargoCapacityKg;
           s.passengerSeats = passengerSeats;
@@ -3192,6 +3323,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             ship.setAngularVelocityRadS(s.shipAngVelRadS);
 
             credits = s.credits;
+            insuranceDebtCr = s.insuranceDebtCr;
             cargo = s.cargo;
 
             cargoCapacityKg = s.cargoCapacityKg;
@@ -8473,7 +8605,55 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Death / respawn
     if (playerHull <= 0.0) {
-      toast(toasts, "Ship destroyed! Respawning (lost cargo, -10% credits).", 4.0);
+      // Insurance rebuy: replacement cost scales with the player's ship progression.
+      // May issue an emergency loan; if the player cannot cover even with loan
+      // headroom, they get a basic loaner ship.
+      sim::InsurancePolicy pol{};
+      sim::PlayerShipEconomyState econShip{};
+      econShip.hull = shipHullClass;
+      econShip.thrusterMk = thrusterMk;
+      econShip.shieldMk = shieldMk;
+      econShip.distributorMk = distributorMk;
+      econShip.weaponPrimary = weaponPrimary;
+      econShip.weaponSecondary = weaponSecondary;
+      econShip.smuggleHoldMk = smuggleHoldMk;
+      econShip.cargoCapacityKg = cargoCapacityKg;
+      econShip.fuelMax = fuelMax;
+      econShip.passengerSeats = passengerSeats;
+      econShip.fsdRangeLy = fsdRangeLy;
+
+      const auto rebuy = sim::applyRebuyOnDeath(pol, econShip, credits, insuranceDebtCr);
+
+      if (rebuy.shipReset) {
+        shipHullClass = econShip.hull;
+        thrusterMk = econShip.thrusterMk;
+        shieldMk = econShip.shieldMk;
+        distributorMk = econShip.distributorMk;
+        weaponPrimary = econShip.weaponPrimary;
+        weaponSecondary = econShip.weaponSecondary;
+        smuggleHoldMk = econShip.smuggleHoldMk;
+        cargoCapacityKg = econShip.cargoCapacityKg;
+        fuelMax = econShip.fuelMax;
+        passengerSeats = econShip.passengerSeats;
+        fsdRangeLy = econShip.fsdRangeLy;
+        recalcPlayerStats();
+      }
+
+      {
+        std::string msg = "Ship destroyed! ";
+        const int rebuyCr = (int)std::round(rebuy.rebuyCostCr);
+        if (rebuy.result == sim::RebuyResult::Paid) {
+          msg += "Rebuy cost -" + std::to_string(rebuyCr) + " cr.";
+        } else if (rebuy.result == sim::RebuyResult::Loan) {
+          const int loanCr = (int)std::round(rebuy.loanTakenCr);
+          const int debtCr = (int)std::round(insuranceDebtCr);
+          msg += "Rebuy -" + std::to_string(rebuyCr) + " cr (loan " + std::to_string(loanCr) + "). Debt: " + std::to_string(debtCr) + " cr.";
+        } else {
+          msg += "Bankrupt. Issued loaner ship.";
+        }
+        msg += " (Cargo lost)";
+        toast(toasts, msg, 4.2);
+      }
 
       if (vfxParticlesEnabled && vfxExplosionsEnabled) {
         const double eBase = 2.2 * (double)vfxParticleIntensity;
@@ -8482,7 +8662,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       playerHull = playerHullMax;
       playerShield = playerShieldMax * 0.60;
-      credits *= 0.90;
       cargo.fill(0.0);
       fuel = fuelMax;
       supercruiseState = SupercruiseState::Idle;
@@ -9278,6 +9457,76 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::Separator();
         ImGui::MenuItem("Auto-save on exit", nullptr, &controlsAutoSaveOnExit);
         if (controlsDirty) {
+          ImGui::TextDisabled("(unsaved changes)");
+        }
+        ImGui::EndMenu();
+      }
+
+      if (ImGui::BeginMenu("Workspace")) {
+        // List available workspaces (sorted by name for stability).
+        std::vector<std::size_t> order;
+        order.reserve(uiWorkspaces.items.size());
+        for (std::size_t i = 0; i < uiWorkspaces.items.size(); ++i) order.push_back(i);
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+          return uiWorkspaces.items[a].name < uiWorkspaces.items[b].name;
+        });
+
+        if (!uiWorkspaces.active.empty()) {
+          ImGui::TextDisabled("Active: %s", uiWorkspaces.active.c_str());
+        }
+
+        for (std::size_t idx : order) {
+          const auto& ws = uiWorkspaces.items[idx];
+          if (ws.name.empty()) continue;
+          const bool isActive = (ws.name == uiWorkspaces.active);
+          if (ImGui::MenuItem(ws.name.c_str(), nullptr, isActive)) {
+            uiWorkspaces.active = ws.name;
+            uiWorkspacesDirty = true;
+            activateWorkspace(ws, /*loadIni=*/true);
+            toast(toasts, (std::string("Workspace: ") + ws.name).c_str(), 1.5);
+          }
+        }
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Capture current -> active")) {
+          if (ui::UiWorkspace* aws = ui::findWorkspace(uiWorkspaces, uiWorkspaces.active)) {
+            captureWorkspaceFromRuntime(*aws);
+            uiWorkspacesDirty = true;
+            toast(toasts, "Workspace snapshot updated.", 1.6);
+          } else {
+            toast(toasts, "No active workspace to update.", 1.6);
+          }
+        }
+
+        ImGui::MenuItem("Workspaces...", nullptr, &showUiWorkspacesWindow);
+
+        ImGui::Separator();
+        if (ImGui::Checkbox("Auto-save on exit", &uiWorkspacesAutoSaveOnExit)) {
+          uiWorkspacesDirty = true;
+        }
+        if (ImGui::MenuItem("Save workspaces")) {
+          uiWorkspaces.autoSaveOnExit = uiWorkspacesAutoSaveOnExit;
+          const bool ok = ui::saveUiWorkspacesToFile(uiWorkspaces, uiWorkspacesPath);
+          if (ok) uiWorkspacesDirty = false;
+          toast(toasts, ok ? "Saved workspaces." : "Failed to save workspaces.", 1.8);
+        }
+        if (ImGui::MenuItem("Load workspaces")) {
+          ui::UiWorkspaces loaded = ui::makeDefaultUiWorkspaces();
+          if (ui::loadUiWorkspacesFromFile(uiWorkspacesPath, loaded)) {
+            uiWorkspaces = std::move(loaded);
+            uiWorkspacesAutoSaveOnExit = uiWorkspaces.autoSaveOnExit;
+            ensureWorkspaceBootstrap();
+            if (const ui::UiWorkspace* aws = ui::activeWorkspace(uiWorkspaces)) {
+              activateWorkspace(*aws, /*loadIni=*/true);
+            }
+            uiWorkspacesDirty = false;
+            toast(toasts, "Loaded workspaces.", 1.8);
+          } else {
+            toast(toasts, "No workspaces file found.", 1.8);
+          }
+        }
+
+        if (uiWorkspacesDirty) {
           ImGui::TextDisabled("(unsaved changes)");
         }
         ImGui::EndMenu();
@@ -13714,6 +13963,29 @@ if (showScanner) {
           ImGui::SameLine();
           ImGui::TextDisabled("(%.1f units, %.0f cr)", fuelBuy, fuelCost);
 
+          // Insurance debt service: pay down emergency loan at any station.
+          if (insuranceDebtCr > 0.01) {
+            ImGui::Separator();
+            ImGui::Text("Insurance");
+            ImGui::Text("Outstanding debt: %.0f cr", insuranceDebtCr);
+
+            const double pay = std::min(insuranceDebtCr, credits);
+            ImGui::BeginDisabled(pay <= 0.01);
+            if (ImGui::Button("Pay debt")) {
+              credits -= pay;
+              insuranceDebtCr = std::max(0.0, insuranceDebtCr - pay);
+              if (insuranceDebtCr <= 0.01) {
+                insuranceDebtCr = 0.0;
+                toast(toasts, "Insurance debt repaid.", 2.0);
+              } else {
+                toast(toasts, "Debt payment: -" + std::to_string((int)std::round(pay)) + " cr", 1.8);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(pay %.0f cr)", pay);
+          }
+
           // Industry / fabrication orders
           {
             const auto recipes = sim::availableIndustryRecipes(station.type);
@@ -17265,6 +17537,220 @@ if (showContacts) {
       ImGui::End();
     }
 
+    // ---- Workspaces ----
+    if (showUiWorkspacesWindow) {
+      ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Workspaces", &showUiWorkspacesWindow)) {
+        ImGui::TextDisabled("Saved to %s", uiWorkspacesPath.c_str());
+        if (!uiWorkspaces.active.empty()) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("| Active: %s", uiWorkspaces.active.c_str());
+        }
+        if (uiWorkspacesDirty) {
+          ImGui::SameLine();
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "*unsaved*");
+        }
+
+        ImGui::Separator();
+
+        // Top actions.
+        if (ImGui::Button("Save")) {
+          uiWorkspaces.autoSaveOnExit = uiWorkspacesAutoSaveOnExit;
+          const bool ok = ui::saveUiWorkspacesToFile(uiWorkspaces, uiWorkspacesPath);
+          if (ok) uiWorkspacesDirty = false;
+          toast(toasts, ok ? "Saved workspaces." : "Failed to save workspaces.", 1.8);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+          ui::UiWorkspaces loaded = ui::makeDefaultUiWorkspaces();
+          if (ui::loadUiWorkspacesFromFile(uiWorkspacesPath, loaded)) {
+            uiWorkspaces = std::move(loaded);
+            uiWorkspacesAutoSaveOnExit = uiWorkspaces.autoSaveOnExit;
+            ensureWorkspaceBootstrap();
+            if (const ui::UiWorkspace* aws = ui::activeWorkspace(uiWorkspaces)) {
+              activateWorkspace(*aws, /*loadIni=*/true);
+            }
+            uiWorkspacesDirty = false;
+            toast(toasts, "Loaded workspaces.", 1.8);
+          } else {
+            toast(toasts, "No workspaces file found.", 1.8);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Auto-save on exit", &uiWorkspacesAutoSaveOnExit)) {
+          uiWorkspacesDirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Capture current -> active")) {
+          if (ui::UiWorkspace* aws = ui::findWorkspace(uiWorkspaces, uiWorkspaces.active)) {
+            captureWorkspaceFromRuntime(*aws);
+            uiWorkspacesDirty = true;
+            toast(toasts, "Workspace snapshot updated.", 1.6);
+          }
+        }
+
+        ImGui::Separator();
+
+        static int wsSelected = 0;
+        if (wsSelected < 0) wsSelected = 0;
+        if (wsSelected >= (int)uiWorkspaces.items.size()) wsSelected = (int)uiWorkspaces.items.size() - 1;
+
+        ImGui::BeginChild("##ws_left", ImVec2(260.0f, 0.0f), true);
+        if (ImGui::BeginListBox("##ws_list", ImVec2(-FLT_MIN, -FLT_MIN))) {
+          for (int i = 0; i < (int)uiWorkspaces.items.size(); ++i) {
+            const auto& ws = uiWorkspaces.items[(std::size_t)i];
+            std::string label = ws.name;
+            if (ws.name == uiWorkspaces.active) label += "  (active)";
+            const bool sel = (wsSelected == i);
+            if (ImGui::Selectable(label.c_str(), sel)) wsSelected = i;
+          }
+          ImGui::EndListBox();
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginGroup();
+        const bool hasSelection = (wsSelected >= 0 && wsSelected < (int)uiWorkspaces.items.size());
+        if (!hasSelection) ImGui::BeginDisabled();
+
+        auto uniqueName = [&](std::string base) {
+          base = ui::sanitizeWorkspaceName(base);
+          if (base.empty()) base = "Workspace";
+          auto exists = [&](const std::string& n) {
+            return ui::findWorkspace(uiWorkspaces, n) != nullptr;
+          };
+          if (!exists(base)) return base;
+          for (int k = 2; k < 1000; ++k) {
+            const std::string c = base + " " + std::to_string(k);
+            if (!exists(c)) return c;
+          }
+          return base + " (copy)";
+        };
+
+        if (hasSelection) {
+          auto& ws = uiWorkspaces.items[(std::size_t)wsSelected];
+          ImGui::Text("Name: %s", ws.name.c_str());
+          ImGui::Text("Layout: %s", ws.imguiIniFile.empty() ? "(inherit)" : ws.imguiIniFile.c_str());
+          ImGui::TextDisabled("Windows captured: %d", (int)ws.windows.size());
+
+          ImGui::Separator();
+
+          if (ImGui::Button("Activate")) {
+            uiWorkspaces.active = ws.name;
+            uiWorkspacesDirty = true;
+            activateWorkspace(ws, /*loadIni=*/true);
+            toast(toasts, (std::string("Workspace: ") + ws.name).c_str(), 1.5);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Capture current -> selected")) {
+            captureWorkspaceFromRuntime(ws);
+            uiWorkspacesDirty = true;
+            toast(toasts, "Workspace snapshot updated.", 1.6);
+          }
+
+          ImGui::Separator();
+
+          if (ImGui::Button("Duplicate")) {
+            ui::UiWorkspace copy = ws;
+            copy.name = uniqueName(ws.name + " Copy");
+            uiWorkspaces.items.push_back(copy);
+            wsSelected = (int)uiWorkspaces.items.size() - 1;
+            uiWorkspacesDirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("New from current")) {
+            ImGui::OpenPopup("New Workspace");
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Rename")) {
+            ImGui::OpenPopup("Rename Workspace");
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Delete")) {
+            ImGui::OpenPopup("Delete Workspace");
+          }
+
+          // New workspace modal.
+          if (ImGui::BeginPopupModal("New Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            static char newNameBuf[96] = "Trading";
+            ImGui::TextUnformatted("Create a new workspace from the current UI state.");
+            ImGui::InputText("Name", newNameBuf, sizeof(newNameBuf));
+            if (ImGui::Button("Create")) {
+              ui::UiWorkspace n;
+              n.name = uniqueName(newNameBuf);
+              captureWorkspaceFromRuntime(n);
+              uiWorkspaces.items.push_back(n);
+              uiWorkspaces.active = n.name;
+              wsSelected = (int)uiWorkspaces.items.size() - 1;
+              uiWorkspacesDirty = true;
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+          }
+
+          // Rename modal.
+          if (ImGui::BeginPopupModal("Rename Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            static char renameBuf[96] = "";
+            if (renameBuf[0] == '\0') {
+              std::snprintf(renameBuf, sizeof(renameBuf), "%s", ws.name.c_str());
+            }
+            ImGui::TextUnformatted("Rename the selected workspace.");
+            ImGui::InputText("New name", renameBuf, sizeof(renameBuf));
+            if (ImGui::Button("Rename")) {
+              const std::string old = ws.name;
+              ws.name = uniqueName(renameBuf);
+              if (uiWorkspaces.active == old) uiWorkspaces.active = ws.name;
+              uiWorkspacesDirty = true;
+              renameBuf[0] = '\0';
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+              renameBuf[0] = '\0';
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+          }
+
+          // Delete modal.
+          if (ImGui::BeginPopupModal("Delete Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Delete workspace '%s'?", ws.name.c_str());
+            ImGui::TextDisabled("This only removes the workspace entry; it does not delete any .ini file.");
+            const bool canDelete = (uiWorkspaces.items.size() > 1);
+            if (!canDelete) {
+              ImGui::TextDisabled("(Cannot delete the last workspace.)");
+            }
+            if (!canDelete) ImGui::BeginDisabled();
+            if (ImGui::Button("Delete")) {
+              const std::string doomed = ws.name;
+              uiWorkspaces.items.erase(uiWorkspaces.items.begin() + wsSelected);
+              if (uiWorkspaces.active == doomed) {
+                uiWorkspaces.active = uiWorkspaces.items.empty() ? std::string() : uiWorkspaces.items.front().name;
+              }
+              wsSelected = std::clamp(wsSelected, 0, (int)uiWorkspaces.items.size() - 1);
+              uiWorkspacesDirty = true;
+              ImGui::CloseCurrentPopup();
+            }
+            if (!canDelete) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+          }
+        }
+
+        if (!hasSelection) ImGui::EndDisabled();
+        ImGui::EndGroup();
+      }
+      ImGui::End();
+    }
+
     // ---- HUD Settings ----
     if (showHudSettingsWindow) {
       ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
@@ -17494,6 +17980,47 @@ if (showContacts) {
       addItem("Toggle Bookmarks window", std::string("Window • ") + onOff(showBookmarksWindow), std::string(), 80, [&]() { showBookmarksWindow = !showBookmarksWindow; });
       addItem("Toggle UI Settings window", std::string("Window • ") + onOff(showUiSettingsWindow), std::string(), 80, [&]() { showUiSettingsWindow = !showUiSettingsWindow; });
       addItem("Toggle HUD Settings window", std::string("Window • ") + onOff(showHudSettingsWindow), std::string(), 80, [&]() { showHudSettingsWindow = !showHudSettingsWindow; });
+
+      // Workspaces
+      addItem("Workspace Manager...", "Workspace", std::string(), 78, [&]() {
+        showUiWorkspacesWindow = true;
+      });
+      addItem("Capture current -> active workspace", "Workspace", std::string(), 72, [&]() {
+        if (ui::UiWorkspace* aws = ui::findWorkspace(uiWorkspaces, uiWorkspaces.active)) {
+          captureWorkspaceFromRuntime(*aws);
+          uiWorkspacesDirty = true;
+          toast(toasts, "Workspace snapshot updated.", 1.6);
+        } else {
+          toast(toasts, "No active workspace to update.", 1.6);
+        }
+      });
+
+      // Activate workspaces (sorted by name for predictable search).
+      {
+        std::vector<std::size_t> order;
+        order.reserve(uiWorkspaces.items.size());
+        for (std::size_t i = 0; i < uiWorkspaces.items.size(); ++i) order.push_back(i);
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+          return uiWorkspaces.items[a].name < uiWorkspaces.items[b].name;
+        });
+
+        for (std::size_t idx : order) {
+          if (idx >= uiWorkspaces.items.size()) continue;
+          const std::string& name = uiWorkspaces.items[idx].name;
+          if (name.empty()) continue;
+          const bool isActive = (name == uiWorkspaces.active);
+          addItem(std::string("Activate workspace: ") + name,
+                  std::string("Workspace") + (isActive ? " • Active" : ""),
+                  std::string(), 45,
+                  [&, idx]() {
+                    if (idx >= uiWorkspaces.items.size()) return;
+                    uiWorkspaces.active = uiWorkspaces.items[idx].name;
+                    uiWorkspacesDirty = true;
+                    activateWorkspace(uiWorkspaces.items[idx], /*loadIni=*/true);
+                    toast(toasts, (std::string("Workspace: ") + uiWorkspaces.active).c_str(), 1.5);
+                  });
+        }
+      }
 
       // HUD
       addItem("Toggle Radar HUD", std::string("HUD • ") + onOff(showRadarHud), game::chordLabel(controls.actions.toggleRadarHud), 70, [&]() { showRadarHud = !showRadarHud; });
@@ -17737,6 +18264,15 @@ if (showContacts) {
   // Persist bookmarks on exit (optional).
   if (bookmarksAutoSaveOnExit && bookmarksDirty) {
     (void)ui::saveBookmarksToFile(bookmarks, bookmarksPath);
+  }
+
+  // Persist UI workspaces on exit (optional).
+  {
+    const bool autoSavePrefChanged = (uiWorkspaces.autoSaveOnExit != uiWorkspacesAutoSaveOnExit);
+    uiWorkspaces.autoSaveOnExit = uiWorkspacesAutoSaveOnExit;
+    if ((uiWorkspacesAutoSaveOnExit && uiWorkspacesDirty) || autoSavePrefChanged) {
+      (void)ui::saveUiWorkspacesToFile(uiWorkspaces, uiWorkspacesPath);
+    }
   }
 
   // Persist UI settings on exit (optional).

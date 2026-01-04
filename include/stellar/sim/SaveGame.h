@@ -193,7 +193,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{21};
+  int version{22};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -209,6 +209,8 @@ struct SaveGame {
 
   // Economy
   double credits{1000.0};
+  // Outstanding insurance loan debt (paid down manually at stations).
+  double insuranceDebtCr{0.0};
   std::array<double, econ::kCommodityCount> cargo{}; // units
 
   // Exploration

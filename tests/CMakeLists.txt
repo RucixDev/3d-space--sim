@@ -37,6 +37,7 @@ add_executable(stellar_tests
   test_ship.cpp
   test_ship_loadout.cpp
   test_shipyard_service.cpp
+  test_insurance.cpp
   test_power_distributor.cpp
   test_flight_controller.cpp
   test_nav_assist.cpp
@@ -53,6 +54,7 @@ add_executable(stellar_tests
   test_jobs.cpp
   test_ui_settings.cpp
   test_hud_settings.cpp
+  test_ui_workspaces.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)
