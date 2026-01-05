@@ -2,6 +2,7 @@
 
 #include "stellar/render/Gl.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace stellar::render {
@@ -165,6 +166,79 @@ Mesh Mesh::makeUvSphere(int slices, int stacks) {
 
       idx.push_back(i0); idx.push_back(i1); idx.push_back(i2);
       idx.push_back(i0); idx.push_back(i2); idx.push_back(i3);
+    }
+  }
+
+  Mesh m;
+  m.upload(v, idx);
+  return m;
+}
+
+Mesh Mesh::makeRing(int segments, float innerRadius, float outerRadius, bool doubleSided) {
+  segments = std::max(3, segments);
+  innerRadius = std::max(0.0f, innerRadius);
+  outerRadius = std::max(innerRadius + 1e-4f, outerRadius);
+
+  // Two vertices per segment (inner + outer). Duplicate the first segment at the end
+  // so u can reach 1.0 for a seamless seam.
+  const int ringVerts = (segments + 1) * 2;
+
+  std::vector<VertexPNUT> v;
+  v.reserve(doubleSided ? ringVerts * 2 : ringVerts);
+  std::vector<std::uint32_t> idx;
+  idx.reserve(static_cast<std::size_t>(segments) * 6u * (doubleSided ? 2u : 1u));
+
+  const float twoPi = 2.0f * 3.14159265358979323846f;
+
+  // Top face (+Y)
+  for (int s = 0; s <= segments; ++s) {
+    const float u = static_cast<float>(s) / static_cast<float>(segments);
+    const float th = u * twoPi;
+    const float c = std::cos(th);
+    const float si = std::sin(th);
+
+    // inner
+    v.push_back(VertexPNUT{innerRadius * c, 0.0f, innerRadius * si,
+                           0.0f, 1.0f, 0.0f,
+                           u, 0.0f});
+    // outer
+    v.push_back(VertexPNUT{outerRadius * c, 0.0f, outerRadius * si,
+                           0.0f, 1.0f, 0.0f,
+                           u, 1.0f});
+  }
+
+  for (int s = 0; s < segments; ++s) {
+    const std::uint32_t i0 = static_cast<std::uint32_t>(s * 2 + 0);
+    const std::uint32_t i1 = static_cast<std::uint32_t>(s * 2 + 1);
+    const std::uint32_t i2 = static_cast<std::uint32_t>((s + 1) * 2 + 0);
+    const std::uint32_t i3 = static_cast<std::uint32_t>((s + 1) * 2 + 1);
+
+    // Two triangles for the quad strip.
+    // Winding is CCW when viewed from +Y.
+    idx.insert(idx.end(), {i0, i1, i3, i0, i3, i2});
+  }
+
+  if (doubleSided) {
+    // Bottom face (-Y): duplicate vertices with flipped normals and reversed winding.
+    const std::uint32_t base = static_cast<std::uint32_t>(v.size());
+    for (int k = 0; k < ringVerts; ++k) {
+      VertexPNUT vv = v[static_cast<std::size_t>(k)];
+      vv.nx = 0.0f;
+      vv.ny = -1.0f;
+      vv.nz = 0.0f;
+      v.push_back(vv);
+    }
+
+    const std::size_t topTriCount = static_cast<std::size_t>(segments) * 2u;
+    const std::size_t topIndexCount = topTriCount * 3u;
+    // Mirror the top-face indices in reverse order to flip winding.
+    for (std::size_t t = 0; t < topIndexCount; t += 3) {
+      const std::uint32_t a = idx[t + 0];
+      const std::uint32_t b = idx[t + 1];
+      const std::uint32_t c = idx[t + 2];
+      idx.push_back(base + a);
+      idx.push_back(base + c);
+      idx.push_back(base + b);
     }
   }
 

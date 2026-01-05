@@ -58,6 +58,18 @@ bool saveUiSettingsToFile(const UiSettings& s, const std::string& path) {
   f << "theme " << toString(s.theme) << "\n";
   f << "autoSaveOnExit " << (s.autoSaveOnExit ? 1 : 0) << "\n";
 
+  // Fonts
+  // Empty fontFile => use Dear ImGui embedded default.
+  f << "fontFile " << (s.font.file.empty() ? std::string("(default)") : s.font.file) << "\n";
+  f << "fontSizePx " << s.font.sizePx << "\n";
+  f << "fontCrispScaling " << (s.font.crispScaling ? 1 : 0) << "\n";
+
+  // Multi-viewport (platform windows)
+  f << "viewportsEnabled " << (s.viewports.enabled ? 1 : 0) << "\n";
+  f << "viewportsNoTaskBarIcon " << (s.viewports.noTaskBarIcon ? 1 : 0) << "\n";
+  f << "viewportsNoAutoMerge " << (s.viewports.noAutoMerge ? 1 : 0) << "\n";
+  f << "viewportsNoDecoration " << (s.viewports.noDecoration ? 1 : 0) << "\n";
+
   f << "dockEnabled " << (s.dock.dockingEnabled ? 1 : 0) << "\n";
   f << "dockPassthruCentral " << (s.dock.passthruCentral ? 1 : 0) << "\n";
   f << "dockLockCentralView " << (s.dock.lockCentralView ? 1 : 0) << "\n";
@@ -87,7 +99,8 @@ bool loadUiSettingsFromFile(const std::string& path, UiSettings& out) {
   }
 
   UiSettings s = makeDefaultUiSettings();
-  s.version = version;
+  // Auto-upgrade version so saving writes the latest schema.
+  s.version = std::max(version, s.version);
 
   std::string line;
   std::getline(f, line); // consume remainder of header line
@@ -116,6 +129,33 @@ bool loadUiSettingsFromFile(const std::string& path, UiSettings& out) {
       int v = 1;
       ss >> v;
       s.autoSaveOnExit = (v != 0);
+    } else if (key == "fontfile" || key == "font" || key == "fontpath") {
+      std::string v;
+      ss >> v;
+      if (v == "(default)" || v == "default") v.clear();
+      s.font.file = v;
+    } else if (key == "fontsizepx" || key == "fontsize" || key == "font_size_px") {
+      ss >> s.font.sizePx;
+    } else if (key == "fontcrispscaling" || key == "fontcrispscale" || key == "fontbuildatscale") {
+      int v = 1;
+      ss >> v;
+      s.font.crispScaling = (v != 0);
+    } else if (key == "viewportsenabled" || key == "multiviewport" || key == "multiviewports" || key == "viewports") {
+      int v = 0;
+      ss >> v;
+      s.viewports.enabled = (v != 0);
+    } else if (key == "viewportsnotaskbaricon" || key == "viewportnotaskbaricon") {
+      int v = 1;
+      ss >> v;
+      s.viewports.noTaskBarIcon = (v != 0);
+    } else if (key == "viewportsnoautomerge") {
+      int v = 0;
+      ss >> v;
+      s.viewports.noAutoMerge = (v != 0);
+    } else if (key == "viewportsnodecoration") {
+      int v = 0;
+      ss >> v;
+      s.viewports.noDecoration = (v != 0);
     } else if (key == "dockenabled" || key == "dockingenabled") {
       int v = 1;
       ss >> v;
@@ -140,6 +180,7 @@ bool loadUiSettingsFromFile(const std::string& path, UiSettings& out) {
   // Clamp to sane values.
   if (s.imguiIniFile.empty()) s.imguiIniFile = "imgui.ini";
   s.scaleUser = std::clamp(s.scaleUser, 0.50f, 3.00f);
+  s.font.sizePx = std::clamp(s.font.sizePx, 10.0f, 32.0f);
   s.dock.leftRatio = std::clamp(s.dock.leftRatio, 0.10f, 0.45f);
   s.dock.rightRatio = std::clamp(s.dock.rightRatio, 0.10f, 0.45f);
   s.dock.bottomRatio = std::clamp(s.dock.bottomRatio, 0.10f, 0.45f);

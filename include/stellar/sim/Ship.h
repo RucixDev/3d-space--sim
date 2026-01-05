@@ -81,6 +81,14 @@ public:
   // Update physics
   void step(double dtSeconds, const ShipInput& input);
 
+  // Update physics with a constant external acceleration in world space.
+  //
+  // Intended for lightweight environmental effects (e.g., Newtonian gravity)
+  // without forcing callers to manually integrate velocity/position.
+  void stepWithExternalAccel(double dtSeconds,
+                             const ShipInput& input,
+                             const math::Vec3d& externalAccelWorldKmS2);
+
   // Convenience vectors in world space
   math::Vec3d forward() const { return orient_.rotate({0,0,1}); }
   math::Vec3d right() const { return orient_.rotate({1,0,0}); }

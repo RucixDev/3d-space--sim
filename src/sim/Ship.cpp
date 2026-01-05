@@ -51,6 +51,12 @@ static stellar::math::Vec3d clampComponents(const stellar::math::Vec3d& v, doubl
 }
 
 void Ship::step(double dtSeconds, const ShipInput& input) {
+  stepWithExternalAccel(dtSeconds, input, {0,0,0});
+}
+
+void Ship::stepWithExternalAccel(double dtSeconds,
+                                 const ShipInput& input,
+                                 const stellar::math::Vec3d& externalAccelWorldKmS2) {
   if (dtSeconds <= 0.0) return;
 
   // Clamp user/control inputs defensively. (AI/autopilot may feed slightly out-of-range values.)
@@ -74,6 +80,7 @@ void Ship::step(double dtSeconds, const ShipInput& input) {
     const double linCap = in.boost ? maxLinAccelBoostKmS2_ : maxLinAccelKmS2_;
 
     stellar::math::Vec3d accelWorld = orient_.rotate(in.thrustLocal) * linCap;
+    accelWorld += externalAccelWorldKmS2;
 
     if (in.dampers) {
       // Dampers attempt to kill velocity (uses thrusters, so cap it).

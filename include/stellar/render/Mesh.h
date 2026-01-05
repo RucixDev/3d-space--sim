@@ -33,6 +33,19 @@ public:
   static Mesh makeCube();
   static Mesh makeUvSphere(int slices = 32, int stacks = 16);
 
+  // Create a flat annulus (ring) mesh in the XZ plane (Y=0).
+  //
+  // UV mapping:
+  //   u = angle around the ring [0..1]
+  //   v = radial coordinate [0..1] (inner->outer)
+  //
+  // When doubleSided is true, the mesh includes both top and bottom faces so
+  // it is visible with backface culling enabled.
+  static Mesh makeRing(int segments = 128,
+                       float innerRadius = 0.65f,
+                       float outerRadius = 1.25f,
+                       bool doubleSided = true);
+
 private:
   void destroy();
 

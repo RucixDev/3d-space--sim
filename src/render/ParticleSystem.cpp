@@ -75,6 +75,15 @@ void ParticleSystem::push(const Particle& p) {
   particles_.push_back(p);
 }
 
+void ParticleSystem::shiftOrigin(const math::Vec3d& deltaU) {
+  if (particles_.empty()) return;
+  if (deltaU.lengthSq() < 1e-24) return;
+
+  for (auto& p : particles_) {
+    p.posU -= deltaU;
+  }
+}
+
 void ParticleSystem::update(double dtSeconds) {
   if (dtSeconds <= 0.0) return;
 

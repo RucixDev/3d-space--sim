@@ -579,6 +579,14 @@ void installDefaultCVars() {
       });
     }
   }
+
+  // r.floating_origin.enabled: camera-relative rendering to reduce GPU float jitter
+  // in huge coordinate spaces (space sims).
+  cvars().defineBool("r.floating_origin.enabled",
+                     true,
+                     CVar_Archive,
+                     "Enable floating origin / camera-relative rendering to reduce GPU float jitter at large distances.");
+
 }
 
 } // namespace stellar::core

@@ -28,6 +28,13 @@ public:
 
   void clear() { particles_.clear(); emitCarry_ = 0.0; }
 
+  // Apply a translation offset in render units to all alive particles.
+  // This is primarily used by the game when employing a floating origin
+  // (camera-relative rendering) to keep GPU floats precise.
+  //
+  // The coordinate transform is: newPosU = oldPosU - deltaU.
+  void shiftOrigin(const math::Vec3d& deltaU);
+
   // Advance particle simulation by dt seconds.
   void update(double dtSeconds);
 

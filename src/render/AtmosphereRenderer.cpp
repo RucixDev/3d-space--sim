@@ -53,6 +53,7 @@ in vec3 vNrm;
 in vec3 vWorldPos;
 
 uniform vec3 uCamPos;
+uniform vec3 uSunPos;
 uniform float uIntensity;
 uniform float uPower;
 uniform float uSunLitBoost;
@@ -64,8 +65,8 @@ void main() {
   vec3 n = normalize(vNrm);
   vec3 v = normalize(uCamPos - vWorldPos);
 
-  // Prototype star is at the origin.
-  vec3 l = normalize(-vWorldPos);
+  // Sun position is provided by the caller.
+  vec3 l = normalize(uSunPos - vWorldPos);
 
   float ndotv = clamp(dot(n, v), 0.0, 1.0);
   float ndotl = clamp(dot(n, l), 0.0, 1.0);
@@ -117,6 +118,7 @@ void AtmosphereRenderer::drawInstances(const std::vector<InstanceData>& instance
   shader_.setUniformMat4("uView", view_);
   shader_.setUniformMat4("uProj", proj_);
   shader_.setUniform3f("uCamPos", camPos_[0], camPos_[1], camPos_[2]);
+  shader_.setUniform3f("uSunPos", sunPos_[0], sunPos_[1], sunPos_[2]);
   shader_.setUniform1f("uIntensity", intensity_);
   shader_.setUniform1f("uPower", power_);
   shader_.setUniform1f("uSunLitBoost", sunLitBoost_);

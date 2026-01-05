@@ -1,6 +1,11 @@
 add_executable(stellar_tests
   main.cpp
   test_orbit.cpp
+  test_gravity.cpp
+  test_atmosphere.cpp
+  test_trajectory_predictor.cpp
+  test_maneuver_computer.cpp
+  test_lambert_solver.cpp
   test_streaming.cpp
   test_query_nearby.cpp
   test_universe_cache.cpp
@@ -50,11 +55,15 @@ add_executable(stellar_tests
   test_bookmarks.cpp
   test_fuzzy_search.cpp
   test_log_sinks.cpp
+  test_log_buffer.cpp
+  test_profiler.cpp
   test_cvars.cpp
   test_jobs.cpp
   test_ui_settings.cpp
+  test_ui_layout_profiles.cpp
   test_hud_settings.cpp
   test_ui_workspaces.cpp
+  test_window_registry.cpp
 )
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)

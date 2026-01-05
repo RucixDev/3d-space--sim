@@ -24,6 +24,10 @@ int test_ui_settings() {
     s.scaleUser = 1.234f;
     s.theme = stellar::ui::UiTheme::HighContrast;
     s.autoSaveOnExit = false;
+    s.viewports.enabled = true;
+    s.viewports.noTaskBarIcon = false;
+    s.viewports.noAutoMerge = true;
+    s.viewports.noDecoration = true;
     s.dock.dockingEnabled = false;
     s.dock.passthruCentral = false;
     s.dock.lockCentralView = false;
@@ -40,6 +44,10 @@ int test_ui_settings() {
     CHECK(feq(out.scaleUser, s.scaleUser));
     CHECK(out.theme == s.theme);
     CHECK(out.autoSaveOnExit == s.autoSaveOnExit);
+    CHECK(out.viewports.enabled == s.viewports.enabled);
+    CHECK(out.viewports.noTaskBarIcon == s.viewports.noTaskBarIcon);
+    CHECK(out.viewports.noAutoMerge == s.viewports.noAutoMerge);
+    CHECK(out.viewports.noDecoration == s.viewports.noDecoration);
     CHECK(out.dock.dockingEnabled == s.dock.dockingEnabled);
     CHECK(out.dock.passthruCentral == s.dock.passthruCentral);
     CHECK(out.dock.lockCentralView == s.dock.lockCentralView);

@@ -1,6 +1,11 @@
 #include <iostream>
 
 int test_orbit();
+int test_gravity();
+int test_atmosphere();
+int test_trajectory_predictor();
+int test_maneuver_computer();
+int test_lambert_solver();
 int test_streaming();
 int test_query_nearby();
 int test_universe_cache();
@@ -50,9 +55,13 @@ int test_encounter_director();
 int test_bookmarks();
 int test_fuzzy_search();
 int test_ui_settings();
+int test_ui_layout_profiles();
 int test_hud_settings();
 int test_ui_workspaces();
+int test_window_registry();
 int test_log_sinks();
+int test_log_buffer();
+int test_profiler();
 
 int test_cvars();
 int test_jobs();
@@ -60,6 +69,11 @@ int main() {
   int fails = 0;
 
   fails += test_orbit();
+  fails += test_gravity();
+  fails += test_atmosphere();
+  fails += test_trajectory_predictor();
+  fails += test_maneuver_computer();
+  fails += test_lambert_solver();
   fails += test_streaming();
   fails += test_query_nearby();
   fails += test_universe_cache();
@@ -109,11 +123,15 @@ int main() {
   fails += test_bookmarks();
   fails += test_fuzzy_search();
   fails += test_ui_settings();
+  fails += test_ui_layout_profiles();
   fails += test_hud_settings();
   fails += test_ui_workspaces();
+  fails += test_window_registry();
   fails += test_cvars();
   fails += test_jobs();
   fails += test_log_sinks();
+  fails += test_log_buffer();
+  fails += test_profiler();
 
   if (fails == 0) {
     std::cout << "[stellar_tests] ALL PASS\n";

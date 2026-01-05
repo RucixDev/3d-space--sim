@@ -8,6 +8,8 @@
 #endif
 
 #include "stellar/core/Log.h"
+#include "stellar/core/CVar.h"
+#include "stellar/core/Profiler.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
 #include "stellar/core/Clamp.h"
@@ -24,6 +26,7 @@
 #include "stellar/render/Texture.h"
 #include "stellar/render/ProceduralSprite.h"
 #include "stellar/render/ProceduralPlanet.h"
+#include "stellar/render/ProceduralRings.h"
 #include "stellar/render/ProceduralLivery.h"
 #include "stellar/render/RenderTarget.h"
 #include "stellar/render/AtmosphereRenderer.h"
@@ -35,10 +38,18 @@
 #include "stellar/ui/HudSettings.h"
 #include "stellar/ui/Livery.h"
 #include "stellar/ui/UiSettings.h"
+#include "stellar/ui/UiLayoutProfiles.h"
 #include "stellar/ui/UiWorkspaces.h"
+#include "stellar/ui/WindowRegistry.h"
 #include "stellar/ui/Bookmarks.h"
 #include "stellar/ui/FuzzySearch.h"
 #include "stellar/sim/Orbit.h"
+#include "stellar/sim/Gravity.h"
+#include "stellar/sim/Atmosphere.h"
+#include "stellar/sim/OrbitalMechanics.h"
+#include "stellar/sim/TrajectoryPredictor.h"
+#include "stellar/sim/ManeuverComputer.h"
+#include "stellar/sim/LambertSolver.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/Law.h"
@@ -75,6 +86,12 @@
 #include "CommandPalette.h"
 #include "ControlsWindow.h"
 #include "ConsoleWindow.h"
+#include "CVarWindow.h"
+#include "MarketDashboardWindow.h"
+#include "ProfilerWindow.h"
+#include "LogWindow.h"
+#include "Screenshot.h"
+#include "PhotoModeWindow.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -228,7 +245,15 @@ static double applyRepToFee(double baseFeeRate, double rep) {
   return std::clamp(eff, 0.0, 0.25);
 }
 
-static math::Vec3d toRenderU(const math::Vec3d& km) { return km * (1.0 / kRENDER_UNIT_KM); }
+static constexpr double kINV_RENDER_UNIT_KM = 1.0 / kRENDER_UNIT_KM;
+
+// Camera-relative render origin (in km). We subtract this from all world positions before
+// scaling to render units so GPU floats retain precision when far from the system origin.
+static math::Vec3d gRenderOriginKm{0,0,0};
+
+static math::Vec3d toRenderPosU(const math::Vec3d& posKm) { return (posKm - gRenderOriginKm) * kINV_RENDER_UNIT_KM; }
+static math::Vec3d toRenderVelU(const math::Vec3d& velKmS) { return velKmS * kINV_RENDER_UNIT_KM; }
+
 
 static math::Quatd quatFromTo(const math::Vec3d& from, const math::Vec3d& to) {
   math::Vec3d f = from.normalized();
@@ -764,7 +789,7 @@ static void emitStationGeometry(const sim::Station& st,
                                 const math::Quatd& stQ,
                                 std::vector<render::InstanceData>& outCubeInstances) {
   // Render in render-units
-  const math::Vec3d posU = toRenderU(stPosKm);
+  const math::Vec3d posU = toRenderPosU(stPosKm);
 
   // Station scale factor: exaggerate a bit so it's readable at prototype camera distances.
   const double s = std::max(0.8, (st.radiusKm / kRENDER_UNIT_KM) * 1800.0);
@@ -808,9 +833,17 @@ static void emitStationGeometry(const sim::Station& st,
 }
 
 int main(int argc, char** argv) {
+  // Register built-in CVars early so they show up in the console/CVar UI.
+  core::installDefaultCVars();
+
   (void)argc; (void)argv;
 
   core::setLogLevel(core::LogLevel::Info);
+
+  // In-game log buffer (fed by core::LogSink). Used by the Log window.
+  ui::LogBuffer uiLogBuffer{};
+  const core::LogSink uiLogSink = uiLogBuffer.makeSink();
+  core::addLogSink(uiLogSink);
 
 #ifdef _WIN32
   SDL_SetMainReady();
@@ -881,6 +914,7 @@ int main(int argc, char** argv) {
   ui::UiWorkspaces uiWorkspaces = ui::makeDefaultUiWorkspaces();
   bool uiWorkspacesDirty = false;
   bool showUiWorkspacesWindow = false;
+  bool showWindowManagerWindow = false;
 
   (void)ui::loadUiWorkspacesFromFile(uiWorkspacesPath, uiWorkspaces);
   bool uiWorkspacesAutoSaveOnExit = uiWorkspaces.autoSaveOnExit;
@@ -901,6 +935,28 @@ int main(int argc, char** argv) {
   uiSettings.imguiIniFile = uiIniFilename;
 
   ui::UiTheme uiTheme = uiSettings.theme;
+
+  // Fonts
+  // NOTE: Font rebuilding (for crisp scaling) is handled later, once ImGui
+  // backends are initialized.
+  std::string uiFontFile = uiSettings.font.file;
+  float uiFontSizePx = uiSettings.font.sizePx;
+  bool uiFontCrispScaling = uiSettings.font.crispScaling;
+  bool uiFontsDirty = true; // rebuild fonts to match settings once backends are initialized
+
+  // Multi-viewport (platform windows). Experimental, but very useful for
+  // multi-monitor setups. When enabled, ImGui can spawn additional OS windows
+  // for detached panels.
+  bool uiViewportsEnabled = uiSettings.viewports.enabled;
+  bool uiViewportsNoTaskBarIcon = uiSettings.viewports.noTaskBarIcon;
+  bool uiViewportsNoAutoMerge = uiSettings.viewports.noAutoMerge;
+  bool uiViewportsNoDecoration = uiSettings.viewports.noDecoration;
+
+  if (uiViewportsEnabled) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+  else io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+  io.ConfigViewportsNoTaskBarIcon = uiViewportsNoTaskBarIcon;
+  io.ConfigViewportsNoAutoMerge = uiViewportsNoAutoMerge;
+  io.ConfigViewportsNoDecoration = uiViewportsNoDecoration;
 
   auto rebuildUiStyle = [&](ui::UiTheme theme, float scale) {
     // Rebuild the style from scratch so switching themes doesn't leave behind
@@ -969,6 +1025,14 @@ int main(int argc, char** argv) {
     if (std::abs(scale - 1.0f) > 0.001f) {
       st.ScaleAllSizes(scale);
     }
+
+    // When viewports are enabled, tweak rounding/background so platform windows
+    // match regular ImGui windows. (This is the pattern used in upstream
+    // examples.)
+    if (uiViewportsEnabled) {
+      st.WindowRounding = 0.0f;
+      st.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
     ImGui::GetStyle() = st;
   };
 
@@ -1013,14 +1077,17 @@ int main(int argc, char** argv) {
   recomputeUiDpiScale();
   recomputeUiScale();
   rebuildUiStyle(uiTheme, uiScale);
-  io.FontGlobalScale = uiScale;
+  io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
   uiScaleApplied = uiScale;
 
   auto applyUiScaleNow = [&]() {
     recomputeUiScale();
     const float denom = std::max(0.001f, uiScaleApplied);
     ImGui::GetStyle().ScaleAllSizes(uiScale / denom);
-    io.FontGlobalScale = uiScale;
+    // When using crisp scaling, fonts are rebuilt at (sizePx * uiScale) and
+    // FontGlobalScale stays at 1.0.
+    io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
+    if (uiFontCrispScaling) uiFontsDirty = true;
     uiScaleApplied = uiScale;
   };
 
@@ -1030,6 +1097,15 @@ int main(int argc, char** argv) {
     uiSettings.scaleUser = uiScaleUser;
     uiSettings.theme = uiTheme;
     uiSettings.autoSaveOnExit = uiSettingsAutoSaveOnExit;
+
+    // Fonts
+    uiSettings.font.file = uiFontFile;
+    uiSettings.font.sizePx = uiFontSizePx;
+    uiSettings.font.crispScaling = uiFontCrispScaling;
+    uiSettings.viewports.enabled = uiViewportsEnabled;
+    uiSettings.viewports.noTaskBarIcon = uiViewportsNoTaskBarIcon;
+    uiSettings.viewports.noAutoMerge = uiViewportsNoAutoMerge;
+    uiSettings.viewports.noDecoration = uiViewportsNoDecoration;
 #ifdef IMGUI_HAS_DOCK
     uiSettings.dock.dockingEnabled = uiDockingEnabled;
     uiSettings.dock.passthruCentral = uiDockPassthruCentral;
@@ -1046,6 +1122,23 @@ int main(int argc, char** argv) {
     uiScaleUser = s.scaleUser;
     uiSettingsAutoSaveOnExit = s.autoSaveOnExit;
 
+    // Fonts
+    uiFontFile = s.font.file;
+    uiFontSizePx = s.font.sizePx;
+    uiFontCrispScaling = s.font.crispScaling;
+    uiFontsDirty = true;
+
+    // Viewports (platform windows)
+    uiViewportsEnabled = s.viewports.enabled;
+    uiViewportsNoTaskBarIcon = s.viewports.noTaskBarIcon;
+    uiViewportsNoAutoMerge = s.viewports.noAutoMerge;
+    uiViewportsNoDecoration = s.viewports.noDecoration;
+    if (uiViewportsEnabled) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    else io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigViewportsNoTaskBarIcon = uiViewportsNoTaskBarIcon;
+    io.ConfigViewportsNoAutoMerge = uiViewportsNoAutoMerge;
+    io.ConfigViewportsNoDecoration = uiViewportsNoDecoration;
+
     uiIniFilename = s.imguiIniFile.empty() ? std::string("imgui.ini") : s.imguiIniFile;
     io.IniFilename = uiIniFilename.c_str();
 
@@ -1061,7 +1154,7 @@ int main(int argc, char** argv) {
     recomputeUiDpiScale();
     recomputeUiScale();
     rebuildUiStyle(uiTheme, uiScale);
-    io.FontGlobalScale = uiScale;
+    io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
     uiScaleApplied = uiScale;
 
     if (loadImGuiIni && io.IniFilename && io.IniFilename[0] != '\0') {
@@ -1088,6 +1181,12 @@ int main(int argc, char** argv) {
   // --- Render assets ---
   render::Mesh sphere = render::Mesh::makeUvSphere(48, 24);
   render::Mesh cube   = render::Mesh::makeCube();
+
+  // Planet rings (annulus meshes). These are purely visual and drawn in the same
+  // star-relative frame as planets.
+  render::Mesh ringThin  = render::Mesh::makeRing(/*segments=*/192, /*inner=*/0.70f, /*outer=*/1.15f, /*doubleSided=*/true);
+  render::Mesh ringMed   = render::Mesh::makeRing(/*segments=*/192, /*inner=*/0.62f, /*outer=*/1.35f, /*doubleSided=*/true);
+  render::Mesh ringThick = render::Mesh::makeRing(/*segments=*/192, /*inner=*/0.56f, /*outer=*/1.55f, /*doubleSided=*/true);
 
   render::Texture2D checker;
   checker.createChecker(256, 256, 16);
@@ -1170,6 +1269,10 @@ int main(int argc, char** argv) {
   // This is separate from the HUD icon sprites: these textures are intended for 3D meshes.
   render::SurfaceTextureCache surfaceTexCache;
   surfaceTexCache.setMaxEntries(128);
+
+  // Procedural planet ring textures (annulus albedo/alpha).
+  render::RingTextureCache ringTexCache;
+  ringTexCache.setMaxEntries(96);
 
   render::MeshRenderer meshRenderer;
   if (!meshRenderer.init(&err)) {
@@ -1280,6 +1383,13 @@ int main(int argc, char** argv) {
   float worldCloudShellScale = 1.012f;  // sphere scale multiplier
   float worldCloudSpinDegPerSec = 2.0f; // visual rotation speed
 
+  bool worldRingsEnabled = true;
+  float worldRingOpacity = 0.55f;   // alpha multiplier (0..1)
+  float worldRingChanceMul = 1.0f;  // global probability scaler (procedural)
+  float worldRingTiltMaxDeg = 12.0f; // random tilt added on top of orbit plane
+  int worldRingTexWidth = 1024;
+  int worldRingTexHeight = 256;
+
   bool worldAtmospheresEnabled = true;
   float worldAtmoIntensity = 1.35f;     // additive color multiplier (HDR friendly)
   float worldAtmoPower = 5.25f;         // rim width
@@ -1287,6 +1397,126 @@ int main(int argc, char** argv) {
   float worldAtmoSunLitBoost = 0.85f;   // how much day-side brightens the rim
   float worldAtmoForwardScatter = 0.35f; // when looking toward the star
   bool worldAtmoTintWithStar = true;
+
+  // --- Physics (experimental): Newtonian gravity ---
+  // Disabled by default to preserve the existing "Elite-ish" local-space feel.
+  bool physicsGravityEnabled = false;
+  sim::GravityParams gravityParams{};
+  gravityParams.includeStar = true;
+  gravityParams.includePlanets = true;
+  gravityParams.scale = 1.0;
+  gravityParams.softeningRadiusScale = 1.05;
+  gravityParams.maxAccelKmS2 = 0.0; // 0 = no clamp
+
+  // --- Physics (experimental): Atmospheric drag + re-entry heating ---
+  // Disabled by default; this can drastically change close-approach flight.
+  // The model is intentionally lightweight: exponential density + dynamic-pressure drag.
+  bool physicsAtmosphereEnabled = false;
+  bool physicsAtmosphereAffectsNpcs = true;
+  sim::AtmosphereParams atmoPhysicsParams{};
+  atmoPhysicsParams.includePlanets = true;
+  atmoPhysicsParams.densityScale = 1.0;
+  atmoPhysicsParams.dragCd = 0.9;
+  atmoPhysicsParams.referenceAreaM2 = 80.0;
+  atmoPhysicsParams.maxDecelKmS2 = 0.75;
+  atmoPhysicsParams.applyHeating = true;
+  atmoPhysicsParams.heatPerKPaSec = 0.06;
+  atmoPhysicsParams.heatingScale = 1.0;
+  atmoPhysicsParams.maxRelSpeedKmS = 0.0; // 0 = disabled
+  sim::AtmosphereSample atmoPlayerLast{};
+
+  // --- Navigation (experimental): trajectory preview + maneuver node ---
+  // Draws a predicted path line in-world (using LineRenderer) and exposes a simple
+  // 1-node maneuver planner in the Ship / Status panel.
+  bool trajPreviewEnabled = false;
+  float trajPreviewHorizonMin = 25.0f; // prediction horizon
+  float trajPreviewStepSec = 2.0f;     // RK4 step
+  int trajPreviewMaxSamples = 1400;    // safety cap
+
+  // 0 = ballistic, 1 = effective (game gravity params), 2 = physical (scale=1, unclamped)
+  int trajPreviewGravityMode = 0;
+
+  // Reference body for orbit-frame (RTN) + altitude readouts.
+  // -1 = auto dominant body, 0 = star, 1..N = planet index+1
+  int trajRefBodyChoice = -1;
+
+  bool maneuverNodeEnabled = false;
+  float maneuverNodeTimeSec = 60.0f; // seconds from now
+  float maneuverDvAlongMS = 0.0f;    // along-track (tangential) delta-v (m/s)
+  float maneuverDvNormalMS = 0.0f;   // orbital plane normal delta-v (m/s)
+  float maneuverDvRadialMS = 0.0f;   // radial-out delta-v (m/s)
+
+  // Maneuver computer (experimental): execute an armed maneuver node as a continuous burn.
+  // The plan is captured when arming, so the node time does not "slide" with the preview UI.
+  sim::ManeuverComputer maneuverComputer;
+  sim::ManeuverComputerParams maneuverComputerParams{};
+  sim::ManeuverComputerOutput maneuverComputerLast{};
+  sim::ManeuverComputerPhase maneuverComputerPrevPhase = sim::ManeuverComputerPhase::Off;
+  bool maneuverComputerDisengageOnManualInput = true;
+  float maneuverComputerManualDeadzone = 0.22f;
+
+  // --- Transfer planner (experimental): Lambert solver helper ---
+  // Computes a 2-body (star-centric) transfer burn to reach the current target
+  // (planet or station) after a user-chosen time-of-flight.
+  float lambertTofHours = 6.0f;   // time-of-flight after the node (hours)
+  bool lambertLongWay = false;
+  bool lambertPrograde = true;
+  bool lambertValidateCoarse = true; // run a coarse RK4 validation to estimate miss distance
+
+  // Last solution diagnostics (for UI feedback).
+  bool lambertLastOk = false;
+  float lambertLastDvMS = 0.0f;
+  float lambertLastArrivalRelMS = 0.0f;
+  float lambertLastMissKm = 0.0f;
+  float lambertLastAngleDeg = 0.0f;
+  int lambertLastIterations = 0;
+
+
+  struct TrajectoryPreviewCache {
+    bool valid{false};
+    double computedAtRealSec{0.0};
+
+    // Inputs snapshot
+    double startTimeDays{0.0};
+    math::Vec3d startPosKm{0,0,0};
+    math::Vec3d startVelKmS{0,0,0};
+    double horizonSec{0.0};
+    double stepSec{0.0};
+    int maxSamples{0};
+    int gravityMode{0};
+    sim::GravityParams gParams{};
+    int refBodyChoice{-1};
+
+    bool nodeEnabled{false};
+    double nodeTimeSec{0.0};
+    double dvAlongMS{0.0};
+    double dvNormalMS{0.0};
+    double dvRadialMS{0.0};
+
+    // Outputs
+    std::vector<sim::TrajectorySample> samples;
+    int nodeIndex{-1};
+
+    // Reference body at start (for labels). At other times, planets move.
+    bool refValid{false};
+    sim::GravityBody refBody{};
+
+    // Derived stats relative to ref body.
+    bool altValid{false};
+    double minAltKm{0.0};
+    double minAltTimeSec{0.0};
+    int minAltIndex{-1};
+    bool impact{false};
+
+    bool burnValid{false};
+    sim::TrajectorySample burnPre{};
+    sim::TrajectorySample burnPost{};
+    sim::TwoBodyOrbit orbitPre{};
+    sim::TwoBodyOrbit orbitPost{};
+    math::Vec3d burnRadialOut{0,0,0};
+    math::Vec3d burnAlong{0,0,0};
+    math::Vec3d burnNormal{0,0,0};
+  } trajCache;
 
   render::Starfield starfield;
   starfield.setRadius(vfxStarRadiusU);
@@ -1706,6 +1936,24 @@ int main(int argc, char** argv) {
   bool controlsAutoSaveOnExit = true;
   game::ControlsWindowState controlsWindow{};
   game::ConsoleWindowState consoleWindow{};
+  game::CVarWindowState cvarWindow{};
+  game::LogWindowState logWindow{};
+  game::ProfilerWindowState profilerWindow{};
+  game::PhotoModeWindowState photoModeWindow{};
+
+  struct PendingScreenshot { bool pending{false}; std::string path; bool copyToClipboard{false}; };
+  PendingScreenshot shotWorld{};
+  PendingScreenshot shotUi{};
+  bool shotRestorePausedPending{false};
+  bool shotPrevPaused{false};
+
+  bool photoModeWasOpen{false};
+  bool photoModePrevPaused{false};
+  bool photoModeForcedPause{false};
+
+  core::Profiler profiler{};
+  core::setActiveProfiler(&profiler);
+
 
   // UI state
   bool showGalaxy = true;
@@ -1715,6 +1963,7 @@ int main(int argc, char** argv) {
   bool showContacts = true;
   bool showScanner = true;
   bool showTrade = true;
+  game::MarketDashboardWindowState marketDashboardWindow{};
   bool showGuide = true;
   bool showSprites = false;
   bool showVfx = false;
@@ -2086,72 +2335,179 @@ int main(int argc, char** argv) {
   // Wire the toast history sink now that timeDays + storage exist.
   setToastHistorySink(&toastHistory, &timeDays);
 
+  // ---- UI Fonts ----
+  // Keep a small bit of state so we don't rebuild the font atlas unnecessarily.
+  std::string uiFontBuiltFile;
+  float uiFontBuiltBaseSizePx = -1.0f;
+  bool uiFontBuiltCrispScaling = true;
+  float uiFontBuiltScale = -1.0f;
+
+  auto rebuildUiFontsNow = [&](bool toastOnFailure) {
+    ImGuiIO& ioRef = ImGui::GetIO();
+
+    // Early-out if nothing changed.
+    const bool scaleMatters = uiFontCrispScaling;
+    const bool unchanged =
+      (!uiFontsDirty) &&
+      (uiFontBuiltFile == uiFontFile) &&
+      (std::abs(uiFontBuiltBaseSizePx - uiFontSizePx) < 0.001f) &&
+      (uiFontBuiltCrispScaling == uiFontCrispScaling) &&
+      (!scaleMatters || std::abs(uiFontBuiltScale - uiScale) < 0.001f);
+    if (unchanged) return;
+
+    // Dear ImGui FAQ recommends: load fonts resized with the DPI/user scale and
+    // scale style sizes with Style.ScaleAllSizes().
+    const float baseSize = std::clamp(uiFontSizePx, 10.0f, 32.0f);
+    const float scaledSize = uiFontCrispScaling ? (baseSize * uiScale) : baseSize;
+    const float sizePx = std::max(8.0f, std::floor(scaledSize));
+
+    ioRef.Fonts->Clear();
+
+    ImFontConfig cfg{};
+    cfg.SizePixels = sizePx;
+
+    ImFont* font = nullptr;
+    std::string err;
+
+    // If a font file is configured, try to load it. Otherwise fall back to the
+    // embedded default.
+    if (!uiFontFile.empty()) {
+      namespace fs = std::filesystem;
+      const fs::path p(uiFontFile);
+      if (fs::exists(p) && fs::is_regular_file(p)) {
+        font = ioRef.Fonts->AddFontFromFileTTF(uiFontFile.c_str(), sizePx, &cfg);
+        if (!font) {
+          err = "Failed to load font file: " + uiFontFile;
+        }
+      } else {
+        err = "Font file not found: " + uiFontFile;
+      }
+    }
+
+    if (!font) {
+      font = ioRef.Fonts->AddFontDefault(&cfg);
+      if (!err.empty() && toastOnFailure) {
+        toast(toasts, err + " (using default)", 3.0);
+      }
+    }
+
+    // Make it explicit which font is used as the default.
+    ioRef.FontDefault = font;
+
+    // For crisp scaling, fonts are rebuilt at the scaled pixel size; keep
+    // FontGlobalScale at 1.0 to avoid double-scaling.
+    ioRef.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
+
+    // Recreate GPU font texture.
+    ImGui_ImplOpenGL3_DestroyFontsTexture();
+    ImGui_ImplOpenGL3_CreateFontsTexture();
+
+    uiFontBuiltFile = uiFontFile;
+    uiFontBuiltBaseSizePx = uiFontSizePx;
+    uiFontBuiltCrispScaling = uiFontCrispScaling;
+    uiFontBuiltScale = uiScale;
+    uiFontsDirty = false;
+  };
+
+  // Initial font build (applies settings from ui_settings.txt).
+  rebuildUiFontsNow(/*toastOnFailure=*/true);
+
+  // ---- UI Windows Registry ----
+  // Central list used by:
+  //  - Workspaces capture/apply
+  //  - Command palette window toggles
+  //  - Window Manager UI (search + bulk actions)
+  ui::WindowRegistry uiWindows;
+  {
+    using ui::WindowBinding;
+    using ui::WindowDesc;
+
+    auto chordOrEmpty = [&](const game::KeyChord& chord) -> std::string {
+      const std::string k = game::chordLabel(chord);
+      return (k == "(unbound)") ? std::string() : k;
+    };
+
+    // Main windows
+    uiWindows.add(WindowBinding{WindowDesc{"Galaxy", "Galaxy / Streaming", "Main", 100, true, true}, &showGalaxy,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleGalaxy); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Ship", "Ship / Status", "Main", 100, true, true}, &showShip,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleShip); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Market", "Market Details", "Main", 100, true, true}, &showEconomy,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleMarket); }});
+    uiWindows.add(WindowBinding{WindowDesc{"MarketDashboard", "Market Dashboard", "Main", 95, false, true}, &marketDashboardWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Contacts", "Contacts / Combat", "Main", 100, true, true}, &showContacts,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleContacts); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Missions", "Missions", "Main", 100, true, true}, &showMissions,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleMissions); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Scanner", "System Scanner", "Main", 100, true, true}, &showScanner,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleScanner); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Trade", "Trade Helper", "Main", 100, true, true}, &showTrade,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleTrade); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Guide", "Pilot Guide", "Main", 90, true, true}, &showGuide,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleGuide); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Hangar", "Hangar / Livery", "Station", 90, false, true}, &showHangar,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleHangar); }});
+
+    // Visual tools / labs
+    uiWindows.add(WindowBinding{WindowDesc{"WorldVisuals", "World Visuals", "Visual", 80, false, true}, &showWorldVisuals,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleWorldVisuals); }});
+    uiWindows.add(WindowBinding{WindowDesc{"SpriteLab", "Sprite Lab", "Visual", 70, false, true}, &showSprites,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleSpriteLab); }});
+    uiWindows.add(WindowBinding{WindowDesc{"VfxLab", "VFX Lab", "Visual", 70, false, true}, &showVfx,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleVfxLab); }});
+    uiWindows.add(WindowBinding{WindowDesc{"PostFx", "Post FX", "Visual", 70, false, true}, &showPostFx,
+                                {}, {}, [&]() { return chordOrEmpty(controls.actions.togglePostFx); }});
+
+    // UI / tools
+    uiWindows.add(WindowBinding{WindowDesc{"Bookmarks", "Bookmarks", "UI", 80, false, true}, &showBookmarksWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Notifications", "Notifications", "UI", 80, false, true}, &showNotifications,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"PhotoMode", "Photo Mode", "Tools", 55, false, true}, &photoModeWindow.open,
+                                [&]() { photoModeWindow.focusDir = true; }, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"Controls", "Controls", "UI", 80, false, true}, &controlsWindow.open,
+                                [&]() { controlsWindow.focusFilter = true; }, {}, [&]() { return chordOrEmpty(controls.actions.toggleControlsWindow); }});
+    uiWindows.add(WindowBinding{WindowDesc{"Console", "Console", "UI", 80, false, true}, &consoleWindow.open,
+                                [&]() { consoleWindow.focusInput = true; }, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Log", "Log", "Debug", 60, false, true}, &logWindow.open,
+                                [&]() { logWindow.focusFilter = true; }, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"CVars", "CVars", "Debug", 60, false, true}, &cvarWindow.open,
+                                [&]() { cvarWindow.focusFilter = true; }, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"Profiler", "Profiler", "Debug", 55, false, true}, &profilerWindow.open,
+                                [&]() { profiler.setEnabled(true); }, [&]() { profiler.setEnabled(false); }, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"HudLayout", "HUD Layout", "HUD", 55, false, true}, &showHudLayoutWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"HudSettings", "HUD Settings", "HUD", 55, false, true}, &showHudSettingsWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Workspaces", "Workspaces", "UI", 55, false, true}, &showUiWorkspacesWindow,
+                                {}, {}, {}});
+
+    // New: window manager
+    uiWindows.add(WindowBinding{WindowDesc{"WindowManager", "Window Manager", "UI", 55, false, false}, &showWindowManagerWindow,
+                                {}, {}, {}});
+
+    // Debug windows (not persisted)
+    uiWindows.add(WindowBinding{WindowDesc{"ImGuiDemo", "ImGui Demo Window", "Debug", 10, false, false}, &showImGuiDemo,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ImGuiMetrics", "ImGui Metrics Window", "Debug", 10, false, false}, &showImGuiMetrics,
+                                {}, {}, {}});
+  }
+
   // ---- UI Workspaces: snapshot + apply window visibility + layout ini ----
-  // Keys are intentionally short/human-readable so the file remains editable.
   auto captureWorkspaceFromRuntime = [&](ui::UiWorkspace& ws) {
     ws.imguiIniFile = uiIniFilename;
-    ws.windows.clear();
-
-    ws.windows["Galaxy"] = showGalaxy;
-    ws.windows["Ship"] = showShip;
-    ws.windows["Market"] = showEconomy;
-    ws.windows["Missions"] = showMissions;
-    ws.windows["Contacts"] = showContacts;
-    ws.windows["Scanner"] = showScanner;
-    ws.windows["Trade"] = showTrade;
-    ws.windows["Guide"] = showGuide;
-    ws.windows["Hangar"] = showHangar;
-    ws.windows["WorldVisuals"] = showWorldVisuals;
-    ws.windows["SpriteLab"] = showSprites;
-    ws.windows["VfxLab"] = showVfx;
-    ws.windows["PostFx"] = showPostFx;
-
-    ws.windows["Controls"] = controlsWindow.open;
-    ws.windows["Console"] = consoleWindow.open;
-    ws.windows["Notifications"] = showNotifications;
-    ws.windows["Bookmarks"] = showBookmarksWindow;
-
-    ws.windows["UiSettings"] = showUiSettingsWindow;
-    ws.windows["HudSettings"] = showHudSettingsWindow;
-    ws.windows["Workspaces"] = showUiWorkspacesWindow;
+    ui::captureWorkspaceWindows(uiWindows, ws);
   };
 
   auto applyWorkspaceWindowsToRuntime = [&](const ui::UiWorkspace& ws) {
-    auto apply = [&](const char* key, bool& v) {
-      const auto it = ws.windows.find(key);
-      if (it != ws.windows.end()) v = it->second;
-    };
-
-    apply("Galaxy", showGalaxy);
-    apply("Ship", showShip);
-    apply("Market", showEconomy);
-    apply("Missions", showMissions);
-    apply("Contacts", showContacts);
-    apply("Scanner", showScanner);
-    apply("Trade", showTrade);
-    apply("Guide", showGuide);
-    apply("Hangar", showHangar);
-    apply("WorldVisuals", showWorldVisuals);
-    apply("SpriteLab", showSprites);
-    apply("VfxLab", showVfx);
-    apply("PostFx", showPostFx);
-
-    {
-      const bool wasOpen = controlsWindow.open;
-      apply("Controls", controlsWindow.open);
-      if (!wasOpen && controlsWindow.open) controlsWindow.focusFilter = true;
-    }
-    {
-      const bool wasOpen = consoleWindow.open;
-      apply("Console", consoleWindow.open);
-      if (!wasOpen && consoleWindow.open) consoleWindow.focusInput = true;
-    }
-    apply("Notifications", showNotifications);
-    apply("Bookmarks", showBookmarksWindow);
-
-    apply("UiSettings", showUiSettingsWindow);
-    apply("HudSettings", showHudSettingsWindow);
-    apply("Workspaces", showUiWorkspacesWindow);
+    ui::applyWorkspaceWindows(uiWindows, ws, /*fireCallbacks=*/true);
   };
 
   auto activateWorkspace = [&](const ui::UiWorkspace& ws, bool loadIni) {
@@ -2695,11 +3051,65 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       }
     });
 
+
+
+  game::consoleAddCommand(consoleWindow, "screenshot", "Capture a screenshot. Usage: screenshot [ui|world] [basename] [dir]",
+    [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      auto lower = [&](std::string_view s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) out.push_back((char)std::tolower((unsigned char)ch));
+        return out;
+      };
+
+      bool includeUi = false;
+      std::string baseName = "stellarforge";
+      std::string outDir = "screenshots";
+
+      std::size_t i = 0;
+      if (i < args.size()) {
+        const std::string mode = lower(args[i]);
+        if (mode == "ui" || mode == "withui" || mode == "with-ui") {
+          includeUi = true;
+          ++i;
+        } else if (mode == "world" || mode == "noui" || mode == "no-ui") {
+          includeUi = false;
+          ++i;
+        }
+      }
+      if (i < args.size()) baseName = std::string(args[i++]);
+      if (i < args.size()) outDir = std::string(args[i++]);
+
+      game::ScreenshotRequest req;
+      req.includeUi = includeUi;
+      req.outDir = outDir;
+      req.baseName = baseName;
+      req.timestamp = true;
+
+      std::string err;
+      const std::string pathOut = game::buildScreenshotPath(req, &err);
+      if (pathOut.empty()) {
+        game::consolePrint(c, core::LogLevel::Warn, err.empty() ? "Failed to schedule screenshot." : err);
+        return;
+      }
+
+      PendingScreenshot& slot = includeUi ? shotUi : shotWorld;
+      slot.pending = true;
+      slot.path = pathOut;
+      slot.copyToClipboard = false;
+
+      shotPrevPaused = paused;
+      paused = true;
+      shotRestorePausedPending = true;
+
+      game::consolePrint(c, core::LogLevel::Info,
+                         std::string("Screenshot scheduled: ") + pathOut + (includeUi ? " (with UI)" : " (world only)"));
+    });
   game::consoleAddCommand(consoleWindow, "window", "Toggle UI windows. Usage: window <name> [on|off|toggle]",
     [&](game::ConsoleWindowState& c, const std::vector<std::string_view>& args) {
       if (args.empty()) {
         game::consolePrint(c, core::LogLevel::Info, "Usage: window <name> [on|off|toggle]");
-        game::consolePrint(c, core::LogLevel::Info, "Names: galaxy ship market contacts missions scanner trade guide hangar visuals notifications bookmarks console");
+        game::consolePrint(c, core::LogLevel::Info, "Names: galaxy ship market contacts missions scanner trade guide hangar visuals notifications bookmarks console photomode");
         return;
       }
       auto lower = [&](std::string_view s) {
@@ -2729,6 +3139,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       else if (name == "notifications") apply(showNotifications);
       else if (name == "bookmarks") apply(showBookmarksWindow);
       else if (name == "console") { apply(consoleWindow.open); if (consoleWindow.open) consoleWindow.focusInput = true; }
+      else if (name == "photomode" || name == "photo") { apply(photoModeWindow.open); if (photoModeWindow.open) photoModeWindow.focusDir = true; }
       else {
         game::consolePrint(c, core::LogLevel::Warn, "Unknown window name.");
         return;
@@ -2941,6 +3352,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   SDL_SetRelativeMouseMode(SDL_FALSE);
 
   while (running) {
+    profiler.beginFrame();
+    {
+      STELLAR_PROFILE_SCOPE("Frame");
+
     // Timing
     auto now = std::chrono::high_resolution_clock::now();
     const double dtReal = std::chrono::duration<double>(now - last).count();
@@ -2986,13 +3401,13 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
       // VFX: impact sparks at the target.
       if (vfxParticlesEnabled && vfxImpactsEnabled) {
-        const math::Vec3d posU = toRenderU(hit.ship.positionKm());
+        const math::Vec3d posU = toRenderPosU(hit.ship.positionKm());
         math::Vec3d n = hit.ship.positionKm() - ship.positionKm();
         if (n.lengthSq() < 1e-12) n = math::Vec3d{0,1,0};
         n = n.normalized();
 
         const double energy = std::clamp((dmg / 18.0) * (double)vfxParticleIntensity, 0.15, 2.5);
-        particles.spawnSparks(posU, n, toRenderU(hit.ship.velocityKmS()), energy);
+        particles.spawnSparks(posU, n, toRenderVelU(hit.ship.velocityKmS()), energy);
       }
 
       // Crimes / reactions (on hit)
@@ -3028,7 +3443,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           // VFX: explosion burst on destruction.
           if (vfxParticlesEnabled && vfxExplosionsEnabled) {
             const double eBase = std::clamp((hit.hullMax / 140.0) * (double)vfxParticleIntensity, 0.45, 2.25);
-            particles.spawnExplosion(toRenderU(deadPos), toRenderU(deadVel), eBase);
+            particles.spawnExplosion(toRenderPosU(deadPos), toRenderVelU(deadVel), eBase);
           }
 
 	        if (deadRole == ContactRole::Pirate) {
@@ -3104,6 +3519,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
     // Events
     SDL_Event event;
+    {
+      STELLAR_PROFILE_SCOPE("InputEvents");
+
     while (SDL_PollEvent(&event)) {
       ImGui_ImplSDL2_ProcessEvent(&event);
 
@@ -3776,6 +4194,21 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         }
 
         if (key(controls.actions.pause) && !io.WantCaptureKeyboard) paused = !paused;
+
+        // Photo Mode can (optionally) force pause while the window is open.
+        if (photoModeWindow.open && !photoModeWasOpen) {
+          photoModePrevPaused = paused;
+          photoModeForcedPause = photoModeWindow.pauseWhileOpen;
+        }
+        if (photoModeWindow.open && photoModeWindow.pauseWhileOpen) {
+          paused = true;
+          photoModeForcedPause = true;
+        }
+        if (!photoModeWindow.open && photoModeWasOpen) {
+          if (photoModeForcedPause) paused = photoModePrevPaused;
+          photoModeForcedPause = false;
+        }
+        photoModeWasOpen = photoModeWindow.open;
 
         if (key(controls.actions.toggleAutopilot) && !io.WantCaptureKeyboard) {
           if (autopilot) {
@@ -4689,7 +5122,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               heatImpulse += fr.heatDelta;
 
               if (fr.hasBeam) {
-                beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
+                beams.push_back({toRenderPosU(fr.beam.aKm), toRenderPosU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
               }
 
               if (fr.hasProjectile) {
@@ -4735,6 +5168,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       }
 
     } // while (SDL_PollEvent)
+    }
+
 
     // Input (6DOF)
     sim::ShipInput input{};
@@ -4840,6 +5275,18 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           toast(toasts, "Docked at " + st.name + " (docking computer)", 2.5);
         }
       }
+    }
+
+
+    // Maneuver computer: execute an armed maneuver node as a continuous burn.
+    // (Automatically disengages if the simulation leaves normal-space.)
+    if (maneuverComputer.active() &&
+        (docked || autopilot || navAssist.active() ||
+         fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle)) {
+      maneuverComputer.disengage();
+      maneuverComputerLast = {};
+      maneuverComputerPrevPhase = maneuverComputer.phase();
+      toast(toasts, "Maneuver computer disengaged (not in normal space).", 1.6);
     }
 
     // Normal-space nav assist: approach / match velocity to the current target.
@@ -5417,6 +5864,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     // Sim step
     const double dtSim = dtReal * timeScale;
     if (!paused) {
+      STELLAR_PROFILE_SCOPE("Sim");
       // --- FSD (system-to-system travel) ---
       bool fsdJustArrived = false;
       if (fsdState == FsdState::Charging) {
@@ -5586,14 +6034,121 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       boostAppliedFrac = 0.0;
       sim::stepDistributor(distributorState, distributorCfg, distributorPips, dtSim);
 
+      // --- Physics helpers (optional gravity integration) ---
+      const bool gravityActive = physicsGravityEnabled && currentSystem &&
+                                (fsdState == FsdState::Idle) &&
+                                (supercruiseState == SupercruiseState::Idle) &&
+                                !fsdJustArrived;
+
+      const bool atmosphereActive = physicsAtmosphereEnabled && currentSystem &&
+                                   (fsdState == FsdState::Idle) &&
+                                   (supercruiseState == SupercruiseState::Idle) &&
+                                   !fsdJustArrived;
+
+      // Reset per-frame sample (keeps UI from showing stale values when leaving
+      // normal space).
+      atmoPlayerLast = {};
+
+      auto stepShipMaybeGravity = [&](sim::Ship& s,
+                                      double dt,
+                                      const sim::ShipInput& in,
+                                      bool allowGravity) {
+        math::Vec3d aExt{0,0,0};
+        bool useExt = false;
+
+        if (allowGravity && gravityActive) {
+          aExt = aExt + sim::systemGravityAccelKmS2(*currentSystem, timeDays, s.positionKm(), gravityParams);
+          useExt = true;
+        }
+
+        if (allowGravity && atmosphereActive && (physicsAtmosphereAffectsNpcs || (&s == &ship))) {
+          double massKg = s.massKg();
+          if (&s == &ship) {
+            massKg += cargoMassKg(cargo);
+          }
+
+          const auto atmo = sim::sampleSystemAtmosphere(*currentSystem,
+                                                        timeDays,
+                                                        s.positionKm(),
+                                                        s.velocityKmS(),
+                                                        massKg,
+                                                        atmoPhysicsParams);
+          if (atmo.inAtmosphere) {
+            aExt = aExt + atmo.dragAccelKmS2;
+            useExt = useExt || (atmo.dragAccelKmS2.lengthSq() > 1e-16);
+          }
+
+          // Player-only HUD + heat.
+          if (&s == &ship) {
+            atmoPlayerLast = atmo;
+
+            if (atmo.inAtmosphere && atmoPhysicsParams.applyHeating && atmo.heatingHeatPerSec > 0.0) {
+              const double ts = std::max(1e-6, timeScale);
+              const double dtRealSub = dt / ts;
+              heatImpulse += atmo.heatingHeatPerSec * dtRealSub;
+            }
+          }
+        }
+
+        if (useExt) {
+          s.stepWithExternalAccel(dt, in, aExt);
+        } else {
+          s.step(dt, in);
+        }
+      };
+
       // --- Ship physics ---
       if (!docked) {
         if (fsdState != FsdState::Idle || fsdJustArrived) {
           sim::ShipInput hold{};
           hold.dampers = true;
           hold.brake = true;
-          ship.step(dtSim, hold);
+          stepShipMaybeGravity(ship, dtSim, hold, /*allowGravity=*/false);
         } else {
+
+          // Maneuver computer guidance runs here so it can use dtSim (for burn throttling).
+          if (maneuverComputer.active() &&
+              !autopilot &&
+              !navAssist.active() &&
+              supercruiseState == SupercruiseState::Idle) {
+
+            // Optional: disengage if the player provides a clear manual input signal.
+            if (maneuverComputerDisengageOnManualInput) {
+              auto magMax = [](double a, double b, double c) {
+                return std::max(std::abs(a), std::max(std::abs(b), std::abs(c)));
+              };
+              const double thrustMag = magMax(input.thrustLocal.x, input.thrustLocal.y, input.thrustLocal.z);
+              const double torqueMag = magMax(input.torqueLocal.x, input.torqueLocal.y, input.torqueLocal.z);
+              if (thrustMag > maneuverComputerManualDeadzone || torqueMag > maneuverComputerManualDeadzone || input.boost || input.brake) {
+                maneuverComputer.disengage();
+                maneuverComputerLast = {};
+                maneuverComputerPrevPhase = maneuverComputer.phase();
+                toast(toasts, "Maneuver computer disengaged (manual override).", 1.6);
+              }
+            }
+
+            if (maneuverComputer.active()) {
+              const auto mcOut = maneuverComputer.update(ship, timeDays, dtSim, maneuverComputerParams);
+              maneuverComputerLast = mcOut;
+
+              // Override ship inputs.
+              input.thrustLocal = mcOut.input.thrustLocal;
+              input.torqueLocal = mcOut.input.torqueLocal;
+              input.dampers = mcOut.input.dampers;
+              input.boost = mcOut.input.boost;
+              input.brake = mcOut.input.brake;
+
+              if (maneuverComputerPrevPhase != mcOut.phase) {
+                if (mcOut.phase == sim::ManeuverComputerPhase::Complete) {
+                  toast(toasts, "Maneuver complete.", 1.8);
+                } else if (mcOut.phase == sim::ManeuverComputerPhase::Aborted) {
+                  toast(toasts, "Maneuver aborted (missed node).", 2.0);
+                }
+              }
+              maneuverComputerPrevPhase = mcOut.phase;
+            }
+          }
+
           // Apply boost only for the fraction we have ENG capacitor for.
           boostAppliedFrac = input.boost ? sim::consumeBoostFraction(distributorState, distributorCfg, dtSim) : 0.0;
           input.boost = (boostAppliedFrac > 1e-6);
@@ -5604,12 +6159,12 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           if (dtBoost > 0.0) {
             sim::ShipInput inBoost = input;
             inBoost.boost = true;
-            ship.step(dtBoost, inBoost);
+            stepShipMaybeGravity(ship, dtBoost, inBoost, /*allowGravity=*/true);
           }
           if (dtNoBoost > 0.0) {
             sim::ShipInput inNoBoost = input;
             inNoBoost.boost = false;
-            ship.step(dtNoBoost, inNoBoost);
+            stepShipMaybeGravity(ship, dtNoBoost, inNoBoost, /*allowGravity=*/true);
           }
         }
       } else {
@@ -5663,7 +6218,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           }
 
           const math::Vec3d exhaustDir = (-accelWorld).normalized();
-          const math::Vec3d shipPosU = toRenderU(ship.positionKm());
+          const math::Vec3d shipPosU = toRenderPosU(ship.positionKm());
 
           // Push the emitter slightly toward the exhaust direction so the plume starts behind the ship.
           const math::Vec3d emitterPosU = shipPosU + exhaustDir * 0.75;
@@ -6419,7 +6974,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                      /*desiredDistKm=*/baseR * 0.65,
                      /*tangentialStrength=*/0.26,
                      /*maxAccelFrac=*/1.4);
-          c.ship.step(dtSim, ai);
+          stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
           continue;
         }
       }
@@ -6450,7 +7005,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
         const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
         chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 240000.0, ship.velocityKmS(), 0.0, 0.28, 1.3);
-        c.ship.step(dtSim, ai);
+        stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
         continue;
       }
 
@@ -6481,7 +7036,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       }
 
       chaseTargetFace(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8, (aimPointKm - c.ship.positionKm()), /*allowBoost*/false);
-      c.ship.step(dtSim, ai);
+      stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
 
       // Fire if aligned and we have weapon capacitor.
       const math::Vec3d to = tgtPos - c.ship.positionKm();
@@ -6597,7 +7152,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                 c.fireCooldown = fr.newCooldownSimSec;
 
                 if (fr.hasBeam) {
-                  beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
+                  beams.push_back({toRenderPosU(fr.beam.aKm), toRenderPosU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
                 }
                 if (fr.hasProjectile) {
                   projectiles.push_back(fr.projectile);
@@ -6633,7 +7188,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
       // Distress victims are "disabled": keep them stationary until the player helps.
       if (c.distressVictim && c.distressNeedUnits > 1e-6) {
-        c.ship.step(dtSim, ai);
+        stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
         continue;
       }
 
@@ -6740,7 +7295,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         }
       }
 
-      c.ship.step(dtStep, ai);
+      stepShipMaybeGravity(c.ship, dtStep, ai, /*allowGravity=*/true);
       continue;
     }
 
@@ -6818,7 +7373,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
 	      }
 
-	      c.ship.step(dtSim, ai);
+	      stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
 
 	      // Fire if aligned at the chosen target.
 	      if (engageShip && (shootPlayer || engageContact)) {
@@ -6923,7 +7478,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	                c.distributorState.wep = std::max(0.0, c.distributorState.wep - capCost);
 	                c.fireCooldown = fr.newCooldownSimSec;
 	                if (fr.hasBeam) {
-	                  beams.push_back({toRenderU(fr.beam.aKm), toRenderU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
+	                  beams.push_back({toRenderPosU(fr.beam.aKm), toRenderPosU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
 	                }
 	                if (fr.hasProjectile) projectiles.push_back(fr.projectile);
 	                if (fr.hasMissile) missiles.push_back(fr.missile);
@@ -8437,7 +8992,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 if (n.lengthSq() < 1e-12) n = ship.forward();
                 n = n.normalized();
                 const double energy = std::clamp((h.dmg / 18.0) * (double)vfxParticleIntensity, 0.10, 1.6);
-                particles.spawnSparks(toRenderU(h.pointKm), n, toRenderU(ship.velocityKmS()), energy);
+                particles.spawnSparks(toRenderPosU(h.pointKm), n, toRenderVelU(ship.velocityKmS()), energy);
               }
             }
           } else {
@@ -8451,7 +9006,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 if (n.lengthSq() < 1e-12) n = ship.forward();
                 n = n.normalized();
                 const double energy = std::clamp((h.dmg / 16.0) * (double)vfxParticleIntensity, 0.12, 2.2);
-                particles.spawnSparks(toRenderU(ship.positionKm()), n, toRenderU(ship.velocityKmS()), energy);
+                particles.spawnSparks(toRenderPosU(ship.positionKm()), n, toRenderVelU(ship.velocityKmS()), energy);
               }
             } else if (h.kind == sim::CombatTargetKind::Ship) {
               if (h.targetIndex < contacts.size()) {
@@ -8508,7 +9063,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               math::Vec3d dir = m.velKmS;
               if (dir.lengthSq() < 1e-12) continue;
               dir = dir.normalized();
-              particles.emitThruster(toRenderU(m.posKm), -dir, intensity, dtReal, /*boost=*/true);
+              particles.emitThruster(toRenderPosU(m.posKm), -dir, intensity, dtReal, /*boost=*/true);
             }
           }
 
@@ -8534,7 +9089,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           if (vfxParticlesEnabled && vfxExplosionsEnabled) {
             for (const auto& det : detonations) {
               const double eBase = std::clamp((det.baseDmg / 28.0) * (double)vfxParticleIntensity, 0.6, 4.2);
-              particles.spawnExplosion(toRenderU(det.pointKm), {0,0,0}, eBase);
+              particles.spawnExplosion(toRenderPosU(det.pointKm), {0,0,0}, eBase);
             }
           }
 
@@ -8657,7 +9212,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (vfxParticlesEnabled && vfxExplosionsEnabled) {
         const double eBase = 2.2 * (double)vfxParticleIntensity;
-        particles.spawnExplosion(toRenderU(ship.positionKm()), toRenderU(ship.velocityKmS()), eBase);
+        particles.spawnExplosion(toRenderPosU(ship.positionKm()), toRenderVelU(ship.velocityKmS()), eBase);
       }
 
       playerHull = playerHullMax;
@@ -8702,6 +9257,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     for (auto& t : toasts) t.ttl -= dtReal;
     toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [](const ToastMsg& t){ return t.ttl <= 0.0; }), toasts.end());
 
+    // ---- Floating origin (camera-relative rendering) ----
+    // Keep the ship near the render origin so GPU floats stay precise at large distances.
+    // This is a pure render-space transform; simulation remains in absolute km coordinates.
+    {
+      const bool floatingOriginEnabled = core::cvars().getBool("r.floating_origin.enabled", true);
+      const math::Vec3d desiredOriginKm = floatingOriginEnabled ? ship.positionKm() : math::Vec3d{0,0,0};
+      const math::Vec3d deltaKm = desiredOriginKm - gRenderOriginKm;
+      if (deltaKm.lengthSq() > 1e-16) {
+        const math::Vec3d deltaU = deltaKm * kINV_RENDER_UNIT_KM;
+
+        // Shift long-lived render-space state into the new origin frame.
+        // newPosU = oldPosU - deltaU
+        particles.shiftOrigin(deltaU);
+        for (auto& b : beams) {
+          b.aU -= deltaU;
+          b.bU -= deltaU;
+        }
+
+        gRenderOriginKm = desiredOriginKm;
+      }
+    }
+
     // ---- Camera follow (third-person) ----
     render::Camera cam;
     int w = 1280, h = 720;
@@ -8710,7 +9287,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     cam.setPerspective(math::degToRad(60.0), aspect, 0.01, 20000.0);
 
-    const math::Vec3d shipPosU = toRenderU(ship.positionKm());
+    const math::Vec3d shipPosU = toRenderPosU(ship.positionKm());
     const math::Vec3d back = ship.forward() * (-6.0);
     const math::Vec3d up = ship.up() * (2.0);
 
@@ -8725,10 +9302,15 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     matToFloat(proj, projF);
 
     meshRenderer.setViewProj(viewF, projF);
-    // World lighting: treat the main star as a point light at the origin.
-    // UI preview scenes can override this temporarily.
-    meshRenderer.setLightPos(0.0f, 0.0f, 0.0f);
+
+    // World lighting: treat the system star (km origin) as a point light.
+    // With a floating origin, the star is no longer necessarily at render-space (0,0,0),
+    // so we feed the renderer the star position in the current render frame.
+    const math::Vec3d sunPosU = toRenderPosU({0,0,0});
+    meshRenderer.setLightPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
+
     atmosphereRenderer.setViewProj(viewF, projF);
+    atmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
 
@@ -8802,6 +9384,15 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     std::vector<PlanetCloudDraw> planetCloudDraws;
     planetCloudDraws.reserve(currentSystem->planets.size());
 
+    struct PlanetRingDraw {
+      render::InstanceData inst;
+      core::u64 ringSeed;
+      float alphaMul;
+      std::uint8_t variant; // 0=thin,1=med,2=thick
+    };
+    std::vector<PlanetRingDraw> planetRingDraws;
+    planetRingDraws.reserve(currentSystem->planets.size());
+
     std::vector<render::InstanceData> planetAtmoDraws;
     planetAtmoDraws.reserve(currentSystem->planets.size());
 
@@ -8829,7 +9420,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, timeDays);
       const math::Vec3d posKm = posAU * kAU_KM;
-      const math::Vec3d posU = toRenderU(posKm);
+      const math::Vec3d posU = toRenderPosU(posKm);
 
       const double radiusKm = p.radiusEarth * kEARTH_RADIUS_KM;
       const float scale = (float)std::max(0.25, (radiusKm / kRENDER_UNIT_KM) * 200.0);
@@ -8923,12 +9514,326 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         planetCloudDraws.push_back(cd);
       }
 
+      // Planet rings (visual only). We align the ring plane to the planet's orbit plane and
+      // add a small per-planet tilt so systems don't look too uniform.
+      if (worldUseProceduralSurfaces && worldRingsEnabled) {
+        // Base probability: gas giants are common, rocky worlds are rare.
+        double baseChance = 0.0;
+        switch (p.type) {
+          case sim::PlanetType::GasGiant: baseChance = 0.75; break;
+          case sim::PlanetType::Ice:      baseChance = 0.35; break;
+          case sim::PlanetType::Ocean:    baseChance = 0.18; break;
+          case sim::PlanetType::Desert:   baseChance = 0.14; break;
+          case sim::PlanetType::Rocky:    baseChance = 0.12; break;
+          default:                        baseChance = 0.10; break;
+        }
+
+        const core::u64 ringSeedBase = core::hashCombine(pSurfaceSeed, core::fnv1a64("rings"));
+        core::SplitMix64 rrng(ringSeedBase);
+        const double chance = baseChance * std::clamp((double)worldRingChanceMul, 0.0, 3.0);
+
+        if (chance > 1e-6 && rrng.chance(chance)) {
+          const std::uint8_t variant = (std::uint8_t)rrng.range(0, 2);
+          const float alphaMul = worldRingOpacity * (float)rrng.range(0.75, 1.10);
+
+          // Orbit plane normal via angular momentum (pos x vel).
+          math::Vec3d n = math::cross(posAU, sim::orbitVelocity3DAU(p.orbit, timeDays));
+          if (n.lengthSq() < 1e-14) n = {0, 1, 0};
+          n = n.normalized();
+
+          // Small tilt around an axis in the plane.
+          const double tiltDeg = rrng.range(-(double)worldRingTiltMaxDeg, (double)worldRingTiltMaxDeg);
+          if (std::abs(tiltDeg) > 1e-4) {
+            math::Vec3d axis = math::cross(n, {0, 1, 0});
+            if (axis.lengthSq() < 1e-14) axis = math::cross(n, {1, 0, 0});
+            axis = axis.normalized();
+            const math::Quatd tq = math::Quatd::fromAxisAngle(axis, math::degToRad(tiltDeg));
+            n = tq.rotate(n).normalized();
+          }
+
+          // Rotate the ring mesh's +Y normal onto the target plane normal.
+          math::Quatd q = quatFromTo({0, 1, 0}, n);
+          // Random spin around the normal (useful if the texture has azimuthal features).
+          const double spin = rrng.range(0.0, 2.0 * math::kPi);
+          q = math::Quatd::fromAxisAngle(n, spin) * q;
+
+          // Scale varies by planet type (gas giants tend to have larger ring systems).
+          double ringScaleMul = 1.0;
+          if (p.type == sim::PlanetType::GasGiant) {
+            ringScaleMul = rrng.range(1.15, 2.25);
+          } else if (p.type == sim::PlanetType::Ice) {
+            ringScaleMul = rrng.range(1.05, 1.75);
+          } else {
+            ringScaleMul = rrng.range(0.95, 1.55);
+          }
+
+          const double ringScale = (double)scale * ringScaleMul;
+          PlanetRingDraw rd{};
+          rd.inst = makeInst(posU, {ringScale, ringScale, ringScale}, q, 1.0f, 1.0f, 1.0f);
+          rd.ringSeed = core::hashCombine(ringSeedBase, (core::u64)variant);
+          rd.alphaMul = alphaMul;
+          rd.variant = variant;
+          planetRingDraws.push_back(rd);
+        }
+      }
+
       if (worldAtmospheresEnabled && atmoStrength > 1e-4f) {
         const double atmoScale = (double)scale * (double)worldAtmoShellScale;
         planetAtmoDraws.push_back(makeInstUniform(posU, atmoScale,
                                                   atmoR * atmoStrength,
                                                   atmoG * atmoStrength,
                                                   atmoB * atmoStrength));
+      }
+    }
+
+    // --- Trajectory preview cache (player) ---
+    // Compute at a low rate to avoid per-frame RK4 work.
+    {
+      const bool inNormal = (fsdState == FsdState::Idle) && (supercruiseState == SupercruiseState::Idle);
+      const bool want = trajPreviewEnabled && inNormal && currentSystem;
+
+      if (!want) {
+        trajCache.valid = false;
+        trajCache.samples.clear();
+      } else {
+        // Clamp reference choice if the system changed.
+        const int maxChoice = (int)currentSystem->planets.size();
+        if (trajRefBodyChoice > maxChoice) trajRefBodyChoice = -1;
+
+        const double horizonSec = std::clamp((double)trajPreviewHorizonMin * 60.0, 10.0, 6.0 * 3600.0);
+        const double stepSec = std::clamp((double)trajPreviewStepSec, 0.05, 30.0);
+        const int maxSamples = std::clamp(trajPreviewMaxSamples, 32, 20000);
+        const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+
+        sim::GravityParams gParams = gravityParams;
+        if (gMode == 2) {
+          // Physical: ignore tuning knobs that intentionally distort reality.
+          gParams.scale = 1.0;
+          gParams.maxAccelKmS2 = 0.0;
+        }
+
+        auto inputsChanged = [&]() {
+          if (!trajCache.valid) return true;
+          if (trajCache.horizonSec != horizonSec) return true;
+          if (trajCache.stepSec != stepSec) return true;
+          if (trajCache.maxSamples != maxSamples) return true;
+          if (trajCache.gravityMode != gMode) return true;
+          if (trajCache.refBodyChoice != trajRefBodyChoice) return true;
+
+          // Gravity params (only fields exposed in UI).
+          if (trajCache.gParams.includeStar != gParams.includeStar) return true;
+          if (trajCache.gParams.includePlanets != gParams.includePlanets) return true;
+          if (trajCache.gParams.scale != gParams.scale) return true;
+          if (trajCache.gParams.softeningRadiusScale != gParams.softeningRadiusScale) return true;
+          if (trajCache.gParams.maxAccelKmS2 != gParams.maxAccelKmS2) return true;
+
+          const bool nodeOn = maneuverNodeEnabled;
+          if (trajCache.nodeEnabled != nodeOn) return true;
+          if (trajCache.nodeTimeSec != (double)maneuverNodeTimeSec) return true;
+          if (trajCache.dvAlongMS != (double)maneuverDvAlongMS) return true;
+          if (trajCache.dvNormalMS != (double)maneuverDvNormalMS) return true;
+          if (trajCache.dvRadialMS != (double)maneuverDvRadialMS) return true;
+
+          // Ship state / ephemerides time.
+          const double posErr = (trajCache.startPosKm - ship.positionKm()).length();
+          const double velErr = (trajCache.startVelKmS - ship.velocityKmS()).length();
+          if (posErr > 25.0) return true;       // 25 km
+          if (velErr > 0.0025) return true;     // 2.5 m/s
+          if (std::abs(trajCache.startTimeDays - timeDays) > (0.25 / 86400.0)) return true;
+
+          return false;
+        };
+
+        const double kMinInterval = 0.25; // seconds (real)
+        const bool timeStale = (timeRealSec - trajCache.computedAtRealSec) > kMinInterval;
+
+        if (inputsChanged() || timeStale) {
+          // Snapshot inputs.
+          trajCache.valid = true;
+          trajCache.computedAtRealSec = timeRealSec;
+          trajCache.startTimeDays = timeDays;
+          trajCache.startPosKm = ship.positionKm();
+          trajCache.startVelKmS = ship.velocityKmS();
+          trajCache.horizonSec = horizonSec;
+          trajCache.stepSec = stepSec;
+          trajCache.maxSamples = maxSamples;
+          trajCache.gravityMode = gMode;
+          trajCache.gParams = gParams;
+          trajCache.refBodyChoice = trajRefBodyChoice;
+          trajCache.nodeEnabled = maneuverNodeEnabled;
+          trajCache.nodeTimeSec = (double)maneuverNodeTimeSec;
+          trajCache.dvAlongMS = (double)maneuverDvAlongMS;
+          trajCache.dvNormalMS = (double)maneuverDvNormalMS;
+          trajCache.dvRadialMS = (double)maneuverDvRadialMS;
+
+          // Determine reference body (for orbit frame + alt readouts).
+          trajCache.refValid = false;
+          trajCache.refBody = {};
+          {
+            // Dominant/auto uses the same gravity model as the preview (if any),
+            // otherwise it uses physical params to pick a sensible body.
+            sim::GravityParams pickParams = gParams;
+            if (gMode == 0) {
+              pickParams.scale = 1.0;
+              pickParams.maxAccelKmS2 = 0.0;
+            }
+
+            if (trajRefBodyChoice == -1) {
+              const auto dom = sim::dominantGravityBody(*currentSystem, timeDays, ship.positionKm(), pickParams);
+              if (dom.valid) {
+                trajCache.refValid = true;
+                trajCache.refBody = dom.body;
+              }
+            } else if (trajRefBodyChoice == 0) {
+              trajCache.refValid = true;
+              trajCache.refBody.kind = sim::GravityBody::Kind::Star;
+              trajCache.refBody.id = currentSystem->stub.id;
+              trajCache.refBody.name = "Star";
+              trajCache.refBody.posKm = {0,0,0};
+              trajCache.refBody.velKmS = {0,0,0};
+              trajCache.refBody.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
+              trajCache.refBody.radiusKm = sim::radiusStarKm(currentSystem->star);
+            } else {
+              const int pi = trajRefBodyChoice - 1;
+              if (pi >= 0 && pi < (int)currentSystem->planets.size()) {
+                const auto& p = currentSystem->planets[(std::size_t)pi];
+                trajCache.refValid = true;
+                trajCache.refBody.kind = sim::GravityBody::Kind::Planet;
+                trajCache.refBody.id = (core::u64)pi;
+                trajCache.refBody.name = p.name;
+                trajCache.refBody.posKm = planetPosKm(p, timeDays);
+                trajCache.refBody.velKmS = planetVelKmS(p, timeDays);
+                trajCache.refBody.muKm3S2 = sim::muPlanetKm3S2(p);
+                trajCache.refBody.radiusKm = sim::radiusPlanetKm(p);
+              }
+            }
+          }
+
+          auto refBodyAtDays = [&](double tDays) -> sim::GravityBody {
+            sim::GravityBody b = trajCache.refBody;
+            if (!trajCache.refValid) return b;
+            if (b.kind == sim::GravityBody::Kind::Star) {
+              b.posKm = {0,0,0};
+              b.velKmS = {0,0,0};
+              b.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
+              b.radiusKm = sim::radiusStarKm(currentSystem->star);
+              return b;
+            }
+            if (b.kind == sim::GravityBody::Kind::Planet) {
+              const std::size_t pi = (std::size_t)b.id;
+              if (pi < currentSystem->planets.size()) {
+                const auto& p = currentSystem->planets[pi];
+                b.posKm = planetPosKm(p, tDays);
+                b.velKmS = planetVelKmS(p, tDays);
+                b.muKm3S2 = sim::muPlanetKm3S2(p);
+                b.radiusKm = sim::radiusPlanetKm(p);
+              }
+              return b;
+            }
+            return b;
+          };
+
+          sim::TrajectoryPredictParams tp;
+          tp.horizonSec = horizonSec;
+          tp.stepSec = stepSec;
+          tp.maxSamples = maxSamples;
+          tp.includeGravity = (gMode != 0);
+          tp.gravity = gParams;
+
+          trajCache.burnValid = false;
+          trajCache.nodeIndex = -1;
+          trajCache.samples.clear();
+
+          // Optional maneuver node.
+          std::optional<sim::ManeuverNode> node;
+          if (maneuverNodeEnabled && trajCache.refValid) {
+            const double tNode = std::clamp((double)maneuverNodeTimeSec, 0.0, horizonSec);
+
+            // Propagate pre-burn state to the node time.
+            sim::TrajectoryPredictParams pre = tp;
+            pre.horizonSec = tNode;
+            const auto preS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                       ship.positionKm(), ship.velocityKmS(), pre);
+            if (!preS.empty()) {
+              trajCache.burnPre = preS.back();
+
+              const sim::GravityBody rb = refBodyAtDays(timeDays + tNode / 86400.0);
+              const math::Vec3d relPos = trajCache.burnPre.posKm - rb.posKm;
+              const math::Vec3d relVel = trajCache.burnPre.velKmS - rb.velKmS;
+
+              // RTN frame (Radial, Tangential/Along-track, Normal).
+              math::Vec3d radial = relPos.normalized();
+              if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+              math::Vec3d normal = math::cross(relPos, relVel);
+              if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+              normal = normal.normalized();
+              math::Vec3d along = math::cross(normal, radial);
+              if (along.lengthSq() < 1e-12) {
+                along = (relVel - radial * math::dot(relVel, radial)).normalized();
+              } else {
+                along = along.normalized();
+              }
+
+              trajCache.burnRadialOut = radial;
+              trajCache.burnAlong = along;
+              trajCache.burnNormal = normal;
+
+              const math::Vec3d dvWorldKmS =
+                along  * (trajCache.dvAlongMS  / 1000.0) +
+                normal * (trajCache.dvNormalMS / 1000.0) +
+                radial * (trajCache.dvRadialMS / 1000.0);
+
+              node = sim::ManeuverNode{tNode, dvWorldKmS};
+              trajCache.burnPost = trajCache.burnPre;
+              trajCache.burnPost.velKmS += dvWorldKmS;
+              trajCache.burnValid = true;
+
+              // Orbit scalars (relative to the reference body). Use an "effective" mu when
+              // the preview is using a scaled gravity model.
+              const double muEff = rb.muKm3S2 * (tp.includeGravity ? tp.gravity.scale : 1.0);
+              trajCache.orbitPre = sim::solveTwoBodyOrbit(relPos, relVel, muEff);
+              trajCache.orbitPost = sim::solveTwoBodyOrbit(relPos, relVel + dvWorldKmS, muEff);
+            }
+          }
+
+          trajCache.samples = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                       ship.positionKm(), ship.velocityKmS(), tp,
+                                                       node ? &(*node) : nullptr);
+
+          // Find node sample index.
+          if (node) {
+            for (std::size_t i = 0; i < trajCache.samples.size(); ++i) {
+              if (std::abs(trajCache.samples[i].tSec - node->timeSec) < 1e-6) {
+                trajCache.nodeIndex = (int)i;
+                break;
+              }
+            }
+          }
+
+          // Altitude scan (relative to reference body).
+          trajCache.altValid = false;
+          if (trajCache.refValid && !trajCache.samples.empty()) {
+            trajCache.altValid = true;
+            trajCache.impact = false;
+            trajCache.minAltKm = std::numeric_limits<double>::infinity();
+            trajCache.minAltTimeSec = 0.0;
+            trajCache.minAltIndex = -1;
+            for (std::size_t si = 0; si < trajCache.samples.size(); ++si) {
+              const auto& s = trajCache.samples[si];
+              const sim::GravityBody rb = refBodyAtDays(timeDays + s.tSec / 86400.0);
+              const double dist = (s.posKm - rb.posKm).length();
+              const double alt = dist - rb.radiusKm;
+              if (alt < trajCache.minAltKm) {
+                trajCache.minAltKm = alt;
+                trajCache.minAltTimeSec = s.tSec;
+                trajCache.minAltIndex = (int)si;
+              }
+              if (alt < 0.0) {
+                trajCache.impact = true;
+              }
+            }
+          }
+        }
       }
     }
 
@@ -8942,7 +9847,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       for (int s = 0; s <= seg; ++s) {
         const double t = (double)s / (double)seg * p.orbit.periodDays;
         const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, t);
-        const math::Vec3d posU = toRenderU(posAU * kAU_KM);
+        const math::Vec3d posU = toRenderPosU(posAU * kAU_KM);
 
         if (s > 0) {
           lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.22f,0.22f,0.25f});
@@ -8961,7 +9866,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       math::Vec3d prev{};
       for (int s = 0; s <= seg; ++s) {
         const double t = (double)s / (double)seg * st.orbit.periodDays;
-        const math::Vec3d posU = toRenderU(sim::orbitPosition3DAU(st.orbit, t) * kAU_KM);
+        const math::Vec3d posU = toRenderPosU(sim::orbitPosition3DAU(st.orbit, t) * kAU_KM);
         if (s > 0) {
           lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.16f,0.18f,0.22f});
           lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.16f,0.18f,0.22f});
@@ -8993,8 +9898,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const float cb = clearanceGranted ? 0.45f : 0.25f;
 
         auto addLineKm = [&](const math::Vec3d& aKm, const math::Vec3d& bKm, float r, float g, float b) {
-          const math::Vec3d aU = toRenderU(aKm);
-          const math::Vec3d bU = toRenderU(bKm);
+          const math::Vec3d aU = toRenderPosU(aKm);
+          const math::Vec3d bU = toRenderPosU(bKm);
           lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, r,g,b});
           lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, r,g,b});
         };
@@ -9046,6 +9951,59 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
     }
 
+    // Trajectory preview (player) - helps visualize ballistic arcs and maneuver planning.
+    if (trajCache.valid && !trajCache.samples.empty()) {
+      const float preR = 0.25f, preG = 0.70f, preB = 1.00f;   // cyan
+      const float postR = 1.00f, postG = 0.45f, postB = 0.90f; // magenta
+
+      for (std::size_t i = 1; i < trajCache.samples.size(); ++i) {
+        const auto& a = trajCache.samples[i - 1];
+        const auto& b = trajCache.samples[i];
+        const bool post = (trajCache.nodeIndex >= 0) && ((int)i > trajCache.nodeIndex);
+        const float r = post ? postR : preR;
+        const float g = post ? postG : preG;
+        const float bb = post ? postB : preB;
+
+        const math::Vec3d aU = toRenderPosU(a.posKm);
+        const math::Vec3d bU = toRenderPosU(b.posKm);
+        lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, r,g,bb});
+        lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, r,g,bb});
+      }
+
+      auto addCrossKm = [&](const math::Vec3d& posKm, const math::Vec3d& axis, double halfLenKm,
+                            float r, float g, float b) {
+        const math::Vec3d aU = toRenderPosU(posKm - axis * halfLenKm);
+        const math::Vec3d bU = toRenderPosU(posKm + axis * halfLenKm);
+        lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, r,g,b});
+        lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, r,g,b});
+      };
+
+      // Maneuver node marker (RTN axes).
+      if (trajCache.nodeIndex >= 0 && trajCache.nodeIndex < (int)trajCache.samples.size()) {
+        const math::Vec3d pKm = trajCache.samples[(std::size_t)trajCache.nodeIndex].posKm;
+        const double len = 22000.0;
+        const math::Vec3d radial = trajCache.burnRadialOut.lengthSq() > 1e-12 ? trajCache.burnRadialOut : math::Vec3d{1,0,0};
+        const math::Vec3d along  = trajCache.burnAlong.lengthSq() > 1e-12 ? trajCache.burnAlong : math::Vec3d{0,0,1};
+        const math::Vec3d normal = trajCache.burnNormal.lengthSq() > 1e-12 ? trajCache.burnNormal : math::Vec3d{0,1,0};
+
+        addCrossKm(pKm, radial, len, 1.0f, 0.9f, 0.25f); // radial (yellow)
+        addCrossKm(pKm, along,  len, 0.25f, 0.95f, 0.55f); // along-track (green)
+        addCrossKm(pKm, normal, len, 0.75f, 0.35f, 1.0f); // normal (purple)
+      }
+
+      // Min-alt marker (red if impact, amber otherwise).
+      if (trajCache.altValid && trajCache.minAltIndex >= 0 && trajCache.minAltIndex < (int)trajCache.samples.size()) {
+        const math::Vec3d pKm = trajCache.samples[(std::size_t)trajCache.minAltIndex].posKm;
+        const double len = 18000.0;
+        const float r = trajCache.impact ? 1.0f : 1.0f;
+        const float g = trajCache.impact ? 0.25f : 0.65f;
+        const float b = trajCache.impact ? 0.25f : 0.15f;
+        addCrossKm(pKm, {1,0,0}, len, r,g,b);
+        addCrossKm(pKm, {0,1,0}, len, r,g,b);
+        addCrossKm(pKm, {0,0,1}, len, r,g,b);
+      }
+    }
+
     // Laser beams
     for (const auto& b : beams) {
       lines.push_back({(float)b.aU.x,(float)b.aU.y,(float)b.aU.z, b.r,b.g,b.b});
@@ -9059,8 +10017,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const double tracerLenKm = 15000.0;
         tailKm = p.posKm - p.velKmS.normalized() * tracerLenKm;
       }
-      const math::Vec3d aU = toRenderU(tailKm);
-      const math::Vec3d bU = toRenderU(p.posKm);
+      const math::Vec3d aU = toRenderPosU(tailKm);
+      const math::Vec3d bU = toRenderPosU(p.posKm);
       lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, p.r,p.g,p.b});
       lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, p.r,p.g,p.b});
     }
@@ -9072,8 +10030,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const double tracerLenKm = 24000.0;
         tailKm = m.posKm - m.velKmS.normalized() * tracerLenKm;
       }
-      const math::Vec3d aU = toRenderU(tailKm);
-      const math::Vec3d bU = toRenderU(m.posKm);
+      const math::Vec3d aU = toRenderPosU(tailKm);
+      const math::Vec3d bU = toRenderPosU(m.posKm);
       lines.push_back({(float)aU.x,(float)aU.y,(float)aU.z, m.r,m.g,m.b});
       lines.push_back({(float)bU.x,(float)bU.y,(float)bU.z, m.r,m.g,m.b});
     }
@@ -9092,7 +10050,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Ship instance (cube, rotated)
     {
-      const auto inst = makeInst(toRenderU(ship.positionKm()),
+      const auto inst = makeInst(toRenderPosU(ship.positionKm()),
                                  {0.35, 0.20, 0.60},
                                  ship.orientation(),
                                  1.00f, 1.00f, 1.00f);
@@ -9113,7 +10071,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       if (c.role == ContactRole::Pirate) { r = 1.0f; g = 0.25f; b = 0.25f; }
       if (c.role == ContactRole::Police) { r = 0.35f; g = 0.75f; b = 1.0f; }
       if (c.role == ContactRole::Trader) { r = 0.45f; g = 0.95f; b = 0.45f; }
-      cubes.push_back(makeInst(toRenderU(c.ship.positionKm()),
+      cubes.push_back(makeInst(toRenderPosU(c.ship.positionKm()),
                                {0.25, 0.18, 0.45},
                                c.ship.orientation(),
                                r,g,b));
@@ -9123,7 +10081,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	    for (const auto& pod : floatingCargo) {
 	      if (pod.units <= 0.0) continue;
 	      const float r = 1.00f, g = 0.85f, b = 0.25f;
-	      cubes.push_back(makeInst(toRenderU(pod.posKm),
+	      cubes.push_back(makeInst(toRenderPosU(pod.posKm),
 	                               {0.12, 0.12, 0.12},
 	                               math::Quatd::identity(),
 	                               r,g,b));
@@ -9133,7 +10091,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	    for (const auto& a : asteroids) {
 	      const float r = 0.55f, g = 0.55f, b = 0.58f;
 	      const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
-	      cubes.push_back(makeInst(toRenderU(a.posKm),
+	      cubes.push_back(makeInst(toRenderPosU(a.posKm),
 	                               {0.55 * s, 0.55 * s, 0.55 * s},
 	                               math::Quatd::identity(),
 	                               r,g,b));
@@ -9145,7 +10103,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	      if (s.type == SignalType::Distress) { r = 1.0f; g = 0.6f; b = 0.2f; }
 	      if (s.type == SignalType::Derelict) { r = 0.75f; g = 0.75f; b = 1.0f; }
 	      if (s.type == SignalType::Resource) { r = 0.55f; g = 0.95f; b = 0.55f; }
-	      cubes.push_back(makeInst(toRenderU(s.posKm),
+	      cubes.push_back(makeInst(toRenderPosU(s.posKm),
 	                               {0.25, 0.25, 0.25},
 	                               math::Quatd::identity(),
 	                               r,g,b));
@@ -9155,6 +10113,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // World pass
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
 
     if (postFxSettings.enabled) {
       postFx.ensureSize(w, h);
@@ -9172,6 +10131,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       glDepthMask(GL_FALSE);
       pointRenderer.drawPointsSprite(nebula.points(), nebulaPointSpriteTex, render::PointBlendMode::Additive);
       glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
     }
 
     // Background stars (point sprites, additive blend). Don't write depth.
@@ -9183,6 +10143,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
       }
       glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
     }
 
     // Lines (orbits, corridor, beams)
@@ -9235,6 +10196,40 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         meshRenderer.setAlphaMul(1.0f);
         meshRenderer.setAlphaFromTexture(false);
         glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+      }
+
+      // Planet rings (alpha-blended annulus). Draw after clouds so rings can appear in front of
+      // the planet disk when inclined toward the camera.
+      if (worldRingsEnabled && !planetRingDraws.empty()) {
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        meshRenderer.setAlphaFromTexture(true);
+        meshRenderer.setUnlit(false);
+
+        auto drawRingVariant = [&](const render::Mesh& ringMesh, std::uint8_t variant) {
+          meshRenderer.setMesh(&ringMesh);
+          for (const auto& rd : planetRingDraws) {
+            if (rd.variant != variant) continue;
+            const auto& ringTex = ringTexCache.get(rd.ringSeed, worldRingTexWidth, worldRingTexHeight);
+            meshRenderer.setTexture(&ringTex);
+            meshRenderer.setAlphaMul(rd.alphaMul);
+            tmp.clear();
+            tmp.push_back(rd.inst);
+            meshRenderer.drawInstances(tmp);
+          }
+        };
+
+        drawRingVariant(ringThin, 0);
+        drawRingVariant(ringMed, 1);
+        drawRingVariant(ringThick, 2);
+
+        meshRenderer.setMesh(&sphere);
+        meshRenderer.setAlphaMul(1.0f);
+        meshRenderer.setAlphaFromTexture(false);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
       }
 
       // Restore default texture for other meshes.
@@ -9255,6 +10250,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       atmosphereRenderer.setForwardScatter(worldAtmoForwardScatter);
       atmosphereRenderer.drawInstances(planetAtmoDraws);
       glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
     }
 
     // Cubes (stations, contacts, salvage, asteroids, signal sources)
@@ -9282,6 +10278,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         pointRenderer.drawPoints(particleVerts, render::PointBlendMode::Additive);
       }
       glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
     }
 
     // PostFX pass (HDR tonemap / bloom) - draw scene to the backbuffer, then render ImGui on top.
@@ -9323,7 +10320,33 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       render::gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    // Screenshot capture (world-only): must happen after the scene is in the backbuffer and before any UI is drawn.
+    if (shotWorld.pending) {
+      std::string err;
+      const bool ok = game::captureBackbufferToPng(shotWorld.path, w, h, &err);
+      if (ok) {
+        photoModeWindow.lastSavedPath = shotWorld.path;
+        if (shotWorld.copyToClipboard) SDL_SetClipboardText(shotWorld.path.c_str());
+        toast(toasts, "Saved screenshot: " + shotWorld.path, 2.2);
+      } else {
+        toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+      }
+      shotWorld.pending = false;
+      shotWorld.path.clear();
+      shotWorld.copyToClipboard = false;
+
+      if (shotRestorePausedPending && !shotUi.pending) {
+        paused = shotPrevPaused;
+        shotRestorePausedPending = false;
+      }
+    }
+
     // ---- UI ----
+    // Rebuild fonts *before* starting a new ImGui frame.
+    // (Font atlas changes must happen before ImGui::NewFrame.)
+    if (uiFontsDirty) {
+      rebuildUiFontsNow(/*toastOnFailure=*/true);
+    }
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
@@ -9354,10 +10377,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       };
 
       if (ImGui::BeginMenu("Windows")) {
+        ImGui::MenuItem("Window Manager...", nullptr, &showWindowManagerWindow);
+        ImGui::Separator();
         ImGui::MenuItem(withKey("Galaxy", controls.actions.toggleGalaxy).c_str(), nullptr, &showGalaxy);
         ImGui::MenuItem("Bookmarks", nullptr, &showBookmarksWindow);
         ImGui::MenuItem(withKey("Ship/Status", controls.actions.toggleShip).c_str(), nullptr, &showShip);
         ImGui::MenuItem(withKey("Market", controls.actions.toggleMarket).c_str(), nullptr, &showEconomy);
+        ImGui::MenuItem("Market Dashboard", nullptr, &marketDashboardWindow.open);
         ImGui::MenuItem(withKey("Contacts", controls.actions.toggleContacts).c_str(), nullptr, &showContacts);
         ImGui::MenuItem(withKey("Missions", controls.actions.toggleMissions).c_str(), nullptr, &showMissions);
         ImGui::MenuItem(withKey("Scanner", controls.actions.toggleScanner).c_str(), nullptr, &showScanner);
@@ -9372,7 +10398,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::Separator();
         ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
         ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        if (ImGui::MenuItem("Photo Mode", nullptr, &photoModeWindow.open)) { if (photoModeWindow.open) photoModeWindow.focusDir = true; }
         if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
+        if (ImGui::MenuItem("Log", nullptr, &logWindow.open)) { if (logWindow.open) logWindow.focusFilter = true; }
+        if (ImGui::MenuItem("CVars", nullptr, &cvarWindow.open)) { if (cvarWindow.open) cvarWindow.focusFilter = true; }
+        if (ImGui::MenuItem("Profiler", nullptr, &profilerWindow.open)) { if (profilerWindow.open) profiler.setEnabled(true); }
         ImGui::EndMenu();
       }
 
@@ -9537,7 +10567,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           game::openCommandPalette(commandPalette);
         }
         ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        if (ImGui::MenuItem("Photo Mode", nullptr, &photoModeWindow.open)) { if (photoModeWindow.open) photoModeWindow.focusDir = true; }
         if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
+        if (ImGui::MenuItem("Log", nullptr, &logWindow.open)) { if (logWindow.open) logWindow.focusFilter = true; }
         ImGui::MenuItem("Bookmarks", nullptr, &showBookmarksWindow);
         ImGui::MenuItem("UI Settings...", nullptr, &showUiSettingsWindow);
         ImGui::Separator();
@@ -9551,7 +10583,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             if (uiTheme == t) return;
             uiTheme = t;
             rebuildUiStyle(uiTheme, uiScale);
-            io.FontGlobalScale = uiScale;
+            io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
             uiScaleApplied = uiScale;
             uiSettingsDirty = true;
           };
@@ -9749,6 +10781,169 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     if (showImGuiDemo) ImGui::ShowDemoWindow(&showImGuiDemo);
     if (showImGuiMetrics) ImGui::ShowMetricsWindow(&showImGuiMetrics);
 
+    // Window Manager
+    if (showWindowManagerWindow) {
+      ImGui::SetNextWindowSize(ImVec2(620.0f, 540.0f), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Window Manager", &showWindowManagerWindow)) {
+        ImGui::TextUnformatted("Search + toggle UI windows. This view also supports bulk open/close.");
+        ImGui::TextDisabled("Tip: open the Command Palette via %s", game::chordLabel(controls.actions.commandPalette).c_str());
+
+        static char filter[128]{0};
+        static bool openOnly = false;
+        static int groupIndex = 0;
+
+        auto anyNonSpace = [](const char* s) {
+          if (!s) return false;
+          for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+            if (std::isspace(*p) == 0) return true;
+          }
+          return false;
+        };
+
+        // Build group list.
+        std::vector<std::string> groups;
+        groups.emplace_back("All");
+        for (const auto& b : uiWindows.items()) {
+          if (b.desc.group.empty()) continue;
+          if (std::find(groups.begin(), groups.end(), b.desc.group) == groups.end()) {
+            groups.push_back(b.desc.group);
+          }
+        }
+        if (groups.size() > 1) {
+          std::sort(groups.begin() + 1, groups.end());
+        }
+        ImGui::PushItemWidth(240.0f);
+        ImGui::InputTextWithHint("##wm_filter", "Filter...", filter, sizeof(filter));
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::Checkbox("Open only", &openOnly);
+        ImGui::SameLine();
+
+        // Group selector.
+        {
+          std::vector<const char*> items;
+          items.reserve(groups.size());
+          for (const auto& g : groups) items.push_back(g.c_str());
+          ImGui::SetNextItemWidth(140.0f);
+          ImGui::Combo("##wm_group", &groupIndex, items.data(), (int)items.size());
+        }
+
+        if (groupIndex < 0) groupIndex = 0;
+        if (groupIndex >= (int)groups.size()) groupIndex = 0;
+        const std::string& activeGroup = groups[(std::size_t)groupIndex];
+
+        auto matchesFilter = [&](const ui::WindowBinding& b) {
+          if (!b.open) return false;
+          if (openOnly && !*b.open) return false;
+          if (groupIndex > 0 && b.desc.group != activeGroup) return false;
+          if (anyNonSpace(filter)) {
+            std::string hay;
+            hay.reserve(b.desc.label.size() + b.desc.key.size() + 2);
+            hay += b.desc.label;
+            hay.push_back(' ');
+            hay += b.desc.key;
+            return ui::fuzzyMatchScore(filter, hay) >= 0;
+          }
+          return true;
+        };
+
+        ImGui::SameLine();
+        if (ImGui::Button("Open listed")) {
+          for (const auto& b : uiWindows.items()) {
+            if (!matchesFilter(b)) continue;
+            uiWindows.setOpen(b.desc.key, true);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close listed")) {
+          for (const auto& b : uiWindows.items()) {
+            if (!matchesFilter(b)) continue;
+            uiWindows.setOpen(b.desc.key, false);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Defaults")) uiWindows.resetToDefaults();
+
+        ImGui::Separator();
+
+        struct Row {
+          const ui::WindowBinding* b;
+          int score;
+        };
+
+        std::vector<Row> rows;
+        rows.reserve(uiWindows.items().size());
+
+        const bool hasQuery = anyNonSpace(filter);
+        for (const auto& b : uiWindows.items()) {
+          if (!matchesFilter(b)) continue;
+
+          int score = b.desc.palettePriority;
+          if (hasQuery) {
+            // Match against "Label Key" to make keys discoverable.
+            std::string hay;
+            hay.reserve(b.desc.label.size() + b.desc.key.size() + 2);
+            hay += b.desc.label;
+            hay.push_back(' ');
+            hay += b.desc.key;
+            score = ui::fuzzyMatchScore(filter, hay);
+            if (score < 0) continue;
+          }
+          rows.push_back(Row{&b, score});
+        }
+
+        std::stable_sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+          if (a.score != b.score) return a.score > b.score;
+          if (a.b->desc.group != b.b->desc.group) return a.b->desc.group < b.b->desc.group;
+          return a.b->desc.label < b.b->desc.label;
+        });
+
+        if (ImGui::BeginTable("##wm_table", 4,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+          ImGui::TableSetupColumn("Open", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+          ImGui::TableSetupColumn("Window", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+          ImGui::TableSetupColumn("Group", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+          ImGui::TableSetupColumn("Hint", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+          ImGui::TableHeadersRow();
+
+          for (const Row& r : rows) {
+            const ui::WindowBinding& b = *r.b;
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+
+            bool open = *b.open;
+            const std::string id = "##wm_open_" + b.desc.key;
+            if (ImGui::Checkbox(id.c_str(), &open)) {
+              uiWindows.setOpen(b.desc.key, open);
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(b.desc.label.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+              ImGui::BeginTooltip();
+              ImGui::TextDisabled("Key: %s", b.desc.key.c_str());
+              ImGui::EndTooltip();
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(b.desc.group.empty() ? "" : b.desc.group.c_str());
+
+            ImGui::TableSetColumnIndex(3);
+            std::string hint;
+            if (b.shortcutLabel) hint = b.shortcutLabel();
+            if (!hint.empty()) {
+              ImGui::TextDisabled("%s", hint.c_str());
+            } else {
+              ImGui::TextDisabled("-");
+            }
+          }
+
+          ImGui::EndTable();
+        }
+      }
+      ImGui::End();
+    }
+
     // HUD Layout editor window
     if (showHudLayoutWindow) {
       ImGui::SetNextWindowSize(ImVec2(520.0f, 450.0f), ImGuiCond_FirstUseEver);
@@ -9920,6 +11115,60 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Console window (log + commands)
     game::drawConsoleWindow(consoleWindow);
 
+    // Log viewer (ring buffer + filtering + export)
+    game::drawLogWindow(logWindow, uiLogBuffer,
+                        [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    // CVar browser/editor (developer tool)
+    game::drawCVarWindow(cvarWindow,
+                         [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+    // CPU profiler (frame breakdown)
+    game::drawProfilerWindow(profilerWindow, profiler,
+                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    // Photo mode / screenshot capture
+    {
+      game::PhotoModeContext ctx;
+      ctx.framebufferW = w;
+      ctx.framebufferH = h;
+      ctx.paused = paused;
+      ctx.toast = [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); };
+
+      ctx.requestScreenshot = [&](bool includeUi,
+                                 const std::string& outDir,
+                                 const std::string& baseName,
+                                 bool timestamp,
+                                 bool copyPathToClipboard) {
+        game::ScreenshotRequest req;
+        req.includeUi = includeUi;
+        req.outDir = outDir;
+        req.baseName = baseName;
+        req.timestamp = timestamp;
+
+        std::string err;
+        const std::string path = game::buildScreenshotPath(req, &err);
+        if (path.empty()) {
+          toast(toasts, err.empty() ? "Failed to schedule screenshot." : err, 2.2);
+          return;
+        }
+
+        PendingScreenshot& slot = includeUi ? shotUi : shotWorld;
+        slot.pending = true;
+        slot.path = path;
+        slot.copyToClipboard = copyPathToClipboard;
+
+        // Pause for a stable capture (restored after the capture completes).
+        shotPrevPaused = paused;
+        paused = true;
+        shotRestorePausedPending = true;
+
+        toast(toasts, std::string("Screenshot scheduled: ") + path, 2.0);
+      };
+
+      game::drawPhotoModeWindow(photoModeWindow, ctx);
+    }
+
+
     // HUD overlay: combat symbology + target marker + toasts
     {
       ImDrawList* draw = ImGui::GetForegroundDrawList();
@@ -10089,7 +11338,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           const math::Vec3d pKm = ship.positionKm() + dir * 120000.0; // direction only (projection stable)
           ImVec2 p{};
           bool off = false;
-          if (projectToScreenAny(toRenderU(pKm), view, proj, w, h, p, off)) {
+          if (projectToScreenAny(toRenderPosU(pKm), view, proj, w, h, p, off)) {
             ImVec2 drawP = p;
             if (off && hudFlightMarkerClampToEdge) {
               drawP = clampToEdge(p, 34.0f);
@@ -10169,7 +11418,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (tgtKm) {
         ImVec2 px{};
-        if (projectToScreen(toRenderU(*tgtKm), view, proj, w, h, px)) {
+        if (projectToScreen(toRenderPosU(*tgtKm), view, proj, w, h, px)) {
           const double distKm = (*tgtKm - ship.positionKm()).length();
           draw->AddCircle({px.x, px.y}, 14.0f, IM_COL32(255,170,80,190), 1.5f);
 
@@ -10216,7 +11465,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 const double t = sol->tSec;
                 const math::Vec3d leadKm = sol->leadPointKm;
                 ImVec2 leadPx{};
-                if (projectToScreen(toRenderU(leadKm), view, proj, w, h, leadPx)) {
+                if (projectToScreen(toRenderPosU(leadKm), view, proj, w, h, leadPx)) {
                   const auto uv = hudAtlas.get(render::SpriteKind::HudLead,
                                                core::hashCombine(core::fnv1a64("hud_lead"), (core::u64)(int)wLeadType));
 
@@ -10252,7 +11501,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           // can still navigate toward it without opening the tactical overlay.
           bool off = false;
           ImVec2 pAny{};
-          if (projectToScreenAny(toRenderU(*tgtKm), view, proj, w, h, pAny, off) && off) {
+          if (projectToScreenAny(toRenderPosU(*tgtKm), view, proj, w, h, pAny, off) && off) {
             const ImVec2 center((float)w * 0.5f, (float)h * 0.5f);
             ImVec2 dir(pAny.x - center.x, pAny.y - center.y);
             const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
@@ -10386,7 +11635,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           const double distKm = (posKm - shipPosKm).length();
           if (distKm > tacticalRangeKm) return;
           ImVec2 px{};
-          if (!projectToScreen(toRenderU(posKm), view, proj, w, h, px)) return;
+          if (!projectToScreen(toRenderPosU(posKm), view, proj, w, h, px)) return;
           markers.push_back({kind, index, px, distKm, iconKind, iconSeed, std::move(label)});
         };
 
@@ -11332,7 +12581,7 @@ if (showVfx) {
       ImGui::SameLine();
       if (ImGui::Button("Test explosion")) {
         const double eBase = 1.75 * (double)vfxParticleIntensity;
-        particles.spawnExplosion(toRenderU(ship.positionKm()), toRenderU(ship.velocityKmS()), eBase);
+        particles.spawnExplosion(toRenderPosU(ship.positionKm()), toRenderVelU(ship.velocityKmS()), eBase);
       }
     } else {
       ImGui::TextDisabled("(particles disabled)");
@@ -11538,6 +12787,616 @@ if (showShip) {
 
   ImGui::Text("Credits: %.0f | Exploration data: %.0f cr", credits, explorationDataCr);
   ImGui::Text("Fuel: %.1f | Ship heat: %.0f", fuel, heat);
+
+  // Gravity / orbit diagnostics (useful while tuning supercruise drops & close approaches).
+  if (currentSystem) {
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Gravity / Orbit", ImGuiTreeNodeFlags_DefaultOpen)) {
+      sim::GravityParams diagParams = gravityParams;
+      diagParams.scale = 1.0;        // diagnostics use physical mu
+      diagParams.maxAccelKmS2 = 0.0; // unclamped
+
+      const auto dom = sim::dominantGravityBody(*currentSystem, timeDays, ship.positionKm(), diagParams);
+      if (!dom.valid) {
+        ImGui::TextDisabled("Gravity bodies disabled.");
+      } else {
+        const math::Vec3d relPos = ship.positionKm() - dom.body.posKm;
+        const math::Vec3d relVel = ship.velocityKmS() - dom.body.velKmS;
+        const double rKm = relPos.length();
+        const double altKm = rKm - dom.body.radiusKm;
+
+        const math::Vec3d aPhysical = sim::systemGravityAccelKmS2(*currentSystem, timeDays, ship.positionKm(), diagParams);
+        const double gPhysicalMS2 = aPhysical.length() * 1000.0;
+        const double gPhysicalG = (sim::kStandardGravityMS2 > 0.0) ? (gPhysicalMS2 / sim::kStandardGravityMS2) : 0.0;
+
+        const math::Vec3d aEffective = physicsGravityEnabled
+          ? sim::systemGravityAccelKmS2(*currentSystem, timeDays, ship.positionKm(), gravityParams)
+          : math::Vec3d{0, 0, 0};
+        const double gEffectiveMS2 = aEffective.length() * 1000.0;
+
+        ImGui::Text("Dominant body: %s", dom.body.name.c_str());
+        ImGui::Text("Distance: %.0f km (alt %.0f km)", rKm, altKm);
+        ImGui::Text("|g|: %.3f m/s^2 (%.3fg) | Effective: %.3f m/s^2", gPhysicalMS2, gPhysicalG, gEffectiveMS2);
+
+        const sim::TwoBodyOrbit orb = sim::solveTwoBodyOrbit(relPos, relVel, dom.body.muKm3S2);
+        ImGui::Text("Orbit: e=%.4f | a=%.0f km", orb.eccentricity, orb.semiMajorAxisKm);
+
+        const double periAltKm = orb.periapsisKm - dom.body.radiusKm;
+        ImGui::Text("Periapsis: %.0f km (alt %.0f km)", orb.periapsisKm, periAltKm);
+
+        if (orb.apoapsisKm > 0.0) {
+          const double apoAltKm = orb.apoapsisKm - dom.body.radiusKm;
+          ImGui::Text("Apoapsis: %.0f km (alt %.0f km)", orb.apoapsisKm, apoAltKm);
+        } else {
+          ImGui::TextDisabled("Apoapsis: unbound");
+        }
+
+        if (orb.periodSec > 0.0) {
+          ImGui::Text("Period: %.1f min (%.2f h)", orb.periodSec / 60.0, orb.periodSec / 3600.0);
+        } else {
+          ImGui::TextDisabled("Period: unbound");
+        }
+
+        // Atmosphere readout (if enabled).
+        ImGui::Separator();
+        if (!physicsAtmosphereEnabled) {
+          ImGui::TextDisabled("Atmosphere (physics): disabled");
+        } else if (!atmoPlayerLast.inAtmosphere) {
+          ImGui::TextDisabled("Atmosphere: vacuum (or no atmospheric planet nearby)");
+        } else {
+          const double qKPa = atmoPlayerLast.dynamicPressurePa / 1000.0;
+          const double dragMS2 = atmoPlayerLast.dragAccelKmS2.length() * 1000.0;
+
+          ImGui::Text("Atmosphere: %s", atmoPlayerLast.planetName.c_str());
+          ImGui::Text("Alt: %.0f km | rho: %.4f kg/m^3 | q: %.1f kPa",
+                      atmoPlayerLast.altitudeKm,
+                      atmoPlayerLast.densityKgM3,
+                      qKPa);
+          ImGui::Text("Rel speed: %.2f km/s | Drag: %.2f m/s^2 | Heat: %.2f /s",
+                      atmoPlayerLast.relSpeedKmS,
+                      dragMS2,
+                      atmoPlayerLast.heatingHeatPerSec);
+        }
+      }
+    }
+  }
+
+  // Trajectory preview + 1-node maneuver planner (experimental).
+  // This is deliberately headless + deterministic so it can be reused in tools/tests later.
+  if (currentSystem) {
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Trajectory / Maneuver Planner (experimental)", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Checkbox("Show trajectory preview line", &trajPreviewEnabled);
+      ImGui::SameLine();
+      ImGui::TextDisabled("(world-space line in the 3D view)");
+
+      const char* gModes[] = {
+        "Ballistic (no gravity)",
+        "Effective gravity (game settings)",
+        "Physical gravity (scale=1, unclamped)",
+      };
+      trajPreviewGravityMode = std::clamp(trajPreviewGravityMode, 0, 2);
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::Combo("Gravity model", &trajPreviewGravityMode, gModes, (int)(sizeof(gModes) / sizeof(gModes[0])));
+
+      ImGui::SetNextItemWidth(180.0f);
+      ImGui::SliderFloat("Horizon (min)", &trajPreviewHorizonMin, 1.0f, 180.0f, "%.1f");
+      ImGui::SetNextItemWidth(180.0f);
+      ImGui::SliderFloat("Step (s)", &trajPreviewStepSec, 0.10f, 10.0f, "%.2f");
+      ImGui::SetNextItemWidth(120.0f);
+      ImGui::InputInt("Max samples", &trajPreviewMaxSamples);
+      trajPreviewMaxSamples = std::clamp(trajPreviewMaxSamples, 32, 20000);
+
+      // Reference body chooser.
+      trajRefBodyChoice = std::clamp(trajRefBodyChoice, -1, (int)currentSystem->planets.size());
+      std::string refLabel;
+      if (trajRefBodyChoice == -1) {
+        refLabel = "Auto (dominant)";
+      } else if (trajRefBodyChoice == 0) {
+        refLabel = "Star";
+      } else {
+        const int pi = trajRefBodyChoice - 1;
+        refLabel = (pi >= 0 && pi < (int)currentSystem->planets.size()) ? currentSystem->planets[(std::size_t)pi].name
+                                                                       : "Planet";
+      }
+
+      ImGui::SetNextItemWidth(260.0f);
+      if (ImGui::BeginCombo("Reference body", refLabel.c_str())) {
+        if (ImGui::Selectable("Auto (dominant)", trajRefBodyChoice == -1)) trajRefBodyChoice = -1;
+        if (ImGui::Selectable("Star", trajRefBodyChoice == 0)) trajRefBodyChoice = 0;
+        for (int i = 0; i < (int)currentSystem->planets.size(); ++i) {
+          const bool sel = (trajRefBodyChoice == (i + 1));
+          if (ImGui::Selectable(currentSystem->planets[(std::size_t)i].name.c_str(), sel)) {
+            trajRefBodyChoice = i + 1;
+          }
+        }
+        ImGui::EndCombo();
+      }
+
+      if (trajCache.valid && !trajCache.samples.empty()) {
+        ImGui::TextDisabled("Samples: %d | Node index: %d", (int)trajCache.samples.size(), trajCache.nodeIndex);
+        if (trajCache.refValid) {
+          ImGui::Text("Ref body: %s", trajCache.refBody.name.c_str());
+        }
+        if (trajCache.altValid) {
+          if (trajCache.impact) {
+            ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "Impact predicted in %.1f min (min alt %.0f km)",
+                               trajCache.minAltTimeSec / 60.0, trajCache.minAltKm);
+          } else {
+            ImGui::Text("Min alt: %.0f km at T+%.1f min", trajCache.minAltKm, trajCache.minAltTimeSec / 60.0);
+          }
+        }
+      } else {
+        ImGui::TextDisabled("Preview not computed (enable it + stay in normal space).");
+      }
+
+      ImGui::Separator();
+      ImGui::Checkbox("Maneuver node", &maneuverNodeEnabled);
+      ImGui::SameLine();
+      ImGui::TextDisabled("(instantaneous delta-v)");
+
+      if (maneuverNodeEnabled) {
+        const float horizonSecUi = std::max(10.0f, trajPreviewHorizonMin * 60.0f);
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::SliderFloat("Burn time (T+ sec)", &maneuverNodeTimeSec, 0.0f, horizonSecUi, "%.0f");
+
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputFloat("Δv along (m/s)", &maneuverDvAlongMS, 1.0f, 10.0f, "%.1f");
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputFloat("Δv normal (m/s)", &maneuverDvNormalMS, 1.0f, 10.0f, "%.1f");
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputFloat("Δv radial (m/s)", &maneuverDvRadialMS, 1.0f, 10.0f, "%.1f");
+        ImGui::TextDisabled("Frame: RTN (Radial out, Tangential/along-track, Normal). Positive along = prograde-ish.");
+
+        // Quick actions.
+        if (ImGui::SmallButton("+50 m/s prograde")) maneuverDvAlongMS += 50.0f;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("-50 m/s retro")) maneuverDvAlongMS -= 50.0f;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Δv")) {
+          maneuverDvAlongMS = 0.0f;
+          maneuverDvNormalMS = 0.0f;
+          maneuverDvRadialMS = 0.0f;
+        }
+
+        // Circularize helper (computes Δv components for a circular orbit at the burn radius).
+        if (ImGui::SmallButton("Compute: Circularize at node")) {
+          const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+          sim::GravityParams gParams = gravityParams;
+          if (gMode == 2) {
+            gParams.scale = 1.0;
+            gParams.maxAccelKmS2 = 0.0;
+          }
+
+          sim::TrajectoryPredictParams tp;
+          tp.horizonSec = std::clamp((double)maneuverNodeTimeSec, 0.0, (double)std::max(10.0f, trajPreviewHorizonMin * 60.0f));
+          tp.stepSec = std::clamp((double)trajPreviewStepSec, 0.05, 30.0);
+          tp.maxSamples = std::clamp(trajPreviewMaxSamples, 32, 20000);
+          tp.includeGravity = (gMode != 0);
+          tp.gravity = gParams;
+
+          // Pick reference body consistent with the preview.
+          sim::GravityBody ref{};
+          bool refOk = false;
+          if (trajRefBodyChoice == -1) {
+            sim::GravityParams pick = gParams;
+            if (gMode == 0) { pick.scale = 1.0; pick.maxAccelKmS2 = 0.0; }
+            const auto dom = sim::dominantGravityBody(*currentSystem, timeDays, ship.positionKm(), pick);
+            if (dom.valid) { ref = dom.body; refOk = true; }
+          } else if (trajRefBodyChoice == 0) {
+            refOk = true;
+            ref.kind = sim::GravityBody::Kind::Star;
+            ref.id = currentSystem->stub.id;
+            ref.name = "Star";
+            ref.posKm = {0,0,0};
+            ref.velKmS = {0,0,0};
+            ref.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
+            ref.radiusKm = sim::radiusStarKm(currentSystem->star);
+          } else {
+            const int pi = trajRefBodyChoice - 1;
+            if (pi >= 0 && pi < (int)currentSystem->planets.size()) {
+              const auto& p = currentSystem->planets[(std::size_t)pi];
+              refOk = true;
+              ref.kind = sim::GravityBody::Kind::Planet;
+              ref.id = (core::u64)pi;
+              ref.name = p.name;
+              ref.posKm = planetPosKm(p, timeDays);
+              ref.velKmS = planetVelKmS(p, timeDays);
+              ref.muKm3S2 = sim::muPlanetKm3S2(p);
+              ref.radiusKm = sim::radiusPlanetKm(p);
+            }
+          }
+
+          if (refOk) {
+            auto refAt = [&](double tDays) -> sim::GravityBody {
+              sim::GravityBody b = ref;
+              if (b.kind == sim::GravityBody::Kind::Star) {
+                b.posKm = {0,0,0};
+                b.velKmS = {0,0,0};
+                b.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
+                b.radiusKm = sim::radiusStarKm(currentSystem->star);
+                return b;
+              }
+              if (b.kind == sim::GravityBody::Kind::Planet) {
+                const std::size_t pi = (std::size_t)b.id;
+                if (pi < currentSystem->planets.size()) {
+                  const auto& p = currentSystem->planets[pi];
+                  b.posKm = planetPosKm(p, tDays);
+                  b.velKmS = planetVelKmS(p, tDays);
+                  b.muKm3S2 = sim::muPlanetKm3S2(p);
+                  b.radiusKm = sim::radiusPlanetKm(p);
+                }
+                return b;
+              }
+              return b;
+            };
+
+            const auto preS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                      ship.positionKm(), ship.velocityKmS(), tp);
+            if (!preS.empty()) {
+              const auto& burn = preS.back();
+              const sim::GravityBody rb = refAt(timeDays + burn.tSec / 86400.0);
+              const math::Vec3d relPos = burn.posKm - rb.posKm;
+              const math::Vec3d relVel = burn.velKmS - rb.velKmS;
+
+              math::Vec3d radial = relPos.normalized();
+              if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+              math::Vec3d normal = math::cross(relPos, relVel);
+              if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+              normal = normal.normalized();
+              math::Vec3d along = math::cross(normal, radial);
+              if (along.lengthSq() < 1e-12) {
+                along = (relVel - radial * math::dot(relVel, radial)).normalized();
+              } else {
+                along = along.normalized();
+              }
+
+              const double rKm = relPos.length();
+              const double muEff = rb.muKm3S2 * (tp.includeGravity ? tp.gravity.scale : 1.0);
+              const double vCirc = (rKm > 1e-9) ? std::sqrt(muEff / rKm) : 0.0;
+
+              const double vt = math::dot(relVel, along);
+              const double vr = math::dot(relVel, radial);
+              const double vn = math::dot(relVel, normal);
+
+              maneuverDvAlongMS = (float)((vCirc - vt) * 1000.0);
+              maneuverDvRadialMS = (float)((-vr) * 1000.0);
+              maneuverDvNormalMS = (float)((-vn) * 1000.0);
+            }
+          }
+        }
+
+        // Lambert transfer helper (star-centric).
+        // This is intentionally a *planning* tool: it computes the instantaneous burn
+        // needed to reach the target's future position under a 2-body star model.
+        // The maneuver computer can then execute the burn.
+        {
+          ImGui::Separator();
+          ImGui::Text("Transfer planner (Lambert)");
+          ImGui::TextDisabled("Star-centric 2-body helper (0-rev). Target must be a planet or station.");
+
+          bool targetOk = false;
+          std::string tgtName;
+          math::Vec3d tgtPosArriveKm{0,0,0};
+          math::Vec3d tgtVelArriveKmS{0,0,0};
+
+          if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+            const auto& p = currentSystem->planets[target.index];
+            tgtName = p.name;
+            targetOk = true;
+          } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+            const auto& st = currentSystem->stations[target.index];
+            tgtName = st.name;
+            targetOk = true;
+          }
+
+          if (!targetOk) {
+            ImGui::TextDisabled("Target: (none)");
+          } else {
+            ImGui::Text("Target: %s", tgtName.c_str());
+          }
+
+          ImGui::SetNextItemWidth(180.0f);
+          ImGui::SliderFloat("TOF (hours)", &lambertTofHours, 0.25f, 240.0f, "%.2f");
+          ImGui::SameLine();
+          ImGui::Checkbox("Long way", &lambertLongWay);
+          ImGui::SameLine();
+          ImGui::Checkbox("Prograde", &lambertPrograde);
+          ImGui::Checkbox("Validate (coarse RK4)", &lambertValidateCoarse);
+
+          if (ImGui::SmallButton("Compute: Lambert transfer to target")) {
+            lambertLastOk = false;
+            lambertLastMissKm = 0.0f;
+            lambertLastArrivalRelMS = 0.0f;
+            lambertLastDvMS = 0.0f;
+            lambertLastAngleDeg = 0.0f;
+            lambertLastIterations = 0;
+
+            if (!targetOk) {
+              // nothing to do
+            } else {
+              const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+              sim::GravityParams gParams = gravityParams;
+              if (gMode == 2) {
+                gParams.scale = 1.0;
+                gParams.maxAccelKmS2 = 0.0;
+              }
+
+              const double tNode = std::clamp((double)maneuverNodeTimeSec, 0.0, (double)horizonSecUi);
+              const double tofSec = std::clamp((double)lambertTofHours * 3600.0, 5.0, 240.0 * 3600.0);
+              const double tArriveSec = tNode + tofSec;
+              const double arriveDays = timeDays + (tArriveSec / 86400.0);
+
+              // Propagate to node time to get a better departure state (e.g. if you're already on an arc).
+              sim::TrajectoryPredictParams pre;
+              pre.horizonSec = tNode;
+              pre.stepSec = std::clamp((double)trajPreviewStepSec, 0.05, 30.0);
+              pre.maxSamples = std::clamp(trajPreviewMaxSamples, 32, 20000);
+              pre.includeGravity = (gMode != 0);
+              pre.gravity = gParams;
+
+              const auto preS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                         ship.positionKm(), ship.velocityKmS(), pre);
+              if (!preS.empty()) {
+                const auto& dep = preS.back();
+
+                // Star-centric frame (star at origin).
+                const math::Vec3d r1 = dep.posKm;
+                const math::Vec3d v0 = dep.velKmS;
+
+                // Target ephemeris at arrival.
+                if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+                  const auto& p = currentSystem->planets[target.index];
+                  tgtPosArriveKm = planetPosKm(p, arriveDays);
+                  tgtVelArriveKmS = planetVelKmS(p, arriveDays);
+                } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+                  const auto& st = currentSystem->stations[target.index];
+                  tgtPosArriveKm = stationPosKm(st, arriveDays);
+                  tgtVelArriveKmS = stationVelKmS(st, arriveDays);
+                }
+
+                const double muStar = sim::muStarKm3S2(currentSystem->star);
+                const double muEff = muStar * ((gMode == 1) ? gParams.scale : 1.0);
+
+                sim::LambertOptions lo;
+                lo.longWay = lambertLongWay;
+                lo.prograde = lambertPrograde;
+                lo.refNormal = math::cross(r1, v0);
+                lo.maxIterations = 96;
+                lo.tolSec = 1e-3;
+
+                const auto sol = sim::solveLambertUniversal(r1, tgtPosArriveKm, tofSec, muEff, lo);
+                if (sol.ok) {
+                  const math::Vec3d dvWorldKmS = sol.v1KmS - v0;
+
+                  // Decompose into RTN components relative to the star at burn time.
+                  math::Vec3d radial = r1.normalized();
+                  if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+                  math::Vec3d normal = math::cross(r1, v0);
+                  if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+                  normal = normal.normalized();
+                  math::Vec3d along = math::cross(normal, radial);
+                  if (along.lengthSq() < 1e-12) {
+                    along = (v0 - radial * math::dot(v0, radial)).normalized();
+                  } else {
+                    along = along.normalized();
+                  }
+
+                  maneuverDvAlongMS = (float)(math::dot(dvWorldKmS, along) * 1000.0);
+                  maneuverDvNormalMS = (float)(math::dot(dvWorldKmS, normal) * 1000.0);
+                  maneuverDvRadialMS = (float)(math::dot(dvWorldKmS, radial) * 1000.0);
+
+                  // Keep the preview UI consistent with this helper.
+                  trajRefBodyChoice = 0; // star
+
+                  lambertLastOk = true;
+                  lambertLastDvMS = (float)(dvWorldKmS.length() * 1000.0);
+                  lambertLastAngleDeg = (float)math::radToDeg(sol.transferAngleRad);
+                  lambertLastIterations = sol.iterations;
+
+                  const math::Vec3d vRelArrive = sol.v2KmS - tgtVelArriveKmS;
+                  lambertLastArrivalRelMS = (float)(vRelArrive.length() * 1000.0);
+
+                  if (lambertValidateCoarse) {
+                    // Coarse propagation out to arrival to estimate miss distance.
+                    sim::ManeuverNode node{tNode, dvWorldKmS};
+
+                    sim::TrajectoryPredictParams val = pre;
+                    val.horizonSec = tArriveSec;
+                    val.maxSamples = 4500;
+                    // Choose a step that keeps the sample count reasonable.
+                    const double minStep = 0.5;
+                    const double idealStep = std::max(minStep, val.horizonSec / (double)val.maxSamples);
+                    val.stepSec = std::clamp(idealStep, 0.5, 240.0);
+
+                    const auto valS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                               ship.positionKm(), ship.velocityKmS(), val, &node);
+                    if (!valS.empty()) {
+                      const auto& end = valS.back();
+                      lambertLastMissKm = (float)((end.posKm - tgtPosArriveKm).length());
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          if (lambertLastOk) {
+            ImGui::Text("Last: Δv=%.1f m/s | angle=%.1f deg | iter=%d", lambertLastDvMS, lambertLastAngleDeg, lambertLastIterations);
+            ImGui::Text("Arrive rel speed: %.1f m/s", lambertLastArrivalRelMS);
+            if (lambertValidateCoarse) {
+              ImGui::Text("Coarse miss dist: %.0f km", lambertLastMissKm);
+            }
+          } else {
+            ImGui::TextDisabled("Last: (no solution yet)");
+          }
+        }
+
+        if (trajCache.burnValid) {
+          const auto& o0 = trajCache.orbitPre;
+          const auto& o1 = trajCache.orbitPost;
+          ImGui::Text("Pre-burn: e=%.4f | peri alt %.0f km", o0.eccentricity, o0.periapsisKm - trajCache.refBody.radiusKm);
+          ImGui::Text("Post-burn: e=%.4f | peri alt %.0f km", o1.eccentricity, o1.periapsisKm - trajCache.refBody.radiusKm);
+          if (o1.apoapsisKm > 0.0) {
+            ImGui::Text("Post apo alt: %.0f km", o1.apoapsisKm - trajCache.refBody.radiusKm);
+          }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Maneuver computer");
+        ImGui::TextDisabled("Execute the node as a continuous burn (prototype).");
+
+        auto phaseLabel = [](sim::ManeuverComputerPhase p) -> const char* {
+          switch (p) {
+            case sim::ManeuverComputerPhase::Off: return "Off";
+            case sim::ManeuverComputerPhase::Orient: return "Orienting";
+            case sim::ManeuverComputerPhase::Burn: return "Burning";
+            case sim::ManeuverComputerPhase::Complete: return "Complete";
+            case sim::ManeuverComputerPhase::Aborted: return "Aborted";
+            default: return "Unknown";
+          }
+        };
+
+        ImGui::Text("Status: %s", phaseLabel(maneuverComputer.phase()));
+
+        // Tuning
+        ImGui::Checkbox("Disable dampers during burn", &maneuverComputerParams.disableDampersDuringBurn);
+        ImGui::Checkbox("Request boost", &maneuverComputerParams.allowBoost);
+
+        float mcAlignTol = (float)maneuverComputerParams.alignToleranceDeg;
+        if (ImGui::SliderFloat("Align tolerance (deg)", &mcAlignTol, 0.5f, 12.0f, "%.1f")) {
+          maneuverComputerParams.alignToleranceDeg = (double)mcAlignTol;
+        }
+
+        float mcFaceGain = (float)maneuverComputerParams.faceGain;
+        if (ImGui::SliderFloat("Face gain", &mcFaceGain, 0.4f, 6.0f, "%.2f")) {
+          maneuverComputerParams.faceGain = (double)mcFaceGain;
+        }
+
+        float mcLead = (float)maneuverComputerParams.extraLeadTimeSec;
+        if (ImGui::SliderFloat("Extra lead (sec)", &mcLead, -8.0f, 8.0f, "%.1f")) {
+          maneuverComputerParams.extraLeadTimeSec = (double)mcLead;
+        }
+
+        float mcDvTol = (float)(maneuverComputerParams.dvToleranceKmS * 1000.0);
+        if (ImGui::SliderFloat("Δv tol (m/s)", &mcDvTol, 0.5f, 20.0f, "%.1f")) {
+          maneuverComputerParams.dvToleranceKmS = (double)mcDvTol / 1000.0;
+        }
+
+        float mcAbort = (float)maneuverComputerParams.abortAfterMissedSec;
+        if (ImGui::SliderFloat("Abort if missed (sec)", &mcAbort, 0.0f, 180.0f, "%.0f")) {
+          maneuverComputerParams.abortAfterMissedSec = (double)mcAbort;
+        }
+
+        ImGui::Checkbox("Disengage on manual input", &maneuverComputerDisengageOnManualInput);
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("Manual deadzone", &maneuverComputerManualDeadzone, 0.05f, 0.75f, "%.2f");
+
+        const bool cacheMatchesNodeTime =
+          trajCache.valid &&
+          trajCache.nodeEnabled == maneuverNodeEnabled &&
+          std::abs(trajCache.nodeTimeSec - (double)maneuverNodeTimeSec) < 1e-3;
+
+        const bool cacheMatchesDv =
+          trajCache.valid &&
+          std::abs(trajCache.dvAlongMS  - (double)maneuverDvAlongMS)  < 1e-3 &&
+          std::abs(trajCache.dvNormalMS - (double)maneuverDvNormalMS) < 1e-3 &&
+          std::abs(trajCache.dvRadialMS - (double)maneuverDvRadialMS) < 1e-3;
+
+        const bool hasDv = (std::abs(maneuverDvAlongMS) + std::abs(maneuverDvNormalMS) + std::abs(maneuverDvRadialMS)) > 0.05f;
+
+        const bool canArm = cacheMatchesNodeTime &&
+                            trajCache.burnValid &&
+                            hasDv &&
+                            !docked &&
+                            fsdState == FsdState::Idle &&
+                            supercruiseState == SupercruiseState::Idle;
+
+        if (!maneuverComputer.active()) {
+          if (maneuverComputer.phase() == sim::ManeuverComputerPhase::Complete ||
+              maneuverComputer.phase() == sim::ManeuverComputerPhase::Aborted) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear")) {
+              maneuverComputer.disengage();
+              maneuverComputerLast = {};
+              maneuverComputerPrevPhase = maneuverComputer.phase();
+            }
+          }
+
+          if (ImGui::Button("Arm maneuver computer")) {
+            if (canArm) {
+              // Disengage other assist systems to avoid fighting over inputs.
+              if (autopilot) {
+                autopilot = false;
+                dockingComputer.reset();
+              }
+              if (navAssist.active()) {
+                navAssist.disengage();
+                navAssistLast = {};
+              }
+
+              const double tNode = std::clamp((double)maneuverNodeTimeSec, 0.0, trajCache.horizonSec);
+
+              const math::Vec3d radial = trajCache.burnRadialOut.lengthSq() > 1e-12 ? trajCache.burnRadialOut : math::Vec3d{1,0,0};
+              const math::Vec3d along  = trajCache.burnAlong.lengthSq() > 1e-12 ? trajCache.burnAlong : math::Vec3d{0,0,1};
+              const math::Vec3d normal = trajCache.burnNormal.lengthSq() > 1e-12 ? trajCache.burnNormal : math::Vec3d{0,1,0};
+
+              sim::ManeuverPlan plan;
+              plan.nodeTimeDays = timeDays + tNode / 86400.0;
+              plan.deltaVWorldKmS =
+                along  * ((double)maneuverDvAlongMS  / 1000.0) +
+                normal * ((double)maneuverDvNormalMS / 1000.0) +
+                radial * ((double)maneuverDvRadialMS / 1000.0);
+
+              maneuverComputer.engage(ship, plan);
+              maneuverComputerLast = {};
+              maneuverComputerPrevPhase = maneuverComputer.phase();
+
+              toast(toasts, "Maneuver computer armed.", 1.8);
+            } else {
+              toast(toasts, "Cannot arm maneuver computer (need a fresh preview + node, in normal space).", 2.2);
+            }
+          }
+
+          if (!cacheMatchesNodeTime) {
+            ImGui::TextDisabled("Preview cache out of date (node time changed).");
+          } else if (!cacheMatchesDv) {
+            ImGui::TextDisabled("Preview cache out of date (Δv changed).");
+          } else if (!trajCache.burnValid) {
+            ImGui::TextDisabled("Need a valid preview at the burn time.");
+          } else if (!hasDv) {
+            ImGui::TextDisabled("Δv is zero; nothing to execute.");
+          }
+        } else {
+          if (ImGui::Button("Abort maneuver computer")) {
+            maneuverComputer.disengage();
+            maneuverComputerLast = {};
+            maneuverComputerPrevPhase = maneuverComputer.phase();
+            toast(toasts, "Maneuver computer aborted.", 1.6);
+          }
+        }
+
+        // Telemetry (plan snapshot + last tick output)
+        if (maneuverComputer.phase() != sim::ManeuverComputerPhase::Off) {
+          const auto& pl = maneuverComputer.plan();
+          const double tTo = (pl.nodeTimeDays - timeDays) * 86400.0;
+          const double dvMs = pl.deltaVWorldKmS.length() * 1000.0;
+          ImGui::Text("Armed node: T%+.1f s | Δv %.1f m/s", tTo, dvMs);
+        }
+
+        if (maneuverComputerLast.phase != sim::ManeuverComputerPhase::Off) {
+          ImGui::Text("Align err: %.1f deg | Burn dur: %.1f s | Start lead: %.1f s",
+                      maneuverComputerLast.alignmentErrorDeg,
+                      maneuverComputerLast.burnDurationSec,
+                      maneuverComputerLast.burnStartLeadSec);
+
+          ImGui::Text("Δv rem: %.1f / %.1f m/s",
+                      maneuverComputerLast.dvRemainingKmS * 1000.0,
+                      maneuverComputerLast.dvTotalKmS * 1000.0);
+        }
+      }
+    }
+  }
 
   // Power distributor
   {
@@ -12307,6 +14166,10 @@ if (showWorldVisuals) {
   ImGui::SameLine();
   if (ImGui::Button("Clear surface cache")) surfaceTexCache.clear();
 
+  ImGui::Text("Ring texture cache: %zu / %zu", ringTexCache.size(), ringTexCache.maxEntries());
+  ImGui::SameLine();
+  if (ImGui::Button("Clear ring cache")) ringTexCache.clear();
+
   ImGui::Separator();
 
   ImGui::Checkbox("Procedural star/planet surfaces", &worldUseProceduralSurfaces);
@@ -12328,6 +14191,92 @@ if (showWorldVisuals) {
   }
 
   ImGui::Separator();
+
+  if (ImGui::CollapsingHeader("Physics (experimental)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Newtonian gravity", &physicsGravityEnabled);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(normal space only)");
+
+    ImGui::BeginDisabled(!physicsGravityEnabled);
+
+    ImGui::Checkbox("Include star", &gravityParams.includeStar);
+    ImGui::SameLine();
+    ImGui::Checkbox("Include planets", &gravityParams.includePlanets);
+
+    static const double kScaleMin = 0.0;
+    static const double kScaleMax = 3.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Gravity scale", ImGuiDataType_Double, &gravityParams.scale, &kScaleMin, &kScaleMax, "%.2f");
+
+    static const double kSoftMin = 1.00;
+    static const double kSoftMax = 1.50;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Softening radius", ImGuiDataType_Double, &gravityParams.softeningRadiusScale, &kSoftMin, &kSoftMax, "%.3f");
+
+    static const double kMaxMin = 0.0;
+    static const double kMaxMax = 0.08; // ~80 m/s^2
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Max accel (km/s^2)", ImGuiDataType_Double, &gravityParams.maxAccelKmS2, &kMaxMin, &kMaxMax, "%.4f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(0 = no clamp)");
+
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::Checkbox("Atmospheric drag + heating", &physicsAtmosphereEnabled);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(planets; normal space)");
+
+    ImGui::BeginDisabled(!physicsAtmosphereEnabled);
+
+    ImGui::Checkbox("Affect NPC ships", &physicsAtmosphereAffectsNpcs);
+    ImGui::SameLine();
+    ImGui::Checkbox("Apply heating", &atmoPhysicsParams.applyHeating);
+
+    static const double kAtmoDensityMin = 0.0;
+    static const double kAtmoDensityMax = 3.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Atmo density scale", ImGuiDataType_Double, &atmoPhysicsParams.densityScale, &kAtmoDensityMin, &kAtmoDensityMax, "%.2f");
+
+    static const double kAtmoCdMin = 0.0;
+    static const double kAtmoCdMax = 2.5;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Drag Cd", ImGuiDataType_Double, &atmoPhysicsParams.dragCd, &kAtmoCdMin, &kAtmoCdMax, "%.2f");
+
+    static const double kAtmoAreaMin = 5.0;
+    static const double kAtmoAreaMax = 260.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Ref area (m^2)", ImGuiDataType_Double, &atmoPhysicsParams.referenceAreaM2, &kAtmoAreaMin, &kAtmoAreaMax, "%.0f");
+
+    static const double kAtmoClampMin = 0.0;
+    static const double kAtmoClampMax = 2.5;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Max drag (km/s^2)", ImGuiDataType_Double, &atmoPhysicsParams.maxDecelKmS2, &kAtmoClampMin, &kAtmoClampMax, "%.3f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(0 = no clamp)");
+
+    static const double kHeatMin = 0.0;
+    static const double kHeatMax = 0.25;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Heat per kPa", ImGuiDataType_Double, &atmoPhysicsParams.heatPerKPaSec, &kHeatMin, &kHeatMax, "%.3f");
+
+    static const double kHeatScaleMin = 0.0;
+    static const double kHeatScaleMax = 3.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Heating scale", ImGuiDataType_Double, &atmoPhysicsParams.heatingScale, &kHeatScaleMin, &kHeatScaleMax, "%.2f");
+
+    static const double kVClampMin = 0.0;
+    static const double kVClampMax = 150.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Clamp rel speed (km/s)", ImGuiDataType_Double, &atmoPhysicsParams.maxRelSpeedKmS, &kVClampMin, &kVClampMax, "%.1f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(0 = disabled)");
+
+    ImGui::EndDisabled();
+
+    ImGui::TextDisabled("Tip: use Ship / Status for live orbit + atmosphere readouts.");
+  }
+
   ImGui::TextDisabled("Secondary layers (visual only)");
 
   ImGui::Checkbox("Atmospheres (limb glow)", &worldAtmospheresEnabled);
@@ -12346,6 +14295,25 @@ if (showWorldVisuals) {
   }
 
   ImGui::BeginDisabled(!worldUseProceduralSurfaces);
+
+  ImGui::Checkbox("Planet rings (alpha)", &worldRingsEnabled);
+  if (worldRingsEnabled) {
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Ring opacity", &worldRingOpacity, 0.0f, 1.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Ring chance", &worldRingChanceMul, 0.0f, 2.0f, "%.2f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Ring tilt max (deg)", &worldRingTiltMaxDeg, 0.0f, 35.0f, "%.1f");
+
+    bool ringTexChanged = false;
+    ImGui::SetNextItemWidth(260.0f);
+    ringTexChanged |= ImGui::SliderInt("Ring tex width", &worldRingTexWidth, 128, 2048, "%d");
+    ImGui::SetNextItemWidth(260.0f);
+    ringTexChanged |= ImGui::SliderInt("Ring tex height", &worldRingTexHeight, 32, 512, "%d");
+    if (ringTexChanged) ringTexCache.clear();
+  }
+
+  ImGui::Separator();
   ImGui::Checkbox("Cloud shell (alpha)", &worldCloudsEnabled);
   if (worldCloudsEnabled) {
     ImGui::SetNextItemWidth(260.0f);
@@ -12358,7 +14326,7 @@ if (showWorldVisuals) {
   ImGui::EndDisabled();
 
   if (!worldUseProceduralSurfaces) {
-    ImGui::TextDisabled("Cloud shells require procedural surfaces enabled.");
+    ImGui::TextDisabled("Rings + cloud shells require procedural surfaces enabled.");
   }
 
   if (ImGui::CollapsingHeader("Surface generator preview", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -12392,6 +14360,16 @@ if (showWorldVisuals) {
       ImGui::TableNextColumn();
       preview(render::SurfaceKind::Clouds, "Clouds", core::hashCombine(base, core::fnv1a64("surf_clouds")));
       ImGui::EndTable();
+    }
+
+    // Ring textures are a different aspect ratio, so preview them separately.
+    ImGui::Separator();
+    {
+      const core::u64 ringSeed = core::hashCombine(base, core::fnv1a64("surf_rings"));
+      const auto& ring = ringTexCache.get(ringSeed, worldRingTexWidth, worldRingTexHeight);
+      const float ringH = thumbW * (float)worldRingTexHeight / (float)std::max(1, worldRingTexWidth);
+      ImGui::TextUnformatted("Rings");
+      ImGui::Image((ImTextureID)(intptr_t)ring.handle(), ImVec2(thumbW, std::max(18.0f, ringH)), ImVec2(0, 0), ImVec2(1, 1));
     }
 
     ImGui::TextDisabled("Tip: star/planet shading is now computed from a point-light at the origin (the star). ");
@@ -12999,6 +14977,12 @@ if (showScanner) {
         bool showAsteroids{true};
         bool showCargo{true};
 
+        // Overlays
+        bool showTrajectory{true};
+        bool showManeuver{true};
+        bool showLambertArrival{true};
+        bool allowTrajPick{true};
+
         double previewOffsetDays{0.0};
         bool previewAnimate{false};
         float previewSpeedDaysPerSec{0.35f};
@@ -13089,7 +15073,7 @@ if (showScanner) {
         return {au.x, au.z};
       };
 
-      ImGui::TextDisabled("Pan: RMB/MMB drag | Zoom: wheel (cursor anchored) | Double-click: center | Right-click: context menu");
+      ImGui::TextDisabled("Pan: RMB/MMB drag | Zoom: wheel (cursor anchored) | Double-click: center | Right-click: context menu | Shift+Click trajectory: set maneuver time");
 
       if (ImGui::Button("Center Star")) { centerOnStar(); }
       ImGui::SameLine();
@@ -13113,6 +15097,16 @@ if (showScanner) {
       ImGui::Checkbox("Asteroids", &map.showAsteroids);
       ImGui::SameLine();
       ImGui::Checkbox("Cargo", &map.showCargo);
+
+      ImGui::Checkbox("Trajectory", &map.showTrajectory);
+      ImGui::SameLine();
+      ImGui::Checkbox("Maneuver", &map.showManeuver);
+      ImGui::SameLine();
+      ImGui::Checkbox("Lambert arrival", &map.showLambertArrival);
+      ImGui::SameLine();
+      ImGui::Checkbox("Pick node", &map.allowTrajPick);
+      ImGui::SameLine();
+      ImGui::TextDisabled("(Shift+Click traj)");
 
       ImGui::Separator();
 
@@ -13365,6 +15359,132 @@ if (showScanner) {
           }
         }
 
+        // Trajectory overlay (player RK4 predictor + maneuver node)
+        struct TrajHover {
+          bool has{false};
+          double tSec{0.0};
+          math::Vec3d posKm{0,0,0};
+          math::Vec3d velKmS{0,0,0};
+          int sampleIndex{0};
+          bool postNode{false};
+          float d2{1e30f};
+        } trajHover;
+
+        std::vector<std::pair<ImVec2, double>> trajPickPts;
+
+        if (map.showTrajectory && trajCache.valid && trajCache.samples.size() >= 2) {
+          const ImU32 colPre  = IM_COL32(80, 190, 255, 155);
+          const ImU32 colPost = IM_COL32(255, 110, 220, 165);
+          const float thick = 1.7f;
+
+          const std::size_t n = trajCache.samples.size();
+          const std::size_t maxPts = 2400;
+          const std::size_t stride = std::max<std::size_t>(1, (n + maxPts - 1) / maxPts);
+          trajPickPts.reserve(std::min<std::size_t>(n, maxPts) + 4);
+
+          auto addPick = [&](std::size_t i) -> ImVec2 {
+            const auto& s = trajCache.samples[i];
+            const ImVec2 p = worldToScreen({s.posKm.x / kAU_KM, s.posKm.z / kAU_KM});
+            trajPickPts.emplace_back(p, s.tSec);
+
+            // Hover: nearest point
+            const float dx = mouse.x - p.x;
+            const float dy = mouse.y - p.y;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 < trajHover.d2) {
+              trajHover.has = true;
+              trajHover.tSec = s.tSec;
+              trajHover.posKm = s.posKm;
+              trajHover.velKmS = s.velKmS;
+              trajHover.sampleIndex = (int)i;
+              trajHover.postNode = (trajCache.nodeIndex >= 0) && ((int)i >= trajCache.nodeIndex);
+              trajHover.d2 = d2;
+            }
+            return p;
+          };
+
+          bool hasPrev = false;
+          ImVec2 prev{};
+          bool prevPost = false;
+
+          std::size_t lastIdx = 0;
+          for (std::size_t i = 0; i < n; i += stride) {
+            const ImVec2 cur = addPick(i);
+            const bool post = (trajCache.nodeIndex >= 0) && ((int)i >= trajCache.nodeIndex);
+            if (hasPrev) {
+              // If we cross the node split between samples, switch color at the segment.
+              const ImU32 c = (prevPost || post) ? colPost : colPre;
+              draw->AddLine(prev, cur, c, thick);
+            }
+            prev = cur;
+            prevPost = post;
+            hasPrev = true;
+            lastIdx = i;
+          }
+          if (lastIdx != n - 1) {
+            const std::size_t i = n - 1;
+            const ImVec2 cur = addPick(i);
+            const bool post = (trajCache.nodeIndex >= 0) && ((int)i >= trajCache.nodeIndex);
+            if (hasPrev) {
+              const ImU32 c = (prevPost || post) ? colPost : colPre;
+              draw->AddLine(prev, cur, c, thick);
+            }
+          }
+
+          // Maneuver node marker
+          if (map.showManeuver && trajCache.nodeIndex >= 0 && trajCache.nodeIndex < (int)n) {
+            const auto& s = trajCache.samples[(std::size_t)trajCache.nodeIndex];
+            const ImVec2 p = worldToScreen({s.posKm.x / kAU_KM, s.posKm.z / kAU_KM});
+            const float r = 7.0f;
+            draw->AddLine(ImVec2(p.x - r, p.y - r), ImVec2(p.x + r, p.y + r), IM_COL32(255, 220, 140, 210), 2.0f);
+            draw->AddLine(ImVec2(p.x - r, p.y + r), ImVec2(p.x + r, p.y - r), IM_COL32(255, 220, 140, 210), 2.0f);
+            draw->AddCircle(p, r + 4.0f, IM_COL32(255, 220, 140, 110), 0, 1.5f);
+          }
+
+          // Min-alt / impact marker
+          if (map.showManeuver && trajCache.altValid && trajCache.minAltIndex >= 0 && trajCache.minAltIndex < (int)n) {
+            const auto& s = trajCache.samples[(std::size_t)trajCache.minAltIndex];
+            const ImVec2 p = worldToScreen({s.posKm.x / kAU_KM, s.posKm.z / kAU_KM});
+            const ImU32 c = trajCache.impact ? IM_COL32(255, 80, 80, 210) : IM_COL32(255, 160, 90, 210);
+            draw->AddCircle(p, 6.0f, c, 0, 2.0f);
+            draw->AddCircleFilled(p, 2.0f, c);
+          }
+
+        }
+
+        // Lambert arrival marker (target position at node+TOF)
+        if (map.showLambertArrival && lambertLastOk && maneuverNodeEnabled &&
+            (target.kind == TargetKind::Planet || target.kind == TargetKind::Station)) {
+          const double arriveSec = (double)maneuverNodeTimeSec + (double)lambertTofHours * 3600.0;
+          const double arriveDays = timeDays + arriveSec / 86400.0;
+
+          math::Vec3d tgtKm{0,0,0};
+          bool ok = false;
+          if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+            tgtKm = planetPosKm(currentSystem->planets[target.index], arriveDays);
+            ok = true;
+          } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+            tgtKm = stationPosKm(currentSystem->stations[target.index], arriveDays);
+            ok = true;
+          }
+
+          if (ok) {
+            const ImVec2 tp = worldToScreen({tgtKm.x / kAU_KM, tgtKm.z / kAU_KM});
+            const float r = 6.0f;
+            draw->AddCircle(tp, r + 4.0f, IM_COL32(255, 210, 120, 140), 0, 1.5f);
+            draw->AddLine(ImVec2(tp.x - r, tp.y), ImVec2(tp.x + r, tp.y), IM_COL32(255, 210, 120, 220), 2.0f);
+            draw->AddLine(ImVec2(tp.x, tp.y - r), ImVec2(tp.x, tp.y + r), IM_COL32(255, 210, 120, 220), 2.0f);
+
+            // If the current preview covers the arrival time, show an estimated miss line.
+            if (trajCache.valid && trajCache.stepSec > 1e-6 && arriveSec >= 0.0 && arriveSec <= trajCache.horizonSec) {
+              const int idx = std::clamp((int)std::llround(arriveSec / trajCache.stepSec), 0, (int)trajCache.samples.size() - 1);
+              const math::Vec3d shipKm = trajCache.samples[(std::size_t)idx].posKm;
+              const ImVec2 sp = worldToScreen({shipKm.x / kAU_KM, shipKm.z / kAU_KM});
+              draw->AddLine(sp, tp, IM_COL32(255, 210, 120, 90), 1.5f);
+            }
+          }
+        }
+
         const float iconScale = std::clamp(0.95f + 0.10f * std::log2(std::max(0.20f, map.zoom)), 0.70f, 1.35f);
 
         // Star at origin
@@ -13557,6 +15677,49 @@ if (showScanner) {
           ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
           ImGui::TextDisabled("Preview: t %+.2f days", (float)map.previewOffsetDays);
           ImGui::EndTooltip();
+        } else if (canvasHovered && trajHover.has && trajHover.d2 < 18.0f * 18.0f) {
+          ImGui::BeginTooltip();
+          ImGui::TextUnformatted("Trajectory");
+          ImGui::Separator();
+
+          ImGui::TextDisabled("T+%.0f s  (%.2f min / %.2f h)",
+                              trajHover.tSec,
+                              trajHover.tSec / 60.0,
+                              trajHover.tSec / 3600.0);
+          ImGui::TextDisabled("Range: %.4f AU", trajHover.posKm.length() / kAU_KM);
+          ImGui::TextDisabled("Speed: %.0f m/s", trajHover.velKmS.length() * 1000.0);
+          ImGui::TextDisabled("Segment: %s", trajHover.postNode ? "post-burn" : "pre-burn");
+
+          if (trajCache.refValid) {
+            math::Vec3d refPosKm{0,0,0};
+            double refRadiusKm = 0.0;
+            std::string refName = trajCache.refBody.name;
+
+            if (trajCache.refBody.kind == sim::GravityBody::Kind::Star) {
+              refPosKm = {0,0,0};
+              refRadiusKm = currentSystem->star.radiusSol * kSOLAR_RADIUS_KM;
+              refName = "Star";
+            } else {
+              const std::size_t pi = (std::size_t)trajCache.refBody.id;
+              if (pi < currentSystem->planets.size()) {
+                refPosKm = planetPosKm(currentSystem->planets[pi], timeDays + trajHover.tSec / 86400.0);
+                refRadiusKm = currentSystem->planets[pi].radiusEarth * kEARTH_RADIUS_KM;
+                refName = currentSystem->planets[pi].name;
+              }
+            }
+
+            if (refRadiusKm > 0.0) {
+              const double altKm = (trajHover.posKm - refPosKm).length() - refRadiusKm;
+              ImGui::TextDisabled("Alt (ref %s): %.0f km", refName.c_str(), altKm);
+            }
+          }
+
+          if (map.allowTrajPick) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Shift+Click: set maneuver node time");
+          }
+
+          ImGui::EndTooltip();
         }
 
         // Click interaction (target / context menu)
@@ -13565,6 +15728,41 @@ if (showScanner) {
         static std::string ctxLabel;
         static render::SpriteKind ctxSpriteKind = render::SpriteKind::Star;
         static core::u64 ctxSpriteSeed = 0;
+
+        // Shift+Click a trajectory point to set the maneuver node time.
+        if (canvasHovered && !hover.has && map.allowTrajPick && map.showTrajectory && io.KeyShift &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+          if (!trajCache.valid || trajPickPts.size() < 2) {
+            if (!trajPreviewEnabled) {
+              trajPreviewEnabled = true;
+              toast(toasts, "Trajectory preview enabled (Ship > Status). Shift+Click again to place a node.", 2.4);
+            } else {
+              toast(toasts, "Trajectory preview not ready. Toggle it on in Ship > Status.", 2.2);
+            }
+          } else {
+            double bestT = trajPickPts.front().second;
+            float bestD2 = 1e30f;
+            for (const auto& pr : trajPickPts) {
+              const float dx = mouse.x - pr.first.x;
+              const float dy = mouse.y - pr.first.y;
+              const float d2 = dx * dx + dy * dy;
+              if (d2 < bestD2) {
+                bestD2 = d2;
+                bestT = pr.second;
+              }
+            }
+
+            const float pickRadiusPx = 14.0f;
+            if (bestD2 < pickRadiusPx * pickRadiusPx) {
+              maneuverNodeEnabled = true;
+              maneuverNodeTimeSec = (float)bestT;
+              // Ensure the preview stays on so the user can immediately tune DV.
+              if (!trajPreviewEnabled) trajPreviewEnabled = true;
+
+              toast(toasts, std::string("Maneuver node time set: T+") + std::to_string((int)std::llround(bestT)) + " s", 1.8);
+            }
+          }
+        }
 
         if (canvasHovered && hover.has) {
           if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -13688,6 +15886,18 @@ if (showScanner) {
             ImGui::MenuItem("Follow ship", nullptr, &map.followShip);
             ImGui::MenuItem("Grid", nullptr, &map.showGrid);
             ImGui::MenuItem("Orbits", nullptr, &map.showOrbits);
+
+            ImGui::Separator();
+            if (!trajPreviewEnabled) {
+              if (ImGui::MenuItem("Enable trajectory preview (Ship > Status)")) {
+                trajPreviewEnabled = true;
+              }
+            }
+            ImGui::MenuItem("Trajectory overlay", nullptr, &map.showTrajectory);
+            ImGui::MenuItem("Maneuver markers", nullptr, &map.showManeuver);
+            ImGui::MenuItem("Lambert arrival marker", nullptr, &map.showLambertArrival);
+            ImGui::MenuItem("Pick node (Shift+Click)", nullptr, &map.allowTrajPick);
+
             if (ImGui::MenuItem("Reset zoom")) map.zoom = 1.0f;
             if (ImGui::MenuItem("Reset preview time")) { map.previewOffsetDays = 0.0; map.previewAnimate = false; }
           }
@@ -13695,7 +15905,7 @@ if (showScanner) {
         }
 
         // Double-click empty canvas centers on star.
-        if (canvasHovered && !hover.has && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (canvasHovered && !hover.has && !io.KeyShift && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
           centerOnStar();
         }
 
@@ -14928,6 +17138,32 @@ if (canTrade) {
 
         ImGui::End();
       }
+    }
+
+    if (marketDashboardWindow.open) {
+      game::MarketDashboardContext mdCtx{universe, currentSystem, timeDays};
+      mdCtx.cargoCapacityKg = cargoCapacityKg;
+      mdCtx.cargoUsedKg = cargoMassKg(cargo);
+      mdCtx.playerCreditsCr = credits;
+      mdCtx.effectiveFeeRate = effectiveFeeRate;
+      mdCtx.routeToStation = [&](sim::SystemId sysId, sim::StationId stId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        if (plotRouteToSystem(sysId, /*showToast=*/true)) {
+          pendingArrivalTargetStationId = stId;
+          // If we're already in-system, target immediately too.
+          if (currentSystem && sysId == currentSystem->stub.id && stId != 0) {
+            tryTargetStationById(stId);
+          }
+        }
+      };
+      mdCtx.targetStation = [&](sim::StationId stId) {
+        if (stId != 0) tryTargetStationById(stId);
+      };
+      mdCtx.toast = [&](std::string_view msg, double ttlSec) {
+        toast(toasts, std::string(msg), ttlSec);
+      };
+      game::drawMarketDashboardWindow(marketDashboardWindow, mdCtx);
     }
 
     if (showTrade) {
@@ -17364,7 +19600,7 @@ if (showContacts) {
           if (ImGui::Combo("Theme", &themeIdx, themeNames, IM_ARRAYSIZE(themeNames))) {
             uiTheme = (ui::UiTheme)themeIdx;
             rebuildUiStyle(uiTheme, uiScale);
-            io.FontGlobalScale = uiScale;
+            io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
             uiScaleApplied = uiScale;
             uiSettingsDirty = true;
           }
@@ -17372,6 +19608,90 @@ if (showContacts) {
           if (uiTheme == ui::UiTheme::HighContrast) {
             ImGui::TextDisabled("High contrast mode targets readability on dark backgrounds.");
           }
+        }
+
+        if (ImGui::CollapsingHeader("Fonts", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::TextUnformatted("For HiDPI and UI scaling, it is generally better to rebuild the font atlas\n"
+                                "at the scaled pixel size (crisper text) than to rely on global font scaling.");
+
+          if (ImGui::Checkbox("Crisp scaling (rebuild fonts when UI scale changes)", &uiFontCrispScaling)) {
+            // Apply immediately for the *next* frame.
+            io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
+            uiFontsDirty = true;
+            uiSettingsDirty = true;
+          }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Base size (px @ 1x)", &uiFontSizePx, 10.0f, 32.0f, "%.0f")) {
+            uiFontsDirty = true;
+            uiSettingsDirty = true;
+          }
+
+          // Discover fonts from the ui_fonts/ folder.
+          namespace fs = std::filesystem;
+          const fs::path fontDir("ui_fonts");
+
+          struct FontChoice { std::string name; std::string path; };
+          std::vector<FontChoice> fonts;
+          fonts.push_back(FontChoice{"Default (embedded)", std::string{}});
+          if (fs::exists(fontDir) && fs::is_directory(fontDir)) {
+            for (const auto& ent : fs::directory_iterator(fontDir)) {
+              if (!ent.is_regular_file()) continue;
+              const fs::path p = ent.path();
+              const std::string ext = p.extension().string();
+              if (ext != ".ttf" && ext != ".otf" && ext != ".ttc") continue;
+              fonts.push_back(FontChoice{p.stem().string(), p.string()});
+            }
+          }
+          if (fonts.size() > 1) {
+            std::sort(fonts.begin() + 1, fonts.end(), [](const FontChoice& a, const FontChoice& b) {
+              return a.name < b.name;
+            });
+          }
+
+          // Compute current selection index.
+          int currentFont = 0;
+          if (!uiFontFile.empty()) {
+            for (int i = 1; i < (int)fonts.size(); ++i) {
+              if (fonts[(std::size_t)i].path == uiFontFile) { currentFont = i; break; }
+            }
+          }
+
+          static int selectedFont = 0;
+          if (selectedFont < 0 || selectedFont >= (int)fonts.size()) selectedFont = currentFont;
+
+          ImGui::TextDisabled("Drop .ttf/.otf into %s", fontDir.string().c_str());
+          if (ImGui::BeginListBox("Available fonts##fonts_list", ImVec2(-FLT_MIN, 140.0f))) {
+            for (int i = 0; i < (int)fonts.size(); ++i) {
+              const bool sel = (selectedFont == i);
+              std::string label = fonts[(std::size_t)i].name;
+              if ((i == 0 && uiFontFile.empty()) || (i != 0 && fonts[(std::size_t)i].path == uiFontFile)) {
+                label += "  (active)";
+              }
+              if (ImGui::Selectable(label.c_str(), sel)) selectedFont = i;
+            }
+            ImGui::EndListBox();
+          }
+
+          const bool canActivateFont = (selectedFont >= 0 && selectedFont < (int)fonts.size());
+          if (!canActivateFont) ImGui::BeginDisabled();
+          if (ImGui::Button("Activate selected") && canActivateFont) {
+            uiFontFile = fonts[(std::size_t)selectedFont].path;
+            uiFontsDirty = true;
+            uiSettingsDirty = true;
+            toast(toasts, "Activated font.", 1.4);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Rebuild now")) {
+            uiFontsDirty = true;
+            toast(toasts, "Font rebuild scheduled.", 1.2);
+          }
+          if (!canActivateFont) ImGui::EndDisabled();
+
+          const float baseSize = std::clamp(uiFontSizePx, 10.0f, 32.0f);
+          const float scaled = uiFontCrispScaling ? std::floor(baseSize * uiScale) : baseSize;
+          ImGui::TextDisabled("Effective font size: %.0f px", scaled);
+          ImGui::TextUnformatted("The quick brown fox jumps over the lazy dog. 0123456789");
         }
 
         if (ImGui::CollapsingHeader("Scaling", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -17400,24 +19720,8 @@ if (showContacts) {
           ImGui::TextUnformatted("Profiles let you keep multiple layouts (e.g. combat vs. trading)."
                                 " Use Save/Load to persist high-level UI preferences.");
 
-          namespace fs = std::filesystem;
-          const fs::path dir("ui_layouts");
-
-          struct LayoutProfile { std::string name; std::string path; bool isDefault; };
-          std::vector<LayoutProfile> profiles;
-          profiles.push_back(LayoutProfile{"Default", "imgui.ini", true});
-          if (fs::exists(dir) && fs::is_directory(dir)) {
-            for (const auto& ent : fs::directory_iterator(dir)) {
-              if (!ent.is_regular_file()) continue;
-              const fs::path p = ent.path();
-              if (p.extension() != ".ini") continue;
-              const std::string name = p.stem().string();
-              profiles.push_back(LayoutProfile{name, p.string(), false});
-            }
-          }
-          std::sort(profiles.begin() + 1, profiles.end(), [](const LayoutProfile& a, const LayoutProfile& b) {
-            return a.name < b.name;
-          });
+          const std::string layoutsDir = ui::defaultUiLayoutsDir();
+          auto profiles = ui::listLayoutProfiles(layoutsDir, /*defaultIniPath=*/"imgui.ini");
 
           // Pick current index by matching the active ini filename.
           int currentProfile = 0;
@@ -17467,21 +19771,13 @@ if (showContacts) {
           ImGui::InputTextWithHint("##new_profile", "New profile name (letters/numbers/-/_)", newProfileName, sizeof(newProfileName));
           ImGui::SameLine();
           if (ImGui::Button("Save As")) {
-            auto sanitize = [](const char* in) {
-              std::string out;
-              for (const unsigned char* p = (const unsigned char*)in; *p; ++p) {
-                const char c = (char)*p;
-                if (std::isalnum(*p) || c == '_' || c == '-') out.push_back(c);
-              }
-              if (out.empty()) out = "profile";
-              return out;
-            };
 
-            const std::string safe = sanitize(newProfileName);
-            fs::create_directories(dir);
-            const fs::path p = dir / (safe + ".ini");
-            ImGui::SaveIniSettingsToDisk(p.string().c_str());
-            uiIniFilename = p.string();
+            const std::string safeStem = ui::sanitizeLayoutStem(newProfileName);
+            (void)ui::ensureLayoutDir(layoutsDir);
+            const std::string p = ui::layoutIniPath(safeStem, layoutsDir);
+
+            ImGui::SaveIniSettingsToDisk(p.c_str());
+            uiIniFilename = p;
             io.IniFilename = uiIniFilename.c_str();
             uiSettingsDirty = true;
             toast(toasts, "Saved new layout profile.", 1.8);
@@ -17492,11 +19788,11 @@ if (showContacts) {
           if (selectedIsDefault) ImGui::BeginDisabled();
           if (ImGui::Button("Delete selected") && canActivate && !selectedIsDefault) {
             const std::string path = profiles[(std::size_t)selectedProfile].path;
-            // Safety: only delete files inside ui_layouts.
-            if (path.rfind("ui_layouts", 0) == 0) {
-              std::error_code ec;
-              fs::remove(fs::path(path), ec);
-              if (!ec) {
+
+            // Safety: only delete direct children inside ui_layouts/.
+            if (ui::isSafeLayoutIniPath(layoutsDir, path)) {
+              const bool ok = ui::deleteLayoutIniFile(path);
+              if (ok) {
                 toast(toasts, "Deleted layout profile.", 1.6);
                 if (uiIniFilename == path) {
                   uiIniFilename = "imgui.ini";
@@ -17511,6 +19807,37 @@ if (showContacts) {
             }
           }
           if (selectedIsDefault) ImGui::EndDisabled();
+        }
+
+        if (ImGui::CollapsingHeader("Multi-monitor (Viewports)", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::TextUnformatted("Detach windows into separate OS windows (great for multi-monitor setups).");
+          ImGui::TextDisabled("Experimental: behavior depends on the window manager/OS.");
+
+          bool vpChanged = false;
+          if (ImGui::Checkbox("Enable multi-viewport (detach windows)", &uiViewportsEnabled)) {
+            vpChanged = true;
+            uiSettingsDirty = true;
+            toast(toasts, uiViewportsEnabled ? "Multi-viewport enabled." : "Multi-viewport disabled.", 1.8);
+          }
+
+          if (!uiViewportsEnabled) ImGui::BeginDisabled();
+          if (ImGui::Checkbox("Hide detached windows from taskbar", &uiViewportsNoTaskBarIcon)) { vpChanged = true; uiSettingsDirty = true; }
+          if (ImGui::Checkbox("Disable auto-merge into main window", &uiViewportsNoAutoMerge)) { vpChanged = true; uiSettingsDirty = true; }
+          if (ImGui::Checkbox("No window decorations (borderless)", &uiViewportsNoDecoration)) { vpChanged = true; uiSettingsDirty = true; }
+          if (!uiViewportsEnabled) ImGui::EndDisabled();
+
+          if (vpChanged) {
+            if (uiViewportsEnabled) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+            else io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+            io.ConfigViewportsNoTaskBarIcon = uiViewportsNoTaskBarIcon;
+            io.ConfigViewportsNoAutoMerge = uiViewportsNoAutoMerge;
+            io.ConfigViewportsNoDecoration = uiViewportsNoDecoration;
+
+            // Style tweak for platform windows.
+            rebuildUiStyle(uiTheme, uiScale);
+            io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
+            uiScaleApplied = uiScale;
+          }
         }
 
 #ifdef IMGUI_HAS_DOCK
@@ -17595,6 +19922,30 @@ if (showContacts) {
         if (wsSelected < 0) wsSelected = 0;
         if (wsSelected >= (int)uiWorkspaces.items.size()) wsSelected = (int)uiWorkspaces.items.size() - 1;
 
+        // Layout profiles (Dear ImGui ini files) available on disk.
+        const std::string layoutsDir = ui::defaultUiLayoutsDir();
+        auto layoutProfiles = ui::listLayoutProfiles(layoutsDir, /*defaultIniPath=*/"imgui.ini");
+
+        // Keep a separate selection index for the layout list, synced to the
+        // selected workspace.
+        static int wsLayoutSelected = 0;
+        static int wsSelectedPrev = -1;
+        if (wsSelected != wsSelectedPrev) {
+          wsSelectedPrev = wsSelected;
+          wsLayoutSelected = 0;
+          if (wsSelected >= 0 && wsSelected < (int)uiWorkspaces.items.size()) {
+            const auto& ws = uiWorkspaces.items[(std::size_t)wsSelected];
+            const std::string match = ws.imguiIniFile.empty() ? uiIniFilename : ws.imguiIniFile;
+            for (int i = 0; i < (int)layoutProfiles.size(); ++i) {
+              if (layoutProfiles[(std::size_t)i].path == match) {
+                wsLayoutSelected = i;
+                break;
+              }
+            }
+          }
+        }
+        if (wsLayoutSelected < 0 || wsLayoutSelected >= (int)layoutProfiles.size()) wsLayoutSelected = 0;
+
         ImGui::BeginChild("##ws_left", ImVec2(260.0f, 0.0f), true);
         if (ImGui::BeginListBox("##ws_list", ImVec2(-FLT_MIN, -FLT_MIN))) {
           for (int i = 0; i < (int)uiWorkspaces.items.size(); ++i) {
@@ -17628,6 +19979,15 @@ if (showContacts) {
           return base + " (copy)";
         };
 
+        auto layoutRefCount = [&](const std::string& path) -> int {
+          if (path.empty()) return 0;
+          int c = 0;
+          for (const auto& w : uiWorkspaces.items) {
+            if (w.imguiIniFile == path) ++c;
+          }
+          return c;
+        };
+
         if (hasSelection) {
           auto& ws = uiWorkspaces.items[(std::size_t)wsSelected];
           ImGui::Text("Name: %s", ws.name.c_str());
@@ -17649,11 +20009,102 @@ if (showContacts) {
             toast(toasts, "Workspace snapshot updated.", 1.6);
           }
 
+          // ---- Layout profile binding ----
+          ImGui::Separator();
+          ImGui::TextDisabled("Layout profile (ini)");
+          ImGui::TextUnformatted("Assign a dedicated .ini file to this workspace so docking/window positions are independent.");
+
+          if (ImGui::BeginListBox("##ws_layout_profiles", ImVec2(-FLT_MIN, 150.0f))) {
+            for (int i = 0; i < (int)layoutProfiles.size(); ++i) {
+              const bool sel = (wsLayoutSelected == i);
+              std::string label = layoutProfiles[(std::size_t)i].name;
+              const std::string& p = layoutProfiles[(std::size_t)i].path;
+              if (!ws.imguiIniFile.empty() && p == ws.imguiIniFile) label += "  (assigned)";
+              if (p == uiIniFilename) label += "  (active)";
+              if (ImGui::Selectable(label.c_str(), sel)) wsLayoutSelected = i;
+            }
+            ImGui::EndListBox();
+          }
+
+          const bool hasLayoutSelection = (wsLayoutSelected >= 0 && wsLayoutSelected < (int)layoutProfiles.size());
+          if (!hasLayoutSelection) ImGui::BeginDisabled();
+          if (ImGui::Button("Assign selected profile")) {
+            ws.imguiIniFile = layoutProfiles[(std::size_t)wsLayoutSelected].path;
+            uiWorkspacesDirty = true;
+            toast(toasts, "Assigned layout profile to workspace.", 1.6);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Save current layout -> assigned")) {
+            // Save the *current runtime* dock/window state to the workspace's
+            // assigned ini file. If none is assigned, pick a unique one.
+            if (ws.imguiIniFile.empty()) {
+              ws.imguiIniFile = ui::uniqueLayoutIniPath(ws.name, layoutsDir);
+              uiWorkspacesDirty = true;
+            }
+            (void)ui::ensureLayoutDir(layoutsDir);
+            ImGui::SaveIniSettingsToDisk(ws.imguiIniFile.c_str());
+            toast(toasts, "Saved layout to workspace ini.", 1.6);
+          }
+          if (!hasLayoutSelection) ImGui::EndDisabled();
+
+          ImGui::SameLine();
+          if (ImGui::Button("Assign unique layout file")) {
+            (void)ui::ensureLayoutDir(layoutsDir);
+            const std::string newPath = ui::uniqueLayoutIniPath(ws.name, layoutsDir);
+
+            // Try to clone the old file, otherwise snapshot current runtime.
+            namespace fs = std::filesystem;
+            bool ok = false;
+            const std::string src = ws.imguiIniFile.empty() ? uiIniFilename : ws.imguiIniFile;
+            std::error_code ec;
+            if (!src.empty() && fs::exists(fs::path(src), ec) && fs::is_regular_file(fs::path(src), ec)) {
+              ok = ui::copyLayoutIniFile(src, newPath, /*overwrite=*/false);
+            }
+            if (!ok) {
+              ImGui::SaveIniSettingsToDisk(newPath.c_str());
+              ok = true;
+            }
+            if (ok) {
+              ws.imguiIniFile = newPath;
+              uiWorkspacesDirty = true;
+              toast(toasts, "Workspace now has a dedicated layout file.", 2.0);
+
+              // If we're editing the active workspace, switch immediately so
+              // subsequent autosaves go to the new file.
+              if (ws.name == uiWorkspaces.active) {
+                activateWorkspace(ws, /*loadIni=*/true);
+              }
+            } else {
+              toast(toasts, "Failed to assign unique layout file.", 2.0);
+            }
+          }
+
           ImGui::Separator();
 
           if (ImGui::Button("Duplicate")) {
             ui::UiWorkspace copy = ws;
             copy.name = uniqueName(ws.name + " Copy");
+
+            // Give the duplicate its own ini file so layouts don't conflict.
+            (void)ui::ensureLayoutDir(layoutsDir);
+            const std::string newPath = ui::uniqueLayoutIniPath(copy.name, layoutsDir);
+            copy.imguiIniFile = newPath;
+
+            // Clone from the source ini if possible, otherwise seed from the
+            // current runtime layout.
+            namespace fs = std::filesystem;
+            bool ok = false;
+            {
+              std::error_code ec;
+              const std::string src = ws.imguiIniFile.empty() ? uiIniFilename : ws.imguiIniFile;
+              if (!src.empty() && fs::exists(src, ec) && fs::is_regular_file(src, ec)) {
+                ok = ui::copyLayoutIniFile(src, newPath, /*overwrite=*/false);
+              }
+            }
+            if (!ok) {
+              ImGui::SaveIniSettingsToDisk(newPath.c_str());
+            }
+
             uiWorkspaces.items.push_back(copy);
             wsSelected = (int)uiWorkspaces.items.size() - 1;
             uiWorkspacesDirty = true;
@@ -17674,16 +20125,29 @@ if (showContacts) {
           // New workspace modal.
           if (ImGui::BeginPopupModal("New Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             static char newNameBuf[96] = "Trading";
+            static bool giveUniqueLayout = true;
             ImGui::TextUnformatted("Create a new workspace from the current UI state.");
             ImGui::InputText("Name", newNameBuf, sizeof(newNameBuf));
+            ImGui::Checkbox("Give this workspace its own layout file", &giveUniqueLayout);
             if (ImGui::Button("Create")) {
               ui::UiWorkspace n;
               n.name = uniqueName(newNameBuf);
               captureWorkspaceFromRuntime(n);
+
+              if (giveUniqueLayout) {
+                (void)ui::ensureLayoutDir(layoutsDir);
+                n.imguiIniFile = ui::uniqueLayoutIniPath(n.name, layoutsDir);
+                // Seed the new ini with the current runtime layout.
+                ImGui::SaveIniSettingsToDisk(n.imguiIniFile.c_str());
+              }
+
               uiWorkspaces.items.push_back(n);
               uiWorkspaces.active = n.name;
               wsSelected = (int)uiWorkspaces.items.size() - 1;
               uiWorkspacesDirty = true;
+
+              // Immediately activate so window state + layout binding is live.
+              activateWorkspace(uiWorkspaces.items.back(), /*loadIni=*/true);
               ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
@@ -17696,15 +20160,58 @@ if (showContacts) {
           // Rename modal.
           if (ImGui::BeginPopupModal("Rename Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             static char renameBuf[96] = "";
+            static bool renameLayoutFile = true;
             if (renameBuf[0] == '\0') {
               std::snprintf(renameBuf, sizeof(renameBuf), "%s", ws.name.c_str());
             }
             ImGui::TextUnformatted("Rename the selected workspace.");
             ImGui::InputText("New name", renameBuf, sizeof(renameBuf));
+
+            // Optional: rename the associated layout ini file (only when it's
+            // a direct child of ui_layouts/ and not referenced by other workspaces).
+            const bool canRenameLayout = (!ws.imguiIniFile.empty()) &&
+                                         ui::isSafeLayoutIniPath(layoutsDir, ws.imguiIniFile) &&
+                                         (layoutRefCount(ws.imguiIniFile) <= 1);
+            if (!canRenameLayout) ImGui::BeginDisabled();
+            ImGui::Checkbox("Also rename its layout file (ui_layouts)", &renameLayoutFile);
+            if (!canRenameLayout) {
+              if (renameLayoutFile) renameLayoutFile = false;
+              ImGui::EndDisabled();
+              if (!ws.imguiIniFile.empty() && layoutRefCount(ws.imguiIniFile) > 1) {
+                ImGui::TextDisabled("(Layout file is shared by multiple workspaces.)");
+              }
+            }
             if (ImGui::Button("Rename")) {
-              const std::string old = ws.name;
-              ws.name = uniqueName(renameBuf);
-              if (uiWorkspaces.active == old) uiWorkspaces.active = ws.name;
+              const std::string oldName = ws.name;
+              const std::string oldLayout = ws.imguiIniFile;
+              const bool wasActive = (uiWorkspaces.active == oldName);
+
+              const std::string newName = uniqueName(renameBuf);
+              std::string newLayout = oldLayout;
+
+              if (renameLayoutFile && canRenameLayout) {
+                (void)ui::ensureLayoutDir(layoutsDir);
+                const std::string desired = ui::uniqueLayoutIniPath(newName, layoutsDir);
+                if (!desired.empty() && desired != oldLayout) {
+                  if (ui::renameLayoutIniFile(oldLayout, desired, /*overwrite=*/false)) {
+                    newLayout = desired;
+                  } else {
+                    toast(toasts, "Failed to rename layout file; keeping old path.", 2.0);
+                  }
+                }
+              }
+
+              ws.name = newName;
+              ws.imguiIniFile = newLayout;
+              if (wasActive) uiWorkspaces.active = ws.name;
+
+              // If the active workspace's ini file path changed, update runtime.
+              if (wasActive && !ws.imguiIniFile.empty() && ws.imguiIniFile != uiIniFilename) {
+                uiIniFilename = ws.imguiIniFile;
+                io.IniFilename = uiIniFilename.c_str();
+                uiSettingsDirty = true;
+              }
+
               uiWorkspacesDirty = true;
               renameBuf[0] = '\0';
               ImGui::CloseCurrentPopup();
@@ -17720,25 +20227,61 @@ if (showContacts) {
           // Delete modal.
           if (ImGui::BeginPopupModal("Delete Workspace", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::Text("Delete workspace '%s'?", ws.name.c_str());
-            ImGui::TextDisabled("This only removes the workspace entry; it does not delete any .ini file.");
+            ImGui::TextDisabled("This removes the workspace entry. Layout files are kept by default.");
+
+            // Optional: delete its layout file (only if it's inside ui_layouts/
+            // and not referenced by other workspaces).
+            static bool deleteLayoutFile = false;
+            const std::string doomedLayout = ws.imguiIniFile;
+            const int doomedRefs = layoutRefCount(doomedLayout);
+            const bool canDeleteLayout = (!doomedLayout.empty()) &&
+                                         ui::isSafeLayoutIniPath(layoutsDir, doomedLayout) &&
+                                         (doomedRefs <= 1);
+            if (!canDeleteLayout) ImGui::BeginDisabled();
+            ImGui::Checkbox("Also delete its layout file (ui_layouts)", &deleteLayoutFile);
+            if (!canDeleteLayout) {
+              if (deleteLayoutFile) deleteLayoutFile = false;
+              ImGui::EndDisabled();
+              if (!doomedLayout.empty() && doomedRefs > 1) {
+                ImGui::TextDisabled("(Layout file is shared by multiple workspaces.)");
+              }
+            }
             const bool canDelete = (uiWorkspaces.items.size() > 1);
             if (!canDelete) {
               ImGui::TextDisabled("(Cannot delete the last workspace.)");
             }
             if (!canDelete) ImGui::BeginDisabled();
             if (ImGui::Button("Delete")) {
-              const std::string doomed = ws.name;
+              const std::string doomedName = ws.name;
+              const bool wasActive = (uiWorkspaces.active == doomedName);
+              const bool deleteLayoutNow = deleteLayoutFile && canDeleteLayout;
+
               uiWorkspaces.items.erase(uiWorkspaces.items.begin() + wsSelected);
-              if (uiWorkspaces.active == doomed) {
+              if (wasActive) {
                 uiWorkspaces.active = uiWorkspaces.items.empty() ? std::string() : uiWorkspaces.items.front().name;
               }
               wsSelected = std::clamp(wsSelected, 0, (int)uiWorkspaces.items.size() - 1);
               uiWorkspacesDirty = true;
+
+              // If we deleted the active workspace, immediately activate the
+              // replacement so the runtime layout/windows are consistent.
+              if (wasActive) {
+                if (const ui::UiWorkspace* aws = ui::activeWorkspace(uiWorkspaces)) {
+                  activateWorkspace(*aws, /*loadIni=*/true);
+                }
+              }
+
+              if (deleteLayoutNow) {
+                const bool ok = ui::deleteLayoutIniFile(doomedLayout);
+                toast(toasts, ok ? "Deleted workspace layout file." : "Failed to delete layout file.", 1.8);
+              }
+              deleteLayoutFile = false;
               ImGui::CloseCurrentPopup();
             }
             if (!canDelete) ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel")) {
+              deleteLayoutFile = false;
               ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
@@ -17959,27 +20502,68 @@ if (showContacts) {
         commandPaletteItems.push_back(game::PaletteItem{std::move(label), std::move(detail), std::move(shortcut), priority, std::move(fn)});
       };
 
+      // --- Console mode (prefix with '>') ---
+      // This makes the palette double as a quick command runner while keeping the full
+      // console window available for history + logs.
+      auto trimAscii = [&](std::string_view sv) -> std::string {
+        std::size_t b = 0;
+        while (b < sv.size() && std::isspace((unsigned char)sv[b])) ++b;
+        std::size_t e = sv.size();
+        while (e > b && std::isspace((unsigned char)sv[e - 1])) --e;
+        return std::string(sv.substr(b, e - b));
+      };
+
+      const bool paletteConsoleMode = (commandPalette.query[0] == '>');
+      if (paletteConsoleMode) {
+        const std::string line = trimAscii(std::string_view(commandPalette.query + 1));
+
+        if (line.empty()) {
+          addItem("> Open Console", "Console", std::string(), 200,
+                  [&]() {
+                    consoleWindow.open = true;
+                    consoleWindow.focusInput = true;
+                  });
+        } else {
+          addItem(std::string("> ") + line, "Console • Execute", std::string(), 220,
+                  [&, line]() {
+                    consoleWindow.open = true;
+                    game::consoleExecLine(consoleWindow, line);
+                  });
+        }
+
+        // Recent history (filtered by the typed line if present).
+        int shown = 0;
+        for (int i = (int)consoleWindow.history.size() - 1; i >= 0 && shown < 10; --i) {
+          const std::string& cmd = consoleWindow.history[(std::size_t)i];
+          if (cmd.empty()) continue;
+          if (!line.empty() && ui::fuzzyMatchScore(line, cmd) < 0) continue;
+          addItem(std::string("> ") + cmd, "Console • History", std::string(), 180 - shown,
+                  [&, cmd]() {
+                    consoleWindow.open = true;
+                    game::consoleExecLine(consoleWindow, cmd);
+                  });
+          ++shown;
+        }
+
+        // Don't add the usual item corpus in console mode.
+        goto draw_command_palette;
+      }
+
       // UI / windows
-      addItem("Toggle Galaxy window", std::string("Window • ") + onOff(showGalaxy), game::chordLabel(controls.actions.toggleGalaxy), 100, [&]() { showGalaxy = !showGalaxy; });
-      addItem("Toggle Ship/Status window", std::string("Window • ") + onOff(showShip), game::chordLabel(controls.actions.toggleShip), 100, [&]() { showShip = !showShip; });
-      addItem("Toggle Market window", std::string("Window • ") + onOff(showEconomy), game::chordLabel(controls.actions.toggleMarket), 100, [&]() { showEconomy = !showEconomy; });
-      addItem("Toggle Contacts window", std::string("Window • ") + onOff(showContacts), game::chordLabel(controls.actions.toggleContacts), 100, [&]() { showContacts = !showContacts; });
-      addItem("Toggle Missions window", std::string("Window • ") + onOff(showMissions), game::chordLabel(controls.actions.toggleMissions), 100, [&]() { showMissions = !showMissions; });
-      addItem("Toggle Scanner window", std::string("Window • ") + onOff(showScanner), game::chordLabel(controls.actions.toggleScanner), 100, [&]() { showScanner = !showScanner; });
-      addItem("Toggle Trade Finder", std::string("Window • ") + onOff(showTrade), game::chordLabel(controls.actions.toggleTrade), 100, [&]() { showTrade = !showTrade; });
-      addItem("Toggle Pilot Guide", std::string("Window • ") + onOff(showGuide), game::chordLabel(controls.actions.toggleGuide), 90, [&]() { showGuide = !showGuide; });
-      addItem("Toggle Hangar", std::string("Window • ") + onOff(showHangar), game::chordLabel(controls.actions.toggleHangar), 90, [&]() { showHangar = !showHangar; });
-      addItem("Toggle World Visuals", std::string("Window • ") + onOff(showWorldVisuals), game::chordLabel(controls.actions.toggleWorldVisuals), 80, [&]() { showWorldVisuals = !showWorldVisuals; });
-      addItem("Toggle Controls window", std::string("Window • ") + onOff(controlsWindow.open), game::chordLabel(controls.actions.toggleControlsWindow), 80,
-              [&]() {
-                controlsWindow.open = !controlsWindow.open;
-                if (controlsWindow.open) controlsWindow.focusFilter = true;
-              });
-      addItem("Toggle Notifications window", std::string("Window • ") + onOff(showNotifications), std::string(), 80, [&]() { showNotifications = !showNotifications; });
-      addItem("Toggle Console window", std::string("Window • ") + onOff(consoleWindow.open), std::string(), 80, [&]() { consoleWindow.open = !consoleWindow.open; if (consoleWindow.open) consoleWindow.focusInput = true; });
-      addItem("Toggle Bookmarks window", std::string("Window • ") + onOff(showBookmarksWindow), std::string(), 80, [&]() { showBookmarksWindow = !showBookmarksWindow; });
-      addItem("Toggle UI Settings window", std::string("Window • ") + onOff(showUiSettingsWindow), std::string(), 80, [&]() { showUiSettingsWindow = !showUiSettingsWindow; });
-      addItem("Toggle HUD Settings window", std::string("Window • ") + onOff(showHudSettingsWindow), std::string(), 80, [&]() { showHudSettingsWindow = !showHudSettingsWindow; });
+      for (const auto& b : uiWindows.items()) {
+        if (!b.open) continue;
+        const std::string key = b.desc.key;
+        const std::string label = std::string("Toggle ") + b.desc.label;
+        const std::string detail = std::string("Window • ") + onOff(*b.open);
+        std::string shortcut;
+        if (b.shortcutLabel) shortcut = b.shortcutLabel();
+        addItem(label, detail, std::move(shortcut), b.desc.palettePriority,
+                [&, key]() {
+                  const ui::WindowBinding* w = uiWindows.find(key);
+                  if (!w || !w->open) return;
+                  uiWindows.setOpen(key, !*w->open);
+                });
+      }
 
       // Workspaces
       addItem("Workspace Manager...", "Workspace", std::string(), 78, [&]() {
@@ -18173,6 +20757,7 @@ if (showContacts) {
     }
 
     // Draw palette last so it appears above other windows.
+draw_command_palette:
     (void)game::drawCommandPalette(commandPalette, commandPaletteItems);
 
     // ---- Offscreen hangar preview render (render-to-texture -> ImGui) ----
@@ -18232,10 +20817,46 @@ if (showContacts) {
       meshRenderer.setLightPos(0.0f, 0.0f, 0.0f);
     }
 
+    STELLAR_PROFILE_SCOPE("Present");
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+    // Screenshot capture (with UI): after ImGui has drawn, but before window swap.
+    if (shotUi.pending) {
+      std::string err;
+      const bool ok = game::captureBackbufferToPng(shotUi.path, w, h, &err);
+      if (ok) {
+        photoModeWindow.lastSavedPath = shotUi.path;
+        if (shotUi.copyToClipboard) SDL_SetClipboardText(shotUi.path.c_str());
+        toast(toasts, "Saved screenshot: " + shotUi.path, 2.2);
+      } else {
+        toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+      }
+      shotUi.pending = false;
+      shotUi.path.clear();
+      shotUi.copyToClipboard = false;
+
+      if (shotRestorePausedPending && !shotWorld.pending) {
+        paused = shotPrevPaused;
+        shotRestorePausedPending = false;
+      }
+    }
+
+    // Multi-viewport (platform windows) support. When enabled, Dear ImGui
+    // may create additional OS windows and needs an extra pass to render
+    // them and swap their buffers.
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+      SDL_Window* backupWindow = SDL_GL_GetCurrentWindow();
+      SDL_GLContext backupCtx = SDL_GL_GetCurrentContext();
+      ImGui::UpdatePlatformWindows();
+      ImGui::RenderPlatformWindowsDefault();
+      SDL_GL_MakeCurrent(backupWindow, backupCtx);
+    }
+
     SDL_GL_SwapWindow(window);
+    }
+    profiler.endFrame();
+
   }
 
   // Persist HUD layout on exit (optional).
@@ -18283,6 +20904,9 @@ if (showContacts) {
 
   // Unhook core log forwarding before shutdown.
   game::consoleRemoveCoreLogSink(consoleWindow);
+
+  // Unhook the UI log buffer sink.
+  core::removeLogSink(uiLogSink);
 
   // Cleanup
   spriteCache.clear();

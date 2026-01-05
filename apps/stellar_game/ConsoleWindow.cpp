@@ -226,6 +226,11 @@ static void execCommand(ConsoleWindowState& st, std::string_view line) {
   cmd->fn(st, args);
 }
 
+void consoleExecLine(ConsoleWindowState& st, std::string_view line) {
+  execCommand(st, line);
+  st.scrollToBottom = true;
+}
+
 // ---- Core log sink ----
 
 static void coreLogSink(core::LogLevel level, std::string_view ts, std::string_view msg, void* user) {

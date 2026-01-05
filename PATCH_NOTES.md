@@ -1,3 +1,225 @@
+## 2026-01-05 (Patch) - Market Dashboard (Economy Analytics UI)
+
+This round adds a new **Market Dashboard** window to make trade planning easier without
+digging through individual station screens.
+
+Key changes:
+
+- **New window:** *Market Dashboard*
+  - Found under **Windows → Market Dashboard** (and in the command palette via the window registry).
+  - Scan scope:
+    - **Current system** (fast, focused)
+    - **Nearby systems** within a configurable radius (includes a max-systems cap)
+
+- **Commodity-centric market view:**
+  - Shows **effective** bid/ask prices (including station fees), **inventory**, and a simple **trend**
+    computed from the station's recent price samples.
+
+- **Quick arbitrage summary:**
+  - Displays best **buy** and best **sell** locations in the current scan and estimates profit per unit.
+  - Includes a “how many units could you move” estimate based on **hold mass** and **credits**.
+
+- **Integrated routing/targeting:**
+  - **Route** button plots a route to the system and sets a **pending arrival target station**.
+  - If already in-system, it can **target** the station immediately.
+
+## 2026-01-05 (Patch) - Floating Origin Rendering (Precision @ Huge Distances)
+
+This round tackles a classic space-sim problem: **GPU float precision jitter** when you get far from the
+system origin. Even if simulation runs in doubles, most render paths (instance buffers, uniforms) end up
+as floats, so tiny local offsets (ships/stations) start to wobble when absolute coordinates get large.
+
+Key changes:
+
+- **Floating origin / camera-relative rendering (game):**
+  - A per-frame **render origin** in km (`gRenderOriginKm`) is subtracted from all world positions before
+    converting to render units.
+  - Default behavior follows the **player ship**, keeping it near `(0,0,0)` in render space.
+  - **New CVar:** `r.floating_origin.enabled` (archived)
+
+- **VFX correctness under origin shifts:**
+  - `ParticleSystem` now supports `shiftOrigin(deltaU)` so already-spawned particles remain stable when
+    the origin moves.
+  - Beam visuals are shifted in the same way so laser lines remain consistent.
+
+- **Lighting + atmosphere fixes:**
+  - The star is no longer assumed to be at render-space origin when floating origin is enabled.
+  - Atmosphere shader now takes an explicit **sun position** uniform (`uSunPos`) and the game sets it
+    each frame.
+
+## 2026-01-05 (Patch) - Workspaces 2.1: Per-Workspace Layout Profiles
+
+This round continues improving **UI systems** by making **workspaces** and **layout profiles**
+play nicely together.
+
+Key changes:
+
+- **New core helper:** `stellar/ui/UiLayoutProfiles.*`
+  - Headless utilities to discover layout profiles in `ui_layouts/`, sanitize filenames,
+    generate unique `.ini` paths, and safely copy/rename/delete profile files.
+  - Used by the game UI to keep file operations consistent and safer.
+
+- **Workspaces window upgrades:**
+  - Each workspace can now be **bound** to a specific layout profile (Dear ImGui `.ini`) from a list.
+  - **Assign unique layout file**: gives the workspace its own dedicated ini (cloned from the assigned
+    layout if possible, otherwise seeded from current runtime layout).
+  - **Save current layout → assigned**: snapshots the current runtime docking/window layout into the
+    workspace’s assigned ini (auto-assigns a unique ini if needed).
+  - **Duplicate** now auto-creates a dedicated layout file for the copy so layouts don’t conflict.
+  - **New from current** can optionally create a dedicated layout file and activates immediately.
+  - **Rename** can optionally rename the workspace’s layout file (when safe and not shared).
+  - **Delete** can optionally delete the workspace’s layout file (when safe and not shared), and now
+    properly activates a replacement workspace when deleting the active one.
+
+## 2026-01-04 (Patch) - Multi-Viewport UI (Detachable Windows)
+
+This round improves **UI systems** with optional **multi-viewport** support (a.k.a. *platform windows*).
+
+When enabled, you can drag ImGui panels outside the main window and they will become real OS windows —
+ideal for multi-monitor cockpit setups.
+
+- **UI Settings → Multi-monitor (Viewports):**
+  - Enable/disable multi-viewport at runtime.
+  - Options:
+    - hide detached windows from the taskbar
+    - disable auto-merge into the main window
+    - borderless (no OS decorations)
+- **Persistence:** stored in `ui_settings.txt` alongside theme/scale/docking.
+- **Renderer integration:** adds the required `UpdatePlatformWindows()` / `RenderPlatformWindowsDefault()` pass.
+
+## 2026-01-04 (Patch) - UI Developer Tools: CVar Browser + Palette Console Mode
+
+This round improves **UI systems** with a new developer-facing runtime-tuning panel and faster command execution.
+
+- **New window:** **CVars** (Debug)
+  - Searchable list of all core CVars (name + help), optional *relevance sort*.
+  - Edit bool/int/float/string CVars in-place (read-only CVars are disabled).
+  - Quick-set line for `name = value` plus **Save/Load** to a config file.
+  - Quality-of-life: reset-to-default + copy-to-clipboard (`name = value`).
+
+- **Command Palette upgrade:** prefix the query with **`>`** to enter *Console mode*
+  - `> your.command args` runs the command directly.
+  - Shows recent console history as runnable entries.
+
+## 2026-01-04 (Patch) - Atmospheric Drag + Reentry Heating (Experimental)
+
+This round adds an **experimental atmosphere physics** layer: a deterministic, headless
+atmosphere model (per-planet) plus optional in-game **drag + heat** integration.
+
+- **New core module:** `stellar/sim/Atmosphere.*`
+  - Deterministic planet atmosphere parameters derived from `PlanetType` + rough mass/radius.
+  - Exponential density falloff: ρ(h) = ρ0 · exp(-h/H).
+  - Drag based on **dynamic pressure**: q = ½ ρ v², with a = q · CdA / m.
+  - Optional heating rate proportional to q (kPa) for a simple “reentry risk” signal.
+- **Game integration:**
+  - Toggle + tuning sliders in **World Visuals → Physics (experimental)**.
+  - Live readout in **Ship / Status → Gravity / Orbit** (altitude, density, dynamic pressure, drag, heat).
+
+- **Tests:** new `test_atmosphere` covers basic in-atmosphere drag directionality and vacuum cutoff.
+
+
+## 2026-01-04 (Patch) - Lambert Transfer Planner (Star-Centric 2-Body)
+
+This round adds an experimental **Lambert solver** (universal variables, 0-rev) and a first-pass
+**transfer planner** in the Trajectory / Maneuver Planner UI.
+
+The goal is a “Kerbal-ish” interplanetary helper: pick a planet/station target, choose a time-of-flight,
+and automatically compute the **maneuver-node Δv** that reaches the target’s future position (star-centric).
+Once computed, the existing **Maneuver Computer** can be used to execute the burn.
+
+- **New core module:** `stellar/sim/LambertSolver.*`
+  - Universal-variable Lambert solver using Stumpff functions + bisection on the z-parameter.
+  - Supports short/long-way solutions and prograde/retrograde selection via a reference plane normal.
+  - Units: km / km/s / km^3/s^2 (consistent with the gravity/orbit tooling added earlier).
+- **Game integration (Ship / Status → Trajectory / Maneuver Planner):**
+  - New **Transfer planner (Lambert)** section under Maneuver Node:
+    - Requires a planet or station target.
+    - Choose **TOF (hours)** + long-way + prograde.
+    - Computes Δv in RTN (relative to the **star** at burn time) and auto-sets Reference Body to **Star**.
+    - Optional **coarse RK4 validation** to estimate miss distance at arrival.
+
+- **Tests:** new `test_lambert_solver` validates canonical circular-orbit 90° (short-way) and 270° (long-way) cases.
+
+
+## 2026-01-04 (Patch) - Maneuver Computer (Auto-Execute Maneuver Node)
+
+This round adds an experimental **maneuver computer** that can *arm* the current maneuver node from the Trajectory / Maneuver Planner
+and automatically execute it as a **continuous burn** (a pragmatic approximation of the planner’s instantaneous Δv).
+
+- **New core module:** `stellar/sim/ManeuverComputer.*`
+  - Captures an absolute-time maneuver plan (node time + world-space Δv).
+  - Centers the burn by starting ~½ the estimated duration early.
+  - Uses a minimal attitude controller to align the ship’s **forward (+Z)** axis to the burn vector.
+  - Throttle shaping on the last step to reduce Δv overshoot.
+  - Tracks achieved Δv by projecting the ship’s *actual* velocity change onto the burn direction.
+- **Game integration (Ship / Status → Trajectory / Maneuver Planner):**
+  - New **Maneuver computer** section with:
+    - **Arm / Abort / Clear** controls.
+    - Live telemetry (time-to-node, alignment error, Δv remaining, burn timing).
+    - Tuning sliders (alignment tolerance, face gain, lead time, Δv tolerance, abort timeout).
+    - Optional manual override disengage (deadzone).
+- **Tests:** new `test_maneuver_computer` covers centered-burn timing, Δv convergence, and miss/abort behavior.
+
+
+## 2026-01-04 (Patch) - Trajectory Preview + 1-Node Maneuver Planner (RK4)
+
+This round adds a deterministic **trajectory predictor** (RK4 integrator) and a first-pass **maneuver node** workflow.
+It’s meant to be a “Kerbal-lite” planning layer for the existing spaceflight model: predict the next N minutes,
+plan an instantaneous delta-v, and visualize the post-burn branch.
+
+- **New core module:** `stellar/sim/TrajectoryPredictor.*`
+  - Headless RK4 propagation in km / km/s.
+  - Supports a single **instantaneous maneuver node** (exact-time event split).
+- **Game integration (Ship / Status):**
+  - New **Trajectory / Maneuver Planner (experimental)** panel:
+    - Toggle world-space trajectory line.
+    - Gravity model chooser: ballistic / effective (game settings) / physical (scale=1).
+    - Reference body selector: auto dominant / star / specific planet.
+    - Maneuver node inputs in **RTN frame** (Radial, Tangential/along-track, Normal).
+    - “Compute: Circularize at node” helper to auto-fill delta-v.
+- **World visualization:**
+  - Cyan pre-burn path, magenta post-burn path.
+  - RTN axis cross drawn at the maneuver node.
+  - Min-altitude marker (amber / red when impact predicted).
+- **Tests:** new `test_trajectory_predictor` covers ballistic motion, exact maneuver event sampling, and circular-orbit stability.
+
+## 2026-01-04 (Patch) - Procedural Planet Rings + Blend-State Hygiene
+
+This round adds a purely-visual **planet ring system** (procedural annulus textures + meshes) and fixes a subtle
+render-state leak where additive blending could carry over into opaque passes.
+
+- **New render generator:** `stellar/render/ProceduralRings.*`
+  - Deterministic RGBA ring textures with banding, gaps, and azimuthal clumping.
+  - LRU cache (`RingTextureCache`) with adjustable resolution (World Visuals).
+- **New mesh helper:** `render::Mesh::makeRing(...)`
+  - Builds a double-sided annulus in the XZ plane with UVs designed for the ring generator.
+- **Game integration:**
+  - Rings are generated per-planet (seeded, type-weighted probability) and aligned to orbit planes with optional tilt.
+  - Toggle + tuning in **World Visuals → Secondary layers → Planet rings**.
+  - Ring texture preview added to the **Surface generator preview** panel.
+- **Render fix:** explicit `glDisable(GL_BLEND)` between transparent background layers and opaque geometry to prevent
+  blend-state bleed into planet/cube passes.
+
+## 2026-01-04 (Patch) - Experimental Newtonian Gravity + Live Orbit Diagnostics
+
+This round introduces an **opt-in Newtonian gravity layer** for normal-space flight plus a lightweight
+**two-body orbit solver** for debugging and future gameplay (safer supercruise drops, close approaches,
+"periapsis warning" HUD, etc.). Gravity is disabled by default to preserve the existing arcade feel.
+
+- **New core module:** `stellar/sim/Gravity.*`
+  - Deterministic gravity acceleration from the system **star + planets** (km/s^2) with softening + optional clamp.
+  - Convenience helpers for **dominant gravity body** selection (useful for orbit UI).
+- **New core module:** `stellar/sim/OrbitalMechanics.*`
+  - State-vector to orbit scalars: eccentricity, semi-major axis, periapsis/apoapsis, and period (when bound).
+- **Ship physics upgrade:** `Ship::stepWithExternalAccel(...)`
+  - Allows environmental accelerations (gravity now, more later) to be integrated consistently with sub-stepping.
+- **Game integration:**
+  - Toggle: **World Visuals → Physics (experimental) → Newtonian gravity**.
+  - Applies gravity to **player + NPC contacts** in normal space.
+  - Adds **Ship / Status → Gravity / Orbit** readout (dominant body, g-levels, peri/apo, period).
+- **Tests:** new `test_gravity` covers gravity direction/magnitude and orbit-solver sanity (circular + elliptical).
+
+
 ## 2026-01-03 (Patch) - Normal-Space Nav Assist (Approach + Match Velocity)
 
 This round adds a **normal-space navigation assist computer** that sits between raw manual thrust and the
@@ -691,3 +913,46 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
   - This restores the intended behavior where `Universe::getSystem(id)` can decode the sector and fetch the correct stub **without requiring a hint**.
 - Added a regression check to `test_streaming` to ensure `getSystem(id)` returns the correct stub position/fields on a fresh Universe.
 - Improved `Universe::getSystem(...)` fallback stub generation to create a **plausible galaxy-disc position** (instead of collapsing to {0,0,0}).
+
+## UI: Window Registry + Window Manager (new)
+- Added `stellar/ui/WindowRegistry` (headless): a small registry that binds window keys to runtime `bool` open flags.
+- UI workspaces now capture/apply window visibility via the registry, reducing "forgot to wire the new window" bugs.
+- Added a new in-game **Window Manager** panel (Windows → Window Manager...) with:
+  - search + group filter
+  - bulk open/close
+  - reset-to-defaults
+- Command Palette window toggles are now generated from the registry (includes shortcut hints where available).
+- Added unit test `test_window_registry`.
+## UI: In-game CPU Profiler (new)
+- Added `stellar/core/Profiler` (headless): a lightweight per-frame CPU scope profiler with nested events.
+- Added a new in-game **Profiler** window (Windows → Profiler) featuring:
+  - rolling frame-time plot
+  - flame graph timeline view
+  - per-scope aggregate table with filtering + one-click copy-to-clipboard
+- Instrumented the game loop with coarse scopes: `Frame`, `InputEvents`, `Sim`, `Present`.
+- Added unit test `test_profiler`.
+
+# Patch Notes (Jan 5, 2026)
+
+## UI: Photo Mode + Screenshot Capture (new)
+- Added a new in-game **Photo Mode** window (Windows → Photo Mode) for quick capture workflows.
+- Supports 2 capture stages:
+  - **World only** (captured before any ImGui UI is drawn)
+  - **With UI** (captured after ImGui draws)
+- Screenshots are written as **PNG** with:
+  - configurable output directory (default: `screenshots/`)
+  - timestamped, unique filenames (auto-suffix if a name already exists)
+  - optional **copy path to clipboard** for fast sharing
+- Added console command: `screenshot [ui|world] [basename] [dir]`.
+
+## UI: In-game Log Viewer (new)
+- Added `stellar/ui/LogBuffer`: a thread-safe ring buffer that can be fed via a `core::LogSink`.
+- Added a new **Log** window (Windows → Log, or UI → Log) with:
+  - per-level filters (Trace/Debug/Info/Warn/Error)
+  - fuzzy text filter (optional relevance sorting)
+  - copy selected line / copy filtered lines
+  - export filtered lines to a text file (auto-creates parent folders)
+- Added unit test `test_log_buffer`.
+
+## Build/test fix
+- Updated `test_atmosphere` to use the current `Star` field names (`massSol`, `radiusSol`).

@@ -89,6 +89,10 @@ void consoleAddCommand(ConsoleWindowState& st,
 // Add built-in commands: help, clear, echo, loglevel.
 void consoleAddBuiltins(ConsoleWindowState& st);
 
+// Execute a command line programmatically (same path as typing into the console).
+// Useful for integrating other UI (e.g., a command palette) with the console.
+void consoleExecLine(ConsoleWindowState& st, std::string_view line);
+
 // Install/remove a core::Log sink that forwards logs into the console.
 void consoleInstallCoreLogSink(ConsoleWindowState& st);
 void consoleRemoveCoreLogSink(ConsoleWindowState& st);

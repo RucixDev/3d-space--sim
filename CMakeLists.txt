@@ -101,14 +101,18 @@ set(STELLAR_CORE_SOURCES
   src/core/Hash.cpp
   src/core/Log.cpp
   src/core/CVar.cpp
+  src/core/Profiler.cpp
 
   src/ui/Bookmarks.cpp
   src/ui/FuzzySearch.cpp
+  src/ui/LogBuffer.cpp
   src/ui/HudLayout.cpp
   src/ui/HudSettings.cpp
   src/ui/Livery.cpp
+  src/ui/UiLayoutProfiles.cpp
   src/ui/UiSettings.cpp
   src/ui/UiWorkspaces.cpp
+  src/ui/WindowRegistry.cpp
 
   src/proc/Noise.cpp
   src/proc/NameGenerator.cpp
@@ -118,6 +122,12 @@ set(STELLAR_CORE_SOURCES
   src/sim/Faction.cpp
   src/sim/FactionProfile.cpp
   src/sim/Orbit.cpp
+  src/sim/Gravity.cpp
+  src/sim/Atmosphere.cpp
+  src/sim/OrbitalMechanics.cpp
+  src/sim/TrajectoryPredictor.cpp
+  src/sim/ManeuverComputer.cpp
+  src/sim/LambertSolver.cpp
   src/sim/Ship.cpp
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
@@ -165,6 +175,7 @@ set(STELLAR_RENDER_SOURCES
   src/render/Texture.cpp
   src/render/ProceduralSprite.cpp
   src/render/ProceduralPlanet.cpp
+  src/render/ProceduralRings.cpp
   src/render/ProceduralLivery.cpp
   src/render/AtmosphereRenderer.cpp
   src/render/Starfield.cpp
@@ -214,7 +225,13 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/main.cpp
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
-  apps/stellar_game/ConsoleWindow.cpp
+    apps/stellar_game/MarketDashboardWindow.cpp
+    apps/stellar_game/ConsoleWindow.cpp
+    apps/stellar_game/LogWindow.cpp
+    apps/stellar_game/CVarWindow.cpp
+    apps/stellar_game/ProfilerWindow.cpp
+    apps/stellar_game/Screenshot.cpp
+    apps/stellar_game/PhotoModeWindow.cpp
   )
   target_link_libraries(stellar_game PRIVATE stellar::stellar ${IMGUI_TARGET})
   set_target_properties(stellar_game PROPERTIES
