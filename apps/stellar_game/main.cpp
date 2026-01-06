@@ -50,6 +50,7 @@
 #include "stellar/sim/TrajectoryPredictor.h"
 #include "stellar/sim/ManeuverComputer.h"
 #include "stellar/sim/LambertSolver.h"
+#include "stellar/sim/LambertPlanner.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/Law.h"
@@ -79,6 +80,8 @@
 #include "stellar/sim/DockingClearanceService.h"
 #include "stellar/sim/ThermalSystem.h"
 #include "stellar/sim/Traffic.h"
+#include "stellar/sim/TrafficLedger.h"
+#include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/Universe.h"
 
@@ -747,6 +750,7 @@ enum class SignalType : int {
   Distress = 0,
   Derelict,
   Resource,
+  TrafficConvoy,
 };
 
 static const char* signalTypeName(SignalType t) {
@@ -754,6 +758,7 @@ static const char* signalTypeName(SignalType t) {
     case SignalType::Distress: return "Distress Call";
     case SignalType::Derelict: return "Derelict";
     case SignalType::Resource: return "Resource Field";
+    case SignalType::TrafficConvoy: return "Traffic Convoy";
     default: return "Signal";
   }
 }
@@ -771,6 +776,11 @@ struct SignalSource {
   sim::DistressPlan distress{};
   core::u64 distressVictimId{0};
   bool distressCompleted{false};
+
+  // Optional payload for Traffic Convoy signals (moving lane traffic).
+  bool hasTrafficConvoy{false};
+  sim::TrafficConvoy trafficConvoy{};
+  sim::TrafficConvoyState trafficState{};
 
   // Whether the player has "resolved" this site (i.e., we have fired its one-shot content).
   bool resolved{false};
@@ -1471,6 +1481,43 @@ int main(int argc, char** argv) {
   float lambertLastAngleDeg = 0.0f;
   int lambertLastIterations = 0;
 
+  // --- Lambert planner (incremental porkchop search) ---
+  // Uses sim::LambertPorkchopStepper to spread the grid search over multiple frames.
+  struct LambertAutoSearchState {
+    bool running{false};
+    bool showAdvanced{false};
+
+    // Search window relative to the maneuver node time.
+    float departWindowHours{2.0f};
+    int departSteps{17};
+
+    float tofMinHours{0.5f};
+    float tofMaxHours{48.0f};
+    int tofSteps{80};
+
+    int topK{8};
+    int scoreMode{(int)sim::LambertScoreMode::MinTotalDv};
+    float arrivalWeight{0.25f};
+
+    int cellsPerFrame{256};
+    bool storeGrid{false};
+
+    // Bookkeeping (frozen at start)
+    double startTimeDays{0.0};
+    double baseTimeDays{0.0};
+    double tNodeStartSec{0.0};
+    double muKm3S2{0.0};
+
+    // Ship ephemeris cache for departure states (predicted from startTimeDays).
+    double ephemStepSec{0.0};
+    std::vector<sim::TrajectorySample> shipSamples;
+
+    sim::EphemerisFn departEphem{};
+    sim::EphemerisFn arriveEphem{};
+
+    sim::LambertPorkchopStepper stepper;
+  } lambertAuto;
+
 
   struct TrajectoryPreviewCache {
     bool valid{false};
@@ -1838,6 +1885,11 @@ int main(int argc, char** argv) {
   // Used to deterministically advance low-cost "ambient" station-to-station trade.
   std::unordered_map<sim::SystemId, int> trafficDayStampBySystem;
 
+  // Traffic shipment ledger (per visited system).
+  // Recorded from simulateNpcTradeTraffic(...) and used to drive TrafficConvoy signals
+  // so visible convoys can reflect the actual market nudges.
+  std::unordered_map<sim::SystemId, sim::TrafficLedger> trafficLedgerBySystem;
+
   // Cached trade helper suggestions (regenerated when docking / day changes)
   struct TradeIdea {
     sim::SystemId toSystem{0};
@@ -1894,6 +1946,12 @@ int main(int argc, char** argv) {
   std::vector<FloatingCargo> floatingCargo;
   std::vector<AsteroidNode> asteroids;
   std::vector<SignalSource> signals;
+
+  // Traffic convoy signals are moving targets; we refresh the active set periodically
+  // and re-evaluate positions every frame.
+  sim::TrafficLaneParams trafficLaneParamsGame{};
+  double nextTrafficConvoyRefreshDays = 0.0;
+  double trafficConvoyRefreshIntervalDays = 30.0 / 86400.0; // ~30s of sim time
 
   // Deterministic world-state persistence:
   // - resolvedSignalIds: one-shot system-entry signals (e.g., starter derelicts) that have already fired.
@@ -1953,6 +2011,12 @@ int main(int argc, char** argv) {
 
   core::Profiler profiler{};
   core::setActiveProfiler(&profiler);
+
+  // Tweak traffic lane density for in-game signal lists.
+  trafficLaneParamsGame.convoysPerStation = 1;
+  trafficLaneParamsGame.maxConvoysPerDay = 12;
+  trafficLaneParamsGame.includeInactive = false;
+  trafficLaneParamsGame.genWindowDays = 1;
 
 
   // UI state
@@ -2600,6 +2664,12 @@ int main(int argc, char** argv) {
   // sandbox tooling, and tests agree on ids/placement.
   if (sys.stations.empty()) return;
 
+  // Ensure the ambient traffic sim has advanced and record shipments so convoy signals
+  // can reflect the actual economy nudges.
+  sim::TrafficLedger& trafficLedger = trafficLedgerBySystem[sys.stub.id];
+  sim::simulateNpcTradeTraffic(universe, sys, timeDays, trafficDayStampBySystem,
+                              /*kMaxBackfillDays=*/14, &trafficLedger);
+
   std::vector<core::u64> resolved;
   resolved.reserve(resolvedSignalIds.size());
   for (core::u64 id : resolvedSignalIds) resolved.push_back(id);
@@ -2611,8 +2681,10 @@ int main(int argc, char** argv) {
   gen.includeDistress = true;
   gen.distressPerDay = 1;
   gen.distressTtlDays = 1.0;
+  gen.includeTrafficConvoys = true;
+  gen.trafficLaneParams = trafficLaneParamsGame;
 
-  const auto plan = sim::generateSystemSignals(universe.seed(), sys, timeDays, missions, resolved, gen);
+  const auto plan = sim::generateSystemSignals(universe.seed(), sys, timeDays, missions, resolved, gen, &trafficLedger);
 
   // Seed deterministic resource field asteroids (persist depletion by id).
   asteroids.reserve(plan.resourceFields.asteroids.size());
@@ -2659,6 +2731,14 @@ int main(int argc, char** argv) {
         s.hasDistressPlan = true;
         s.distress = site.distress;
         break;
+      case sim::SignalKind::TrafficConvoy:
+        s.type = SignalType::TrafficConvoy;
+        s.hasTrafficConvoy = site.hasTrafficConvoy;
+        if (s.hasTrafficConvoy) {
+          s.trafficConvoy = site.trafficConvoy;
+          s.trafficState = site.trafficState;
+        }
+        break;
       case sim::SignalKind::MissionSalvage:
         // Mission salvage sites are represented as derelict signals in the prototype UI.
         s.type = SignalType::Derelict;
@@ -2669,10 +2749,101 @@ int main(int argc, char** argv) {
   }
 };
 
+  auto syncTrafficConvoySignals = [&](const sim::StarSystem& sys) {
+    // Defensive: collapse any duplicate convoy signals (same id) left by older versions.
+    {
+      std::unordered_set<core::u64> seen;
+      seen.reserve(signals.size() * 2 + 1);
+      for (std::size_t i = 0; i < signals.size(); /*manual*/) {
+        if (signals[i].type != SignalType::TrafficConvoy) { ++i; continue; }
+        if (seen.insert(signals[i].id).second) { ++i; continue; }
+
+        if (target.kind == TargetKind::Signal) {
+          if (target.index == i) target = {};
+          else if (target.index > i) target.index--;
+        }
+        signals.erase(signals.begin() + i);
+      }
+    }
+
+    std::vector<sim::TrafficConvoyView> views;
+
+    // Prefer replaying recorded NPC trade shipments as convoys so the visible traffic layer
+    // matches the market nudges done by simulateNpcTradeTraffic(...).
+    auto itLedger = trafficLedgerBySystem.find(sys.stub.id);
+    if (itLedger != trafficLedgerBySystem.end()) {
+      views = sim::generateTrafficConvoysFromLedger(itLedger->second,
+                                                   sys,
+                                                   timeDays,
+                                                   trafficLaneParamsGame.genWindowDays,
+                                                   trafficLaneParamsGame.includeInactive,
+                                                   trafficLaneParamsGame);
+    }
+
+    // Fallback: deterministic lane prototype (ensures traffic even if no shipments were recorded).
+    if (views.empty()) {
+      views = sim::generateTrafficConvoys(universe.seed(), sys, timeDays, trafficLaneParamsGame);
+    }
+
+    std::unordered_map<core::u64, std::size_t> existing;
+    existing.reserve(signals.size());
+    for (std::size_t i = 0; i < signals.size(); ++i) {
+      if (signals[i].type != SignalType::TrafficConvoy) continue;
+      existing[signals[i].id] = i;
+    }
+
+    std::unordered_set<core::u64> keep;
+    keep.reserve(views.size() * 2 + 4);
+
+    // Upsert the active convoy set.
+    for (const auto& v : views) {
+      keep.insert(v.convoy.id);
+
+      auto it = existing.find(v.convoy.id);
+      if (it != existing.end()) {
+        auto& s = signals[it->second];
+        s.type = SignalType::TrafficConvoy;
+        s.hasTrafficConvoy = true;
+        s.trafficConvoy = v.convoy;
+        s.trafficState = v.state;
+        s.posKm = v.state.posKm;
+        s.expireDay = v.convoy.arriveDay;
+      } else {
+        SignalSource s{};
+        s.id = v.convoy.id;
+        s.type = SignalType::TrafficConvoy;
+        s.posKm = v.state.posKm;
+        s.expireDay = v.convoy.arriveDay;
+        s.resolved = false;
+
+        s.hasTrafficConvoy = true;
+        s.trafficConvoy = v.convoy;
+        s.trafficState = v.state;
+        signals.push_back(std::move(s));
+      }
+    }
+
+    // Remove convoy signals that are no longer active in the current window.
+    for (std::size_t i = 0; i < signals.size(); /*manual*/) {
+      if (signals[i].type != SignalType::TrafficConvoy) { ++i; continue; }
+      if (keep.find(signals[i].id) != keep.end()) { ++i; continue; }
+
+      if (target.kind == TargetKind::Signal) {
+        if (target.index == i) target = {};
+        else if (target.index > i) target.index--;
+      }
+
+      signals.erase(signals.begin() + i);
+    }
+  };
+
+
 
   // Spawn near first station for immediate gameplay.
   respawnNearStation(*currentSystem, 0);
   seedSystemSpaceObjects(*currentSystem);
+  syncTrafficConvoySignals(*currentSystem);
+  nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
 
   galaxySelectedSystemId = currentSystem->stub.id;
 
@@ -3718,6 +3889,40 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                       return a.systemId < b.systemId;
                     });
 
+          // Recent NPC-trade shipments (TrafficLedger replay).
+          //
+          // This is intentionally kept small by TrafficLedger::prune(); we persist it so
+          // TrafficConvoy signals remain consistent across save/load.
+          s.trafficShipments.clear();
+          {
+            for (auto& kv : trafficLedgerBySystem) {
+              kv.second.prune(timeDays);
+              for (const auto& sh : kv.second.shipments) {
+                sim::TrafficShipmentState out{};
+                out.id = sh.id;
+                out.systemId = sh.systemId;
+                out.dayStamp = sh.dayStamp;
+                out.fromStation = sh.fromStation;
+                out.toStation = sh.toStation;
+                out.factionId = sh.factionId;
+                out.commodity = sh.commodity;
+                out.units = sh.units;
+                out.departDay = sh.departDay;
+                out.arriveDay = sh.arriveDay;
+                out.distKm = sh.distKm;
+                out.speedKmS = sh.speedKmS;
+                s.trafficShipments.push_back(std::move(out));
+              }
+            }
+
+            std::sort(s.trafficShipments.begin(), s.trafficShipments.end(),
+                      [](const sim::TrafficShipmentState& a, const sim::TrafficShipmentState& b) {
+                        if (a.systemId != b.systemId) return a.systemId < b.systemId;
+                        if (a.dayStamp != b.dayStamp) return a.dayStamp < b.dayStamp;
+                        return a.id < b.id;
+                      });
+          }
+
           if (sim::saveToFile(s, savePath)) {
             toast(toasts, "Saved to " + savePath, 2.5);
           }
@@ -3815,6 +4020,29 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                 trafficDayStampBySystem.clear();
                 for (const auto& t : s.trafficStamps) {
                   trafficDayStampBySystem[t.systemId] = t.dayStamp;
+                }
+
+                // Restore recent traffic shipments into per-system ledgers so convoy signals
+                // remain consistent after load (even when no new day has advanced).
+                trafficLedgerBySystem.clear();
+                for (const auto& sh : s.trafficShipments) {
+                  sim::TrafficShipment tsh{};
+                  tsh.id = sh.id;
+                  tsh.systemId = sh.systemId;
+                  tsh.dayStamp = sh.dayStamp;
+                  tsh.fromStation = sh.fromStation;
+                  tsh.toStation = sh.toStation;
+                  tsh.factionId = sh.factionId;
+                  tsh.commodity = sh.commodity;
+                  tsh.units = sh.units;
+                  tsh.departDay = sh.departDay;
+                  tsh.arriveDay = sh.arriveDay;
+                  tsh.distKm = sh.distKm;
+                  tsh.speedKmS = sh.speedKmS;
+                  trafficLedgerBySystem[tsh.systemId].record(std::move(tsh));
+                }
+                for (auto& kv : trafficLedgerBySystem) {
+                  kv.second.prune(timeDays);
                 }
 
                 // Station storage / warehouse
@@ -4289,9 +4517,18 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               const auto& s = signals[target.index];
               if (s.expireDay > 0.0 && timeDays > s.expireDay) return false;
               outPosKm = s.posKm;
-              outVelKmS = {0, 0, 0};
+
+              // Most signal sources are stationary, but Traffic Convoy signals represent moving targets.
+              if (s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy) {
+                outVelKmS = s.trafficState.velKmS;
+                const auto def = econ::commodityDef(s.trafficConvoy.commodity);
+                outName = std::string("Traffic Convoy (") + def.name + ")";
+              } else {
+                outVelKmS = {0, 0, 0};
+                outName = signalTypeName(s.type);
+              }
+
               outSuggestedDistKm = 3500.0;
-              outName = signalTypeName(s.type);
               return true;
             }
             default:
@@ -5369,7 +5606,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               const auto& s = signals[target.index];
               if (!(s.expireDay > 0.0 && timeDays > s.expireDay)) {
                 tPosKm = s.posKm;
-                tVelKmS = {0,0,0};
+                tVelKmS = (s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy)
+                            ? s.trafficState.velKmS
+                            : math::Vec3d{0, 0, 0};
                 ok = true;
               }
             }
@@ -5647,7 +5886,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	      } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
 	        const auto& s = signals[target.index];
 	        destPosKm = s.posKm;
-	        destVelKmS = {0, 0, 0};
+	        destVelKmS = (s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy) ? s.trafficState.velKmS : math::Vec3d{0, 0, 0};
 	        dropKm = 70000.0;
 	        hasDest = true;
       }
@@ -5660,7 +5899,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       }
 
 	      // Spawn intermittent signal sources while travelling in supercruise.
-	      if (currentSystem && hasDest && timeDays >= nextSignalSpawnDays && signals.size() < 10) {
+	      int nonConvoySignals = 0;
+	      for (const auto& s : signals) {
+	        if (s.expireDay > 0.0 && timeDays > s.expireDay) continue;
+	        if (s.type == SignalType::TrafficConvoy) continue;
+	        nonConvoySignals++;
+	      }
+
+	      if (currentSystem && hasDest && timeDays >= nextSignalSpawnDays && nonConvoySignals < 10) {
 	        nextSignalSpawnDays = timeDays + (rng.range(55.0, 120.0) / 86400.0);
 
 	        const double r = rng.nextUnit();
@@ -8117,6 +8363,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              double value = 140.0;
 	              if (s.type == SignalType::Distress) value = 180.0;
 	              if (s.type == SignalType::Derelict) value = 320.0;
+	              if (s.type == SignalType::TrafficConvoy) value = 220.0;
 	              explorationDataCr += value;
 
 	              // Derelicts sometimes still hold an intact data core you can scoop.
@@ -8125,6 +8372,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              }
 
 	              completeScan(std::string("Signal scan logged (+data ") + std::to_string((int)value) + " cr).", 2.5);
+
+	              if (s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy && currentSystem) {
+	                auto stationNameById = [&](sim::StationId id) -> std::string {
+	                  for (const auto& st : currentSystem->stations) { if (st.id == id) return st.name; }
+	                  return std::string("Station ") + std::to_string((long long)id);
+	                };
+	                const auto def = econ::commodityDef(s.trafficConvoy.commodity);
+	                toast(toasts,
+	                      std::string("Convoy manifest: ") + def.name +
+	                        " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
+	                        stationNameById(s.trafficConvoy.fromStation) + " -> " + stationNameById(s.trafficConvoy.toStation),
+	                      3.2);
+	              }
 
 	              // Distress scans can reveal what the call is likely asking for.
 	              if (s.type == SignalType::Distress && currentSystem) {
@@ -8226,6 +8486,22 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	      // --- Salvage / signals / mining objects ---
 	      {
+	        // Periodically refresh moving traffic convoy signal set.
+	        if (currentSystem && timeDays >= nextTrafficConvoyRefreshDays) {
+	          syncTrafficConvoySignals(*currentSystem);
+	          nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
+	        }
+
+	        // Update convoy positions every frame so they remain moving targets.
+	        if (currentSystem) {
+	          for (auto& s : signals) {
+	            if (s.type != SignalType::TrafficConvoy || !s.hasTrafficConvoy) continue;
+	            s.trafficState = sim::evaluateTrafficConvoy(s.trafficConvoy, *currentSystem, timeDays, trafficLaneParamsGame);
+	            s.posKm = s.trafficState.posKm;
+	            s.expireDay = s.trafficConvoy.arriveDay;
+	          }
+	        }
+
 	        // Police "submit or fight" window expiry
 	        if (policeDemand.active && timeDays > policeDemand.untilDays) {
 	          toast(toasts, policeDemand.sourceName + ": no compliance detected. Lethal force authorized!", 3.0);
@@ -8290,7 +8566,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              if (target.index == i) target = {};
 	              else if (target.index > i) target.index--;
 	            }
-	            signals.erase(signals.begin() + (std::ptrdiff_t)i);
+	            signals.erase(signals.begin() + i);
 	            continue;
 	          }
 	          ++i;
@@ -8342,11 +8618,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	            // Persist one-shot deterministic signals (e.g., system-entry derelicts) so players
 	            // can't farm them by leaving/re-entering a system.
-	            if ((s.id & kDeterministicWorldIdBit) && s.type != SignalType::Resource) {
+	            if ((s.id & kDeterministicWorldIdBit) && s.type != SignalType::Resource && s.type != SignalType::TrafficConvoy) {
 	              resolvedSignalIds.insert(s.id);
 	            }
 	
-	            if (s.type == SignalType::Resource) {
+	            if (s.type == SignalType::TrafficConvoy) {
+              if (s.hasTrafficConvoy && currentSystem) {
+                auto stationNameById = [&](sim::StationId id) -> std::string {
+                  for (const auto& st : currentSystem->stations) { if (st.id == id) return st.name; }
+                  return std::string("Station ") + std::to_string((long long)id);
+                };
+                const auto def = econ::commodityDef(s.trafficConvoy.commodity);
+                toast(toasts,
+                      std::string("Traffic convoy acquired: ") + def.name +
+                        " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
+                        stationNameById(s.trafficConvoy.fromStation) + " -> " + stationNameById(s.trafficConvoy.toStation),
+                      3.2);
+              } else {
+                toast(toasts, "Traffic convoy acquired.", 2.6);
+              }
+            }
+
+            if (s.type == SignalType::Resource) {
 	              if (!s.fieldSpawned) {
 	                s.fieldSpawned = true;
 	                const int n = 24 + rng.range(0, 16);
@@ -8597,7 +8890,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // --- Background NPC trade traffic (market nudging) ---
       if (currentSystem) {
-        sim::simulateNpcTradeTraffic(universe, *currentSystem, timeDays, trafficDayStampBySystem);
+        auto& trafficLedger = trafficLedgerBySystem[currentSystem->stub.id];
+        sim::simulateNpcTradeTraffic(universe, *currentSystem, timeDays, trafficDayStampBySystem,
+                                     /*kMaxBackfillDays=*/14, &trafficLedger);
       }
 
       // --- Escort mission runtime (convoy status + ambush events) ---
@@ -10103,6 +10398,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	      if (s.type == SignalType::Distress) { r = 1.0f; g = 0.6f; b = 0.2f; }
 	      if (s.type == SignalType::Derelict) { r = 0.75f; g = 0.75f; b = 1.0f; }
 	      if (s.type == SignalType::Resource) { r = 0.55f; g = 0.95f; b = 0.55f; }
+	      if (s.type == SignalType::TrafficConvoy) { r = 0.35f; g = 0.90f; b = 1.0f; }
 	      cubes.push_back(makeInst(toRenderPosU(s.posKm),
 	                               {0.25, 0.25, 0.25},
 	                               math::Quatd::identity(),
@@ -13230,6 +13526,327 @@ if (showShip) {
           } else {
             ImGui::TextDisabled("Last: (no solution yet)");
           }
+
+          // -----------------------------------------------------------------
+          // Auto-search over a window (porkchop) — incremental, frame-friendly
+          // -----------------------------------------------------------------
+          {
+            ImGui::Separator();
+            ImGui::Text("Auto-search (porkchop)");
+            ImGui::TextDisabled("Searches a departure/TOF window for low-Δv transfers (incremental).");
+
+            // Step the search each frame while it runs.
+            if (lambertAuto.running && lambertAuto.stepper.started() && !lambertAuto.stepper.done()) {
+              lambertAuto.stepper.step(std::clamp(lambertAuto.cellsPerFrame, 1, 20000));
+              if (lambertAuto.stepper.done()) {
+                lambertAuto.running = false;
+              }
+            }
+
+            // Controls
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::SliderFloat("Depart window (h)", &lambertAuto.departWindowHours, 0.0f, 24.0f, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Depart steps", &lambertAuto.departSteps, 1, 96);
+
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::SliderFloat("TOF min (h)", &lambertAuto.tofMinHours, 0.25f, 240.0f, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::SliderFloat("TOF max (h)", &lambertAuto.tofMaxHours, 0.25f, 240.0f, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("TOF steps", &lambertAuto.tofSteps, 1, 160);
+
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Top K", &lambertAuto.topK, 1, 32);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            {
+              const char* modes[] = {"Min depart Δv", "Min total (Δv+rel)", "Min arrival rel", "Weighted"};
+              int m = lambertAuto.scoreMode;
+              if (m < 0) m = 0;
+              if (m > 3) m = 3;
+              if (ImGui::Combo("Score", &m, modes, 4)) {
+                lambertAuto.scoreMode = m;
+              }
+            }
+            if ((sim::LambertScoreMode)lambertAuto.scoreMode == sim::LambertScoreMode::Weighted) {
+              ImGui::SetNextItemWidth(180.0f);
+              ImGui::SliderFloat("Arrival weight", &lambertAuto.arrivalWeight, 0.0f, 5.0f, "%.2f");
+            }
+
+            if (ImGui::Checkbox("Store grid", &lambertAuto.storeGrid)) {
+              // toggled
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Cells/frame", &lambertAuto.cellsPerFrame, 16, 4096);
+            ImGui::SameLine();
+            ImGui::Checkbox("Advanced", &lambertAuto.showAdvanced);
+
+            if (lambertAuto.showAdvanced) {
+              ImGui::TextDisabled("Tip: Center the node time, then search a small depart window for phasing.");
+            }
+
+            const bool canStart = targetOk;
+
+            if (!lambertAuto.running) {
+              if (!canStart) {
+                ImGui::TextDisabled("Start: (select a planet or station target)");
+              } else {
+                if (ImGui::SmallButton("Start search")) {
+                  // Freeze a planning snapshot.
+                  lambertAuto.startTimeDays = timeDays;
+                  lambertAuto.tNodeStartSec = std::clamp((double)maneuverNodeTimeSec, 0.0, (double)horizonSecUi);
+                  lambertAuto.baseTimeDays = lambertAuto.startTimeDays + (lambertAuto.tNodeStartSec / 86400.0);
+
+                  // Gravity mode (consistent with the manual Lambert helper).
+                  const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+                  sim::GravityParams gParams = gravityParams;
+                  if (gMode == 2) {
+                    gParams.scale = 1.0;
+                    gParams.maxAccelKmS2 = 0.0;
+                  }
+
+                  const double muStar = sim::muStarKm3S2(currentSystem->star);
+                  lambertAuto.muKm3S2 = muStar * ((gMode == 1) ? gParams.scale : 1.0);
+
+                  // Precompute ship ephemeris out to the end of the depart window.
+                  const double departWindowSec = std::max(0.0, (double)lambertAuto.departWindowHours * 3600.0);
+                  sim::TrajectoryPredictParams pre;
+                  pre.horizonSec = lambertAuto.tNodeStartSec + departWindowSec;
+                  pre.stepSec = std::clamp((double)trajPreviewStepSec, 0.2, 30.0);
+                  pre.maxSamples = std::clamp((int)std::ceil(pre.horizonSec / pre.stepSec) + 4, 64, 60000);
+                  pre.includeGravity = (gMode != 0);
+                  pre.gravity = gParams;
+
+                  lambertAuto.shipSamples = sim::predictTrajectoryRK4(*currentSystem, lambertAuto.startTimeDays,
+                                                                     ship.positionKm(), ship.velocityKmS(), pre);
+                  lambertAuto.ephemStepSec = pre.stepSec;
+
+                  lambertAuto.departEphem = [&lambertAuto](double queryDays, math::Vec3d& outPosKm, math::Vec3d& outVelKmS) {
+                    // Interpolate within the cached trajectory samples.
+                    if (lambertAuto.shipSamples.empty() || !(lambertAuto.ephemStepSec > 1e-9)) {
+                      outPosKm = {0,0,0};
+                      outVelKmS = {0,0,0};
+                      return;
+                    }
+
+                    const double qSec = (queryDays - lambertAuto.startTimeDays) * 86400.0;
+                    if (!std::isfinite(qSec)) {
+                      const auto& s0 = lambertAuto.shipSamples.front();
+                      outPosKm = s0.posKm;
+                      outVelKmS = s0.velKmS;
+                      return;
+                    }
+
+                    if (qSec <= lambertAuto.shipSamples.front().tSec) {
+                      const auto& s0 = lambertAuto.shipSamples.front();
+                      outPosKm = s0.posKm;
+                      outVelKmS = s0.velKmS;
+                      return;
+                    }
+                    if (qSec >= lambertAuto.shipSamples.back().tSec) {
+                      const auto& s1 = lambertAuto.shipSamples.back();
+                      outPosKm = s1.posKm;
+                      outVelKmS = s1.velKmS;
+                      return;
+                    }
+
+                    const int n = (int)lambertAuto.shipSamples.size();
+                    const int i0 = std::clamp((int)std::floor(qSec / lambertAuto.ephemStepSec), 0, std::max(0, n - 2));
+                    const int i1 = i0 + 1;
+                    const auto& a = lambertAuto.shipSamples[(std::size_t)i0];
+                    const auto& b = lambertAuto.shipSamples[(std::size_t)i1];
+                    const double dt = std::max(1e-9, b.tSec - a.tSec);
+                    const double u = std::clamp((qSec - a.tSec) / dt, 0.0, 1.0);
+                    outPosKm = a.posKm * (1.0 - u) + b.posKm * u;
+                    outVelKmS = a.velKmS * (1.0 - u) + b.velKmS * u;
+                  };
+
+                  // Target ephemeris at arbitrary times.
+                  if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
+                    const sim::Planet pCopy = currentSystem->planets[target.index];
+                    lambertAuto.arriveEphem = [pCopy](double tDays, math::Vec3d& outPosKm, math::Vec3d& outVelKmS) {
+                      const math::Vec3d posAU = sim::orbitPosition3DAU(pCopy.orbit, tDays);
+                      const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(pCopy.orbit, tDays);
+                      outPosKm = posAU * kAU_KM;
+                      outVelKmS = velAUPerDay * (kAU_KM / 86400.0);
+                    };
+                  } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+                    const sim::Station stCopy = currentSystem->stations[target.index];
+                    lambertAuto.arriveEphem = [stCopy](double tDays, math::Vec3d& outPosKm, math::Vec3d& outVelKmS) {
+                      const math::Vec3d posAU = sim::orbitPosition3DAU(stCopy.orbit, tDays);
+                      const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(stCopy.orbit, tDays);
+                      outPosKm = posAU * kAU_KM;
+                      outVelKmS = velAUPerDay * (kAU_KM / 86400.0);
+                    };
+                  }
+
+                  sim::LambertPorkchopParams sp;
+                  sp.departMinSec = 0.0;
+                  sp.departMaxSec = departWindowSec;
+                  sp.departSteps = std::clamp(lambertAuto.departSteps, 1, 256);
+
+                  const double tofMinSec = std::max(0.25 * 3600.0, (double)lambertAuto.tofMinHours * 3600.0);
+                  const double tofMaxSec = std::max(tofMinSec, (double)lambertAuto.tofMaxHours * 3600.0);
+                  sp.tofMinSec = tofMinSec;
+                  sp.tofMaxSec = tofMaxSec;
+                  sp.tofSteps = std::clamp(lambertAuto.tofSteps, 1, 512);
+
+                  sp.topK = std::clamp(lambertAuto.topK, 1, 64);
+                  sp.scoreMode = (sim::LambertScoreMode)std::clamp(lambertAuto.scoreMode, 0, 3);
+                  sp.arrivalWeight = std::clamp((double)lambertAuto.arrivalWeight, 0.0, 100.0);
+                  sp.storeGrid = lambertAuto.storeGrid;
+
+                  sp.lambertOpt.longWay = lambertLongWay;
+                  sp.lambertOpt.prograde = lambertPrograde;
+                  sp.lambertOpt.refNormal = {0,0,0}; // auto
+                  sp.lambertOpt.maxIterations = 96;
+                  sp.lambertOpt.tolSec = 1e-3;
+
+                  lambertAuto.stepper.start(lambertAuto.baseTimeDays,
+                                           lambertAuto.departEphem,
+                                           lambertAuto.arriveEphem,
+                                           lambertAuto.muKm3S2,
+                                           sp);
+                  lambertAuto.running = true;
+                }
+              }
+            } else {
+              ImGui::SameLine();
+              if (ImGui::SmallButton("Cancel")) {
+                lambertAuto.running = false;
+                lambertAuto.stepper.reset();
+              }
+            }
+
+            // Progress
+            if (lambertAuto.stepper.started()) {
+              const float p = (float)lambertAuto.stepper.progress01();
+              ImGui::ProgressBar(p, ImVec2(0.0f, 0.0f));
+            }
+
+            // Results table (best-K)
+            const auto& best = lambertAuto.stepper.result().best;
+            if (!best.empty()) {
+              if (ImGui::BeginTable("LambertBest", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 22.0f);
+                ImGui::TableSetupColumn("Depart +h");
+                ImGui::TableSetupColumn("TOF h");
+                ImGui::TableSetupColumn("Δv dep (m/s)");
+                ImGui::TableSetupColumn("Arr rel (m/s)");
+                ImGui::TableSetupColumn("Score");
+                ImGui::TableSetupColumn("Apply", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+                ImGui::TableHeadersRow();
+
+                for (int idx = 0; idx < (int)best.size(); ++idx) {
+                  const auto& c = best[(std::size_t)idx];
+                  ImGui::TableNextRow();
+                  ImGui::TableSetColumnIndex(0);
+                  ImGui::Text("%d", idx + 1);
+                  ImGui::TableSetColumnIndex(1);
+                  ImGui::Text("%.2f", c.departAfterSec / 3600.0);
+                  ImGui::TableSetColumnIndex(2);
+                  ImGui::Text("%.2f", c.tofSec / 3600.0);
+                  ImGui::TableSetColumnIndex(3);
+                  ImGui::Text("%.1f", c.dvDepartMagKmS * 1000.0);
+                  ImGui::TableSetColumnIndex(4);
+                  ImGui::Text("%.1f", c.arriveRelSpeedKmS * 1000.0);
+                  ImGui::TableSetColumnIndex(5);
+                  ImGui::Text("%.4f", c.score);
+                  ImGui::TableSetColumnIndex(6);
+
+                  ImGui::PushID(idx);
+                  if (ImGui::SmallButton("Apply")) {
+                    // Candidate departure time in absolute days.
+                    const double departAbsDays = lambertAuto.baseTimeDays + c.departAfterSec / 86400.0;
+                    const double departFromNowSec = (departAbsDays - timeDays) * 86400.0;
+
+                    // Arm the node at the candidate's absolute depart time (clamped to >=0 sec from now).
+                    maneuverNodeTimeSec = (float)std::max(0.0, departFromNowSec);
+                    lambertTofHours = (float)(c.tofSec / 3600.0);
+
+                    // Compute RTN basis at the departure time and project dv into it.
+                    math::Vec3d r1{0,0,0};
+                    math::Vec3d v0{0,0,0};
+                    if (lambertAuto.departEphem) {
+                      lambertAuto.departEphem(departAbsDays, r1, v0);
+                    }
+
+                    math::Vec3d radial = r1.normalized();
+                    if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+                    math::Vec3d normal = math::cross(r1, v0);
+                    if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+                    normal = normal.normalized();
+                    math::Vec3d along = math::cross(normal, radial);
+                    if (along.lengthSq() < 1e-12) {
+                      along = (v0 - radial * math::dot(v0, radial)).normalized();
+                    } else {
+                      along = along.normalized();
+                    }
+
+                    const math::Vec3d dvWorldKmS = c.dvDepartKmS;
+                    maneuverDvAlongMS = (float)(math::dot(dvWorldKmS, along) * 1000.0);
+                    maneuverDvNormalMS = (float)(math::dot(dvWorldKmS, normal) * 1000.0);
+                    maneuverDvRadialMS = (float)(math::dot(dvWorldKmS, radial) * 1000.0);
+                    trajRefBodyChoice = 0; // star
+
+                    // Update diagnostics from the candidate.
+                    lambertLastOk = c.ok;
+                    lambertLastDvMS = (float)(c.dvDepartMagKmS * 1000.0);
+                    lambertLastArrivalRelMS = (float)(c.arriveRelSpeedKmS * 1000.0);
+                    lambertLastAngleDeg = (float)math::radToDeg(c.lambert.transferAngleRad);
+                    lambertLastIterations = c.lambert.iterations;
+
+                    // Optional coarse validation (from current state) for immediate feedback.
+                    lambertLastMissKm = 0.0f;
+                    if (lambertValidateCoarse && departFromNowSec >= 0.0) {
+                      const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+                      sim::GravityParams gParams = gravityParams;
+                      if (gMode == 2) {
+                        gParams.scale = 1.0;
+                        gParams.maxAccelKmS2 = 0.0;
+                      }
+
+                      const double tArriveSec = std::max(0.0, departFromNowSec) + c.tofSec;
+
+                      sim::ManeuverNode node{std::max(0.0, departFromNowSec), dvWorldKmS};
+                      sim::TrajectoryPredictParams val;
+                      val.horizonSec = tArriveSec;
+                      val.includeGravity = (gMode != 0);
+                      val.gravity = gParams;
+                      val.maxSamples = 4500;
+                      const double idealStep = std::max(0.5, val.horizonSec / (double)val.maxSamples);
+                      val.stepSec = std::clamp(idealStep, 0.5, 240.0);
+
+                      const auto valS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                                 ship.positionKm(), ship.velocityKmS(), val, &node);
+                      if (!valS.empty()) {
+                        const auto& end = valS.back();
+                        const double arriveDays = timeDays + (tArriveSec / 86400.0);
+
+                        math::Vec3d tgtPos{0,0,0};
+                        math::Vec3d tgtVel{0,0,0};
+                        if (lambertAuto.arriveEphem) {
+                          lambertAuto.arriveEphem(arriveDays, tgtPos, tgtVel);
+                        }
+
+                        lambertLastMissKm = (float)((end.posKm - tgtPos).length());
+                      }
+                    }
+                  }
+                  ImGui::PopID();
+                }
+
+                ImGui::EndTable();
+              }
+            } else if (lambertAuto.stepper.started() && lambertAuto.stepper.done()) {
+              ImGui::TextDisabled("No viable solutions found in the searched window.");
+            }
+          }
         }
 
         if (trajCache.burnValid) {
@@ -13843,6 +14460,22 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
     const auto& s = signals[target.index];
     const double distKm = (s.posKm - ship.positionKm()).length();
     ImGui::Text("Target: Signal (%s) (%.0f km)", signalTypeName(s.type), distKm);
+
+    if (currentSystem && s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy) {
+      auto stationNameById = [&](sim::StationId id) -> std::string {
+        for (const auto& st : currentSystem->stations) { if (st.id == id) return st.name; }
+        return std::string("Station ") + std::to_string((long long)id);
+      };
+
+      const auto def = econ::commodityDef(s.trafficConvoy.commodity);
+      ImGui::TextDisabled("Convoy: %s  %.0f u", def.name, s.trafficConvoy.units);
+      ImGui::TextDisabled("Route: %s -> %s",
+                          stationNameById(s.trafficConvoy.fromStation).c_str(),
+                          stationNameById(s.trafficConvoy.toStation).c_str());
+      const double remainMin = std::max(0.0, (s.trafficConvoy.arriveDay - timeDays) * 86400.0 / 60.0);
+      ImGui::TextDisabled("Speed: %.0f km/s  ETA: %.1f min", s.trafficState.speedKmS, remainMin);
+    }
+
     if (s.type == SignalType::Distress && s.hasDistressPlan && !s.distressCompleted) {
       if (s.distress.hasVictim) {
         const auto def = econ::commodityDef(s.distress.needCommodity);
@@ -15571,9 +16204,25 @@ if (showScanner) {
             const ImVec2 sp = worldToScreen({posAU3.x, posAU3.z});
             const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
             const bool sel = (target.kind == TargetKind::Signal && target.index == i);
-            drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed, IM_COL32(255, 210, 120, 230), sel);
-            considerHover(TargetKind::Signal, i, sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed,
-                          (ssrc.type == SignalType::Resource ? (std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")") : std::string(signalTypeName(ssrc.type))) + " Signal");
+
+            ImU32 tint = IM_COL32(255, 210, 120, 230);
+            if (ssrc.type == SignalType::Distress) tint = IM_COL32(255, 150, 90, 235);
+            if (ssrc.type == SignalType::Derelict) tint = IM_COL32(200, 200, 255, 235);
+            if (ssrc.type == SignalType::Resource) tint = IM_COL32(150, 255, 160, 235);
+            if (ssrc.type == SignalType::TrafficConvoy) tint = IM_COL32(170, 235, 255, 235);
+
+            drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed, tint, sel);
+
+            std::string label;
+            if (ssrc.type == SignalType::Resource) {
+              label = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")";
+            } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
+              label = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ")";
+            } else {
+              label = signalTypeName(ssrc.type);
+            }
+
+            considerHover(TargetKind::Signal, i, sp, 13.0f * iconScale, render::SpriteKind::Signal, sSeed, label + " Signal");
           }
         }
 
@@ -15956,8 +16605,30 @@ if (showScanner) {
         } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
           const auto& ssrc = signals[target.index];
           const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
-          showTargetHeader((ssrc.type == SignalType::Resource ? (std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")") : std::string(signalTypeName(ssrc.type))) + " Signal", render::SpriteKind::Signal, sSeed, ImVec4(1,1,1,1));
+
+          std::string title;
+          if (ssrc.type == SignalType::Resource) {
+            title = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ") Signal";
+          } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
+            title = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ") Signal";
+          } else {
+            title = std::string(signalTypeName(ssrc.type)) + " Signal";
+          }
+
+          showTargetHeader(title, render::SpriteKind::Signal, sSeed, ImVec4(1,1,1,1));
           ImGui::TextDisabled("Distance: %.0f km", (ssrc.posKm - ship.positionKm()).length());
+
+          if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
+            auto stationNameById = [&](sim::StationId id) -> std::string {
+              for (const auto& st : currentSystem->stations) { if (st.id == id) return st.name; }
+              return std::string("Station ") + std::to_string((long long)id);
+            };
+
+            const auto def = econ::commodityDef(ssrc.trafficConvoy.commodity);
+            ImGui::TextDisabled("Route: %s -> %s", stationNameById(ssrc.trafficConvoy.fromStation).c_str(), stationNameById(ssrc.trafficConvoy.toStation).c_str());
+            ImGui::TextDisabled("Cargo: %s  %.0f u", def.name, ssrc.trafficConvoy.units);
+            ImGui::TextDisabled("Speed: %.0f km/s  Progress: %.0f%%", ssrc.trafficState.speedKmS, ssrc.trafficState.progress01 * 100.0);
+          }
         } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
           const auto& a = asteroids[target.index];
           const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
@@ -16071,6 +16742,8 @@ if (showScanner) {
               std::string name;
               if (ssrc.type == SignalType::Resource) {
                 name = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")";
+              } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
+                name = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ")";
               } else {
                 name = signalTypeName(ssrc.type);
               }

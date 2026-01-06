@@ -3,6 +3,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
 #include "stellar/econ/Market.h"
+#include "stellar/sim/TrafficLedger.h"
 
 #include <algorithm>
 #include <array>
@@ -105,7 +106,8 @@ static void simulateNpcTradeTrafficImpl(Universe& universe,
                                         const StarSystem& system,
                                         double timeDays,
                                         int& lastDay,
-                                        int kMaxBackfillDays) {
+                                        int kMaxBackfillDays,
+                                        TrafficLedger* ledger) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
@@ -115,6 +117,11 @@ static void simulateNpcTradeTrafficImpl(Universe& universe,
   if (currentDay <= lastDay) {
     // Still advance station economies to the current time so callers see up-to-date state.
     for (const auto& st : system.stations) (void)universe.stationEconomy(st, timeDays);
+
+    // Even if we don't simulate new days, keep the optional shipment ledger bounded.
+    if (ledger) {
+      ledger->prune(timeDays);
+    }
     return;
   }
 
@@ -187,6 +194,10 @@ static void simulateNpcTradeTrafficImpl(Universe& universe,
       const double taken = econ::takeInventory(srcState, src.economyModel, cid, units);
       if (taken <= 1e-6) continue;
       (void)econ::addInventory(dstState, dst.economyModel, cid, taken);
+
+      if (ledger) {
+        ledger->record(makeNpcTradeShipment(universe.seed(), system, day, r, src, dst, cid, taken, ledger->params));
+      }
     }
   }
 
@@ -194,6 +205,10 @@ static void simulateNpcTradeTrafficImpl(Universe& universe,
   for (const auto& st : system.stations) (void)universe.stationEconomy(st, timeDays);
 
   lastDay = currentDay;
+
+  if (ledger) {
+    ledger->prune(timeDays);
+  }
 }
 
 } // namespace
@@ -202,7 +217,8 @@ void simulateNpcTradeTraffic(Universe& universe,
                              const StarSystem& system,
                              double timeDays,
                              std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
-                             int kMaxBackfillDays) {
+                             int kMaxBackfillDays,
+                             TrafficLedger* ledger) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
@@ -218,14 +234,15 @@ void simulateNpcTradeTraffic(Universe& universe,
     it = lastTrafficDayBySystem.find(sysId);
   }
 
-  simulateNpcTradeTrafficImpl(universe, system, timeDays, it->second, kMaxBackfillDays);
+  simulateNpcTradeTrafficImpl(universe, system, timeDays, it->second, kMaxBackfillDays, ledger);
 }
 
 void simulateNpcTradeTraffic(Universe& universe,
                              const StarSystem& system,
                              double timeDays,
                              std::vector<SystemTrafficStamp>& trafficStamps,
-                             int kMaxBackfillDays) {
+                             int kMaxBackfillDays,
+                             TrafficLedger* ledger) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
@@ -250,7 +267,7 @@ void simulateNpcTradeTraffic(Universe& universe,
     first->dayStamp = maxDay;
   }
 
-  simulateNpcTradeTrafficImpl(universe, system, timeDays, first->dayStamp, kMaxBackfillDays);
+  simulateNpcTradeTrafficImpl(universe, system, timeDays, first->dayStamp, kMaxBackfillDays, ledger);
 
   // Remove any duplicate entries for this system (keep the first occurrence).
   bool kept = false;

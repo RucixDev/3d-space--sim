@@ -49,6 +49,36 @@ static std::string replaceCountLine(const std::string& content,
   return oss.str();
 }
 
+static std::string duplicateSecondLineWithPrefix(const std::string& content,
+                                                 const std::string& prefix,
+                                                 bool& duplicated) {
+  duplicated = false;
+  std::istringstream iss(content);
+  std::ostringstream oss;
+  std::string line;
+
+  std::string firstMatch;
+  int seen = 0;
+
+  while (std::getline(iss, line)) {
+    if (line.rfind(prefix, 0) == 0) {
+      ++seen;
+      if (seen == 1) {
+        firstMatch = line;
+        oss << line << "\n";
+        continue;
+      }
+      if (seen == 2 && !firstMatch.empty()) {
+        oss << firstMatch << "\n";
+        duplicated = true;
+        continue;
+      }
+    }
+    oss << line << "\n";
+  }
+  return oss.str();
+}
+
 int test_savegame() {
   int fails = 0;
 
@@ -171,6 +201,40 @@ int test_savegame() {
 
   // Background traffic day-stamps (per visited system).
   s.trafficStamps.push_back({10, 41});
+
+  // Recent NPC-trade shipments (TrafficLedger replay).
+  {
+    TrafficShipmentState sh{};
+    sh.id = 0x6000000000000011ull;
+    sh.systemId = 10;
+    sh.dayStamp = 41;
+    sh.fromStation = 111;
+    sh.toStation = 222;
+    sh.factionId = 7;
+    sh.commodity = econ::CommodityId::Food;
+    sh.units = 12.5;
+    sh.departDay = 41.25;
+    sh.arriveDay = 41.32;
+    sh.distKm = 120000.0;
+    sh.speedKmS = 8000.0;
+    s.trafficShipments.push_back(sh);
+  }
+  {
+    TrafficShipmentState sh{};
+    sh.id = 0x6000000000000012ull;
+    sh.systemId = 10;
+    sh.dayStamp = 42;
+    sh.fromStation = 222;
+    sh.toStation = 333;
+    sh.factionId = 0;
+    sh.commodity = econ::CommodityId::Metals;
+    sh.units = 3.75;
+    sh.departDay = 42.10;
+    sh.arriveDay = 42.22;
+    sh.distKm = 250000.0;
+    sh.speedKmS = 6000.0;
+    s.trafficShipments.push_back(sh);
+  }
 
   // Station economy overrides (cached economies persisted).
   {
@@ -376,6 +440,27 @@ int test_savegame() {
     }
   }
 
+  // Traffic shipment replay.
+  if (l.trafficShipments.size() != s.trafficShipments.size()) {
+    std::cerr << "[test_savegame] trafficShipments size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.trafficShipments.size(); ++i) {
+      const auto& a = l.trafficShipments[i];
+      const auto& b = s.trafficShipments[i];
+      if (a.id != b.id || a.systemId != b.systemId || a.dayStamp != b.dayStamp || a.fromStation != b.fromStation || a.toStation != b.toStation) {
+        std::cerr << "[test_savegame] trafficShipments entry mismatch\n";
+        ++fails;
+        break;
+      }
+      if (a.commodity != b.commodity || !nearly(a.units, b.units) || !nearly(a.departDay, b.departDay) || !nearly(a.arriveDay, b.arriveDay)) {
+        std::cerr << "[test_savegame] trafficShipments fields mismatch\n";
+        ++fails;
+        break;
+      }
+    }
+  }
+
   // Station overrides.
   if (l.stationOverrides.size() != s.stationOverrides.size()) {
     std::cerr << "[test_savegame] stationOverrides size mismatch\n";
@@ -547,6 +632,62 @@ int test_savegame() {
                 std::cerr << "[test_savegame] reputation value mismatch after stale mission_offers count\n";
                 ++fails;
               }
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If the trafficShipments count is wrong, the loader should stop when it no longer sees
+      // "shipment" and continue parsing later keys (e.g. station_overrides).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "trafficShipments", s.trafficShipments.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_traffic_shipments.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt trafficShipments save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale trafficShipments count\n";
+            ++fails;
+          } else {
+            if (x.trafficShipments.size() != s.trafficShipments.size()) {
+              std::cerr << "[test_savegame] stale trafficShipments count changed parsed shipment count\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] stale trafficShipments count broke parsing of later keys (station_overrides)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // Defensive: if trafficShipments lines are duplicated (same shipment id), the loader should
+      // de-dup them instead of producing duplicated convoy signals after load.
+      {
+        bool duplicated = false;
+        const std::string corrupt = duplicateSecondLineWithPrefix(original, "shipment ", duplicated);
+        const std::string p = "savegame_test_corrupt_traffic_shipments_dup.sav";
+        if (!duplicated || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write duplicate trafficShipments save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on duplicate trafficShipments entries\n";
+            ++fails;
+          } else {
+            if (x.trafficShipments.size() != s.trafficShipments.size() - 1) {
+              std::cerr << "[test_savegame] duplicate trafficShipments lines were not deduped\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] duplicate trafficShipments broke parsing of later keys (station_overrides)\n";
+              ++fails;
             }
           }
           std::filesystem::remove(p);

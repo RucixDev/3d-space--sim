@@ -22,6 +22,14 @@
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/Signature.h"
 #include "stellar/sim/Signals.h"
+#include "stellar/sim/WorldIds.h"
+#include "stellar/sim/Gravity.h"
+#include "stellar/sim/LambertPlanner.h"
+#include "stellar/sim/Traffic.h"
+#include "stellar/sim/TrafficLedger.h"
+#include "stellar/sim/TrafficConvoyLayer.h"
+#include "stellar/sim/TrafficLanes.h"
+#include "stellar/sim/Units.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -197,6 +205,35 @@ static void printHelp() {
             << "  --signalDistressTtl <d> Distress time-to-live in days (default: 1.0)\n"
             << "  --signalNoDistress    Disable distress call generation\n"
             << "  --signalNoDerelict    Disable daily derelict generation\n"
+            << "  --signalTraffic      Include traffic convoy sites (trade-lane traffic)\n"
+            << "                      (uses --convoyAll/--convoyWindow for the day window)\n"
+            << "\n"
+            << "Traffic lanes / convoys (prototype):\n"
+            << "  --convoys             Print deterministic in-system trade convoys for the chosen system\n"
+            << "  --convoyAll           With --convoys, include *all* scheduled convoys in the day window (not just active)\n"
+            << "  --convoyWindow <d>    Day window (+/-d) when printing active convoys (default: 1)\n"
+            << "\n"
+            << "Traffic ledger (NPC trade shipments → moving convoys):\n"
+            << "  --ledgerConvoys       Print convoy views derived from recorded NPC traffic shipments\n"
+            << "  --ledgerBackfill <d>  Days to backfill shipments for the log (default: 14)\n"
+            << "                       (uses --convoyAll/--convoyWindow for filtering)\n"
+            << "\n"
+            << "Orbital transfer planner (Lambert / porkchop):\n"
+            << "  --lambert             Search a Lambert transfer window inside the chosen system\n"
+            << "  --lambertTarget <k>   Target kind: station | planet (default: station)\n"
+            << "  --lambertIdx <n>      Target index within that list (default: 0)\n"
+            << "  --lambertDepartH <h>  Departure center offset from --day (hours) (default: 0)\n"
+            << "  --lambertDepartWindowH <h> Departure search window +/-h (hours) (default: 0)\n"
+            << "  --lambertDepartSteps <n> Departure samples (default: 1)\n"
+            << "  --lambertTofMinH <h>  Min time-of-flight (hours) (default: 0.25)\n"
+            << "  --lambertTofMaxH <h>  Max time-of-flight (hours) (default: 48)\n"
+            << "  --lambertTofSteps <n> TOF samples (default: 64)\n"
+            << "  --lambertScore <m>    depart | total | arrive | weighted (default: total)\n"
+            << "  --lambertArrivalWeight <w> Arrival weight when score=weighted (default: 0.25)\n"
+            << "  --lambertTop <n>      Keep/print top N candidates (default: 5)\n"
+            << "  --lambertGrid         With --json, include the full grid (for plotting)\n"
+            << "  --lambertLongWay      Request long-way Lambert solutions (transfer angle > pi)\n"
+            << "  --lambertRetrograde   Flip the prograde test (useful for retrograde transfers)\n"
             << "\n"
             << "Law / contraband (headless):\n"
             << "  --law                 Print law + contraband profile for the chosen station\n"
@@ -289,6 +326,9 @@ int main(int argc, char** argv) {
 
   const bool doTrade = args.hasFlag("trade");
   const bool doSignals = args.hasFlag("signals");
+  const bool doConvoys = args.hasFlag("convoys");
+  const bool doLedgerConvoys = args.hasFlag("ledgerConvoys");
+  const bool doLambert = args.hasFlag("lambert");
   const bool doTradeMix = args.hasFlag("tradeMix");
   const bool doTradeLoop = args.hasFlag("tradeLoop");
   const bool doTradeRun = args.hasFlag("tradeRun");
@@ -306,6 +346,63 @@ int main(int argc, char** argv) {
     if (args.getU64("fromStation", v)) fromStationIdx = (std::size_t)v;
   }
 
+  const bool convoyAll = args.hasFlag("convoyAll");
+  int convoyWindowDays = 1;
+  (void)args.getInt("convoyWindow", convoyWindowDays);
+  convoyWindowDays = std::max(0, convoyWindowDays);
+
+  // Traffic ledger playback settings.
+  int ledgerBackfillDays = 14;
+  (void)args.getInt("ledgerBackfill", ledgerBackfillDays);
+  ledgerBackfillDays = std::clamp(ledgerBackfillDays, 0, 365);
+
+  // Lambert / porkchop settings.
+  std::string lambertTargetKind = "station";
+  (void)args.getString("lambertTarget", lambertTargetKind);
+  int lambertTargetIdx = 0;
+  (void)args.getInt("lambertIdx", lambertTargetIdx);
+
+  double lambertDepartH = 0.0;
+  double lambertDepartWindowH = 0.0;
+  (void)args.getDouble("lambertDepartH", lambertDepartH);
+  (void)args.getDouble("lambertDepartWindowH", lambertDepartWindowH);
+  if (!std::isfinite(lambertDepartH)) lambertDepartH = 0.0;
+  if (!std::isfinite(lambertDepartWindowH)) lambertDepartWindowH = 0.0;
+  lambertDepartWindowH = std::max(0.0, lambertDepartWindowH);
+
+  int lambertDepartSteps = 1;
+  (void)args.getInt("lambertDepartSteps", lambertDepartSteps);
+  lambertDepartSteps = std::max(1, lambertDepartSteps);
+  if (lambertDepartWindowH <= 0.0) lambertDepartSteps = 1;
+
+  double lambertTofMinH = 0.25;
+  double lambertTofMaxH = 48.0;
+  (void)args.getDouble("lambertTofMinH", lambertTofMinH);
+  (void)args.getDouble("lambertTofMaxH", lambertTofMaxH);
+  if (!std::isfinite(lambertTofMinH)) lambertTofMinH = 0.25;
+  if (!std::isfinite(lambertTofMaxH)) lambertTofMaxH = 48.0;
+  lambertTofMinH = std::max(0.001, lambertTofMinH);
+  lambertTofMaxH = std::max(lambertTofMinH, lambertTofMaxH);
+
+  int lambertTofSteps = 64;
+  (void)args.getInt("lambertTofSteps", lambertTofSteps);
+  lambertTofSteps = std::max(1, lambertTofSteps);
+
+  std::string lambertScoreStr = "total";
+  (void)args.getString("lambertScore", lambertScoreStr);
+  double lambertArrivalWeight = 0.25;
+  (void)args.getDouble("lambertArrivalWeight", lambertArrivalWeight);
+  if (!std::isfinite(lambertArrivalWeight)) lambertArrivalWeight = 0.25;
+  lambertArrivalWeight = std::max(0.0, lambertArrivalWeight);
+
+  int lambertTop = 5;
+  (void)args.getInt("lambertTop", lambertTop);
+  lambertTop = std::max(0, lambertTop);
+
+  const bool lambertGrid = args.hasFlag("lambertGrid");
+  const bool lambertLongWay = args.hasFlag("lambertLongWay");
+  const bool lambertRetrograde = args.hasFlag("lambertRetrograde");
+
   // Signal generator settings.
   int signalFieldCount = 1;
   int signalDistressPerDay = 1;
@@ -320,6 +417,7 @@ int main(int argc, char** argv) {
   signalDistressTtlDays = std::clamp(signalDistressTtlDays, 0.1, 10.0);
   const bool signalNoDistress = args.hasFlag("signalNoDistress");
   const bool signalNoDerelict = args.hasFlag("signalNoDerelict");
+  const bool signalTraffic = args.hasFlag("signalTraffic");
   double cargoCapacityKg = 420.0;
   (void)args.getDouble("cargoKg", cargoCapacityKg);
   std::size_t tradeLimit = 12;
@@ -785,7 +883,21 @@ int main(int argc, char** argv) {
     p.distressPerDay = std::max(0, signalDistressPerDay);
     p.distressTtlDays = signalDistressTtlDays;
 
+    p.includeTrafficConvoys = signalTraffic;
+    if (p.includeTrafficConvoys) {
+      // Reuse convoy window flags to keep CLI surface small.
+      p.trafficLaneParams.includeInactive = convoyAll;
+      p.trafficLaneParams.genWindowDays = convoyWindowDays;
+    }
+
     const auto plan = sim::generateSystemSignals(seed, sys, timeDays, save.missions, save.resolvedSignalIds, p);
+
+    auto stationName = [&](sim::StationId id) -> std::string_view {
+      for (const auto& st : sys.stations) {
+        if (st.id == id) return st.name;
+      }
+      return std::string_view{"?"};
+    };
 
     if (json) {
       j.key("signals");
@@ -804,6 +916,14 @@ int main(int argc, char** argv) {
       j.key("includeDistress"); j.value(p.includeDistress);
       j.key("distressPerDay"); j.value((unsigned long long)p.distressPerDay);
       j.key("distressTtlDays"); j.value(p.distressTtlDays);
+      j.key("includeTrafficConvoys"); j.value(p.includeTrafficConvoys);
+      if (p.includeTrafficConvoys) {
+        j.key("trafficLaneParams");
+        j.beginObject();
+        j.key("includeInactive"); j.value(p.trafficLaneParams.includeInactive);
+        j.key("genWindowDays"); j.value((unsigned long long)p.trafficLaneParams.genWindowDays);
+        j.endObject();
+      }
       j.endObject();
 
       j.key("resourceFields");
@@ -851,6 +971,30 @@ int main(int argc, char** argv) {
         if (s.kind == sim::SignalKind::MissionSalvage) {
           j.key("missionId"); j.value((unsigned long long)s.missionId);
         }
+        if (s.kind == sim::SignalKind::TrafficConvoy && s.hasTrafficConvoy) {
+          j.key("trafficConvoy");
+          j.beginObject();
+          j.key("fromStationId"); j.value((unsigned long long)s.trafficConvoy.fromStation);
+          j.key("toStationId"); j.value((unsigned long long)s.trafficConvoy.toStation);
+          j.key("fromStationName"); j.value(stationName(s.trafficConvoy.fromStation));
+          j.key("toStationName"); j.value(stationName(s.trafficConvoy.toStation));
+          j.key("factionId"); j.value((unsigned long long)s.trafficConvoy.factionId);
+          j.key("commodity"); j.value(econ::commodityDef(s.trafficConvoy.commodity).code);
+          j.key("units"); j.value(s.trafficConvoy.units);
+          j.key("departDay"); j.value(s.trafficConvoy.departDay);
+          j.key("arriveDay"); j.value(s.trafficConvoy.arriveDay);
+          j.key("active"); j.value(s.trafficState.active);
+          j.key("progress01"); j.value(s.trafficState.progress01);
+          j.key("distKm"); j.value(s.trafficState.distKm);
+          j.key("speedKmS"); j.value(s.trafficState.speedKmS);
+          j.key("velKmS");
+          j.beginArray();
+          j.value(s.trafficState.velKmS.x);
+          j.value(s.trafficState.velKmS.y);
+          j.value(s.trafficState.velKmS.z);
+          j.endArray();
+          j.endObject();
+        }
         j.endObject();
       }
       j.endArray();
@@ -888,7 +1032,433 @@ int main(int argc, char** argv) {
         if (s.kind == sim::SignalKind::MissionSalvage) {
           std::cout << " missionId=" << (unsigned long long)s.missionId;
         }
+        if (s.kind == sim::SignalKind::TrafficConvoy && s.hasTrafficConvoy) {
+          std::cout << " "
+                    << econ::commodityDef(s.trafficConvoy.commodity).code
+                    << "x" << std::fixed << std::setprecision(0) << s.trafficConvoy.units
+                    << " " << stationName(s.trafficConvoy.fromStation)
+                    << " -> " << stationName(s.trafficConvoy.toStation)
+                    << " dep=" << std::fixed << std::setprecision(2) << s.trafficConvoy.departDay
+                    << " arr=" << std::fixed << std::setprecision(2) << s.trafficConvoy.arriveDay
+                    << " prog=" << std::fixed << std::setprecision(1) << (100.0 * s.trafficState.progress01) << "%"
+                    << " speed=" << std::fixed << std::setprecision(1) << s.trafficState.speedKmS << " km/s";
+          if (!s.trafficState.active) std::cout << " [inactive]";
+        }
         std::cout << "\n";
+      }
+    }
+  }
+
+
+  if (doConvoys && !systems.empty()) {
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+    const auto& stub = systems[fromSysIdx];
+    const auto& sys = u.getSystem(stub.id, &stub);
+
+    sim::TrafficLaneParams p;
+    p.includeInactive = convoyAll;
+    p.genWindowDays = convoyWindowDays;
+
+    const auto convoys = sim::generateTrafficConvoys(seed, sys, timeDays, p);
+
+    auto stationName = [&](sim::StationId id) -> std::string_view {
+      for (const auto& st : sys.stations) {
+        if (st.id == id) return st.name;
+      }
+      return std::string_view{"?"};
+    };
+
+    if (json) {
+      j.key("convoys");
+      j.beginObject();
+      j.key("system");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)stub.id);
+      j.key("systemName"); j.value(stub.name);
+      j.key("day"); j.value(timeDays);
+      j.endObject();
+
+      j.key("params");
+      j.beginObject();
+      j.key("includeInactive"); j.value(p.includeInactive);
+      j.key("genWindowDays"); j.value((unsigned long long)p.genWindowDays);
+      j.endObject();
+
+      j.key("items");
+      j.beginArray();
+      for (const auto& v : convoys) {
+        j.beginObject();
+        j.key("id"); j.value((unsigned long long)v.convoy.id);
+        j.key("fromStationId"); j.value((unsigned long long)v.convoy.fromStation);
+        j.key("toStationId"); j.value((unsigned long long)v.convoy.toStation);
+        j.key("fromStationName"); j.value(stationName(v.convoy.fromStation));
+        j.key("toStationName"); j.value(stationName(v.convoy.toStation));
+        j.key("factionId"); j.value((unsigned long long)v.convoy.factionId);
+        j.key("commodity"); j.value(econ::commodityDef(v.convoy.commodity).code);
+        j.key("units"); j.value(v.convoy.units);
+        j.key("departDay"); j.value(v.convoy.departDay);
+        j.key("arriveDay"); j.value(v.convoy.arriveDay);
+        j.key("active"); j.value(v.state.active);
+        j.key("progress01"); j.value(v.state.progress01);
+        j.key("distKm"); j.value(v.state.distKm);
+        j.key("speedKmS"); j.value(v.state.speedKmS);
+        j.key("posKm");
+        j.beginArray();
+        j.value(v.state.posKm.x); j.value(v.state.posKm.y); j.value(v.state.posKm.z);
+        j.endArray();
+        j.key("velKmS");
+        j.beginArray();
+        j.value(v.state.velKmS.x); j.value(v.state.velKmS.y); j.value(v.state.velKmS.z);
+        j.endArray();
+        j.endObject();
+      }
+      j.endArray();
+
+      j.endObject();
+    } else {
+      std::cout << "\n--- Convoys @ " << stub.name << " (day=" << timeDays << ") ---\n";
+      std::cout << "count=" << convoys.size() << " includeInactive=" << (p.includeInactive ? "true" : "false")
+                << " windowDays=" << p.genWindowDays << "\n";
+      for (const auto& v : convoys) {
+        const auto& c = v.convoy;
+        const auto& s = v.state;
+        std::cout << "  - id=" << (unsigned long long)c.id
+                  << " " << econ::commodityDef(c.commodity).code << "x" << std::fixed << std::setprecision(0) << c.units
+                  << " " << stationName(c.fromStation) << " -> " << stationName(c.toStation)
+                  << " dep=" << std::fixed << std::setprecision(2) << c.departDay
+                  << " arr=" << std::fixed << std::setprecision(2) << c.arriveDay
+                  << " prog=" << std::fixed << std::setprecision(2) << (100.0 * s.progress01) << "%"
+                  << " speed=" << std::fixed << std::setprecision(1) << s.speedKmS << " km/s";
+        if (!s.active) std::cout << " [inactive]";
+        std::cout << "\n";
+      }
+    }
+  }
+
+
+  if (doLedgerConvoys && !systems.empty()) {
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+    const auto& stub = systems[fromSysIdx];
+    const auto& sys = u.getSystem(stub.id, &stub);
+
+    // Run the ambient traffic sim to generate/record shipments.
+    // This is deterministic for a given (seed, system, day stamps).
+    std::unordered_map<sim::SystemId, int> stamps;
+    sim::TrafficLedger ledger;
+    ledger.params.keepDays = std::max(1, std::min(365, ledgerBackfillDays + 2));
+
+    sim::simulateNpcTradeTraffic(u, sys, timeDays, stamps, ledgerBackfillDays, &ledger);
+    ledger.prune(timeDays);
+
+    sim::TrafficLaneParams laneParams;
+    laneParams.includeInactive = convoyAll;
+
+    const auto convoys = sim::generateTrafficConvoysFromLedger(ledger, sys, timeDays, convoyWindowDays, convoyAll, laneParams);
+
+    auto stationName = [&](sim::StationId id) -> std::string_view {
+      for (const auto& st : sys.stations) {
+        if (st.id == id) return st.name;
+      }
+      return std::string_view{"?"};
+    };
+
+    if (json) {
+      j.key("ledgerConvoys");
+      j.beginObject();
+      j.key("system");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)stub.id);
+      j.key("systemName"); j.value(stub.name);
+      j.key("day"); j.value(timeDays);
+      j.endObject();
+
+      j.key("params");
+      j.beginObject();
+      j.key("includeInactive"); j.value(convoyAll);
+      j.key("windowDays"); j.value((unsigned long long)convoyWindowDays);
+      j.key("backfillDays"); j.value((unsigned long long)ledgerBackfillDays);
+      j.key("ledgerKeepDays"); j.value((unsigned long long)ledger.params.keepDays);
+      j.endObject();
+
+      j.key("stats");
+      j.beginObject();
+      j.key("recordedShipments"); j.value((unsigned long long)ledger.shipments.size());
+      j.key("returnedConvoys"); j.value((unsigned long long)convoys.size());
+      j.endObject();
+
+      j.key("items");
+      j.beginArray();
+      for (const auto& v : convoys) {
+        j.beginObject();
+        j.key("id"); j.value((unsigned long long)v.convoy.id);
+        j.key("fromStationId"); j.value((unsigned long long)v.convoy.fromStation);
+        j.key("toStationId"); j.value((unsigned long long)v.convoy.toStation);
+        j.key("fromStationName"); j.value(stationName(v.convoy.fromStation));
+        j.key("toStationName"); j.value(stationName(v.convoy.toStation));
+        j.key("factionId"); j.value((unsigned long long)v.convoy.factionId);
+        j.key("commodity"); j.value(econ::commodityDef(v.convoy.commodity).code);
+        j.key("units"); j.value(v.convoy.units);
+        j.key("departDay"); j.value(v.convoy.departDay);
+        j.key("arriveDay"); j.value(v.convoy.arriveDay);
+        j.key("active"); j.value(v.state.active);
+        j.key("progress01"); j.value(v.state.progress01);
+        j.key("distKm"); j.value(v.state.distKm);
+        j.key("speedKmS"); j.value(v.state.speedKmS);
+        j.key("posKm");
+        j.beginArray();
+        j.value(v.state.posKm.x); j.value(v.state.posKm.y); j.value(v.state.posKm.z);
+        j.endArray();
+        j.key("velKmS");
+        j.beginArray();
+        j.value(v.state.velKmS.x); j.value(v.state.velKmS.y); j.value(v.state.velKmS.z);
+        j.endArray();
+        j.endObject();
+      }
+      j.endArray();
+      j.endObject();
+    } else {
+      std::cout << "\n--- Ledger Convoys (NPC trade shipments) @ " << stub.name << " (day=" << timeDays << ") ---\n";
+      std::cout << "recordedShipments=" << ledger.shipments.size()
+                << " returnedConvoys=" << convoys.size()
+                << " includeInactive=" << (convoyAll ? "true" : "false")
+                << " windowDays=" << convoyWindowDays
+                << " backfillDays=" << ledgerBackfillDays << "\n";
+      for (const auto& v : convoys) {
+        const auto& c = v.convoy;
+        const auto& s = v.state;
+        std::cout << "  - id=" << (unsigned long long)c.id
+                  << " " << econ::commodityDef(c.commodity).code << "x" << std::fixed << std::setprecision(0) << c.units
+                  << " " << stationName(c.fromStation) << " -> " << stationName(c.toStation)
+                  << " dep=" << std::fixed << std::setprecision(2) << c.departDay
+                  << " arr=" << std::fixed << std::setprecision(2) << c.arriveDay
+                  << " prog=" << std::fixed << std::setprecision(2) << (100.0 * s.progress01) << "%"
+                  << " speed=" << std::fixed << std::setprecision(1) << s.speedKmS << " km/s";
+        if (!s.active) std::cout << " [inactive]";
+        std::cout << "\n";
+      }
+    }
+  }
+
+
+  if (doLambert && !systems.empty()) {
+    // Clamp indices so the tool remains easy to use from scripts.
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& stub = systems[fromSysIdx];
+    const auto& sys = u.getSystem(stub.id, &stub);
+    if (sys.stations.empty()) {
+      std::cerr << "\n[lambert] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, sys.stations.size() - 1);
+    const auto& dep = sys.stations[fromStationIdx];
+
+    // Normalize kind string to lowercase.
+    std::string kind = lambertTargetKind;
+    for (auto& c : kind) c = (char)std::tolower((unsigned char)c);
+
+    const bool targetIsPlanet = (kind == "planet" || kind == "pl");
+    const bool targetIsStation = (kind == "station" || kind == "st" || kind == "sta");
+    if (!targetIsPlanet && !targetIsStation) {
+      std::cerr << "\n[lambert] invalid --lambertTarget: '" << lambertTargetKind << "' (expected station|planet)\n";
+      return 1;
+    }
+
+    std::string targetName;
+    core::u64 targetId = 0;
+
+    sim::EphemerisFn departEphem = [&](double tDays, math::Vec3d& posKm, math::Vec3d& velKmS) {
+      posKm = sim::stationPosKm(dep, tDays);
+      velKmS = sim::stationVelKmS(dep, tDays);
+    };
+
+    sim::EphemerisFn arriveEphem;
+
+    if (targetIsStation) {
+      if (sys.stations.empty()) {
+        std::cerr << "\n[lambert] system has no stations for target\n";
+        return 1;
+      }
+
+      lambertTargetIdx = std::clamp(lambertTargetIdx, 0, (int)sys.stations.size() - 1);
+      const auto& tgt = sys.stations[(std::size_t)lambertTargetIdx];
+      targetName = std::string(tgt.name);
+      targetId = tgt.id;
+
+      arriveEphem = [&](double tDays, math::Vec3d& posKm, math::Vec3d& velKmS) {
+        posKm = sim::stationPosKm(tgt, tDays);
+        velKmS = sim::stationVelKmS(tgt, tDays);
+      };
+    } else {
+      if (sys.planets.empty()) {
+        std::cerr << "\n[lambert] system has no planets for target\n";
+        return 1;
+      }
+
+      lambertTargetIdx = std::clamp(lambertTargetIdx, 0, (int)sys.planets.size() - 1);
+      const auto& tgt = sys.planets[(std::size_t)lambertTargetIdx];
+      targetName = std::string(tgt.name);
+      // Planets don't currently carry a stable in-system id, so synthesize one
+      // for tooling output. This is stable for a given (system, index).
+      targetId = sim::makeDeterministicWorldId(core::hashCombine(stub.id, 0x504C414E4554ull),
+                                               (core::u64)lambertTargetIdx);
+
+      arriveEphem = [&](double tDays, math::Vec3d& posKm, math::Vec3d& velKmS) {
+        posKm = sim::planetPosKm(tgt, tDays);
+        velKmS = sim::planetVelKmS(tgt, tDays);
+      };
+    }
+
+    auto scoreModeFromString = [](const std::string& s) {
+      std::string t = s;
+      for (auto& c : t) c = (char)std::tolower((unsigned char)c);
+      if (t == "depart" || t == "dep") return sim::LambertScoreMode::MinDepartDv;
+      if (t == "arrive" || t == "arrival" || t == "arr") return sim::LambertScoreMode::MinArrivalRelSpeed;
+      if (t == "weighted" || t == "w") return sim::LambertScoreMode::Weighted;
+      return sim::LambertScoreMode::MinTotalDv;
+    };
+
+    sim::LambertPorkchopParams p;
+    p.departMinSec = (lambertDepartH - lambertDepartWindowH) * 3600.0;
+    p.departMaxSec = (lambertDepartH + lambertDepartWindowH) * 3600.0;
+    p.departSteps = lambertDepartSteps;
+    p.tofMinSec = lambertTofMinH * 3600.0;
+    p.tofMaxSec = lambertTofMaxH * 3600.0;
+    p.tofSteps = lambertTofSteps;
+    p.scoreMode = scoreModeFromString(lambertScoreStr);
+    p.arrivalWeight = lambertArrivalWeight;
+    p.topK = lambertTop;
+    p.storeGrid = lambertGrid;
+    p.lambertOpt.longWay = lambertLongWay;
+    p.lambertOpt.prograde = !lambertRetrograde;
+    p.lambertOpt.refNormal = {0, 0, 0}; // auto
+    p.lambertOpt.maxIterations = 96;
+    p.lambertOpt.tolSec = 1e-4;
+
+    const double mu = sim::muStarKm3S2(sys.star);
+    const auto r = sim::searchLambertPorkchop(timeDays, departEphem, arriveEphem, mu, p);
+
+    if (json) {
+      j.key("lambert");
+      j.beginObject();
+
+      j.key("system");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)stub.id);
+      j.key("systemName"); j.value(stub.name);
+      j.key("day"); j.value(timeDays);
+      j.endObject();
+
+      j.key("departure");
+      j.beginObject();
+      j.key("stationIdx"); j.value((unsigned long long)fromStationIdx);
+      j.key("stationId"); j.value((unsigned long long)dep.id);
+      j.key("stationName"); j.value(dep.name);
+      j.endObject();
+
+      j.key("target");
+      j.beginObject();
+      j.key("kind"); j.value(targetIsPlanet ? "planet" : "station");
+      j.key("index"); j.value((unsigned long long)lambertTargetIdx);
+      j.key("id"); j.value((unsigned long long)targetId);
+      j.key("name"); j.value(targetName);
+      j.endObject();
+
+      j.key("params");
+      j.beginObject();
+      j.key("departMinSec"); j.value(p.departMinSec);
+      j.key("departMaxSec"); j.value(p.departMaxSec);
+      j.key("departSteps"); j.value((unsigned long long)p.departSteps);
+      j.key("tofMinSec"); j.value(p.tofMinSec);
+      j.key("tofMaxSec"); j.value(p.tofMaxSec);
+      j.key("tofSteps"); j.value((unsigned long long)p.tofSteps);
+      j.key("scoreMode");
+      switch (p.scoreMode) {
+        case sim::LambertScoreMode::MinDepartDv: j.value("depart"); break;
+        case sim::LambertScoreMode::MinArrivalRelSpeed: j.value("arrive"); break;
+        case sim::LambertScoreMode::Weighted: j.value("weighted"); break;
+        case sim::LambertScoreMode::MinTotalDv:
+        default: j.value("total"); break;
+      }
+      j.key("arrivalWeight"); j.value(p.arrivalWeight);
+      j.key("topK"); j.value((unsigned long long)p.topK);
+      j.key("longWay"); j.value(p.lambertOpt.longWay);
+      j.key("prograde"); j.value(p.lambertOpt.prograde);
+      j.endObject();
+
+      j.key("best");
+      j.beginArray();
+      for (const auto& b : r.best) {
+        j.beginObject();
+        j.key("departAfterSec"); j.value(b.departAfterSec);
+        j.key("tofSec"); j.value(b.tofSec);
+        j.key("dvDepartMagKmS"); j.value(b.dvDepartMagKmS);
+        j.key("dvDepartKmS");
+        j.beginArray();
+        j.value(b.dvDepartKmS.x); j.value(b.dvDepartKmS.y); j.value(b.dvDepartKmS.z);
+        j.endArray();
+        j.key("arriveRelSpeedKmS"); j.value(b.arriveRelSpeedKmS);
+        j.key("arriveRelVelKmS");
+        j.beginArray();
+        j.value(b.arriveRelVelKmS.x); j.value(b.arriveRelVelKmS.y); j.value(b.arriveRelVelKmS.z);
+        j.endArray();
+        j.key("totalDvKmS"); j.value(b.totalDvKmS);
+        j.key("score"); j.value(b.score);
+        j.key("transferAngleRad"); j.value(b.lambert.transferAngleRad);
+        j.key("iterations"); j.value((unsigned long long)b.lambert.iterations);
+        j.endObject();
+      }
+      j.endArray();
+
+      if (lambertGrid) {
+        j.key("grid");
+        j.beginObject();
+        j.key("departSteps"); j.value((unsigned long long)r.departSteps);
+        j.key("tofSteps"); j.value((unsigned long long)r.tofSteps);
+        j.key("cells");
+        j.beginArray();
+        for (const auto& c : r.grid) {
+          j.beginObject();
+          j.key("ok"); j.value(c.ok);
+          j.key("departAfterSec"); j.value(c.departAfterSec);
+          j.key("tofSec"); j.value(c.tofSec);
+          j.key("dvDepartMagKmS"); j.value(c.dvDepartMagKmS);
+          j.key("arriveRelSpeedKmS"); j.value(c.arriveRelSpeedKmS);
+          j.key("totalDvKmS"); j.value(c.totalDvKmS);
+          j.key("score"); j.value(c.score);
+          j.endObject();
+        }
+        j.endArray();
+        j.endObject();
+      }
+
+      j.endObject();
+    } else {
+      std::cout << "\n--- Lambert Transfer (porkchop) @ " << stub.name << " (day=" << timeDays << ") ---\n";
+      std::cout << "From: station[" << fromStationIdx << "] " << dep.name
+                << "  ->  " << (targetIsPlanet ? "planet" : "station")
+                << "[" << lambertTargetIdx << "] " << targetName << "\n";
+      std::cout << "Window: departCenter=" << std::fixed << std::setprecision(2) << lambertDepartH
+                << "h +/-" << lambertDepartWindowH << "h  tof=[" << lambertTofMinH
+                << "h.." << lambertTofMaxH << "h] steps=" << lambertDepartSteps
+                << "x" << lambertTofSteps << " score='" << lambertScoreStr << "'\n";
+
+      if (r.best.empty()) {
+        std::cout << "No valid Lambert solutions in window.\n";
+      } else {
+        for (std::size_t i = 0; i < r.best.size(); ++i) {
+          const auto& b = r.best[i];
+          std::cout << "  #" << i
+                    << " dep+" << std::fixed << std::setprecision(2) << (b.departAfterSec / 3600.0) << "h"
+                    << " tof=" << std::fixed << std::setprecision(2) << (b.tofSec / 3600.0) << "h"
+                    << " dvDep=" << std::fixed << std::setprecision(1) << (b.dvDepartMagKmS * 1000.0) << " m/s"
+                    << " arrRel=" << std::fixed << std::setprecision(1) << (b.arriveRelSpeedKmS * 1000.0) << " m/s"
+                    << " total=" << std::fixed << std::setprecision(1) << (b.totalDvKmS * 1000.0) << " m/s"
+                    << " angle=" << std::fixed << std::setprecision(1) << (b.lambert.transferAngleRad * (180.0 / 3.141592653589793))
+                    << " deg"
+                    << "\n";
+        }
       }
     }
   }

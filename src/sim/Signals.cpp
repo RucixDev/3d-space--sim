@@ -3,6 +3,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/Units.h"
 #include "stellar/sim/WorldIds.h"
 
@@ -17,6 +18,7 @@ const char* signalKindName(SignalKind k) {
     case SignalKind::Derelict: return "Derelict";
     case SignalKind::Distress: return "Distress";
     case SignalKind::MissionSalvage: return "MissionSalvage";
+    case SignalKind::TrafficConvoy: return "TrafficConvoy";
     default: return "Unknown";
   }
 }
@@ -52,13 +54,22 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                       double timeDays,
                                       const std::vector<Mission>& activeMissions,
                                       const std::vector<core::u64>& resolvedSignalIds,
-                                      const SignalGenParams& params) {
+                                      const SignalGenParams& params,
+                                      const TrafficLedger* trafficLedger) {
   SystemSignalPlan out{};
 
   const Station* anchor = pickAnchorStation(system);
   if (!anchor) return out;
 
-  const math::Vec3d anchorPosKm = stationPosKm(*anchor, timeDays);
+  // Integer day stamp (so non-traffic signals don't jitter on small dt).
+  const core::u64 dayStamp = (core::u64)std::max(0.0, std::floor(timeDays));
+
+  // Use a stable "anchor time" inside the current day so static sites don't
+  // shift slightly when queried at different times (e.g. system entry vs. UI
+  // refresh).
+  const double anchorTimeDays = (double)dayStamp + 0.5;
+
+  const math::Vec3d anchorPosKm = stationPosKm(*anchor, anchorTimeDays);
   const double anchorCommsKm = std::max(0.0, anchor->commsRangeKm);
 
   // System-stable key used by the renderer/game prototype as a base for procedural ids.
@@ -80,9 +91,6 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
       out.sites.push_back(s);
     }
   }
-
-  // Integer day stamp (so signals don't jitter on small dt).
-  const core::u64 dayStamp = (core::u64)std::max(0.0, std::floor(timeDays));
 
   // --- Daily derelict salvage site ---
   if (params.includeDailyDerelict) {
@@ -122,11 +130,14 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
       s.id = id;
       s.kind = SignalKind::Distress;
       s.posKm = anchorPosKm + dir * distKm;
-      s.expireDay = timeDays + ttl;
+      // Anchor TTL to the integer day stamp so repeated queries within a day
+      // can't extend the lifetime of a deterministic distress call.
+      s.expireDay = (double)dayStamp + ttl;
       s.resolved = isSignalResolved(resolvedSignalIds, id);
 
       s.hasDistressPlan = true;
-      s.distress = planDistressEncounter(universeSeed, system.stub.id, id, timeDays, localFactionId);
+      // Use the stable anchor time inside the day for determinism.
+      s.distress = planDistressEncounter(universeSeed, system.stub.id, id, anchorTimeDays, localFactionId);
 
       out.sites.push_back(s);
     }
@@ -149,7 +160,7 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
       if (st.id == m.toStation) { baseSt = &st; break; }
     }
 
-    const math::Vec3d basePos = stationPosKm(*baseSt, timeDays);
+    const math::Vec3d basePos = stationPosKm(*baseSt, anchorTimeDays);
     const double commsKm = std::max(0.0, baseSt->commsRangeKm);
 
     core::SplitMix64 srng(core::hashCombine((core::u64)system.stub.id, (core::u64)m.targetNpcId));
@@ -170,9 +181,58 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
     out.sites.push_back(s);
   }
 
+  // --- Traffic convoy signals (moving lane traffic) ---
+  if (params.includeTrafficConvoys) {
+    std::vector<TrafficConvoyView> views;
+
+    // Integration hook: if the caller provides a TrafficLedger recorded from
+    // simulateNpcTradeTraffic(...), prefer turning those *actual shipments* into
+    // convoy sites. If no shipments are available, fall back to the deterministic
+    // lane prototype so the UI doesn't go empty.
+    if (trafficLedger) {
+      views = generateTrafficConvoysFromLedger(*trafficLedger,
+                                              system,
+                                              timeDays,
+                                              params.trafficLaneParams.genWindowDays,
+                                              params.trafficLaneParams.includeInactive,
+                                              params.trafficLaneParams);
+    }
+    if (views.empty()) {
+      views = generateTrafficConvoys(universeSeed, system, timeDays, params.trafficLaneParams);
+    }
+
+    out.sites.reserve(out.sites.size() + views.size());
+    for (const auto& v : views) {
+      // Skip already-arrived convoys even when includeInactive=true.
+      if (v.convoy.arriveDay > 0.0 && timeDays > v.convoy.arriveDay) continue;
+
+      // When includeInactive=false, generateTrafficConvoysFromLedger() already
+      // filters, but keep this guard for safety (and for the fallback path).
+      if (!params.trafficLaneParams.includeInactive && !v.state.active) continue;
+
+      SignalSite s{};
+      s.id = v.convoy.id;
+      s.kind = SignalKind::TrafficConvoy;
+      s.posKm = v.state.posKm;
+      s.expireDay = v.convoy.arriveDay;
+      s.resolved = false;
+
+      s.hasTrafficConvoy = true;
+      s.trafficConvoy = v.convoy;
+      s.trafficState = v.state;
+
+      out.sites.push_back(s);
+    }
+  }
+
   // Stable ordering makes consumer code simpler.
   std::sort(out.sites.begin(), out.sites.end(), [](const SignalSite& a, const SignalSite& b) {
     if (a.kind != b.kind) return (core::u8)a.kind < (core::u8)b.kind;
+    if (a.kind == SignalKind::TrafficConvoy && a.hasTrafficConvoy && b.hasTrafficConvoy) {
+      if (a.trafficConvoy.departDay != b.trafficConvoy.departDay) {
+        return a.trafficConvoy.departDay < b.trafficConvoy.departDay;
+      }
+    }
     return a.id < b.id;
   });
 

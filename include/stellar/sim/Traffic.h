@@ -10,6 +10,8 @@
 
 namespace stellar::sim {
 
+struct TrafficLedger; // fwd (optional instrumentation)
+
 // Simulate low-cost "NPC trader" traffic for the given system.
 //
 // This nudges station inventories (and therefore prices) by moving commodity units
@@ -25,7 +27,8 @@ void simulateNpcTradeTraffic(Universe& universe,
                              const StarSystem& system,
                              double timeDays,
                              std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
-                             int kMaxBackfillDays = 14);
+                             int kMaxBackfillDays = 14,
+                             TrafficLedger* ledger = nullptr);
 
 // SaveGame-friendly overload.
 //
@@ -35,6 +38,7 @@ void simulateNpcTradeTraffic(Universe& universe,
                              const StarSystem& system,
                              double timeDays,
                              std::vector<SystemTrafficStamp>& trafficStamps,
-                             int kMaxBackfillDays = 14);
+                             int kMaxBackfillDays = 14,
+                             TrafficLedger* ledger = nullptr);
 
 } // namespace stellar::sim

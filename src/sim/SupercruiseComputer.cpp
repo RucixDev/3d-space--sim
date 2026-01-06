@@ -39,8 +39,11 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
   // In gameplay code this typically means "drop now" (not an emergency).
   if (dist < 1e-6) {
     out.hud.safeDropReady = true;
-    out.dropNow = true;
-    out.emergencyDrop = false;
+    // Respect interdiction gating (callers may prevent drops while interdicted).
+    if (!interdicted) {
+      out.dropNow = true;
+      out.emergencyDrop = false;
+    }
     // dirToDest defaults to forward.
     return out;
   }
@@ -52,13 +55,37 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
   const double closing = math::dot(vRel, dir);
   out.hud.closingKmS = closing;
 
+  // Lateral relative speed (orthogonal to the line of sight).
+  const math::Vec3d vLat = vRel - dir * closing;
+  const double lateral = vLat.length();
+  out.hud.lateralKmS = lateral;
+
   const double tta = (closing > 1e-3) ? (dist / closing) : 1e9;
   out.hud.ttaSec = tta;
+
+  // Predicted miss distance under constant relative velocity.
+  // rel(t) = rel - vRel * t, so closest approach occurs at:
+  //   tCA = dot(rel, vRel) / |vRel|^2
+  // (clamped to [0, +inf)).
+  const double vRelSq = vRel.lengthSq();
+  double missKm = dist;
+  if (vRelSq > 1e-12) {
+    const double tca = std::max(0.0, math::dot(rel, vRel) / vRelSq);
+    const math::Vec3d relAt = rel - vRel * tca;
+    missKm = relAt.length();
+  }
+  out.hud.missKm = missKm;
 
   // --- Safe-drop heuristic ---
   const double safeMin = std::max(0.0, params.safeTtaSec - params.safeWindowSlackSec);
   const double safeMax = params.safeTtaSec + params.safeWindowSlackSec;
-  const bool safeWindow = (dist < dropRadiusKm) && (tta > safeMin) && (tta < safeMax) && (closing > params.minClosingKmS);
+  const bool lateralOk = (closing > params.minClosingKmS)
+    ? (lateral <= std::max(0.0, closing) * std::max(0.0, params.maxLateralFrac))
+    : true;
+  const bool safeWindow = (dist <= dropRadiusKm)
+    && (tta > safeMin) && (tta < safeMax)
+    && (closing > params.minClosingKmS)
+    && lateralOk;
   out.hud.safeDropReady = safeWindow;
 
   // --- Drop decisions ---

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 
 namespace stellar::sim {
 
@@ -88,7 +89,7 @@ static math::Vec3d makeEscapeDir(core::SplitMix64& rng,
   const double maxCos = std::clamp(params.maxInitialCos, -1.0, 1.0);
   const double t = rng.range(std::min(minCos, maxCos), std::max(minCos, maxCos));
 
-  const double theta = rng.range(0.0, 2.0 * M_PI);
+  const double theta = rng.range(0.0, 2.0 * std::numbers::pi_v<double>);
   const math::Vec3d lateral = (right * std::cos(theta) + upOrtho * std::sin(theta)).normalized();
 
   // Construct a unit vector with dot(fwd, dir)=t.

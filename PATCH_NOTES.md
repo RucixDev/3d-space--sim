@@ -1,3 +1,226 @@
+## 2026-01-06 (Patch) - Traffic Convoys: Schedule Hydration + Signal Expiry Consistency
+
+This round tightens **robustness** in the traffic/convoy replay pipeline, especially for older or
+hand-edited saves where shipment schedule metadata may be missing.
+
+- Added `shipmentScheduleLooksValid(...)` and `hydrateShipmentScheduleFromId(...)` so convoy replay
+  can deterministically recover missing `departDay/arriveDay/distKm/speedKmS` from shipment ids.
+- `TrafficConvoyLayer` ledger replay now hydrates schedules before evaluation, and skips broken
+  station references to avoid spawning "(0,0,0)" convoys.
+- Clarified `SignalSite.expireDay` semantics (expired when `timeDays > expireDay`) and aligned
+  convoy filtering to match.
+- New regression coverage in `test_traffic_convoy_layer`: replay a schedule-less shipment and
+  assert deterministic mid-flight visibility.
+
+
+## 2026-01-06 (Patch) - Game: Ledger-driven Traffic Convoys + TrafficLedger Schedule Fixes
+
+This round focuses on **bug fixing + integration polish** for the traffic stack:
+
+- The game already runs `simulateNpcTradeTraffic(...)` to nudge markets.
+- We already had `TrafficLedger` to record the *actual* shipments chosen by that nudger.
+- We already had `Signals` + `TrafficConvoyLayer` to expose those shipments as **moving convoy signals**.
+
+### Key fixes & integrations
+
+- **Game integration:** `stellar_game` now maintains a per-system `TrafficLedger` and passes it into:
+  - `simulateNpcTradeTraffic(...)` (records shipments while markets are nudged)
+  - `generateSystemSignals(..., trafficLedger)` and the convoy refresh path
+
+  Result: visible **Traffic Convoy** signals now reflect the *real* commodity flows driving the station economies.
+
+- **Bug fix:** `TrafficLedger::makeNpcTradeShipment(...)` schedule metadata now uses the same **distance-at-arrival refinement** logic as the traffic lane prototype, so `distKm/speedKmS/arriveDay` are internally consistent even when stations move during the trip.
+
+- **Safety guard:** `TrafficLedger::record(...)` now ignores duplicate shipment ids (protects against accidental double-simulation in callers).
+
+### Tests
+
+- `test_traffic_ledger` now sanity-checks that a shipment's stored `distKm` and `speedKmS` match the computed endpoints/timeline.
+
+
+## 2026-01-06 (Patch) - Signals: Ledger-backed Traffic Convoy Signals (Integration)
+
+This round continues the **integration + bug-fixing** theme by closing the loop between:
+
+- `sim::simulateNpcTradeTraffic(...)` (ambient inventory nudger)
+- `sim::TrafficLedger` (records the chosen shipments)
+- `sim::Signals` (in-system signal generation)
+
+### Key change
+
+- `generateSystemSignals(...)` now accepts an **optional** `TrafficLedger*`.
+  - When provided, `SignalKind::TrafficConvoy` sites are derived from the ledger shipments via
+    `sim::TrafficConvoyLayer` (so visible convoys can reflect the *actual* trade flows that
+    moved station inventories).
+  - If the ledger has no matching shipments, signals fall back to the existing deterministic
+    `sim::TrafficLanes` convoy prototype (so UI/gameplay doesn’t go empty).
+
+### Tests
+
+- Extended `test_signals` to validate that ledger-backed convoy sites map back to recorded shipments
+  (ids + commodity + units) and become active when sampled mid-flight.
+
+
+## 2026-01-06 (Patch) - Game: Moving Traffic Convoy Signals (Integration + Bug Fixes)
+
+This round focuses on **bug fixing and integrating existing systems** by making the new
+`sim::Signals` *TrafficConvoy* sites work end-to-end inside `stellar_game`:
+
+- **Enabled** traffic convoy signal generation on system entry (uses the existing `sim::Signals` + `sim::TrafficLanes`).
+- **Fixed a missing enum mapping** in the game that previously would have mis-typed convoy sites when enabled.
+- **Made convoys actually move in-game:**
+  - Periodic refresh to **add/remove** active convoys as time advances.
+  - Per-frame state evaluation so convoy positions/velocities stay current.
+- **Fixed persistence bug:** convoy ids are deterministic, but convoys should *not* be written into `resolvedSignalIds`.
+- **UI polish:** System map + selection panel show convoy commodity and basic manifest details; signal scan grants data for convoy scans too.
+
+
+## 2026-01-05 (Patch) - Signals: Traffic Convoy Sites + Stable Daily Anchoring
+
+This round improves the **headless signal generator** and tightens determinism:
+
+- **New signal kind:** `SignalKind::TrafficConvoy`
+  - Optional payload: `TrafficConvoy` + evaluated `TrafficConvoyState` at the query time.
+  - Driven by the existing `sim::TrafficLanes` prototype (deterministic lane traffic).
+- **New generation knobs:** `SignalGenParams::includeTrafficConvoys` and `SignalGenParams::trafficLaneParams`.
+- **Bug fix:** static signal placement now uses a stable *mid-day anchor time* inside the current integer day,
+  preventing small-dt drift when querying signals multiple times within the same day.
+- **Sandbox tooling:** `stellar_sandbox --signals --signalTraffic`
+  - Prints convoy sites with route/cargo/progress details.
+  - JSON output includes a `trafficConvoy` object per site.
+- **Tests:** extended `test_signals` coverage for convoy signal generation.
+
+## 2026-01-05 (Patch) - Lambert Planner: Incremental Porkchop Stepper + In-game Auto-search
+
+This round focuses on **interactive navigation tooling** and makes the Lambert porkchop search
+usable inside real-time UI without freezing the frame.
+
+Key changes:
+
+- **New incremental API:** `sim::LambertPorkchopStepper`
+  - Evaluates the same fixed-size `(departure, TOF)` grid as `searchLambertPorkchop(...)`, but in
+    **bounded chunks** via `step(maxCells)`.
+  - Maintains **best-K** candidates and optionally captures the full grid (`storeGrid`).
+- **Refactor:** `searchLambertPorkchop(...)` now runs the stepper to completion internally
+  (keeps behavior deterministic while removing duplicate looping logic).
+- **New test:** `test_lambert_planner_stepper`
+  - Verifies the stepper reproduces the one-shot helper results and reports correct progress.
+
+- **Game UI:** Transfer planner (Lambert) gained an **Auto-search (porkchop)** section
+  - Incremental progress bar + best-K table.
+  - One-click **Apply**: arms the maneuver node at the candidate departure time and fills RTN Δv.
+  - Optional coarse RK4 miss-distance validation on apply.
+
+## 2026-01-05 (Patch) - Traffic Convoy Layer: Replay NPC Trade Shipments as Moving Convoys
+
+This round closes the loop between **ambient economy traffic** and **visible in-system convoys**.
+
+We already had:
+- `sim::simulateNpcTradeTraffic(...)` (background market nudging)
+- `sim::TrafficLedger` (records the shipments chosen by that nudger)
+- `sim::TrafficLanes` (a deterministic lane + convoy kinematics prototype)
+
+Now we can turn those recorded shipments into *actual moving convoy trajectories* for tooling and future gameplay hooks.
+
+Key changes:
+
+- **New core module:** `stellar/sim/TrafficConvoyLayer.*`
+  - `convoyFromShipment(...)` converts a `TrafficShipment` to a `TrafficConvoy` (lossless metadata copy).
+  - `generateTrafficConvoysFromLedger(...)` returns `TrafficConvoyView` items with evaluated `pos/vel/progress` at the query time.
+  - `sampleTrafficConvoyPathKm(...)` provides a simple polyline sampler for future UI/renderer lane visualization.
+
+- **Sandbox tooling:** `stellar_sandbox --ledgerConvoys`
+  - Runs the background traffic sim for the chosen system, records shipments, then prints them as moving convoys.
+  - Supports JSON output (`--json`) and backfill control (`--ledgerBackfill <d>`).
+
+- **New test:** `test_traffic_convoy_layer`
+  - Verifies determinism and endpoint correctness for ledger-derived convoy playback.
+
+## 2026-01-05 (Patch) - Orbital Navigation: Lambert Porkchop Transfer Planner
+
+This round adds a **navigation / astrodynamics tooling layer** on top of the existing Lambert solver:
+
+- **New `LambertPlanner` module** (`include/stellar/sim/LambertPlanner.h`, `src/sim/LambertPlanner.cpp`)
+  - Deterministic "porkchop" search over a grid of **departure time** × **time-of-flight**.
+  - Returns **best-K** candidates sorted by a configurable score:
+    - `depart`: minimize only departure Δv (useful for flybys)
+    - `arrive`: minimize arrival relative speed (soft arrival)
+    - `total`: minimize departure Δv + arrival relative speed (rendezvous-friendly)
+    - `weighted`: custom blend
+  - Optional full-grid capture for tooling/plotting.
+
+- **Sandbox integration:** `stellar_sandbox --lambert`
+  - Search transfers **from the chosen station** (`--fromSys`, `--fromStation`) to a target
+    station/planet (`--lambertTarget`, `--lambertIdx`).
+  - JSON output supports emitting the full porkchop grid with `--json --lambertGrid`.
+
+- **New test:** `test_lambert_planner.cpp`
+  - Verifies planner wiring/determinism using a canonical circular-orbit case.
+
+## 2026-01-05 (Patch) - Supercruise: Corridor-Aware Drop Window + Diagnostics
+
+This round upgrades the **supercruise guidance** to be more robust when approaching targets:
+it now tracks **lateral (cross-track) motion** and provides a simple **predicted miss distance**
+metric, which can be used by UI tooling and helps avoid dropping while sliding past the destination.
+
+Key changes:
+
+- `SupercruiseHud` now reports:
+  - `lateralKmS`: relative speed orthogonal to the ship→destination line
+  - `missKm`: predicted closest-approach distance under constant relative velocity
+
+- `SupercruiseParams` adds `maxLateralFrac` (default 0.6) so the safe-drop window can require the
+  approach to be reasonably "on-axis" (prevents weird sideways drops).
+
+## 2026-01-05 (Patch) - Traffic Ledger (Economic Shipments → Gameplay Hook)
+
+This round adds a small but powerful missing piece for the economy/traffic stack: a **traffic ledger**
+that can record the *actual* station-to-station shipments chosen by the existing ambient model
+(`sim::simulateNpcTradeTraffic`).
+
+The goal is to bridge the gap between "invisible inventory deltas" and concrete gameplay/UI targets:
+
+- Tooling can print **daily shipment manifests**.
+- The game can spawn **visible convoys** that correspond to real commodity flows.
+- Tests can verify **determinism** of shipment generation across seeds.
+
+Key changes:
+
+- **New core module:** `stellar/sim/TrafficLedger.*`
+  - `TrafficShipment` records `{from,to,commodity,units}` plus deterministic schedule metadata
+    (`departDay`, `arriveDay`, `distKm`, `speedKmS`).
+  - `TrafficLedger` is a lightweight in-memory log with pruning + queries.
+
+- **Traffic simulation hook:** `sim::simulateNpcTradeTraffic(...)`
+  - Added an optional `TrafficLedger*` parameter to record shipments as the simulation runs.
+  - Recording is **side-effect free**: schedule metadata is derived from shipment ids so the traffic
+    RNG sequence (and inventory results) are not perturbed.
+
+## 2026-01-05 (Patch) - Traffic Lanes (Ambient Convoys Prototype)
+
+This round starts building a **real traffic layer**: deterministic, in-system **trade convoys** that
+travel between stations on predictable "lanes".
+
+The goal is to support the kind of space-sim flavor mentioned in the README (convoys you can
+eventually **interdict** or **protect**) while keeping the feature **headless + deterministic** so it
+can be tested and used by tooling.
+
+Key changes:
+
+- **New core module:** `stellar/sim/TrafficLanes.*`
+  - Generates a daily schedule of convoys (seed + system + day stamp).
+  - Convoys pick **export-ish** commodities from the origin station and bias toward destinations that
+    **consume** them.
+  - Provides a lightweight evaluator that returns a convoy's **pos/vel/progress** at a given time.
+  - Adds a smooth **lane arc** offset (zero at endpoints) derived from the convoy id — no extra saved
+    state required.
+
+- **Sandbox tooling:** `stellar_sandbox`
+  - **New flags:** `--convoys`, `--convoyAll`, `--convoyWindow <d>`.
+  - JSON output includes a `convoys` section with schedule + evaluated state.
+
+- **Tests:** added `test_traffic_lanes` for determinism and endpoint correctness.
+
 ## 2026-01-05 (Patch) - Market Dashboard (Economy Analytics UI)
 
 This round adds a new **Market Dashboard** window to make trade planning easier without
@@ -956,3 +1179,82 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
 
 ## Build/test fix
 - Updated `test_atmosphere` to use the current `Star` field names (`massSol`, `radiusSol`).
+
+# Patch Notes (Jan 5, 2026) — Round 6
+
+## Traffic lanes + convoys: smoother arcs + schedule robustness
+- **Lane arcs now ease-in/out**: the sideways lane offset uses `sin^2(pi*phase)` so convoys have ~zero lateral velocity at **depart/arrive** (they no longer “kick” sideways when spawning or docking).
+- **Arc magnitude clamping tightened**: `arcMinKm` is treated as a preferred minimum *only when allowed* by the distance-based cap (prevents comically large arcs for short station-to-station hops).
+- **Schedule generation made more robust**:
+  - uses a stable min/max duration clamp
+  - applies speed clamps safely
+  - performs a single refinement step using destination position at arrival time
+  - handles near-zero station separation without producing zero-duration trips
+
+## Portability fixes
+- Replaced the non‑standard `M_PI` usage with C++20 `std::numbers::pi_v<double>` in:
+  - `sim/TrafficLanes` lane arc math
+  - `sim/Interdiction` escape direction sampling
+
+## Tests
+- Added regression checks ensuring **endpoint lateral speed ~ 0** for:
+  - `test_traffic_lanes`
+  - `test_traffic_convoy_layer`
+
+# Patch Notes (Jan 6, 2026) — Round 11
+
+## Save/load: persist recent NPC trade shipments
+- Added `SaveGame::trafficShipments` to persist recent NPC trade shipments in a save-friendly format.
+- `stellar_game` now restores per-system `TrafficLedger` state from `SaveGame::trafficShipments` on load.
+  - Fixes a mismatch where markets were advanced via `trafficStamps`, but convoy signals would fall back to
+    deterministic lanes after a save/load (because no new day had advanced to re-record shipments).
+- `simulateNpcTradeTraffic(...)` now prunes the optional `TrafficLedger` even when no new day is simulated,
+  keeping memory bounded after loads / time tweaks.
+
+## Tests
+- Extended `test_savegame` to cover `trafficShipments` round-tripping and robustness against stale section counts.
+
+
+# Patch Notes (Jan 6, 2026) — Round 12
+
+## Supercruise: safer drop logic at the boundary
+- Fixed a long-standing edge-case where a **manual drop exactly at the drop radius** could be flagged as an
+  **emergency drop** due to a strict `<` comparison. Safe-drop readiness now treats `dist == dropRadius` as valid.
+- `guideSupercruise(...)` no longer forces a drop in the **degenerate `dist≈0` case** when `interdicted=true`
+  (keeps interdiction gating consistent with the normal drop path).
+
+## Traffic convoys: cleaner inactive state
+- When convoys are queried with `includeInactive=true`, convoys outside their active schedule window are now treated as
+  **stationary at their endpoint** (zero velocity), avoiding confusing non-zero velocities in UI/nav.
+
+## Game: robustness
+- Added a defensive **de-duplication** pass for `TrafficConvoy` signals by id during refresh, ensuring older saves/patches
+  that accidentally left duplicates cannot cause convoy lists to grow.
+
+## Tests
+- Extended `test_supercruise` with boundary + interdiction regressions.
+
+
+# Patch Notes (Jan 6, 2026) — Round 13
+
+## Save/load: traffic shipment robustness
+- **De-dupe** `trafficShipments` by shipment id during save-file parsing (guards against corrupted/hand-edited files and older patches that may have accidentally duplicated entries).
+- Traffic shipment parsing now treats schedule metadata (depart/arrive/dist/speed) as **optional** while still requiring the core identifiers to be present.
+
+## Game: TrafficLedger restore correctness
+- Restored shipments are ingested via `TrafficLedger::record(...)` (now supports move ingestion) so duplicates can't surface as duplicated convoy signals.
+
+## Signals: deterministic distress TTL
+- Distress call `expireDay` is now **anchored to the integer day stamp** (instead of `timeDays + ttl`), preventing repeated queries within a day from “extending” deterministic distress calls.
+
+## Tests
+- Extended `test_savegame` with a regression that ensures duplicated `trafficShipments` lines are de-duped and do not break parsing of later keys.
+## 2026-01-06 (Patch) - Nav Assist + Traffic Convoy Target QoL
+
+## Game: Nav Assist respects moving convoy signals
+- When your **current target is a Traffic Convoy signal**, nav assist now uses the convoy's **current velocity** (instead of treating it as stationary).
+  - This fixes "match velocity" feeling wrong for convoy targets.
+  - It also improves approach guidance by allowing intercept-course logic to lead the target properly.
+
+## UI: Status panel shows convoy details
+- The **Status** window's target summary now displays Traffic Convoy **cargo, route, speed, and ETA** when a convoy signal is targeted.

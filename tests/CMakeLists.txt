@@ -6,12 +6,18 @@ add_executable(stellar_tests
   test_trajectory_predictor.cpp
   test_maneuver_computer.cpp
   test_lambert_solver.cpp
+  test_lambert_planner.cpp
+  test_lambert_planner_stepper.cpp
   test_streaming.cpp
   test_query_nearby.cpp
   test_universe_cache.cpp
   test_proc.cpp
   test_economy.cpp
   test_traffic.cpp
+
+  test_traffic_ledger.cpp
+  test_traffic_lanes.cpp
+  test_traffic_convoy_layer.cpp
   test_route_planner.cpp
   test_manifest_planner.cpp
   test_savegame.cpp

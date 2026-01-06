@@ -1,9 +1,13 @@
 #include "stellar/sim/Signals.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/Traffic.h"
+#include "stellar/sim/TrafficLedger.h"
 #include "stellar/sim/Universe.h"
 
 #include <cmath>
 #include <iostream>
+#include <unordered_map>
+#include <unordered_set>
 
 static bool nearly(double a, double b, double eps = 1e-9) {
   return std::abs(a - b) <= eps;
@@ -28,8 +32,24 @@ int test_signals() {
     return 1;
   }
 
-  const auto& stub = stubs.front();
-  const auto& sys = u.getSystem(stub.id, &stub);
+  // Pick a system that actually has stations (required by signal generation).
+  const StarSystem* sysPtr = nullptr;
+  const SystemStub* stubPtr = nullptr;
+  for (const auto& s : stubs) {
+    const auto& candidate = u.getSystem(s.id, &s);
+    if (!candidate.stations.empty()) {
+      sysPtr = &candidate;
+      stubPtr = &s;
+      break;
+    }
+  }
+  if (!sysPtr || !stubPtr) {
+    std::cerr << "[test_signals] no nearby system with stations\n";
+    return 1;
+  }
+
+  const auto& stub = *stubPtr;
+  const auto& sys = *sysPtr;
 
   const double t = 1000.25;
 
@@ -71,6 +91,45 @@ int test_signals() {
       std::cerr << "[test_signals] site mismatch (posKm)\n";
       ++fails;
       break;
+    }
+
+    // Optional traffic convoy payloads should be deterministic too.
+    if (sa.hasTrafficConvoy != sb.hasTrafficConvoy) {
+      std::cerr << "[test_signals] site mismatch (hasTrafficConvoy)\n";
+      ++fails;
+      break;
+    }
+    if (sa.hasTrafficConvoy) {
+      const auto& ca = sa.trafficConvoy;
+      const auto& cb = sb.trafficConvoy;
+      if (ca.id != cb.id || ca.systemId != cb.systemId || ca.fromStation != cb.fromStation || ca.toStation != cb.toStation || ca.commodity != cb.commodity) {
+        std::cerr << "[test_signals] traffic convoy mismatch (ids/route/commodity)\n";
+        ++fails;
+        break;
+      }
+      if (!nearly(ca.units, cb.units) || !nearly(ca.departDay, cb.departDay) || !nearly(ca.arriveDay, cb.arriveDay)) {
+        std::cerr << "[test_signals] traffic convoy mismatch (numeric)\n";
+        ++fails;
+        break;
+      }
+
+      const auto& saState = sa.trafficState;
+      const auto& sbState = sb.trafficState;
+      if (saState.active != sbState.active) {
+        std::cerr << "[test_signals] traffic state mismatch (active)\n";
+        ++fails;
+        break;
+      }
+      if (!nearly(saState.progress01, sbState.progress01) || !nearly(saState.distKm, sbState.distKm) || !nearly(saState.speedKmS, sbState.speedKmS)) {
+        std::cerr << "[test_signals] traffic state mismatch (numeric)\n";
+        ++fails;
+        break;
+      }
+      if (!vecNearly(saState.velKmS, sbState.velKmS, 1e-6)) {
+        std::cerr << "[test_signals] traffic state mismatch (velKmS)\n";
+        ++fails;
+        break;
+      }
     }
     if (sa.kind == SignalKind::Distress) {
       if (!sa.hasDistressPlan || !sb.hasDistressPlan) {
@@ -161,6 +220,191 @@ int test_signals() {
     if (!found) {
       std::cerr << "[test_signals] missing mission salvage site\n";
       ++fails;
+    }
+  }
+
+  // Traffic convoy sites should appear when enabled (requires >=2 stations).
+  {
+    const StarSystem* trafficSys = nullptr;
+    for (const auto& s : stubs) {
+      const auto& candidate = u.getSystem(s.id, &s);
+      if (candidate.stations.size() >= 2) {
+        trafficSys = &candidate;
+        break;
+      }
+    }
+
+    if (trafficSys) {
+      SignalGenParams pt{};
+      pt.resourceFieldCount = 0;
+      pt.includeDailyDerelict = false;
+      pt.includeDistress = false;
+      pt.includeTrafficConvoys = true;
+
+      // Increase the likelihood of at least one convoy by bumping traffic density.
+      pt.trafficLaneParams.convoysPerDayBase = 6;
+      pt.trafficLaneParams.convoysPerStation = 3;
+      pt.trafficLaneParams.maxConvoysPerDay = 24;
+      pt.trafficLaneParams.includeInactive = true;
+      pt.trafficLaneParams.genWindowDays = 0;
+      pt.trafficLaneParams.minDurationDays = 0.25;
+      pt.trafficLaneParams.maxDurationDays = 0.75;
+
+      std::vector<Mission> emptyMissions;
+      std::vector<core::u64> emptyResolved;
+
+      const auto all = generateSystemSignals(seed, *trafficSys, t, emptyMissions, emptyResolved, pt);
+      const SignalSite* first = nullptr;
+      for (const auto& s : all.sites) {
+        if (s.kind == SignalKind::TrafficConvoy && s.hasTrafficConvoy) {
+          first = &s;
+          break;
+        }
+      }
+
+      if (!first) {
+        std::cerr << "[test_signals] expected traffic convoy sites when enabled\n";
+        ++fails;
+      } else {
+        // Pick a time inside this convoy so it must be active.
+        const double midT = 0.5 * (first->trafficConvoy.departDay + first->trafficConvoy.arriveDay);
+
+        pt.trafficLaneParams.includeInactive = false;
+        pt.trafficLaneParams.genWindowDays = 1;
+
+        const auto mid = generateSystemSignals(seed, *trafficSys, midT, emptyMissions, emptyResolved, pt);
+        bool found = false;
+        for (const auto& s : mid.sites) {
+          if (s.kind != SignalKind::TrafficConvoy) continue;
+          if (s.id != first->id) continue;
+          if (!s.hasTrafficConvoy) continue;
+          found = true;
+          if (!s.trafficState.active) {
+            std::cerr << "[test_signals] expected chosen convoy to be active at midT\n";
+            ++fails;
+          }
+          if (s.trafficState.progress01 < -1e-6 || s.trafficState.progress01 > 1.0 + 1e-6) {
+            std::cerr << "[test_signals] unexpected convoy progress01\n";
+            ++fails;
+          }
+          if (!nearly(s.expireDay, s.trafficConvoy.arriveDay, 1e-9)) {
+            std::cerr << "[test_signals] convoy signal expireDay should match arriveDay\n";
+            ++fails;
+          }
+          break;
+        }
+        if (!found) {
+          std::cerr << "[test_signals] expected to find chosen convoy in midT plan\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
+  // If the caller provides a TrafficLedger recorded from simulateNpcTradeTraffic(...),
+  // signal generation should prefer *those* convoys (bridging the market nudger to
+  // visible traffic sites).
+  {
+    const StarSystem* ledgerSys = nullptr;
+    TrafficLedger ledger;
+    std::unordered_map<SystemId, int> stamps;
+
+    // Find a nearby multi-station system that produces at least one recorded shipment.
+    for (const auto& s : stubs) {
+      const auto& candidate = u.getSystem(s.id, &s);
+      if (candidate.stations.size() < 2) continue;
+
+      ledger.clear();
+      stamps.clear();
+
+      simulateNpcTradeTraffic(u, candidate, t, stamps, /*kMaxBackfillDays=*/14, &ledger);
+      if (!ledger.shipments.empty()) {
+        ledgerSys = &candidate;
+        break;
+      }
+    }
+
+    if (ledgerSys) {
+      SignalGenParams pt{};
+      pt.resourceFieldCount = 0;
+      pt.includeDailyDerelict = false;
+      pt.includeDistress = false;
+      pt.includeTrafficConvoys = true;
+
+      // We want to see the full day's manifest so we can pick a specific convoy.
+      pt.trafficLaneParams.includeInactive = true;
+      pt.trafficLaneParams.genWindowDays = 0;
+
+      std::vector<Mission> emptyMissions;
+      std::vector<core::u64> emptyResolved;
+
+      const auto all = generateSystemSignals(seed, *ledgerSys, t, emptyMissions, emptyResolved, pt, &ledger);
+
+      // The plan should include at least one convoy derived from the ledger.
+      std::unordered_set<core::u64> shipmentIds;
+      shipmentIds.reserve(ledger.shipments.size() * 2 + 1);
+      for (const auto& sh : ledger.shipments) shipmentIds.insert(sh.id);
+
+      const SignalSite* first = nullptr;
+      for (const auto& s : all.sites) {
+        if (s.kind != SignalKind::TrafficConvoy) continue;
+        if (!s.hasTrafficConvoy) continue;
+        if (shipmentIds.find(s.id) == shipmentIds.end()) {
+          std::cerr << "[test_signals] traffic convoy id not found in ledger shipments\n";
+          ++fails;
+          break;
+        }
+        first = &s;
+        break;
+      }
+
+      if (!first) {
+        std::cerr << "[test_signals] expected ledger-backed traffic convoys\n";
+        ++fails;
+      } else {
+        // Verify basic payload mapping back to the matching shipment.
+        const TrafficShipment* match = nullptr;
+        for (const auto& sh : ledger.shipments) {
+          if (sh.id == first->id) { match = &sh; break; }
+        }
+        if (!match) {
+          std::cerr << "[test_signals] could not find matching ledger shipment for convoy\n";
+          ++fails;
+        } else {
+          if (first->trafficConvoy.commodity != match->commodity) {
+            std::cerr << "[test_signals] ledger convoy commodity mismatch\n";
+            ++fails;
+          }
+          if (!nearly(first->trafficConvoy.units, match->units, 1e-9)) {
+            std::cerr << "[test_signals] ledger convoy units mismatch\n";
+            ++fails;
+          }
+        }
+
+        // Choose a time inside the convoy window so it must be active.
+        const double midT = 0.5 * (first->trafficConvoy.departDay + first->trafficConvoy.arriveDay);
+
+        pt.trafficLaneParams.includeInactive = false;
+        pt.trafficLaneParams.genWindowDays = 1;
+
+        const auto mid = generateSystemSignals(seed, *ledgerSys, midT, emptyMissions, emptyResolved, pt, &ledger);
+        bool found = false;
+        for (const auto& s : mid.sites) {
+          if (s.kind != SignalKind::TrafficConvoy) continue;
+          if (s.id != first->id) continue;
+          if (!s.hasTrafficConvoy) continue;
+          found = true;
+          if (!s.trafficState.active) {
+            std::cerr << "[test_signals] expected ledger convoy to be active at midT\n";
+            ++fails;
+          }
+          break;
+        }
+        if (!found) {
+          std::cerr << "[test_signals] expected to find ledger convoy in midT plan\n";
+          ++fails;
+        }
+      }
     }
   }
 

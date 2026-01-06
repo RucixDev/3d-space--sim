@@ -22,6 +22,15 @@ struct SupercruiseParams {
   // Minimum positive closing speed required to consider the window valid.
   double minClosingKmS{0.05};
 
+  // Additional safety gates for the drop window.
+  //
+  // The classic "6/7 second rule" is mostly about along-track closing speed, but
+  // in practice you also want to avoid dropping while sliding past the target.
+  //
+  // Lateral velocity is measured orthogonal to the ship→destination line.
+  // A value of 0.6 corresponds to ~31 degrees off-axis (tan(angle)).
+  double maxLateralFrac{0.6};
+
   // Supercruise handling caps (used by callers to set ship caps while active).
   double accelCapKmS2{6.0};
   double angularCapRadS2{1.2};
@@ -46,6 +55,11 @@ struct SupercruiseHud {
   double distKm{0.0};
   double closingKmS{0.0};
   double ttaSec{0.0};
+
+  // Lateral relative speed (orthogonal to the approach line) and predicted miss
+  // distance if we kept current relative velocity.
+  double lateralKmS{0.0};
+  double missKm{0.0};
 
   // Diagnostics for tuning / UI.
   double desiredSpeedKmS{0.0};

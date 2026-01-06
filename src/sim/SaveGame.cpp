@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 
 namespace stellar::sim {
 
@@ -228,6 +229,28 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "trafficStamps " << s.trafficStamps.size() << "\n";
   for (const auto& t : s.trafficStamps) {
     f << "traffic " << t.systemId << " " << t.dayStamp << "\n";
+  }
+
+  // Recent NPC trade shipments (TrafficLedger replay).
+  //
+  // Stored as a flat list with systemId on each record to keep the format simple
+  // and robust across version changes.
+  f << "trafficShipments " << s.trafficShipments.size() << "\n";
+  for (const auto& sh : s.trafficShipments) {
+    f << "shipment "
+      << sh.id << " "
+      << sh.systemId << " "
+      << sh.dayStamp << " "
+      << sh.fromStation << " "
+      << sh.toStation << " "
+      << sh.factionId << " "
+      << static_cast<int>(sh.commodity) << " "
+      << sh.units << " "
+      << sh.departDay << " "
+      << sh.arriveDay << " "
+      << sh.distKm << " "
+      << sh.speedKmS
+      << "\n";
   }
 
   // Station warehouse / cargo storage (player-owned, per station).
@@ -809,6 +832,58 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         SystemTrafficStamp t{};
         if (!(f >> t.systemId >> t.dayStamp)) break;
         out.trafficStamps.push_back(std::move(t));
+      }
+    } else if (key == "trafficShipments") {
+      std::size_t n = 0;
+      f >> n;
+      out.trafficShipments.clear();
+      out.trafficShipments.reserve(std::min<std::size_t>(n, 100000));
+
+      // Defensive: allow corrupted or hand-edited save files to contain duplicate
+      // shipment ids. These can otherwise surface as duplicated convoy signals.
+      std::unordered_set<core::u64> seenIds;
+      seenIds.reserve(std::min<std::size_t>(n, 4096) * 2 + 1);
+
+      // Robustness strategy: if the count is stale/corrupt, stop when we no longer
+      // see "shipment" and continue parsing later top-level keys.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "shipment") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        // Parse the rest of the shipment line so we can extend fields over time.
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        TrafficShipmentState sh{};
+        int commodity = 0;
+        // Mandatory fields.
+        if (!(iss >> sh.id
+                  >> sh.systemId
+                  >> sh.dayStamp
+                  >> sh.fromStation
+                  >> sh.toStation
+                  >> sh.factionId
+                  >> commodity
+                  >> sh.units)) {
+          continue;
+        }
+
+        // Optional schedule metadata (older saves may omit).
+        iss >> sh.departDay >> sh.arriveDay >> sh.distKm >> sh.speedKmS;
+
+        sh.commodity = static_cast<econ::CommodityId>(std::clamp(commodity, 0, (int)econ::kCommodityCount - 1));
+
+        if (sh.id != 0 && sh.systemId != 0 && sh.fromStation != 0 && sh.toStation != 0) {
+          if (!seenIds.insert(sh.id).second) continue;
+          out.trafficShipments.push_back(std::move(sh));
+        }
       }
     } else if (key == "station_storage") {
       std::size_t n = 0;

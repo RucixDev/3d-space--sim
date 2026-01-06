@@ -128,6 +128,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/TrajectoryPredictor.cpp
   src/sim/ManeuverComputer.cpp
   src/sim/LambertSolver.cpp
+  src/sim/LambertPlanner.cpp
   src/sim/Ship.cpp
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
@@ -156,6 +157,9 @@ set(STELLAR_CORE_SOURCES
   src/sim/Insurance.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
+  src/sim/TrafficLedger.cpp
+  src/sim/TrafficLanes.cpp
+  src/sim/TrafficConvoyLayer.cpp
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
   src/sim/TradeRunPlanner.cpp

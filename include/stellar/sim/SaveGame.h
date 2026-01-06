@@ -38,6 +38,33 @@ struct SystemTrafficStamp {
   int dayStamp{-1};
 };
 
+// Persisted record of a recent NPC-trade shipment.
+//
+// This is a small, save-friendly subset of sim::TrafficShipment used by
+// stellar_game to restore the in-memory TrafficLedger after load.
+//
+// Design intent:
+//  - Keep recent shipments only (TrafficLedger already prunes to a small window).
+//  - Preserve stable IDs so TrafficConvoy signals remain consistent across save/load.
+struct TrafficShipmentState {
+  core::u64 id{0};
+  SystemId systemId{0};
+  int dayStamp{0};
+
+  StationId fromStation{0};
+  StationId toStation{0};
+  core::u32 factionId{0};
+
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  double units{0.0};
+
+  // Schedule metadata (used for convoy replay / visualization).
+  double departDay{0.0};
+  double arriveDay{0.0};
+  double distKm{0.0};
+  double speedKmS{0.0};
+};
+
 // Player-owned cargo stored at a specific station.
 //
 // This is intentionally lightweight (no pointers/strings) and persists across runs.
@@ -302,6 +329,12 @@ struct SaveGame {
 
   // Background NPC traffic simulation (for markets). Stores last simulated day per system.
   std::vector<SystemTrafficStamp> trafficStamps{};
+
+  // Recent NPC trade shipments captured from sim::simulateNpcTradeTraffic(...).
+  //
+  // This is used to restore the in-memory TrafficLedger on load so that
+  // TrafficConvoy signals remain consistent across save/load.
+  std::vector<TrafficShipmentState> trafficShipments{};
 
   // Player station storage / warehouse entries.
   std::vector<StationStorage> stationStorage{};

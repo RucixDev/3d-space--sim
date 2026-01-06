@@ -5,18 +5,21 @@
 #include "stellar/sim/Distress.h"
 #include "stellar/sim/ResourceField.h"
 #include "stellar/sim/System.h"
+#include "stellar/sim/TrafficLanes.h"
 
 #include <vector>
 
 namespace stellar::sim {
 
 struct Mission; // fwd
+struct TrafficLedger; // fwd
 
 enum class SignalKind : core::u8 {
   ResourceField = 0,
   Derelict = 1,
   Distress = 2,
   MissionSalvage = 3,
+  TrafficConvoy = 4,
 };
 
 const char* signalKindName(SignalKind k);
@@ -26,7 +29,7 @@ struct SignalSite {
   SignalKind kind{SignalKind::Derelict};
   math::Vec3d posKm{0,0,0};
 
-  // When expireDay > 0 and timeDays >= expireDay, the site should be treated as expired.
+  // When expireDay > 0 and timeDays > expireDay, the site should be treated as expired.
   // Persistent sites can leave this at 0.
   double expireDay{0.0};
 
@@ -41,6 +44,11 @@ struct SignalSite {
 
   // For mission-related signals, helps correlate UI -> mission list.
   core::u64 missionId{0};
+
+  // Optional payloads for TrafficConvoy sites.
+  bool hasTrafficConvoy{false};
+  TrafficConvoy trafficConvoy{};
+  TrafficConvoyState trafficState{};
 };
 
 struct SignalGenParams {
@@ -54,6 +62,12 @@ struct SignalGenParams {
   bool includeDistress{true};
   int distressPerDay{1};
   double distressTtlDays{1.0};
+
+  // Traffic convoys: in-system lane traffic derived from the deterministic
+  // TrafficLanes prototype. These are *moving* sites whose posKm/state depends
+  // on timeDays.
+  bool includeTrafficConvoys{false};
+  TrafficLaneParams trafficLaneParams{};
 };
 
 struct SystemSignalPlan {
@@ -70,7 +84,8 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                       double timeDays,
                                       const std::vector<Mission>& activeMissions,
                                       const std::vector<core::u64>& resolvedSignalIds,
-                                      const SignalGenParams& params = {});
+                                      const SignalGenParams& params = {},
+                                      const TrafficLedger* trafficLedger = nullptr);
 
 // O(n) helper (resolvedSignalIds is usually small). Returns true if signalId is contained.
 bool isSignalResolved(const std::vector<core::u64>& resolvedSignalIds, core::u64 signalId);
