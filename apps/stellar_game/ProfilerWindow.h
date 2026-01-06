@@ -26,6 +26,13 @@ struct ProfilerWindowState {
 
   // Simple substring filter applied to aggregate rows.
   char filter[96]{};
+
+  // ---- Trace export (chrome://tracing / Perfetto legacy JSON) ----
+  // Default export path is relative to the working directory.
+  char exportPath[256]{"profiler_trace.json"};
+  bool exportAllFrames{true};
+  bool exportIncludeFrameEvents{true};
+  bool exportPretty{false};
 };
 
 using ToastFn = std::function<void(const std::string& msg, double ttlSec)>;

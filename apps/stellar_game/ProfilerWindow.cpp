@@ -1,5 +1,6 @@
 #include "ProfilerWindow.h"
 
+#include "stellar/core/ChromeTrace.h"
 #include "stellar/core/Hash.h"
 
 #include <imgui.h>
@@ -346,6 +347,52 @@ void drawProfilerWindow(ProfilerWindowState& st,
               st.selectedFrameOffset,
               nsToMs(sel->durationNs()),
               sel->events.size());
+
+  if (ImGui::CollapsingHeader("Export Trace", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::TextWrapped("Writes a Chrome JSON trace (chrome://tracing / Perfetto legacy JSON). ");
+
+    ImGui::InputTextWithHint("Path",
+                            "profiler_trace.json",
+                            st.exportPath,
+                            sizeof(st.exportPath));
+
+    ImGui::Checkbox("Export all history frames", &st.exportAllFrames);
+    ImGui::SameLine();
+    ImGui::Checkbox("Include frame spans", &st.exportIncludeFrameEvents);
+    ImGui::SameLine();
+    ImGui::Checkbox("Pretty JSON", &st.exportPretty);
+
+    core::ChromeTraceWriteOptions opt;
+    opt.includeFrameEvents = st.exportIncludeFrameEvents;
+    opt.pretty = st.exportPretty;
+
+    if (ImGui::Button("Export##trace")) {
+      std::string err;
+      bool ok = false;
+
+      if (st.exportAllFrames) {
+        ok = core::writeProfilerChromeTraceJson(st.exportPath, profiler.frames(), opt, &err);
+      } else {
+        ok = core::writeProfilerChromeTraceJson(st.exportPath, *sel, opt, &err);
+      }
+
+      if (toast) {
+        if (ok) {
+          toast(std::string("Wrote trace: ") + st.exportPath, 2.2);
+        } else {
+          toast(std::string("Trace export failed: ") + (err.empty() ? "unknown error" : err), 2.8);
+        }
+      }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Copy path##trace")) {
+      ImGui::SetClipboardText(st.exportPath);
+      if (toast) toast("Copied trace path to clipboard.", 1.2);
+    }
+
+    ImGui::TextDisabled("Open the JSON in chrome://tracing (legacy) or Perfetto UI.");
+  }
 
   if (st.showFlameGraph) {
     if (ImGui::CollapsingHeader("Flame Graph", ImGuiTreeNodeFlags_DefaultOpen)) {

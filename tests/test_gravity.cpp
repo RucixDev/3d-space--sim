@@ -31,6 +31,12 @@ int test_gravity() {
     const double vKmS = std::sqrt(mu / rKm);
     const auto orb = stellar::sim::solveTwoBodyOrbit({rKm, 0, 0}, {0, vKmS, 0}, mu);
 
+    if (orb.type != stellar::sim::TwoBodyOrbit::Type::Elliptic) {
+      std::cerr << "[test_gravity] expected circular orbit to classify as Elliptic, got type="
+                << (int)orb.type << "\n";
+      ++fails;
+    }
+
     if (orb.eccentricity > 1e-6) {
       std::cerr << "[test_gravity] expected near-circular e~0, got e=" << orb.eccentricity << "\n";
       ++fails;
@@ -43,6 +49,16 @@ int test_gravity() {
     const double expectedPeriod = 2.0 * stellar::math::kPi * std::sqrt((rKm * rKm * rKm) / mu);
     if (!near(orb.periodSec, expectedPeriod, 1e-3)) {
       std::cerr << "[test_gravity] expected period~" << expectedPeriod << " s, got " << orb.periodSec << " s\n";
+      ++fails;
+    }
+
+    // With our circular convention, current position is treated as periapsis.
+    if (!near(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
+      std::cerr << "[test_gravity] expected timeToPeriapsis=0 for circular convention, got " << orb.timeToPeriapsisSec << "\n";
+      ++fails;
+    }
+    if (!near(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+      std::cerr << "[test_gravity] expected timeToApoapsis~" << (0.5 * expectedPeriod) << " s, got " << orb.timeToApoapsisSec << " s\n";
       ++fails;
     }
   }
@@ -59,6 +75,8 @@ int test_gravity() {
     const double vp = std::sqrt(mu * (2.0 / rp - 1.0 / a));
     const auto orb = stellar::sim::solveTwoBodyOrbit({rp, 0, 0}, {0, vp, 0}, mu);
 
+    const double expectedPeriod = 2.0 * stellar::math::kPi * std::sqrt((a * a * a) / mu);
+
     if (!near(orb.semiMajorAxisKm, a, 1e-2)) {
       std::cerr << "[test_gravity] expected a~" << a << " km, got a=" << orb.semiMajorAxisKm << "\n";
       ++fails;
@@ -70,6 +88,28 @@ int test_gravity() {
     if (!near(orb.periapsisKm, rp, 1e-2) || !near(orb.apoapsisKm, ra, 1e-2)) {
       std::cerr << "[test_gravity] expected rp/ra (" << rp << "," << ra << ") got (" << orb.periapsisKm
                 << "," << orb.apoapsisKm << ")\n";
+      ++fails;
+    }
+
+    // At periapsis, time to periapsis should be 0 and time to apoapsis ~ period/2.
+    if (!near(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
+      std::cerr << "[test_gravity] expected timeToPeriapsis=0 at periapsis, got " << orb.timeToPeriapsisSec << "\n";
+      ++fails;
+    }
+    if (!near(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+      std::cerr << "[test_gravity] expected timeToApoapsis~" << (0.5 * expectedPeriod) << " s, got " << orb.timeToApoapsisSec << " s\n";
+      ++fails;
+    }
+
+    // Validate apoapsis phase.
+    const double va = std::sqrt(mu * (2.0 / ra - 1.0 / a));
+    const auto orbApo = stellar::sim::solveTwoBodyOrbit({-ra, 0, 0}, {0, -va, 0}, mu);
+    if (!near(orbApo.timeToApoapsisSec, 0.0, 1e-6)) {
+      std::cerr << "[test_gravity] expected timeToApoapsis=0 at apoapsis, got " << orbApo.timeToApoapsisSec << "\n";
+      ++fails;
+    }
+    if (!near(orbApo.timeToPeriapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+      std::cerr << "[test_gravity] expected timeToPeriapsis~" << (0.5 * expectedPeriod) << " s, got " << orbApo.timeToPeriapsisSec << " s\n";
       ++fails;
     }
   }

@@ -102,6 +102,7 @@ set(STELLAR_CORE_SOURCES
   src/core/Log.cpp
   src/core/CVar.cpp
   src/core/Profiler.cpp
+  src/core/ChromeTrace.cpp
 
   src/ui/Bookmarks.cpp
   src/ui/FuzzySearch.cpp
@@ -230,10 +231,15 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
     apps/stellar_game/MarketDashboardWindow.cpp
+    apps/stellar_game/TradePlannerWindow.cpp
     apps/stellar_game/ConsoleWindow.cpp
     apps/stellar_game/LogWindow.cpp
     apps/stellar_game/CVarWindow.cpp
     apps/stellar_game/ProfilerWindow.cpp
+    apps/stellar_game/FlightRecorderWindow.cpp
+    apps/stellar_game/CinematicCameraWindow.cpp
+    apps/stellar_game/OrbitAnalyzerWindow.cpp
+    apps/stellar_game/PorkchopPlot.cpp
     apps/stellar_game/Screenshot.cpp
     apps/stellar_game/PhotoModeWindow.cpp
   )

@@ -1,5 +1,6 @@
 add_executable(stellar_game
   main.cpp
+  CinematicCameraWindow.cpp
 )
 
 target_compile_features(stellar_game PRIVATE cxx_std_20)

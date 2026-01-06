@@ -14,9 +14,8 @@ namespace stellar::sim {
 //
 // A lightweight path propagator for in-system debugging and gameplay.
 //
-// - Uses RK4 integration so the preview stays stable even with larger step sizes.
-// - Supports a single instantaneous maneuver node (delta-v) at a requested time.
 // - Deterministic + headless; safe to call from tools/tests.
+// - Supports a single instantaneous maneuver node (delta-v) at a requested time.
 //
 // Units:
 //   - position: km
@@ -41,7 +40,11 @@ struct TrajectoryPredictParams {
   // Total prediction time horizon (seconds).
   double horizonSec{1800.0};
 
-  // Integrator step size (seconds). The final step is shortened to end exactly at horizonSec.
+  // Integrator step size (seconds).
+  //
+  // For predictTrajectoryRK4(): this is the fixed integrator step.
+  // For predictTrajectoryRK45Adaptive(): this is the *output sampling* interval.
+  //   (internal adaptive steps are chosen automatically).
   double stepSec{2.0};
 
   // Safety cap for output size.
@@ -50,6 +53,25 @@ struct TrajectoryPredictParams {
   // Include gravity from the provided system (star + planets) using GravityParams.
   bool includeGravity{true};
   GravityParams gravity{};
+
+  // ---------------------------------------------------------------------------
+  // Adaptive stepping controls (RK45)
+  // ---------------------------------------------------------------------------
+  //
+  // Used only by predictTrajectoryRK45Adaptive(). These are intentionally opt-in
+  // so existing gameplay behavior stays stable.
+
+  // Smallest / largest internal step (seconds).
+  double minStepSec{0.05};
+  double maxStepSec{30.0};
+
+  // Error tolerances for adaptive step control.
+  //
+  // A step is accepted if the estimated local truncation error is <= 1.0 when
+  // normalized by the tolerance scales.
+  double relTol{1e-6};
+  double absTolPosKm{1e-3};   // 1 meter
+  double absTolVelKmS{1e-6};  // 1 mm/s
 };
 
 // Predict a future trajectory using 4th-order Runge-Kutta integration.
@@ -62,5 +84,22 @@ std::vector<TrajectorySample> predictTrajectoryRK4(const StarSystem& sys,
                                                    const math::Vec3d& startVelKmS,
                                                    const TrajectoryPredictParams& params,
                                                    const ManeuverNode* node = nullptr);
+
+// Predict a future trajectory using an adaptive Dormand–Prince RK5(4) (RK45) integrator.
+//
+// Differences vs RK4:
+// - Uses an embedded 5th/4th order pair to estimate local error and adapt the internal timestep.
+// - `params.stepSec` controls output sampling interval (trajectory samples are emitted at that
+//   cadence, plus a sample at the maneuver node time if provided).
+// - Internal integration steps are clamped to [minStepSec, maxStepSec].
+//
+// This is useful for long-horizon previews: you can request coarse output samples (stepSec)
+// while still keeping accuracy during fast dynamics (close passes) via smaller internal steps.
+std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sys,
+                                                           double startTimeDays,
+                                                           const math::Vec3d& startPosKm,
+                                                           const math::Vec3d& startVelKmS,
+                                                           const TrajectoryPredictParams& params,
+                                                           const ManeuverNode* node = nullptr);
 
 } // namespace stellar::sim

@@ -17,7 +17,16 @@ namespace stellar::sim {
 //   - mu: km^3/s^2
 
 struct TwoBodyOrbit {
+  enum class Type : unsigned char {
+    Invalid = 0,
+    Elliptic,
+    Parabolic,
+    Hyperbolic,
+  };
+
   double muKm3S2{0.0};
+
+  Type type{Type::Invalid};
 
   double rKm{0.0};
   double vKmS{0.0};
@@ -38,6 +47,27 @@ struct TwoBodyOrbit {
 
   // Orbital period (seconds) for bound ellipses. 0 for unbound.
   double periodSec{0.0};
+
+  // Phase / timing.
+  // For elliptic orbits:
+  //  - trueAnomalyRad is normalized to [0, 2pi)
+  //  - meanAnomalyRad is normalized to [0, 2pi)
+  //  - timeToPeriapsisSec/timeToApoapsisSec refer to the *next* occurrence
+  // For hyperbolic orbits:
+  //  - trueAnomalyRad is in (-pi, pi)
+  //  - timeSincePeriapsisSec is signed (negative before periapsis)
+  //  - timeToPeriapsisSec is max(0, -timeSincePeriapsisSec)
+  double trueAnomalyRad{0.0};
+  double eccentricAnomalyRad{0.0};
+  double meanAnomalyRad{0.0};
+  double meanMotionRadPerSec{0.0};
+  double timeSincePeriapsisSec{0.0};
+  double timeToPeriapsisSec{0.0};
+  double timeToApoapsisSec{0.0};
+
+  // Velocity decomposition at the current state (body-centric two-body frame).
+  double radialSpeedKmS{0.0};
+  double tangentialSpeedKmS{0.0};
 
   // Debug vectors
   math::Vec3d angularMomentumKm2S{0, 0, 0};

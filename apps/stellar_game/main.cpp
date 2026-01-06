@@ -91,10 +91,15 @@
 #include "ConsoleWindow.h"
 #include "CVarWindow.h"
 #include "MarketDashboardWindow.h"
+#include "TradePlannerWindow.h"
 #include "ProfilerWindow.h"
+#include "FlightRecorderWindow.h"
+#include "CinematicCameraWindow.h"
+#include "OrbitAnalyzerWindow.h"
 #include "LogWindow.h"
 #include "Screenshot.h"
 #include "PhotoModeWindow.h"
+#include "PorkchopPlot.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -285,28 +290,6 @@ static math::Quatd quatFromTo(const math::Vec3d& from, const math::Vec3d& to) {
   const double s = std::sqrt((1.0 + c) * 2.0);
   const double invs = 1.0 / s;
   return math::Quatd{ s * 0.5, axis.x * invs, axis.y * invs, axis.z * invs }.normalized();
-}
-
-static math::Vec3d stationPosKm(const sim::Station& st, double timeDays) {
-  const math::Vec3d posAU = sim::orbitPosition3DAU(st.orbit, timeDays);
-  return posAU * kAU_KM;
-}
-
-static math::Vec3d stationVelKmS(const sim::Station& st, double timeDays) {
-  // Analytic Keplerian velocity (avoids numerical jitter in local-frame velocity matching).
-  const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(st.orbit, timeDays);
-  return velAUPerDay * (kAU_KM / 86400.0);
-}
-
-static math::Vec3d planetPosKm(const sim::Planet& p, double timeDays) {
-  const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, timeDays);
-  return posAU * kAU_KM;
-}
-
-static math::Vec3d planetVelKmS(const sim::Planet& p, double timeDays) {
-  // Analytic Keplerian velocity.
-  const math::Vec3d velAUPerDay = sim::orbitVelocity3DAU(p.orbit, timeDays);
-  return velAUPerDay * (kAU_KM / 86400.0);
 }
 
 static math::Quatd stationOrient(const sim::Station& st, const math::Vec3d& posKm, double timeDays) {
@@ -1512,6 +1495,16 @@ int main(int argc, char** argv) {
     int cellsPerFrame{256};
     bool storeGrid{false};
 
+    // --- Porkchop plot UI (visualization of the stored grid) ---
+    bool showPlot{true};
+    int plotMetric{(int)game::PorkchopMetric::Score};
+    float plotGamma{0.65f};
+    int plotMaxCols{220};
+    int plotMaxRows{160};
+    bool plotShowBestMarkers{true};
+    bool plotShowAxes{true};
+    char plotCsvPath[128]{"porkchop.csv"};
+
     // Bookkeeping (frozen at start)
     double startTimeDays{0.0};
     double baseTimeDays{0.0};
@@ -2007,6 +2000,9 @@ int main(int argc, char** argv) {
   game::CVarWindowState cvarWindow{};
   game::LogWindowState logWindow{};
   game::ProfilerWindowState profilerWindow{};
+  game::FlightRecorderWindowState flightRecorderWindow{};
+  game::CinematicCameraWindowState cinematicCameraWindow{};
+  game::OrbitAnalyzerWindowState orbitAnalyzerWindow{};
   game::PhotoModeWindowState photoModeWindow{};
 
   struct PendingScreenshot { bool pending{false}; std::string path; bool copyToClipboard{false}; };
@@ -2038,6 +2034,7 @@ int main(int argc, char** argv) {
   bool showScanner = true;
   bool showTrade = true;
   game::MarketDashboardWindowState marketDashboardWindow{};
+  game::TradePlannerWindowState tradePlannerWindow{};
   bool showGuide = true;
   bool showSprites = false;
   bool showVfx = false;
@@ -2518,6 +2515,8 @@ int main(int argc, char** argv) {
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleScanner); }});
     uiWindows.add(WindowBinding{WindowDesc{"Trade", "Trade Helper", "Main", 100, true, true}, &showTrade,
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleTrade); }});
+    uiWindows.add(WindowBinding{WindowDesc{"TradePlanner", "Trade Planner", "Main", 95, false, true}, &tradePlannerWindow.open,
+                                {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"Guide", "Pilot Guide", "Main", 90, true, true}, &showGuide,
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleGuide); }});
     uiWindows.add(WindowBinding{WindowDesc{"Hangar", "Hangar / Livery", "Station", 90, false, true}, &showHangar,
@@ -2553,6 +2552,15 @@ int main(int argc, char** argv) {
 
     uiWindows.add(WindowBinding{WindowDesc{"Profiler", "Profiler", "Debug", 55, false, true}, &profilerWindow.open,
                                 [&]() { profiler.setEnabled(true); }, [&]() { profiler.setEnabled(false); }, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"FlightRecorder", "Flight Recorder", "Tools", 55, false, true}, &flightRecorderWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"CinematicCamera", "Cinematic Camera", "Tools", 55, false, true}, &cinematicCameraWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"OrbitAnalyzer", "Orbit Analyzer", "Tools", 55, false, true}, &orbitAnalyzerWindow.open,
+                                {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
                                 {}, {}, {}});
@@ -2639,12 +2647,12 @@ int main(int argc, char** argv) {
     stationIdx = std::min(stationIdx, sys.stations.size() - 1);
     const auto& st = sys.stations[stationIdx];
 
-    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
     const math::Quatd stQ = stationOrient(st, stPos, timeDays);
     const math::Vec3d axis = stQ.rotate({0,0,1}); // outward
     const double startDistKm = st.radiusKm * 14.0;
     ship.setPositionKm(stPos + axis * startDistKm);
-    ship.setVelocityKmS(stationVelKmS(st, timeDays));
+    ship.setVelocityKmS(sim::stationVelKmS(st, timeDays));
     ship.setAngularVelocityRadS({0,0,0});
     // face toward the slot (into station)
     ship.setOrientation(quatFromTo({0,0,1}, -axis));
@@ -3353,7 +3361,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
     // Stations (treat as heavy bodies / traffic control).
     for (const auto& st : currentSystem->stations) {
-      const math::Vec3d stPos = stationPosKm(st, timeDays);
+      const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
       const double distKm = (shipPos - stPos).length();
       const double lockKm = st.radiusKm * 12.0;
       if (distKm < lockKm) return true;
@@ -3670,7 +3678,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
   while (running) {
     profiler.beginFrame();
-    {
       STELLAR_PROFILE_SCOPE("Frame");
 
     // Timing
@@ -4477,8 +4484,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             case TargetKind::Station: {
               if (target.index >= currentSystem->stations.size()) return false;
               const auto& st = currentSystem->stations[target.index];
-              outPosKm = stationPosKm(st, timeDays);
-              outVelKmS = stationVelKmS(st, timeDays);
+              outPosKm = sim::stationPosKm(st, timeDays);
+              outVelKmS = sim::stationVelKmS(st, timeDays);
               outSuggestedDistKm = std::max(st.radiusKm * 12.0, st.approachRadiusKm * 1.2);
               outName = st.name;
               return true;
@@ -4486,8 +4493,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
             case TargetKind::Planet: {
               if (target.index >= currentSystem->planets.size()) return false;
               const auto& p = currentSystem->planets[target.index];
-              outPosKm = planetPosKm(p, timeDays);
-              outVelKmS = planetVelKmS(p, timeDays);
+              outPosKm = sim::planetPosKm(p, timeDays);
+              outVelKmS = sim::planetVelKmS(p, timeDays);
               const double rKm = std::max(1.0, p.radiusEarth) * 6371.0;
               outSuggestedDistKm = rKm * 1.5;
               outName = p.name;
@@ -5010,7 +5017,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           // Request docking clearance from targeted station
           if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
             const auto& st = currentSystem->stations[target.index];
-            const math::Vec3d stPos = stationPosKm(st, timeDays);
+            const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
             const double dist = (ship.positionKm() - stPos).length();
 
             auto& cs = clearances[st.id];
@@ -5052,11 +5059,11 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                                          [&](const sim::Station& s){ return s.id == dockedStationId; });
             if (it != currentSystem->stations.end()) {
               const auto& st = *it;
-              const math::Vec3d stPos = stationPosKm(st, timeDays);
+              const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
               const math::Quatd stQ = stationOrient(st, stPos, timeDays);
               const math::Vec3d axis = stQ.rotate({0,0,1});
               ship.setPositionKm(stPos + axis * (st.radiusKm * 1.8));
-              ship.setVelocityKmS(stationVelKmS(st, timeDays));
+              ship.setVelocityKmS(sim::stationVelKmS(st, timeDays));
               ship.setAngularVelocityRadS({0,0,0});
               ship.setOrientation(quatFromTo({0,0,1}, -axis));
 
@@ -5110,8 +5117,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                 }
 
                 const auto& originSt = currentSystem->stations[*fromIdx];
-                const math::Vec3d originPosKm = stationPosKm(originSt, timeDays);
-                const math::Vec3d originVelKmS = stationVelKmS(originSt, timeDays);
+                const math::Vec3d originPosKm = sim::stationPosKm(originSt, timeDays);
+                const math::Vec3d originVelKmS = sim::stationVelKmS(originSt, timeDays);
 
                 // Spawn convoy (trader) contact.
                 Contact convoy{};
@@ -5226,9 +5233,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               auto& cs = clearances[st.id];
               const bool clearanceValid = sim::dockingClearanceValid(cs, timeDays);
 
-              const math::Vec3d stPos = stationPosKm(st, timeDays);
+              const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
               const math::Quatd stQ = stationOrient(st, stPos, timeDays);
-              const math::Vec3d stV = stationVelKmS(st, timeDays);
+              const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
 
               const math::Vec3d relWorldKm = ship.positionKm() - stPos;
               const math::Vec3d relLocalKm = stQ.conjugate().rotate(relWorldKm);
@@ -5477,9 +5484,9 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       if (autopilot) {
         const auto& st = currentSystem->stations[target.index];
 
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
         const math::Quatd stQ = stationOrient(st, stPos, timeDays);
-        const math::Vec3d stV = stationVelKmS(st, timeDays);
+        const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
 
         auto& cs = clearances[st.id];
         const bool clearanceValid = sim::dockingClearanceValid(cs, timeDays);
@@ -5573,8 +5580,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           case TargetKind::Station: {
             if (target.index < currentSystem->stations.size()) {
               const auto& st = currentSystem->stations[target.index];
-              tPosKm = stationPosKm(st, timeDays);
-              tVelKmS = stationVelKmS(st, timeDays);
+              tPosKm = sim::stationPosKm(st, timeDays);
+              tVelKmS = sim::stationVelKmS(st, timeDays);
               ok = true;
             }
             break;
@@ -5582,8 +5589,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           case TargetKind::Planet: {
             if (target.index < currentSystem->planets.size()) {
               const auto& p = currentSystem->planets[target.index];
-              tPosKm = planetPosKm(p, timeDays);
-              tVelKmS = planetVelKmS(p, timeDays);
+              tPosKm = sim::planetPosKm(p, timeDays);
+              tVelKmS = sim::planetVelKmS(p, timeDays);
               ok = true;
             }
             break;
@@ -5661,24 +5668,24 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
       // Prefer stations when nearby (keeps you "riding along" with their orbital motion).
       for (const auto& st : currentSystem->stations) {
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
         const double d = (stPos - ship.positionKm()).length();
         const double influence = std::max(st.commsRangeKm * 1.5, st.approachLengthKm * 2.0 + st.radiusKm * 12.0);
         if (d < influence && d < best) {
           best = d;
-          desiredVel = stationVelKmS(st, timeDays);
+          desiredVel = sim::stationVelKmS(st, timeDays);
         }
       }
 
       // Fall back to planets if no station "wins".
       for (const auto& p : currentSystem->planets) {
-        const math::Vec3d pPos = planetPosKm(p, timeDays);
+        const math::Vec3d pPos = sim::planetPosKm(p, timeDays);
         const double d = (pPos - ship.positionKm()).length();
         const double rKm = p.radiusEarth * 6371.0;
         const double influence = std::max(250000.0, rKm * 80.0);
         if (d < influence && d < best) {
           best = d;
-          desiredVel = planetVelKmS(p, timeDays);
+          desiredVel = sim::planetVelKmS(p, timeDays);
         }
       }
 
@@ -5886,14 +5893,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
       if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
-        destPosKm = stationPosKm(st, timeDays);
-        destVelKmS = stationVelKmS(st, timeDays);
+        destPosKm = sim::stationPosKm(st, timeDays);
+        destVelKmS = sim::stationVelKmS(st, timeDays);
         dropKm = std::max(15000.0, st.radiusKm * 3.0);
         hasDest = true;
       } else if (currentSystem && target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
         const auto& p = currentSystem->planets[target.index];
-        destPosKm = planetPosKm(p, timeDays);
-        destVelKmS = planetVelKmS(p, timeDays);
+        destPosKm = sim::planetPosKm(p, timeDays);
+        destVelKmS = sim::planetVelKmS(p, timeDays);
         const double rKm = p.radiusEarth * 6371.0;
         dropKm = std::max(60000.0, rKm * 12.0);
         hasDest = true;
@@ -6086,7 +6093,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           ship.setMaxAngularAccelRadS2(sc.recommendedMaxAngularAccelRadS2);
         }
       }
-    }
 
     if (supercruiseState == SupercruiseState::Active) {
       ship.setMaxLinearAccelKmS2(6.0);
@@ -6264,7 +6270,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                 double bestD2 = 1e300;
                 for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
                   const auto& st = currentSystem->stations[i];
-                  const math::Vec3d sp = stationPosKm(st, timeDays);
+                  const math::Vec3d sp = sim::stationPosKm(st, timeDays);
                   const double d2 = (sp - p).lengthSq();
                   if (d2 < bestD2) {
                     bestD2 = d2;
@@ -6432,9 +6438,9 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                                [&](const sim::Station& s){ return s.id == dockedStationId; });
         if (it != currentSystem->stations.end()) {
           const auto& st = *it;
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
           const math::Quatd stQ = stationOrient(st, stPos, timeDays);
-          const math::Vec3d stV = stationVelKmS(st, timeDays);
+          const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
 
           const double wz = st.radiusKm * 1.10;
           const double dockZ = wz - st.slotDepthKm - st.radiusKm * 0.25;
@@ -6558,7 +6564,7 @@ for (const auto& c : contacts) {
     }
     stIdx = std::min(stIdx, currentSystem->stations.size() - 1);
     const auto& st = currentSystem->stations[stIdx];
-    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
     const math::Quatd stQ = stationOrient(st, stPos, timeDays);
     const math::Vec3d axis = stQ.rotate({0,0,1});
     const math::Vec3d tangent = stQ.rotate({1,0,0});
@@ -6566,7 +6572,7 @@ for (const auto& c : contacts) {
     const double distKm = rng.range(st.radiusKm * minDistMul, st.radiusKm * maxDistMul);
     const math::Vec3d p = stPos + axis * distKm + tangent * rng.range(-st.radiusKm*2.0, st.radiusKm*2.0);
     outShip.setPositionKm(p);
-    outShip.setVelocityKmS(stationVelKmS(st, timeDays));
+    outShip.setVelocityKmS(sim::stationVelKmS(st, timeDays));
     outShip.setOrientation(quatFromTo({0,0,1}, (stPos - p).normalized()));
   };
 
@@ -7058,8 +7064,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
         if (hideoutIdx && currentSystem && *hideoutIdx < currentSystem->stations.size()) {
           const auto& st = currentSystem->stations[*hideoutIdx];
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
-          const math::Vec3d stVel = stationVelKmS(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+          const math::Vec3d stVel = sim::stationVelKmS(st, timeDays);
           const math::Quatd stQ = stationOrient(st, stPos, timeDays);
           const math::Vec3d axis = stQ.rotate({0,0,1});
           const math::Vec3d tangent = stQ.rotate({1,0,0});
@@ -7215,7 +7221,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       if (c.missionTarget && c.attackTargetId == 0 && currentSystem && !currentSystem->stations.empty()) {
         const std::size_t stIdx = std::min<std::size_t>((std::size_t)c.homeStationIndex, currentSystem->stations.size() - 1);
         const auto& st = currentSystem->stations[stIdx];
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
 
         // Engage when the player is plausibly "in the area" (or after being fired upon).
         const double engageDistKm = std::max(90000.0, st.commsRangeKm * 1.25);
@@ -7229,7 +7235,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
           chaseTarget(c.ship,
                      ai,
                      stPos + offset,
-                     stationVelKmS(st, timeDays),
+                     sim::stationVelKmS(st, timeDays),
                      /*desiredDistKm=*/baseR * 0.65,
                      /*tangentialStrength=*/0.26,
                      /*maxAccelFrac=*/1.4);
@@ -7464,9 +7470,9 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         if (currentSystem->stations.size() >= 2) {
           std::size_t destIdx = std::min(c.tradeDestStationIndex, currentSystem->stations.size() - 1);
           const auto& st = currentSystem->stations[destIdx];
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
 
-          const math::Vec3d stVel = stationVelKmS(st, timeDays);
+          const math::Vec3d stVel = sim::stationVelKmS(st, timeDays);
 
           // Approach to comms-range and "trade" (we simulate docking by adjusting inventories).
           const double desiredDist = std::clamp(st.commsRangeKm * 0.55, st.radiusKm * 6.0, st.radiusKm * 14.0);
@@ -7546,11 +7552,11 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         } else {
           // Single-station systems: lazy orbit/patrol around their home station.
           const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
           const double baseR = st.radiusKm * 26.0;
           const double ang = std::fmod((double)(c.id % 1000) * 0.01 + timeDays * 0.75, 2.0 * math::kPi);
           const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.15*std::sin(ang*0.7), std::sin(ang)} * baseR;
-          chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.18, 1.2);
+          chaseTarget(c.ship, ai, stPos + offset, sim::stationVelKmS(st, timeDays), baseR * 0.6, 0.18, 1.2);
         }
       }
 
@@ -7625,11 +7631,11 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	      } else if (currentSystem && !currentSystem->stations.empty()) {
 	        // Patrol around home station.
 	        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
-	        const math::Vec3d stPos = stationPosKm(st, timeDays);
+	        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
 	        const double baseR = st.radiusKm * 22.0;
 	        const double ang = std::fmod((double)(c.id % 1000) * 0.012 + timeDays * 1.10, 2.0 * math::kPi);
 	        const math::Vec3d offset = math::Vec3d{std::cos(ang), 0.10*std::sin(ang*0.6), std::sin(ang)} * baseR;
-	        chaseTarget(c.ship, ai, stPos + offset, stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
+	        chaseTarget(c.ship, ai, stPos + offset, sim::stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
 	      }
 
 	      stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
@@ -7777,7 +7783,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   // - Help against pirates
   // - If you are WANTED with the station's faction, the station will also chip at you near the no-fire zone.
   for (const auto& st : currentSystem->stations) {
-    const math::Vec3d stPos = stationPosKm(st, timeDays);
+    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
     const double zoneKm = st.radiusKm * 25.0;
     const double distShip = (ship.positionKm() - stPos).length();
 
@@ -7812,13 +7818,13 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       // Collisions (player with station hull)
       if (!docked) {
         for (const auto& st : currentSystem->stations) {
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
           const math::Quatd stQ = stationOrient(st, stPos, timeDays);
           const math::Vec3d relLocal = stQ.conjugate().rotate(ship.positionKm() - stPos);
 
           if (sim::insideStationHullExceptSlot(st, relLocal)) {
             // Damage based on relative speed and push outward slightly.
-            const math::Vec3d stV = stationVelKmS(st, timeDays);
+            const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
             const double relSpeed = (ship.velocityKmS() - stV).length();
             applyDamage(relSpeed * 18.0, playerShield, playerHull);
 
@@ -7954,7 +7960,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
               if (currentSystem) {
                 for (const auto& st : currentSystem->stations) {
                   if (st.id == cargoScanStationId) {
-                    const math::Vec3d stPos = stationPosKm(st, timeDays);
+                    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
                     const double dist = (ship.positionKm() - stPos).length();
                     inRange = dist < cargoScanRangeKm;
                     break;
@@ -8106,7 +8112,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
               double nearestKm = 1e99;
               const sim::Station* nearest = nullptr;
               for (const auto& st : currentSystem->stations) {
-                const math::Vec3d stPos = stationPosKm(st, timeDays);
+                const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
                 const double dist = (ship.positionKm() - stPos).length();
                 if (dist < nearestKm) { nearestKm = dist; nearest = &st; }
               }
@@ -8287,7 +8293,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     if (!valid && scanLockedTarget.kind == TargetKind::Station && scanLockedTarget.index < currentSystem->stations.size()) {
       const auto& st = currentSystem->stations[scanLockedTarget.index];
       if (st.id == scanLockedId) {
-        const double dist = (stationPosKm(st, timeDays) - ship.positionKm()).length();
+        const double dist = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
         if (dist <= scanRangeKm) {
           valid = true;
           scanProgressSec += dtReal;
@@ -9099,7 +9105,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           // Arrival: once the convoy is in range of the destination station, it "checks in".
           if (!m.scanned) {
             if (const sim::Station* destSt = findStationById(m.toStation)) {
-              const math::Vec3d destPos = stationPosKm(*destSt, timeDays);
+              const math::Vec3d destPos = sim::stationPosKm(*destSt, timeDays);
               const double d = (convoy->ship.positionKm() - destPos).length();
               if (d < destSt->commsRangeKm * 0.70) {
                 m.scanned = true;
@@ -9588,19 +9594,47 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // ---- Camera follow (third-person) ----
+    // Cinematic camera (keyframed chase-rig)
+    game::tickCinematicCamera(cinematicCameraWindow, dtReal, dtSim, paused);
+
+    // Default chase camera
+    double camFovDeg = 60.0;
+    math::Vec3d camOffsetLocalU{0.0, 2.0, -6.0};
+    bool camLookAtShip = false;
+
+    if (cinematicCameraWindow.enabled) {
+      const auto sample = game::sampleCinematicCamera(cinematicCameraWindow);
+      camOffsetLocalU = sample.offsetLocalU;
+      camLookAtShip = cinematicCameraWindow.lookAtShip;
+      if (cinematicCameraWindow.overrideFov && sample.hasFov) {
+        camFovDeg = sample.fovDeg;
+      }
+    }
+
     render::Camera cam;
     int w = 1280, h = 720;
     SDL_GetWindowSize(window, &w, &h);
-    const double aspect = (h > 0) ? (double)w / (double)h : 16.0/9.0;
-
-    cam.setPerspective(math::degToRad(60.0), aspect, 0.01, 20000.0);
+    glViewport(0, 0, w, h);
+    double aspect = (double)w / (double)h;
+    cam.setPerspective(math::degToRad(camFovDeg), aspect, 0.01, 20000.0);
 
     const math::Vec3d shipPosU = toRenderPosU(ship.positionKm());
-    const math::Vec3d back = ship.forward() * (-6.0);
-    const math::Vec3d up = ship.up() * (2.0);
+    const math::Vec3d camOffsetU = ship.right() * camOffsetLocalU.x +
+                                   ship.up() * camOffsetLocalU.y +
+                                   ship.forward() * camOffsetLocalU.z;
+    const math::Vec3d camPosU = shipPosU + camOffsetU;
+    cam.setPosition(camPosU);
 
-    cam.setPosition(shipPosU + back + up);
-    cam.setOrientation(ship.orientation());
+    if (camLookAtShip) {
+      const math::Vec3d toShipU = shipPosU - camPosU;
+      if (toShipU.lengthSq() > 1e-12) {
+        cam.setOrientation(quatFromTo(math::Vec3d{0.0, 0.0, 1.0}, toShipU.normalized()));
+      } else {
+        cam.setOrientation(ship.orientation());
+      }
+    } else {
+      cam.setOrientation(ship.orientation());
+    }
 
     const math::Mat4d view = cam.viewMatrix();
     const math::Mat4d proj = cam.projectionMatrix();
@@ -10009,8 +10043,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 trajCache.refBody.kind = sim::GravityBody::Kind::Planet;
                 trajCache.refBody.id = (core::u64)pi;
                 trajCache.refBody.name = p.name;
-                trajCache.refBody.posKm = planetPosKm(p, timeDays);
-                trajCache.refBody.velKmS = planetVelKmS(p, timeDays);
+                trajCache.refBody.posKm = sim::planetPosKm(p, timeDays);
+                trajCache.refBody.velKmS = sim::planetVelKmS(p, timeDays);
                 trajCache.refBody.muKm3S2 = sim::muPlanetKm3S2(p);
                 trajCache.refBody.radiusKm = sim::radiusPlanetKm(p);
               }
@@ -10031,8 +10065,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               const std::size_t pi = (std::size_t)b.id;
               if (pi < currentSystem->planets.size()) {
                 const auto& p = currentSystem->planets[pi];
-                b.posKm = planetPosKm(p, tDays);
-                b.velKmS = planetVelKmS(p, tDays);
+                b.posKm = sim::planetPosKm(p, tDays);
+                b.velKmS = sim::planetVelKmS(p, tDays);
                 b.muKm3S2 = sim::muPlanetKm3S2(p);
                 b.radiusKm = sim::radiusPlanetKm(p);
               }
@@ -10184,7 +10218,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // docking corridor guidance for targeted station
       if (target.kind == TargetKind::Station && target.index == i) {
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
         const math::Quatd stQ = stationOrient(st, stPos, timeDays);
         const math::Vec3d axis = stQ.rotate({0,0,1});
         const math::Vec3d right = stQ.rotate({1,0,0});
@@ -10351,7 +10385,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     shipCubes.reserve(1);
 
     for (const auto& st : currentSystem->stations) {
-      const math::Vec3d stPos = stationPosKm(st, timeDays);
+      const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
       const math::Quatd stQ = stationOrient(st, stPos, timeDays);
       emitStationGeometry(st, stPos, stQ, cubes);
     }
@@ -10650,6 +10684,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
     }
 
+
+    // Flight telemetry recorder (sample after simulation + render, before UI).
+    game::tickFlightRecorder(flightRecorderWindow, dtReal, timeRealSec, timeDays, ship, paused);
+
     // ---- UI ----
     // Rebuild fonts *before* starting a new ImGui frame.
     // (Font atlas changes must happen before ImGui::NewFrame.)
@@ -10697,6 +10735,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::MenuItem(withKey("Missions", controls.actions.toggleMissions).c_str(), nullptr, &showMissions);
         ImGui::MenuItem(withKey("Scanner", controls.actions.toggleScanner).c_str(), nullptr, &showScanner);
         ImGui::MenuItem(withKey("Trade Finder", controls.actions.toggleTrade).c_str(), nullptr, &showTrade);
+        ImGui::MenuItem("Trade Planner", nullptr, &tradePlannerWindow.open);
         ImGui::MenuItem(withKey("Guide", controls.actions.toggleGuide).c_str(), nullptr, &showGuide);
         ImGui::MenuItem(withKey("Hangar", controls.actions.toggleHangar).c_str(), nullptr, &showHangar);
         ImGui::MenuItem(withKey("World Visuals", controls.actions.toggleWorldVisuals).c_str(), nullptr, &showWorldVisuals);
@@ -10712,6 +10751,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (ImGui::MenuItem("Log", nullptr, &logWindow.open)) { if (logWindow.open) logWindow.focusFilter = true; }
         if (ImGui::MenuItem("CVars", nullptr, &cvarWindow.open)) { if (cvarWindow.open) cvarWindow.focusFilter = true; }
         if (ImGui::MenuItem("Profiler", nullptr, &profilerWindow.open)) { if (profilerWindow.open) profiler.setEnabled(true); }
+        ImGui::MenuItem("Flight Recorder", nullptr, &flightRecorderWindow.open);
+        ImGui::MenuItem("Cinematic Camera", nullptr, &cinematicCameraWindow.open);
+        ImGui::MenuItem("Orbit Analyzer", nullptr, &orbitAnalyzerWindow.open);
         ImGui::EndMenu();
       }
 
@@ -11435,6 +11477,22 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     game::drawProfilerWindow(profilerWindow, profiler,
                              [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
+    // Flight telemetry recorder
+    game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawCinematicCameraWindow(cinematicCameraWindow,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    // Orbit analyzer + maneuver planning helpers
+    game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, sys, timeDays, ship, gravityParams,
+                                  game::OrbitAnalyzerBindings{&trajRefBodyChoice,
+                                                             &maneuverNodeEnabled,
+                                                             &maneuverNodeTimeSec,
+                                                             &maneuverDvAlongMS,
+                                                             &maneuverDvNormalMS,
+                                                             &maneuverDvRadialMS});
+
     // Photo mode / screenshot capture
     {
       game::PhotoModeContext ctx;
@@ -11682,7 +11740,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
-        tgtKm = stationPosKm(st, timeDays);
+        tgtKm = sim::stationPosKm(st, timeDays);
         tgtLabel = st.name;
         tgtIcon = {render::SpriteKind::Station, core::hashCombine(core::fnv1a64("station"), st.id)};
       } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
@@ -11866,9 +11924,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
         const auto& st = currentSystem->stations[target.index];
 
-        const math::Vec3d stPos = stationPosKm(st, timeDays);
+        const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
         const math::Quatd stQ = stationOrient(st, stPos, timeDays);
-        const math::Vec3d stV = stationVelKmS(st, timeDays);
+        const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
 
         const math::Vec3d relLocal = stQ.conjugate().rotate(ship.positionKm() - stPos);
         const math::Vec3d vRelLocal = stQ.conjugate().rotate(ship.velocityKmS() - stV);
@@ -11951,7 +12009,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (tacticalShowStations) {
           for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
             const auto& st = currentSystem->stations[i];
-            const math::Vec3d posKm = stationPosKm(st, timeDays);
+            const math::Vec3d posKm = sim::stationPosKm(st, timeDays);
             addMarker(TargetKind::Station,
                       i,
                       posKm,
@@ -12373,7 +12431,7 @@ if (showRadarHud && currentSystem) {
   // Always include current target (clamped to edge if out of range)
   if (target.kind != TargetKind::None) {
     if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
-      addBlip(TargetKind::Station, target.index, stationPosKm(currentSystem->stations[target.index], timeDays), true);
+      addBlip(TargetKind::Station, target.index, sim::stationPosKm(currentSystem->stations[target.index], timeDays), true);
     } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
       addBlip(TargetKind::Planet, target.index, sim::orbitPosition3DAU(currentSystem->planets[target.index].orbit, timeDays) * kAU_KM, true);
     } else if (target.kind == TargetKind::Contact && target.index < contacts.size() && contacts[target.index].alive) {
@@ -12401,7 +12459,7 @@ if (showRadarHud && currentSystem) {
 
   // Nearby stations/planets (only if they actually fall within the radar range).
   for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
-    addBlip(TargetKind::Station, i, stationPosKm(currentSystem->stations[i], timeDays), false);
+    addBlip(TargetKind::Station, i, sim::stationPosKm(currentSystem->stations[i], timeDays), false);
   }
   for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
     addBlip(TargetKind::Planet, i, sim::orbitPosition3DAU(currentSystem->planets[i].orbit, timeDays) * kAU_KM, false);
@@ -12662,7 +12720,7 @@ if (objectiveHudEnabled) {
             if (s.id == destSt) { st = &s; break; }
           }
           if (st) {
-            const double distKm = (stationPosKm(*st, timeDays) - ship.positionKm()).length();
+            const double distKm = (sim::stationPosKm(*st, timeDays) - ship.positionKm()).length();
             ImGui::Text("Next: %s (%.0f km)", st->name.c_str(), distKm);
           } else {
             ImGui::Text("Next: %s (this system)", uiStationNameById(destSys, destSt).c_str());
@@ -13309,8 +13367,8 @@ if (showShip) {
               ref.kind = sim::GravityBody::Kind::Planet;
               ref.id = (core::u64)pi;
               ref.name = p.name;
-              ref.posKm = planetPosKm(p, timeDays);
-              ref.velKmS = planetVelKmS(p, timeDays);
+              ref.posKm = sim::planetPosKm(p, timeDays);
+              ref.velKmS = sim::planetVelKmS(p, timeDays);
               ref.muKm3S2 = sim::muPlanetKm3S2(p);
               ref.radiusKm = sim::radiusPlanetKm(p);
             }
@@ -13330,8 +13388,8 @@ if (showShip) {
                 const std::size_t pi = (std::size_t)b.id;
                 if (pi < currentSystem->planets.size()) {
                   const auto& p = currentSystem->planets[pi];
-                  b.posKm = planetPosKm(p, tDays);
-                  b.velKmS = planetVelKmS(p, tDays);
+                  b.posKm = sim::planetPosKm(p, tDays);
+                  b.velKmS = sim::planetVelKmS(p, tDays);
                   b.muKm3S2 = sim::muPlanetKm3S2(p);
                   b.radiusKm = sim::radiusPlanetKm(p);
                 }
@@ -13456,12 +13514,12 @@ if (showShip) {
                 // Target ephemeris at arrival.
                 if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
                   const auto& p = currentSystem->planets[target.index];
-                  tgtPosArriveKm = planetPosKm(p, arriveDays);
-                  tgtVelArriveKmS = planetVelKmS(p, arriveDays);
+                  tgtPosArriveKm = sim::planetPosKm(p, arriveDays);
+                  tgtVelArriveKmS = sim::planetVelKmS(p, arriveDays);
                 } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
                   const auto& st = currentSystem->stations[target.index];
-                  tgtPosArriveKm = stationPosKm(st, arriveDays);
-                  tgtVelArriveKmS = stationVelKmS(st, arriveDays);
+                  tgtPosArriveKm = sim::stationPosKm(st, arriveDays);
+                  tgtVelArriveKmS = sim::stationVelKmS(st, arriveDays);
                 }
 
                 const double muStar = sim::muStarKm3S2(currentSystem->star);
@@ -13744,6 +13802,88 @@ if (showShip) {
 
             // Results table (best-K)
             const auto& best = lambertAuto.stepper.result().best;
+
+            // Shared helper: apply a candidate by arming a node at its departure time and
+            // projecting the dv into the local RTN basis at departure.
+            auto applyLambertCandidate = [&](const sim::LambertTransferMetrics& c) {
+              // Candidate departure time in absolute days.
+              const double departAbsDays = lambertAuto.baseTimeDays + c.departAfterSec / 86400.0;
+              const double departFromNowSec = (departAbsDays - timeDays) * 86400.0;
+
+              // Arm the node at the candidate's absolute depart time (clamped to >=0 sec from now).
+              maneuverNodeTimeSec = (float)std::max(0.0, departFromNowSec);
+              lambertTofHours = (float)(c.tofSec / 3600.0);
+
+              // Compute RTN basis at the departure time and project dv into it.
+              math::Vec3d r1{0,0,0};
+              math::Vec3d v0{0,0,0};
+              if (lambertAuto.departEphem) {
+                lambertAuto.departEphem(departAbsDays, r1, v0);
+              }
+
+              math::Vec3d radial = r1.normalized();
+              if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+              math::Vec3d normal = math::cross(r1, v0);
+              if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+              normal = normal.normalized();
+              math::Vec3d along = math::cross(normal, radial);
+              if (along.lengthSq() < 1e-12) {
+                along = (v0 - radial * math::dot(v0, radial)).normalized();
+              } else {
+                along = along.normalized();
+              }
+
+              const math::Vec3d dvWorldKmS = c.dvDepartKmS;
+              maneuverDvAlongMS = (float)(math::dot(dvWorldKmS, along) * 1000.0);
+              maneuverDvNormalMS = (float)(math::dot(dvWorldKmS, normal) * 1000.0);
+              maneuverDvRadialMS = (float)(math::dot(dvWorldKmS, radial) * 1000.0);
+              trajRefBodyChoice = 0; // star
+
+              // Update diagnostics from the candidate.
+              lambertLastOk = c.ok;
+              lambertLastDvMS = (float)(c.dvDepartMagKmS * 1000.0);
+              lambertLastArrivalRelMS = (float)(c.arriveRelSpeedKmS * 1000.0);
+              lambertLastAngleDeg = (float)math::radToDeg(c.lambert.transferAngleRad);
+              lambertLastIterations = c.lambert.iterations;
+
+              // Optional coarse validation (from current state) for immediate feedback.
+              lambertLastMissKm = 0.0f;
+              if (lambertValidateCoarse && departFromNowSec >= 0.0) {
+                const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+                sim::GravityParams gParams = gravityParams;
+                if (gMode == 2) {
+                  gParams.scale = 1.0;
+                  gParams.maxAccelKmS2 = 0.0;
+                }
+
+                const double tArriveSec = std::max(0.0, departFromNowSec) + c.tofSec;
+
+                sim::ManeuverNode node{std::max(0.0, departFromNowSec), dvWorldKmS};
+                sim::TrajectoryPredictParams val;
+                val.horizonSec = tArriveSec;
+                val.includeGravity = (gMode != 0);
+                val.gravity = gParams;
+                val.maxSamples = 4500;
+                const double idealStep = std::max(0.5, val.horizonSec / (double)val.maxSamples);
+                val.stepSec = std::clamp(idealStep, 0.5, 240.0);
+
+                const auto valS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
+                                                           ship.positionKm(), ship.velocityKmS(), val, &node);
+                if (!valS.empty()) {
+                  const auto& end = valS.back();
+                  const double arriveDays = timeDays + (tArriveSec / 86400.0);
+
+                  math::Vec3d tgtPos{0,0,0};
+                  math::Vec3d tgtVel{0,0,0};
+                  if (lambertAuto.arriveEphem) {
+                    lambertAuto.arriveEphem(arriveDays, tgtPos, tgtVel);
+                  }
+
+                  lambertLastMissKm = (float)((end.posKm - tgtPos).length());
+                }
+              }
+            };
+
             if (!best.empty()) {
               if (ImGui::BeginTable("LambertBest", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
                 ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 22.0f);
@@ -13774,82 +13914,7 @@ if (showShip) {
 
                   ImGui::PushID(idx);
                   if (ImGui::SmallButton("Apply")) {
-                    // Candidate departure time in absolute days.
-                    const double departAbsDays = lambertAuto.baseTimeDays + c.departAfterSec / 86400.0;
-                    const double departFromNowSec = (departAbsDays - timeDays) * 86400.0;
-
-                    // Arm the node at the candidate's absolute depart time (clamped to >=0 sec from now).
-                    maneuverNodeTimeSec = (float)std::max(0.0, departFromNowSec);
-                    lambertTofHours = (float)(c.tofSec / 3600.0);
-
-                    // Compute RTN basis at the departure time and project dv into it.
-                    math::Vec3d r1{0,0,0};
-                    math::Vec3d v0{0,0,0};
-                    if (lambertAuto.departEphem) {
-                      lambertAuto.departEphem(departAbsDays, r1, v0);
-                    }
-
-                    math::Vec3d radial = r1.normalized();
-                    if (radial.lengthSq() < 1e-12) radial = {1,0,0};
-                    math::Vec3d normal = math::cross(r1, v0);
-                    if (normal.lengthSq() < 1e-12) normal = {0,1,0};
-                    normal = normal.normalized();
-                    math::Vec3d along = math::cross(normal, radial);
-                    if (along.lengthSq() < 1e-12) {
-                      along = (v0 - radial * math::dot(v0, radial)).normalized();
-                    } else {
-                      along = along.normalized();
-                    }
-
-                    const math::Vec3d dvWorldKmS = c.dvDepartKmS;
-                    maneuverDvAlongMS = (float)(math::dot(dvWorldKmS, along) * 1000.0);
-                    maneuverDvNormalMS = (float)(math::dot(dvWorldKmS, normal) * 1000.0);
-                    maneuverDvRadialMS = (float)(math::dot(dvWorldKmS, radial) * 1000.0);
-                    trajRefBodyChoice = 0; // star
-
-                    // Update diagnostics from the candidate.
-                    lambertLastOk = c.ok;
-                    lambertLastDvMS = (float)(c.dvDepartMagKmS * 1000.0);
-                    lambertLastArrivalRelMS = (float)(c.arriveRelSpeedKmS * 1000.0);
-                    lambertLastAngleDeg = (float)math::radToDeg(c.lambert.transferAngleRad);
-                    lambertLastIterations = c.lambert.iterations;
-
-                    // Optional coarse validation (from current state) for immediate feedback.
-                    lambertLastMissKm = 0.0f;
-                    if (lambertValidateCoarse && departFromNowSec >= 0.0) {
-                      const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
-                      sim::GravityParams gParams = gravityParams;
-                      if (gMode == 2) {
-                        gParams.scale = 1.0;
-                        gParams.maxAccelKmS2 = 0.0;
-                      }
-
-                      const double tArriveSec = std::max(0.0, departFromNowSec) + c.tofSec;
-
-                      sim::ManeuverNode node{std::max(0.0, departFromNowSec), dvWorldKmS};
-                      sim::TrajectoryPredictParams val;
-                      val.horizonSec = tArriveSec;
-                      val.includeGravity = (gMode != 0);
-                      val.gravity = gParams;
-                      val.maxSamples = 4500;
-                      const double idealStep = std::max(0.5, val.horizonSec / (double)val.maxSamples);
-                      val.stepSec = std::clamp(idealStep, 0.5, 240.0);
-
-                      const auto valS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
-                                                                 ship.positionKm(), ship.velocityKmS(), val, &node);
-                      if (!valS.empty()) {
-                        const auto& end = valS.back();
-                        const double arriveDays = timeDays + (tArriveSec / 86400.0);
-
-                        math::Vec3d tgtPos{0,0,0};
-                        math::Vec3d tgtVel{0,0,0};
-                        if (lambertAuto.arriveEphem) {
-                          lambertAuto.arriveEphem(arriveDays, tgtPos, tgtVel);
-                        }
-
-                        lambertLastMissKm = (float)((end.posKm - tgtPos).length());
-                      }
-                    }
+                    applyLambertCandidate(c);
                   }
                   ImGui::PopID();
                 }
@@ -13858,6 +13923,85 @@ if (showShip) {
               }
             } else if (lambertAuto.stepper.started() && lambertAuto.stepper.done()) {
               ImGui::TextDisabled("No viable solutions found in the searched window.");
+            }
+
+            // ---------------------------------------------------------------
+            // Porkchop heatmap visualization (requires Store grid)
+            // ---------------------------------------------------------------
+            if (lambertAuto.storeGrid && lambertAuto.stepper.started()) {
+              ImGui::Separator();
+              ImGui::Text("Porkchop plot");
+
+              ImGui::Checkbox("Show plot", &lambertAuto.showPlot);
+
+              if (lambertAuto.showPlot) {
+                const char* metrics[] = {"Score", "Depart Δv", "Arrival rel", "Total Δv"};
+                int pm = std::clamp(lambertAuto.plotMetric, 0, 3);
+                if (ImGui::Combo("Metric", &pm, metrics, 4)) {
+                  lambertAuto.plotMetric = pm;
+                }
+
+                ImGui::SetNextItemWidth(160.0f);
+                ImGui::SliderFloat("Gamma", &lambertAuto.plotGamma, 0.25f, 2.5f, "%.2f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::SliderInt("Max cols", &lambertAuto.plotMaxCols, 64, 512);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::SliderInt("Max rows", &lambertAuto.plotMaxRows, 64, 512);
+
+                ImGui::Checkbox("Best markers", &lambertAuto.plotShowBestMarkers);
+                ImGui::SameLine();
+                ImGui::Checkbox("Axes", &lambertAuto.plotShowAxes);
+
+                ImGui::InputText("CSV path", lambertAuto.plotCsvPath, sizeof(lambertAuto.plotCsvPath));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Export CSV")) {
+                  std::string err;
+                  if (game::exportPorkchopCsv(lambertAuto.plotCsvPath, lambertAuto.stepper.result(), &err)) {
+                    toast(toasts, std::string("Exported porkchop grid to ") + lambertAuto.plotCsvPath);
+                  } else {
+                    toast(toasts, std::string("Failed to export porkchop CSV: ") + (err.empty() ? "unknown" : err));
+                  }
+                }
+
+                game::PorkchopPlotOptions plotOpt;
+                plotOpt.metric = (game::PorkchopMetric)std::clamp(lambertAuto.plotMetric, 0, 3);
+                plotOpt.gamma = std::clamp(lambertAuto.plotGamma, 0.05f, 10.0f);
+                plotOpt.maxCols = std::clamp(lambertAuto.plotMaxCols, 16, 1024);
+                plotOpt.maxRows = std::clamp(lambertAuto.plotMaxRows, 16, 1024);
+                plotOpt.showBestMarkers = lambertAuto.plotShowBestMarkers;
+                plotOpt.showAxesLabels = lambertAuto.plotShowAxes;
+
+                const auto plotPick = game::drawPorkchopPlot(lambertAuto.stepper.result(), best, plotOpt, ImVec2(0.0f, 260.0f));
+                if (plotPick.clicked) {
+                  // Re-evaluate the selected cell to recover the full dv vector.
+                  sim::LambertOptions lo;
+                  lo.longWay = lambertLongWay;
+                  lo.prograde = lambertPrograde;
+                  lo.refNormal = {0,0,0};
+                  lo.maxIterations = 96;
+                  lo.tolSec = 1e-3;
+
+                  const sim::LambertScoreMode sMode = (sim::LambertScoreMode)std::clamp(lambertAuto.scoreMode, 0, 3);
+                  const double aW = std::clamp((double)lambertAuto.arrivalWeight, 0.0, 100.0);
+
+                  const sim::LambertTransferMetrics cand = sim::evaluateLambertTransfer(lambertAuto.baseTimeDays,
+                                                                                        plotPick.departAfterSec,
+                                                                                        plotPick.tofSec,
+                                                                                        lambertAuto.departEphem,
+                                                                                        lambertAuto.arriveEphem,
+                                                                                        lambertAuto.muKm3S2,
+                                                                                        lo,
+                                                                                        sMode,
+                                                                                        aW);
+                  if (cand.ok) {
+                    applyLambertCandidate(cand);
+                  } else {
+                    toast(toasts, "Selected porkchop cell did not yield a valid transfer.");
+                  }
+                }
+              }
             }
           }
         }
@@ -14154,7 +14298,7 @@ if (showShip) {
           }
 
           for (const auto& st : currentSystem->stations) {
-            const math::Vec3d stPos = stationPosKm(st, timeDays);
+            const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
             const double d = (stPos - ship.positionKm()).length();
             if (d <= st.commsRangeKm * 1.05) return {true, st.name};
           }
@@ -14451,7 +14595,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
   ImGui::Separator();
   if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
     const auto& st = currentSystem->stations[target.index];
-    ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), (stationPosKm(st, timeDays) - ship.positionKm()).length());
+    ImGui::Text("Target: %s (%.0f km)", st.name.c_str(), (sim::stationPosKm(st, timeDays) - ship.positionKm()).length());
   } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
     const auto& p = currentSystem->planets[target.index];
     const math::Vec3d pPos = sim::orbitPosition3DAU(p.orbit, timeDays) * kAU_KM;
@@ -16107,10 +16251,10 @@ if (showScanner) {
           math::Vec3d tgtKm{0,0,0};
           bool ok = false;
           if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
-            tgtKm = planetPosKm(currentSystem->planets[target.index], arriveDays);
+            tgtKm = sim::planetPosKm(currentSystem->planets[target.index], arriveDays);
             ok = true;
           } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
-            tgtKm = stationPosKm(currentSystem->stations[target.index], arriveDays);
+            tgtKm = sim::stationPosKm(currentSystem->stations[target.index], arriveDays);
             ok = true;
           }
 
@@ -16275,12 +16419,12 @@ if (showScanner) {
 
           if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
             const auto& st = currentSystem->stations[target.index];
-            destKm = stationPosKm(st, timeDays);
+            destKm = sim::stationPosKm(st, timeDays);
             dropKm = std::max(15000.0, st.radiusKm * 3.0);
             ok = true;
           } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
             const auto& p = currentSystem->planets[target.index];
-            destKm = planetPosKm(p, timeDays);
+            destKm = sim::planetPosKm(p, timeDays);
             const double rKm = p.radiusEarth * 6371.0;
             dropKm = std::max(60000.0, rKm * 12.0);
             ok = true;
@@ -16311,10 +16455,10 @@ if (showScanner) {
             wPosKm = {0,0,0};
             hasPos = true;
           } else if (hover.kind == TargetKind::Planet && hover.idx < currentSystem->planets.size()) {
-            wPosKm = planetPosKm(currentSystem->planets[hover.idx], timeDays);
+            wPosKm = sim::planetPosKm(currentSystem->planets[hover.idx], timeDays);
             hasPos = true;
           } else if (hover.kind == TargetKind::Station && hover.idx < currentSystem->stations.size()) {
-            wPosKm = stationPosKm(currentSystem->stations[hover.idx], timeDays);
+            wPosKm = sim::stationPosKm(currentSystem->stations[hover.idx], timeDays);
             hasPos = true;
           } else if (hover.kind == TargetKind::Contact && hover.idx < contacts.size()) {
             wPosKm = contacts[hover.idx].ship.positionKm();
@@ -16364,7 +16508,7 @@ if (showScanner) {
             } else {
               const std::size_t pi = (std::size_t)trajCache.refBody.id;
               if (pi < currentSystem->planets.size()) {
-                refPosKm = planetPosKm(currentSystem->planets[pi], timeDays + trajHover.tSec / 86400.0);
+                refPosKm = sim::planetPosKm(currentSystem->planets[pi], timeDays + trajHover.tSec / 86400.0);
                 refRadiusKm = currentSystem->planets[pi].radiusEarth * kEARTH_RADIUS_KM;
                 refName = currentSystem->planets[pi].name;
               }
@@ -16601,13 +16745,13 @@ if (showScanner) {
           const auto& p = currentSystem->planets[target.index];
           const core::u64 pSeed = core::hashCombine(core::hashCombine(core::fnv1a64("planet"), (core::u64)currentSystem->stub.seed), (core::u64)target.index);
           showTargetHeader(p.name, render::SpriteKind::Planet, pSeed, ImVec4(1,1,1,1));
-          const math::Vec3d pPos = planetPosKm(p, timeDays);
+          const math::Vec3d pPos = sim::planetPosKm(p, timeDays);
           ImGui::TextDisabled("Distance: %.0f km", (pPos - ship.positionKm()).length());
         } else if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
           const auto& st = currentSystem->stations[target.index];
           const core::u64 stSeed = core::hashCombine(core::fnv1a64("station"), (core::u64)st.id);
           showTargetHeader(st.name, render::SpriteKind::Station, stSeed, ImVec4(1,1,1,1));
-          const math::Vec3d stPos = stationPosKm(st, timeDays);
+          const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
           ImGui::TextDisabled("Distance: %.0f km", (stPos - ship.positionKm()).length());
           ImGui::TextDisabled("Type: %s", stationTypeName(st.type));
         } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
@@ -17850,6 +17994,40 @@ if (canTrade) {
         toast(toasts, std::string(msg), ttlSec);
       };
       game::drawMarketDashboardWindow(marketDashboardWindow, mdCtx);
+    }
+
+    if (tradePlannerWindow.open) {
+      // Default origin station: docked (if any), else targeted station.
+      sim::StationId preferredFromStationId = 0;
+      if (docked && dockedStationId != 0) {
+        preferredFromStationId = dockedStationId;
+      } else if (currentSystem && target.kind == TargetKind::Station && target.index >= 0
+                 && (std::size_t)target.index < currentSystem->stations.size()) {
+        preferredFromStationId = currentSystem->stations[(std::size_t)target.index].id;
+      }
+
+      game::TradePlannerContext tctx{universe, currentSystem, timeDays};
+      tctx.preferredFromStationId = preferredFromStationId;
+      tctx.cargoCapacityKg = cargoCapacityKg;
+      tctx.cargoUsedKg = cargoMassKg(cargo);
+      tctx.playerCreditsCr = credits;
+      tctx.effectiveFeeRate = effectiveFeeRate;
+      tctx.routeToStation = [&](sim::SystemId sysId, sim::StationId stId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        if (plotRouteToSystem(sysId, /*showToast=*/true)) {
+          pendingArrivalTargetStationId = stId;
+          // If we're already in-system, target immediately too.
+          if (currentSystem && sysId == currentSystem->stub.id && stId != 0) {
+            tryTargetStationById(stId);
+          }
+        }
+      };
+      tctx.toast = [&](std::string_view msg, double ttlSec) {
+        toast(toasts, std::string(msg), ttlSec);
+      };
+
+      game::drawTradePlannerWindow(tradePlannerWindow, tctx);
     }
 
     if (showTrade) {
