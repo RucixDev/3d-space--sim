@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <cstddef>
 #include <cctype>
 #include <fstream>
 #include <iomanip>
@@ -578,7 +579,7 @@ static int TextEditCallback(ImGuiInputTextCallbackData* data) {
           if (c == ' ' || c == '\t' || c == ',') break;
           ++cmd_end;
         }
-        const std::string cmd_name(data->Buf, cmd_end);
+        const std::string cmd_name(data->Buf, static_cast<std::size_t>(cmd_end - data->Buf));
         const bool wants_cvar =
           Stricmp(cmd_name.c_str(), "cvar.get") == 0 ||
           Stricmp(cmd_name.c_str(), "cvar.set") == 0 ||

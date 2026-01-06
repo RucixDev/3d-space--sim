@@ -104,6 +104,16 @@
 #undef main
 #endif
 
+// On some Windows configurations, <windows.h> (pulled transitively) can still leak
+// min/max macros even when NOMINMAX is set. Undefine defensively so std::min/std::max
+// work reliably.
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
 #include <imgui.h>
 #ifdef IMGUI_HAS_DOCK
 #include <imgui_internal.h>
@@ -3515,6 +3525,142 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
   };
 
+  // Helper: apply damage from the player to a contact (laser / cannon / projectiles).
+  // Kept outside the main loop so it can be reused from multiple systems without
+  // fighting scope / capture issues.
+  auto playerDamageContact = [&](int idx, double dmg) {
+    if (idx < 0 || idx >= (int)contacts.size()) return;
+    auto& hit = contacts[(std::size_t)idx];
+    if (!hit.alive) return;
+
+    hit.underFireUntilDays = std::max(hit.underFireUntilDays, timeDays + (6.0 / 86400.0));
+
+    // Attacking pirates while they are extorting you voids any "deal".
+    if (pirateDemand.active && hit.role == ContactRole::Pirate && hit.groupId != 0 && hit.groupId == pirateDemand.groupId) {
+      const std::string src = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
+      resolvePirateDemand(false, src + ": betrayal! Open fire!");
+    }
+
+    // Apply damage
+    applyDamage(dmg, hit.shield, hit.hull);
+
+    // VFX: impact sparks at the target.
+    if (vfxParticlesEnabled && vfxImpactsEnabled) {
+      const math::Vec3d posU = toRenderPosU(hit.ship.positionKm());
+      math::Vec3d n = hit.ship.positionKm() - ship.positionKm();
+      if (n.lengthSq() < 1e-12) n = math::Vec3d{0,1,0};
+      n = n.normalized();
+
+      const double energy = std::clamp((dmg / 18.0) * (double)vfxParticleIntensity, 0.15, 2.5);
+      particles.spawnSparks(posU, n, toRenderVelU(hit.ship.velocityKmS()), energy);
+    }
+
+    // Crimes / reactions (on hit)
+    if (hit.alive && hit.role == ContactRole::Trader) {
+      hit.fleeUntilDays = timeDays + (180.0 / 86400.0); // flee ~3 minutes
+      commitCrime(hit.factionId, 250.0, -5.0, "Assault on trader");
+    }
+    if (hit.alive && hit.role == ContactRole::Police) {
+      hit.hostileToPlayer = true;
+      commitCrime(hit.factionId, 600.0, -10.0, "Assault on security");
+    }
+
+    // Pirates may disengage when badly hurt (adds a little "morale" to fights).
+    if (hit.alive && hit.role == ContactRole::Pirate && !hit.missionTarget) {
+      const double hullFrac = (hit.hullMax > 1e-6) ? (hit.hull / hit.hullMax) : 0.0;
+      if (hullFrac < 0.25 && timeDays >= hit.fleeUntilDays) {
+        hit.fleeUntilDays = timeDays + (110.0 / 86400.0);
+      }
+    }
+
+    // If destroyed
+    if (hit.hull <= 0.0) {
+      const core::u64 deadId = hit.id;
+      const ContactRole deadRole = hit.role;
+      const core::u32 deadFaction = hit.factionId;
+
+      hit.alive = false;
+
+      const math::Vec3d deadPos = hit.ship.positionKm();
+      const math::Vec3d deadVel = hit.ship.velocityKmS();
+
+      // VFX: explosion burst on destruction.
+      if (vfxParticlesEnabled && vfxExplosionsEnabled) {
+        const double eBase = std::clamp((hit.hullMax / 140.0) * (double)vfxParticleIntensity, 0.45, 2.25);
+        particles.spawnExplosion(toRenderPosU(deadPos), toRenderVelU(deadVel), eBase);
+      }
+
+      if (deadRole == ContactRole::Pirate) {
+        // Bounty vouchers: redeemed at stations (ties combat -> station loop).
+        const core::u32 authority = currentSystem ? currentSystem->stub.factionId : 0;
+        const double bountyCr = 450.0;
+        if (authority != 0) {
+          addVoucher(authority, bountyCr);
+          toast(toasts, "Pirate destroyed. Bounty voucher +" + std::to_string((int)bountyCr) + " cr", 2.5);
+          addRep(authority, +0.5);
+        } else {
+          credits += bountyCr;
+          toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
+        }
+
+        // Salvage: pirates drop a few cargo pods.
+        static constexpr econ::CommodityId kPirateLoot[] = {
+          econ::CommodityId::Ore,
+          econ::CommodityId::Metals,
+          econ::CommodityId::Machinery,
+          econ::CommodityId::Electronics,
+          econ::CommodityId::Fuel,
+          econ::CommodityId::Luxury,
+        };
+        const int pods = rng.range<int>(1, 3);
+        for (int i = 0; i < pods; ++i) {
+          const auto cid = kPirateLoot[rng.range<int>(0, (int)std::size(kPirateLoot) - 1)];
+          const double units = (double)rng.range<int>(4, 14);
+          spawnCargoPod(cid, units, deadPos, deadVel, 1.0);
+        }
+      } else if (deadRole == ContactRole::Trader) {
+        // Traders drop their carried commodity as pods (ties piracy -> scooping loop).
+        const double totalUnits = std::max(0.0, hit.tradeUnits * 0.75);
+        if (totalUnits > 0.0) {
+          spawnCargoBurst(hit.tradeCommodity, totalUnits, deadPos, deadVel, rng.range<int>(2, 4));
+        }
+        toast(toasts, "Trader destroyed. Cargo pods ejected. (WANTED!)", 3.0);
+        commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+      } else if (deadRole == ContactRole::Police) {
+        toast(toasts, "Security destroyed. (WANTED!)", 3.0);
+        commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+      }
+
+      // Bounty kill missions (pirate targets)
+      {
+        sim::SaveGame tmp{};
+        tmp.credits = credits;
+        tmp.missions = missions;
+
+        tmp.reputation.reserve(repByFaction.size());
+        for (const auto& kv : repByFaction) {
+          tmp.reputation.push_back(sim::FactionReputation{kv.first, kv.second});
+        }
+
+        const sim::SystemId sysId = currentSystem ? currentSystem->stub.id : 0;
+        const auto res = sim::tryCompleteBountyKill(tmp, sysId, deadId, +2.0);
+        if (res.completed > 0) {
+          credits = tmp.credits;
+          missions = std::move(tmp.missions);
+
+          repByFaction.clear();
+          for (const auto& r : tmp.reputation) {
+            repByFaction[r.factionId] = r.rep;
+          }
+
+          toast(toasts,
+                "Mission complete: bounty target eliminated. +" + std::to_string((int)std::round(res.rewardCr)) + " cr",
+                3.0);
+        }
+      }
+    }
+  };
+
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
 
@@ -3551,142 +3697,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       SDL_SetRelativeMouseMode(wantRelMouse);
       SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
     }
-
-
-    // Per-frame helper: apply damage from the player to a contact (laser / cannon / projectiles).
-    auto playerDamageContact = [&](int idx, double dmg) {
-      if (idx < 0 || idx >= (int)contacts.size()) return;
-      auto& hit = contacts[(std::size_t)idx];
-      if (!hit.alive) return;
-
-      hit.underFireUntilDays = std::max(hit.underFireUntilDays, timeDays + (6.0 / 86400.0));
-
-      // Attacking pirates while they are extorting you voids any "deal".
-      if (pirateDemand.active && hit.role == ContactRole::Pirate && hit.groupId != 0 && hit.groupId == pirateDemand.groupId) {
-        const std::string src = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
-        resolvePirateDemand(false, src + ": betrayal! Open fire!");
-      }
-
-      // Apply damage
-      applyDamage(dmg, hit.shield, hit.hull);
-
-      // VFX: impact sparks at the target.
-      if (vfxParticlesEnabled && vfxImpactsEnabled) {
-        const math::Vec3d posU = toRenderPosU(hit.ship.positionKm());
-        math::Vec3d n = hit.ship.positionKm() - ship.positionKm();
-        if (n.lengthSq() < 1e-12) n = math::Vec3d{0,1,0};
-        n = n.normalized();
-
-        const double energy = std::clamp((dmg / 18.0) * (double)vfxParticleIntensity, 0.15, 2.5);
-        particles.spawnSparks(posU, n, toRenderVelU(hit.ship.velocityKmS()), energy);
-      }
-
-      // Crimes / reactions (on hit)
-      if (hit.alive && hit.role == ContactRole::Trader) {
-        hit.fleeUntilDays = timeDays + (180.0 / 86400.0); // flee ~3 minutes
-        commitCrime(hit.factionId, 250.0, -5.0, "Assault on trader");
-      }
-      if (hit.alive && hit.role == ContactRole::Police) {
-        hit.hostileToPlayer = true;
-        commitCrime(hit.factionId, 600.0, -10.0, "Assault on security");
-      }
-
-      // Pirates may disengage when badly hurt (adds a little "morale" to fights).
-      if (hit.alive && hit.role == ContactRole::Pirate && !hit.missionTarget) {
-        const double hullFrac = (hit.hullMax > 1e-6) ? (hit.hull / hit.hullMax) : 0.0;
-        if (hullFrac < 0.25 && timeDays >= hit.fleeUntilDays) {
-          hit.fleeUntilDays = timeDays + (110.0 / 86400.0);
-        }
-      }
-
-      // If destroyed
-      if (hit.hull <= 0.0) {
-        const core::u64 deadId = hit.id;
-        const ContactRole deadRole = hit.role;
-        const core::u32 deadFaction = hit.factionId;
-        const double lootCr = hit.cargoValueCr;
-
-        hit.alive = false;
-
-	        const math::Vec3d deadPos = hit.ship.positionKm();
-	        const math::Vec3d deadVel = hit.ship.velocityKmS();
-
-          // VFX: explosion burst on destruction.
-          if (vfxParticlesEnabled && vfxExplosionsEnabled) {
-            const double eBase = std::clamp((hit.hullMax / 140.0) * (double)vfxParticleIntensity, 0.45, 2.25);
-            particles.spawnExplosion(toRenderPosU(deadPos), toRenderVelU(deadVel), eBase);
-          }
-
-	        if (deadRole == ContactRole::Pirate) {
-	          // Bounty vouchers: redeemed at stations (ties combat -> station loop).
-	          const core::u32 authority = currentSystem ? currentSystem->stub.factionId : 0;
-	          const double bountyCr = 450.0;
-	          if (authority != 0) {
-	            addVoucher(authority, bountyCr);
-	            toast(toasts, "Pirate destroyed. Bounty voucher +" + std::to_string((int)bountyCr) + " cr", 2.5);
-	            addRep(authority, +0.5);
-	          } else {
-	            credits += bountyCr;
-	            toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
-	          }
-
-	          // Salvage: pirates drop a few cargo pods.
-	          static constexpr econ::CommodityId kPirateLoot[] = {
-	            econ::CommodityId::Ore,
-	            econ::CommodityId::Metals,
-	            econ::CommodityId::Machinery,
-	            econ::CommodityId::Electronics,
-	            econ::CommodityId::Fuel,
-	            econ::CommodityId::Luxury,
-	          };
-	          const int pods = rng.range<int>(1, 3);
-	          for (int i = 0; i < pods; ++i) {
-	            const auto cid = kPirateLoot[rng.range<int>(0, (int)std::size(kPirateLoot) - 1)];
-	            const double units = (double)rng.range<int>(4, 14);
-	            spawnCargoPod(cid, units, deadPos, deadVel, 1.0);
-	          }
-	        } else if (deadRole == ContactRole::Trader) {
-	          // Traders drop their carried commodity as pods (ties piracy -> scooping loop).
-	          const double totalUnits = std::max(0.0, hit.tradeUnits * 0.75);
-	          if (totalUnits > 0.0) {
-	            spawnCargoBurst(hit.tradeCommodity, totalUnits, deadPos, deadVel, rng.range<int>(2, 4));
-	          }
-	          toast(toasts, "Trader destroyed. Cargo pods ejected. (WANTED!)", 3.0);
-	          commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
-	        } else if (deadRole == ContactRole::Police) {
-	          toast(toasts, "Security destroyed. (WANTED!)", 3.0);
-	          commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
-	        }
-
-        // Bounty kill missions (pirate targets)
-        {
-          sim::SaveGame tmp{};
-          tmp.credits = credits;
-          tmp.missions = missions;
-
-          tmp.reputation.reserve(repByFaction.size());
-          for (const auto& kv : repByFaction) {
-            tmp.reputation.push_back(sim::FactionReputation{kv.first, kv.second});
-          }
-
-          const sim::SystemId sysId = currentSystem ? currentSystem->stub.id : 0;
-          const auto res = sim::tryCompleteBountyKill(tmp, sysId, deadId, +2.0);
-          if (res.completed > 0) {
-            credits = tmp.credits;
-            missions = std::move(tmp.missions);
-
-            repByFaction.clear();
-            for (const auto& r : tmp.reputation) {
-              repByFaction[r.factionId] = r.rep;
-            }
-
-            toast(toasts,
-                  "Mission complete: bounty target eliminated. +" + std::to_string((int)std::round(res.rewardCr)) + " cr",
-                  3.0);
-          }
-        }
-      }
-    };
 
     // Events
     SDL_Event event;
@@ -5408,6 +5418,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
 
 
+    // Precompute sim dt for this frame (used by autopilots and the sim step).
+    const double dtSim = dtReal * timeScale;
+
+
     // Input (6DOF)
     sim::ShipInput input{};
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
@@ -6108,7 +6122,6 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
 
     // Sim step
-    const double dtSim = dtReal * timeScale;
     if (!paused) {
       STELLAR_PROFILE_SCOPE("Sim");
       // --- FSD (system-to-system travel) ---

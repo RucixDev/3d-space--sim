@@ -442,7 +442,7 @@ void drawMarketDashboardWindow(MarketDashboardWindowState& st, const MarketDashb
 
       ImGui::TableSetColumnIndex(col++);
       if (ImGui::Selectable(r.stationName.c_str(), selected,
-                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap)) {
+                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
         st.selectedSystem = r.systemId;
         st.selectedStation = r.stationId;
       }

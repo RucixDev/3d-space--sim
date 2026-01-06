@@ -42,4 +42,7 @@ inline Vec3d cross(const Vec3d& a, const Vec3d& b) {
   };
 }
 
+// Free-function helpers (mirrors common vector-math APIs).
+inline double length(const Vec3d& v) { return v.length(); }
+
 } // namespace stellar::math
