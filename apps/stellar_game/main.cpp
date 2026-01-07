@@ -11484,15 +11484,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     game::drawCinematicCameraWindow(cinematicCameraWindow,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
-
     // Orbit analyzer + maneuver planning helpers
-    game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, sys, timeDays, ship, gravityParams,
-                                  game::OrbitAnalyzerBindings{&trajRefBodyChoice,
-                                                             &maneuverNodeEnabled,
-                                                             &maneuverNodeTimeSec,
-                                                             &maneuverDvAlongMS,
-                                                             &maneuverDvNormalMS,
-                                                             &maneuverDvRadialMS});
+    if (currentSystem) {
+      game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, *currentSystem, timeDays, ship, gravityParams,
+                                    game::OrbitAnalyzerBindings{&trajRefBodyChoice,
+                                                               &maneuverNodeEnabled,
+                                                               &maneuverNodeTimeSec,
+                                                               &maneuverDvAlongMS,
+                                                               &maneuverDvNormalMS,
+                                                               &maneuverDvRadialMS});
+    }
 
     // Photo mode / screenshot capture
     {
@@ -21728,7 +21729,6 @@ draw_command_palette:
     }
 
     SDL_GL_SwapWindow(window);
-    }
     profiler.endFrame();
 
   }

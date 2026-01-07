@@ -41,8 +41,8 @@ static RefBody pickRefBody(const stellar::sim::StarSystem& sys,
     // Star at origin in local system frame.
     stellar::sim::GravityBody b;
     b.kind = stellar::sim::GravityBody::Kind::Star;
-    b.id = sys.id;
-    b.name = sys.star.name;
+    b.id = sys.stub.id;
+    b.name = sys.stub.name.empty() ? "Star" : (sys.stub.name + " (Star)");
     b.posKm = {0, 0, 0};
     b.velKmS = {0, 0, 0};
     b.muKm3S2 = stellar::sim::muStarKm3S2(sys.star);
