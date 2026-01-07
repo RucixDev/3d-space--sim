@@ -127,7 +127,9 @@ set(STELLAR_CORE_SOURCES
   src/sim/Atmosphere.cpp
   src/sim/OrbitalMechanics.cpp
   src/sim/TrajectoryPredictor.cpp
+  src/sim/TrajectoryAnalysis.cpp
   src/sim/ManeuverComputer.cpp
+  src/sim/ManeuverProgramComputer.cpp
   src/sim/LambertSolver.cpp
   src/sim/LambertPlanner.cpp
   src/sim/Ship.cpp
