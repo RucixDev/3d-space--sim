@@ -3,6 +3,8 @@
 #include "stellar/core/Types.h"
 #include "stellar/math/Vec3.h"
 
+#include <vector>
+
 namespace stellar::sim {
 
 // -----------------------------------------------------------------------------
@@ -53,6 +55,10 @@ struct LambertResult {
   // Diagnostics
   double z{0.0};
   int iterations{0};
+
+  // Number of complete revolutions (M) of the transfer orbit.
+  // 0 corresponds to the classic single-revolution solution.
+  int revolutions{0};
 };
 
 LambertResult solveLambertUniversal(const math::Vec3d& r1Km,
@@ -60,5 +66,23 @@ LambertResult solveLambertUniversal(const math::Vec3d& r1Km,
                                    double dtSec,
                                    double muKm3S2,
                                    const LambertOptions& opt = {});
+
+
+// Find *all* feasible Lambert solutions up to maxRevolutions.
+//
+// For a given geometry and time-of-flight there can be multiple feasible
+// multi-revolution solutions (typically up to two per M>0 branch).
+// The returned solutions are sorted by (revolutions, z).
+struct LambertMultiRevResult {
+  bool ok{false};
+  std::vector<LambertResult> solutions;
+};
+
+LambertMultiRevResult solveLambertUniversalMultiRev(const math::Vec3d& r1Km,
+                                                    const math::Vec3d& r2Km,
+                                                    double dtSec,
+                                                    double muKm3S2,
+                                                    int maxRevolutions,
+                                                    const LambertOptions& opt = {});
 
 } // namespace stellar::sim

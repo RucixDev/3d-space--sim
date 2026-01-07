@@ -57,6 +57,9 @@ struct LambertTransferMetrics {
   // Lambert diagnostics/solution
   LambertResult lambert{};
 
+  // Selected number of complete revolutions (M) for this solution.
+  int revolutions{0};
+
   // Derived burns/metrics
   math::Vec3d dvDepartKmS{0, 0, 0};
   double dvDepartMagKmS{0.0};
@@ -79,6 +82,9 @@ struct LambertPorkchopCell {
   double arriveRelSpeedKmS{0.0};
   double totalDvKmS{0.0};
   double score{0.0};
+
+  // Number of complete revolutions (M) for the selected solution.
+  int revolutions{0};
 };
 
 struct LambertPorkchopParams {
@@ -102,6 +108,13 @@ struct LambertPorkchopParams {
 
   // If true, populate LambertPorkchopResult::grid.
   bool storeGrid{false};
+
+  // Maximum number of complete revolutions (M) to consider.
+  //
+  // When >0, the planner will evaluate all feasible solutions for M in [0..maxRevolutions]
+  // and keep whichever yields the best score. This can be significantly more expensive
+  // than a classic 0-rev solve, so keep grid sizes modest.
+  int maxRevolutions{0};
 
   // Lambert options used for each solve.
   // If refNormal is left as {0,0,0}, the planner will choose a stable reference
@@ -199,7 +212,8 @@ LambertTransferMetrics evaluateLambertTransfer(double baseTimeDays,
                                                double muKm3S2,
                                                const LambertOptions& opt,
                                                LambertScoreMode scoreMode,
-                                               double arrivalWeight = 0.25);
+                                               double arrivalWeight = 0.25,
+                                               int maxRevolutions = 0);
 
 // Search a (departure, TOF) window for the best transfer(s).
 LambertPorkchopResult searchLambertPorkchop(double baseTimeDays,

@@ -1491,6 +1491,7 @@ int main(int argc, char** argv) {
     int topK{8};
     int scoreMode{(int)sim::LambertScoreMode::MinTotalDv};
     float arrivalWeight{0.25f};
+    int maxRevolutions{0};
 
     int cellsPerFrame{256};
     bool storeGrid{false};
@@ -13659,6 +13660,10 @@ if (showShip) {
 
             if (lambertAuto.showAdvanced) {
               ImGui::TextDisabled("Tip: Center the node time, then search a small depart window for phasing.");
+              ImGui::SetNextItemWidth(140.0f);
+              ImGui::SliderInt("Max revs", &lambertAuto.maxRevolutions, 0, 3);
+              ImGui::SameLine();
+              ImGui::TextDisabled("(multi-rev Lambert; slower)");
             }
 
             const bool canStart = targetOk;
@@ -13770,6 +13775,7 @@ if (showShip) {
                   sp.topK = std::clamp(lambertAuto.topK, 1, 64);
                   sp.scoreMode = (sim::LambertScoreMode)std::clamp(lambertAuto.scoreMode, 0, 3);
                   sp.arrivalWeight = std::clamp((double)lambertAuto.arrivalWeight, 0.0, 100.0);
+                  sp.maxRevolutions = std::clamp(lambertAuto.maxRevolutions, 0, 3);
                   sp.storeGrid = lambertAuto.storeGrid;
 
                   sp.lambertOpt.longWay = lambertLongWay;
@@ -13885,10 +13891,11 @@ if (showShip) {
             };
 
             if (!best.empty()) {
-              if (ImGui::BeginTable("LambertBest", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+              if (ImGui::BeginTable("LambertBest", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
                 ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 22.0f);
                 ImGui::TableSetupColumn("Depart +h");
                 ImGui::TableSetupColumn("TOF h");
+                ImGui::TableSetupColumn("M", ImGuiTableColumnFlags_WidthFixed, 24.0f);
                 ImGui::TableSetupColumn("Δv dep (m/s)");
                 ImGui::TableSetupColumn("Arr rel (m/s)");
                 ImGui::TableSetupColumn("Score");
@@ -13905,12 +13912,14 @@ if (showShip) {
                   ImGui::TableSetColumnIndex(2);
                   ImGui::Text("%.2f", c.tofSec / 3600.0);
                   ImGui::TableSetColumnIndex(3);
-                  ImGui::Text("%.1f", c.dvDepartMagKmS * 1000.0);
+                  ImGui::Text("%d", c.revolutions);
                   ImGui::TableSetColumnIndex(4);
-                  ImGui::Text("%.1f", c.arriveRelSpeedKmS * 1000.0);
+                  ImGui::Text("%.1f", c.dvDepartMagKmS * 1000.0);
                   ImGui::TableSetColumnIndex(5);
-                  ImGui::Text("%.4f", c.score);
+                  ImGui::Text("%.1f", c.arriveRelSpeedKmS * 1000.0);
                   ImGui::TableSetColumnIndex(6);
+                  ImGui::Text("%.4f", c.score);
+                  ImGui::TableSetColumnIndex(7);
 
                   ImGui::PushID(idx);
                   if (ImGui::SmallButton("Apply")) {
@@ -13994,7 +14003,8 @@ if (showShip) {
                                                                                         lambertAuto.muKm3S2,
                                                                                         lo,
                                                                                         sMode,
-                                                                                        aW);
+                                                                                        aW,
+                                                                                        std::clamp(lambertAuto.maxRevolutions, 0, 3));
                   if (cand.ok) {
                     applyLambertCandidate(cand);
                   } else {

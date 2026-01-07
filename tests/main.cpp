@@ -1,11 +1,15 @@
 #include <iostream>
 
 int test_orbit();
+int test_orbital_elements();
 int test_gravity();
 int test_atmosphere();
 int test_trajectory_predictor();
+int test_trajectory_analysis();
 int test_maneuver_computer();
+int test_maneuver_program_computer();
 int test_lambert_solver();
+int test_lambert_solver_multirev();
 int test_lambert_planner();
 int test_lambert_planner_stepper();
 int test_streaming();
@@ -74,11 +78,15 @@ int main() {
   int fails = 0;
 
   fails += test_orbit();
+  fails += test_orbital_elements();
   fails += test_gravity();
   fails += test_atmosphere();
   fails += test_trajectory_predictor();
+  fails += test_trajectory_analysis();
   fails += test_maneuver_computer();
+  fails += test_maneuver_program_computer();
   fails += test_lambert_solver();
+  fails += test_lambert_solver_multirev();
   fails += test_lambert_planner();
   fails += test_lambert_planner_stepper();
   fails += test_streaming();

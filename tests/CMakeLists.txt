@@ -1,11 +1,15 @@
 add_executable(stellar_tests
   main.cpp
   test_orbit.cpp
+  test_orbital_elements.cpp
   test_gravity.cpp
   test_atmosphere.cpp
   test_trajectory_predictor.cpp
+  test_trajectory_analysis.cpp
   test_maneuver_computer.cpp
+  test_maneuver_program_computer.cpp
   test_lambert_solver.cpp
+  test_lambert_solver_multirev.cpp
   test_lambert_planner.cpp
   test_lambert_planner_stepper.cpp
   test_streaming.cpp

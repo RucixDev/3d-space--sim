@@ -16,6 +16,9 @@ struct OrbitAnalyzerWindowState {
   // Planner targets (altitudes above the reference body's radius).
   float targetApoAltKm{200000.0f};
   float targetPeriAltKm{200000.0f};
+
+  // Plane-change planner options.
+  bool planeAlignForcePrograde{false};
 };
 
 struct OrbitAnalyzerBindings {

@@ -1,3 +1,56 @@
+## 2026-01-07 (Patch) - Trajectory Encounter / Impact Analysis (Segment-Sphere)
+
+This round adds a robust preview-time trajectory analysis pass that finds **closest approaches** and detects
+**impacts even between coarse samples**.
+
+- New headless `sim::TrajectoryAnalysis` module:
+  - piecewise-linear closest approach per segment against **moving** bodies
+  - analytic segment/sphere intersection for earliest **impact entry** time
+  - per-body results: min altitude, times, relative speed, and optional marker positions
+
+- Game integration:
+  - Trajectory / Maneuver Planner shows an **Encounter scan** table (sorted by min altitude) plus improved
+    impact time/speed readouts.
+  - Map + 3D view markers now place the closest-approach marker at the **analytic** point (not just the nearest
+    sample), and draw a separate **red** marker for impact entry when predicted.
+  - Added knobs: include stations, and radius padding (safety margin / ship radius).
+
+- Fix: `OrbitAnalyzerWindow` planet ephemeris calls now use the `Units.h` overloads (build fix).
+
+- Tests: added `test_trajectory_analysis` (coarse-sampled impact + moving-body relative motion).
+
+
+## 2026-01-06 (Patch) - Multi-node Trajectory Preview + Maneuver Programs
+
+This round adds **multi-node impulsive maneuver support** to the headless trajectory
+predictor and introduces a small orchestration layer for executing a sequence of
+planned burns.
+
+- `TrajectoryPredictor` now accepts a **sequence of maneuver nodes** (not just one),
+  splitting integration steps so burns apply at *exact* requested times and emitting
+  post-burn "kink" samples.
+- New `ManeuverProgramComputer` chains multiple `ManeuverPlan` nodes using the
+  existing `ManeuverComputer` (with optional skip-over for missed nodes).
+- Added regression tests for multi-node prediction (RK4 + adaptive RK45) and program
+  execution.
+
+
+## 2026-01-06 (Patch) - Multi-rev Lambert Solutions (Solver + Planner + Porkchop UI)
+
+This round adds **multi-revolution (M>0) Lambert support** end-to-end:
+
+- `LambertSolver` gains `solveLambertUniversalMultiRev(...)` which searches for *all* feasible solutions
+  up to a caller-specified `maxRevolutions`, returning each solution tagged with its revolution count.
+- `LambertPlanner` can now optionally consider solutions across `M in [0..maxRevolutions]` and keep
+  whichever yields the best score (Δv / arrival rel speed / weighted).
+- The porkchop UI/CSV export now surfaces the selected **M** (tooltip + export column), and the
+  Auto Lambert search exposes a `Max revs` knob under **Advanced**.
+
+Notes:
+- Multi-rev searches are inherently more expensive than classic 0-rev solves; keep grid sizes modest
+  when `Max revs > 0`.
+
+
 ## 2026-01-06 (Patch) - Traffic Convoys: Schedule Hydration + Signal Expiry Consistency
 
 This round tightens **robustness** in the traffic/convoy replay pipeline, especially for older or
@@ -1258,3 +1311,21 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
 
 ## UI: Status panel shows convoy details
 - The **Status** window's target summary now displays Traffic Convoy **cargo, route, speed, and ETA** when a convoy signal is targeted.
+
+## 2026-01-07 (Patch) - Classical orbital elements + plane align planner
+
+## Core: classical orbital elements (km / s)
+- Added `solveClassicalOrbitElements(...)` for extracting the **six Keplerian elements** *(a, e, i, Ω, ω, ν)* from a body-centric state vector.
+- Added `stateFromClassicalOrbitElements...` helpers for converting **elements → state**, plus `timeToTrueAnomalySecElliptic(...)` to support node timing.
+
+## UI: Orbit Analyzer
+- Orbit Analyzer now shows **inclination / RAAN / argument of periapsis / true anomaly**.
+- Added a **Plane change (ref plane)** planner section that can write a maneuver node to **align your orbit plane to the reference XY plane** at the next **ascending** or **descending** node.
+  - Optional **Force prograde align** toggle (otherwise retrograde orbits align to the equatorial plane without flipping direction).
+
+## Tests
+- Added `test_orbital_elements` coverage for:
+  - Element ↔ state round-trip (inclined elliptic case)
+  - Ascending node (z≈0) sanity
+  - Circular-orbit degeneracy handling
+

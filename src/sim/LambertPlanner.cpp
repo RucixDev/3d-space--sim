@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace stellar::sim {
 namespace {
@@ -206,7 +207,8 @@ bool LambertPorkchopStepper::step(int maxCells) {
                                                           muKm3S2_,
                                                           params_.lambertOpt,
                                                           params_.scoreMode,
-                                                          params_.arrivalWeight);
+                                                          params_.arrivalWeight,
+                                                          params_.maxRevolutions);
 
     if (params_.storeGrid) {
       LambertPorkchopCell cell{};
@@ -217,6 +219,7 @@ bool LambertPorkchopStepper::step(int maxCells) {
       cell.arriveRelSpeedKmS = cand.arriveRelSpeedKmS;
       cell.totalDvKmS = cand.totalDvKmS;
       cell.score = cand.score;
+      cell.revolutions = cand.revolutions;
       res_.grid.push_back(cell);
     }
 
@@ -249,7 +252,8 @@ LambertTransferMetrics evaluateLambertTransfer(double baseTimeDays,
                                                double muKm3S2,
                                                const LambertOptions& opt,
                                                LambertScoreMode scoreMode,
-                                               double arrivalWeight) {
+                                               double arrivalWeight,
+                                               int maxRevolutions) {
   LambertTransferMetrics out{};
   out.departAfterSec = departAfterSec;
   out.tofSec = tofSec;
@@ -278,17 +282,66 @@ LambertTransferMetrics evaluateLambertTransfer(double baseTimeDays,
   arriveEphem(arriveDays, r2Km, vTgtKmS);
 
   LambertOptions baked = bakeOptions(opt, r1Km, v0KmS, r2Km);
-  out.lambert = solveLambertUniversal(r1Km, r2Km, safeTofSec, muKm3S2, baked);
-  out.ok = out.lambert.ok;
-  if (!out.ok) {
-    return out;
+
+  // Optionally consider multi-revolution solutions and keep whichever yields the best score.
+  if (maxRevolutions > 0) {
+    const LambertMultiRevResult multi = solveLambertUniversalMultiRev(r1Km, r2Km, safeTofSec, muKm3S2, maxRevolutions, baked);
+
+    bool bestOk = false;
+    double bestScore = std::numeric_limits<double>::infinity();
+    LambertResult bestLambert{};
+    math::Vec3d bestDvDepart{0, 0, 0};
+    math::Vec3d bestArrRel{0, 0, 0};
+    double bestDvDepartMag = 0.0;
+    double bestArrRelSpeed = 0.0;
+
+    for (const auto& sol : multi.solutions) {
+      if (!sol.ok) continue;
+
+      const math::Vec3d dvDepart = sol.v1KmS - v0KmS;
+      const double dvDepartMag = dvDepart.length();
+      const math::Vec3d arrRelVel = sol.v2KmS - vTgtKmS;
+      const double arrRelSpeed = arrRelVel.length();
+      const double score = computeScore(scoreMode, dvDepartMag, arrRelSpeed, arrivalWeight);
+
+      if (!std::isfinite(score)) continue;
+
+      if (!bestOk || score < bestScore) {
+        bestOk = true;
+        bestScore = score;
+        bestLambert = sol;
+        bestDvDepart = dvDepart;
+        bestArrRel = arrRelVel;
+        bestDvDepartMag = dvDepartMag;
+        bestArrRelSpeed = arrRelSpeed;
+      }
+    }
+
+    if (!bestOk) {
+      return out;
+    }
+
+    out.lambert = bestLambert;
+    out.ok = true;
+    out.revolutions = bestLambert.revolutions;
+    out.dvDepartKmS = bestDvDepart;
+    out.dvDepartMagKmS = bestDvDepartMag;
+    out.arriveRelVelKmS = bestArrRel;
+    out.arriveRelSpeedKmS = bestArrRelSpeed;
+  } else {
+    out.lambert = solveLambertUniversal(r1Km, r2Km, safeTofSec, muKm3S2, baked);
+    out.ok = out.lambert.ok;
+    if (!out.ok) {
+      return out;
+    }
+
+    out.revolutions = out.lambert.revolutions;
+    out.dvDepartKmS = out.lambert.v1KmS - v0KmS;
+    out.dvDepartMagKmS = out.dvDepartKmS.length();
+
+    out.arriveRelVelKmS = out.lambert.v2KmS - vTgtKmS;
+    out.arriveRelSpeedKmS = out.arriveRelVelKmS.length();
   }
-
-  out.dvDepartKmS = out.lambert.v1KmS - v0KmS;
-  out.dvDepartMagKmS = out.dvDepartKmS.length();
-
-  out.arriveRelVelKmS = out.lambert.v2KmS - vTgtKmS;
-  out.arriveRelSpeedKmS = out.arriveRelVelKmS.length();
 
   out.totalDvKmS = out.dvDepartMagKmS + out.arriveRelSpeedKmS;
   out.score = computeScore(scoreMode, out.dvDepartMagKmS, out.arriveRelSpeedKmS, arrivalWeight);

@@ -39,6 +39,7 @@ struct PlotCell {
   double arriveRelSpeedKmS{0.0};
   double totalDvKmS{0.0};
   double score{0.0};
+  int revolutions{0};
 };
 
 } // namespace
@@ -102,6 +103,7 @@ PorkchopPlotPick drawPorkchopPlot(const sim::LambertPorkchopResult& res,
       pc.arriveRelSpeedKmS = c.arriveRelSpeedKmS;
       pc.totalDvKmS = c.totalDvKmS;
       pc.score = c.score;
+      pc.revolutions = c.revolutions;
       binned[bi] = pc;
     }
   }
@@ -202,6 +204,7 @@ PorkchopPlotPick drawPorkchopPlot(const sim::LambertPorkchopResult& res,
       ImGui::BeginTooltip();
       ImGui::Text("Depart: +%.2f h", c.departAfterSec / 3600.0);
       ImGui::Text("TOF: %.2f h", c.tofSec / 3600.0);
+      ImGui::Text("Revs: %d", c.revolutions);
       ImGui::Separator();
       ImGui::Text("Δv dep: %.1f m/s", c.dvDepartMagKmS * 1000.0);
       ImGui::Text("Arr rel: %.1f m/s", c.arriveRelSpeedKmS * 1000.0);
@@ -261,13 +264,14 @@ bool exportPorkchopCsv(const char* path, const sim::LambertPorkchopResult& res, 
 
   f << "# departSteps," << depSteps << "\n";
   f << "# tofSteps," << tofSteps << "\n";
-  f << "departAfterSec,tofSec,ok,dvDepartMagKmS,arriveRelSpeedKmS,totalDvKmS,score\n";
+  f << "departAfterSec,tofSec,ok,revolutions,dvDepartMagKmS,arriveRelSpeedKmS,totalDvKmS,score\n";
 
   for (std::size_t i = 0; i < expected; ++i) {
     const auto& c = res.grid[i];
     f << c.departAfterSec << ','
       << c.tofSec << ','
       << (c.ok ? 1 : 0) << ','
+      << c.revolutions << ','
       << c.dvDepartMagKmS << ','
       << c.arriveRelSpeedKmS << ','
       << c.totalDvKmS << ','
