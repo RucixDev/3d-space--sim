@@ -14,33 +14,47 @@ double takeInventory(StationEconomyState& state,
                      const StationEconomyModel& model,
                      CommodityId id,
                      double units) {
-  if (units <= 0.0 || !std::isfinite(units)) return 0.0;
+    if (units <= 0.0 || !std::isfinite(units)) return 0.0;
 
-  const double cap = std::max(0.0, model.capacity[idx(id)]);
-  double& inv = state.inventory[idx(id)];
-  if (!std::isfinite(inv)) inv = 0.0;
-  inv = std::clamp(inv, 0.0, cap);
+    const std::size_t i = idx(id);
+    double cap = model.capacity[i];
+    if (cap < 0.0) cap = 0.0;  // std::max(0.0, ...) without function call
 
-  const double taken = std::min(inv, units);
-  inv = std::clamp(inv - taken, 0.0, cap);
-  return taken;
+    double& inv = state.inventory[i];
+    if (!std::isfinite(inv) || inv < 0.0 || inv > cap) {
+        inv = (inv < 0.0 || !std::isfinite(inv)) ? 0.0 : cap;
+    }
+
+    const double taken = (units < inv) ? units : inv;  // faster than std::min on some platforms
+    inv -= taken;
+    
+    if (inv < 0.0) inv = 0.0;
+
+    return taken;
 }
 
 double addInventory(StationEconomyState& state,
                     const StationEconomyModel& model,
                     CommodityId id,
                     double units) {
-  if (units <= 0.0 || !std::isfinite(units)) return 0.0;
+    if (units <= 0.0 || !std::isfinite(units)) return 0.0;
 
-  const double cap = std::max(0.0, model.capacity[idx(id)]);
-  double& inv = state.inventory[idx(id)];
-  if (!std::isfinite(inv)) inv = 0.0;
-  inv = std::max(0.0, inv);
+    const std::size_t i = idx(id);
+    double cap = model.capacity[i];
+    if (cap < 0.0) cap = 0.0;
 
-  const double space = std::max(0.0, cap - inv);
-  const double added = std::min(space, units);
-  inv = std::min(cap, inv + added);
-  return added;
+    double& inv = state.inventory[i];
+    if (!std::isfinite(inv) || inv < 0.0 || inv > cap) {
+        inv = (inv < 0.0 || !std::isfinite(inv)) ? 0.0 : cap;
+    }
+
+    const double space = cap - inv;  // ≥ 0 due to above correction
+    const double added = (units < space) ? units : space;
+    inv += added;
+    
+    if (inv > cap) inv = cap;  // or use `inv = std::min(inv, cap);`
+
+    return added;
 }
 
 MarketQuote quote(const StationEconomyState& state,
