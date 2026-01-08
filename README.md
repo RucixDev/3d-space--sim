@@ -74,6 +74,7 @@ This repo contains:
 - Interdiction: align to escape vector (HUD) | **H** submit
 - FSD jump: **J** (to selected system in Galaxy)
 - UI: **TAB** Galaxy, **F1** Flight, **F2** Market, **F3** Contacts, **F4** Missions, **F6** Scanner
+- Action Wheel: **Alt+V** hold (scroll to switch pages)
 - Sprite Lab: **F10** (procedural UI icons)
 - VFX Lab: **F11** (starfield + particle effects)
 - Post FX: **F12** (HDR bloom + tonemap)

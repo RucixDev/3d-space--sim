@@ -230,6 +230,7 @@ set_target_properties(stellar_sandbox PROPERTIES
 if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
   add_executable(stellar_game
     apps/stellar_game/main.cpp
+    apps/stellar_game/ActionWheel.cpp
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
     apps/stellar_game/MarketDashboardWindow.cpp

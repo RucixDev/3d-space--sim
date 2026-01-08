@@ -359,6 +359,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Quick save", a.quicksave);
   addAction("Quick load", a.quickload);
   addAction("Command Palette", a.commandPalette);
+  addAction("Action Wheel", a.actionWheel);
   addAction("Toggle Galaxy window", a.toggleGalaxy);
   addAction("Toggle Ship window", a.toggleShip);
   addAction("Toggle Market window", a.toggleMarket);
@@ -739,6 +740,8 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Quick save", controls.actions.quicksave, ad.quicksave);
     add("Quick load", controls.actions.quickload, ad.quickload);
     add("Command Palette", controls.actions.commandPalette, ad.commandPalette);
+
+    add("Action Wheel", controls.actions.actionWheel, ad.actionWheel);
 
     add("Toggle Galaxy window", controls.actions.toggleGalaxy, ad.toggleGalaxy);
     add("Toggle Ship window", controls.actions.toggleShip, ad.toggleShip);

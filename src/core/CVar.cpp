@@ -120,6 +120,74 @@ static std::string quoteIfNeeded(std::string_view s) {
   return out;
 }
 
+static bool isTokenBoundary(char c) {
+  return std::isspace((unsigned char)c) || c == '=';
+}
+
+static std::string_view stripTrailingComment(std::string_view sv) {
+  // Remove trailing "#" or "//" comments, but only if they appear outside quotes.
+  // This avoids breaking common string values such as URLs ("http://") or fragments
+  // ("#") when they are quoted.
+  bool inDouble = false;
+  bool inSingle = false;
+  bool escape = false;
+
+  for (std::size_t i = 0; i < sv.size(); ++i) {
+    const char c = sv[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if ((inDouble || inSingle) && c == '\\') {
+      escape = true;
+      continue;
+    }
+
+    // Only treat quotes as starting a quoted region if they appear at a token boundary.
+    // This prevents apostrophes inside unquoted tokens (e.g. O'Reilly) from toggling
+    // quote state and disabling comment stripping.
+    if (!inSingle && c == '"') {
+      if (inDouble) {
+        inDouble = false;
+        continue;
+      }
+      if (i == 0 || isTokenBoundary(sv[i - 1])) {
+        inDouble = true;
+        continue;
+      }
+    }
+    if (!inDouble && c == '\'') {
+      if (inSingle) {
+        inSingle = false;
+        continue;
+      }
+      if (i == 0 || isTokenBoundary(sv[i - 1])) {
+        inSingle = true;
+        continue;
+      }
+    }
+
+    if (inDouble || inSingle) continue;
+
+    if (c == '#') {
+      return trimView(sv.substr(0, i));
+    }
+
+    if (c == '/' && i + 1 < sv.size() && sv[i + 1] == '/') {
+      // Treat "//" as a comment start only if it looks like it begins a comment.
+      // (i.e. at start of line or following whitespace). This prevents unquoted URLs
+      // like http://example.com/a//b from being truncated.
+      if (i == 0 || std::isspace((unsigned char)sv[i - 1])) {
+        return trimView(sv.substr(0, i));
+      }
+    }
+  }
+
+  return sv;
+}
+
 const CVar* CVarRegistry::find(std::string_view name) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto it = vars_.find(name);
@@ -437,15 +505,8 @@ bool CVarRegistry::loadFile(const std::string& path, std::string* outError) {
     if (sv.rfind("#", 0) == 0) continue;
     if (sv.rfind("//", 0) == 0) continue;
 
-    // Strip trailing comments: "x = y  # comment"
-    {
-      const std::size_t hash = sv.find('#');
-      const std::size_t sl = sv.find("//");
-      std::size_t cut = std::string_view::npos;
-      if (hash != std::string_view::npos) cut = hash;
-      if (sl != std::string_view::npos) cut = std::min(cut, sl);
-      if (cut != std::string_view::npos) sv = trimView(sv.substr(0, cut));
-    }
+    // Strip trailing comments: "x = y  # comment" (but ignore comment tokens inside quotes)
+    sv = stripTrailingComment(sv);
 
     if (sv.empty()) continue;
 
@@ -519,7 +580,9 @@ bool CVarRegistry::saveFile(const std::string& path, std::string* outError) cons
   if (!pending_.empty()) {
     out << "\n# Pending (unknown at save time)\n";
     for (const auto& kv : pending_) {
-      out << kv.first << " = " << quoteIfNeeded(kv.second) << "\n";
+      // Preserve pending values exactly as they appeared in the file.
+      // (They may already be quoted/escaped, and double-quoting would corrupt them.)
+      out << kv.first << " = " << kv.second << "\n";
     }
   }
 

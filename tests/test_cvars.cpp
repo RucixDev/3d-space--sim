@@ -3,6 +3,8 @@
 #include "test_harness.h"
 
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 int test_cvars() {
@@ -101,6 +103,55 @@ int test_cvars() {
     CHECK(b.getString("rt.s", "") == "with spaces");
 
     std::remove(path.c_str());
+  }
+
+  // ---- Comment parsing + pending preservation regression ----
+  {
+    const std::string path = "stellar_test_cvars_comments.cfg";
+    const std::string pathOut = "stellar_test_cvars_comments_out.cfg";
+
+    {
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      CHECK(f != nullptr);
+      if (f) {
+        std::fputs("# test comment parsing\n", f);
+        std::fputs("known.url = \"http://example.com/a//b#frag\" # trailing comment\n", f);
+        std::fputs("known.hash = \"abc # def\" // trailing comment\n", f);
+        std::fputs("known.apos = O'Reilly # trailing comment\n", f);
+        std::fputs("known.unquoted_url = http://example.com/a//b // trailing comment\n", f);
+        std::fputs("pending.url = \"http://example.com/#frag\" # keep fragment\n", f);
+        std::fclose(f);
+      }
+    }
+
+    CVarRegistry r;
+    std::string err;
+    CHECK(r.loadFile(path, &err));
+
+    CHECK(r.defineString("known.url", "") != nullptr);
+    CHECK(r.defineString("known.hash", "") != nullptr);
+    CHECK(r.defineString("known.apos", "") != nullptr);
+    CHECK(r.defineString("known.unquoted_url", "") != nullptr);
+
+    CHECK(r.getString("known.url", "") == "http://example.com/a//b#frag");
+    CHECK(r.getString("known.hash", "") == "abc # def");
+    CHECK(r.getString("known.apos", "") == "O'Reilly");
+    CHECK(r.getString("known.unquoted_url", "") == "http://example.com/a//b");
+
+    CHECK(r.hasPending("pending.url"));
+    CHECK(r.saveFile(pathOut, &err));
+
+    // Pending values should be preserved verbatim (not double-quoted).
+    {
+      std::ifstream in(pathOut);
+      CHECK((bool)in);
+      std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      CHECK(contents.find("pending.url = \"http://example.com/#frag\"") != std::string::npos);
+      CHECK(contents.find("pending.url = \"\\\"http://example.com/#frag\\\"\"") == std::string::npos);
+    }
+
+    std::remove(path.c_str());
+    std::remove(pathOut.c_str());
   }
 
   return failures;

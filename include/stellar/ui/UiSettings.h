@@ -14,6 +14,7 @@ namespace stellar::ui {
 //  - tune UI readability (scale)
 //  - pick an accessible theme (e.g. high contrast)
 //  - tweak the default dockspace ratios
+//  - optionally fine-tune padding/rounding/accent colors (style overrides)
 // without having to delete their entire imgui.ini.
 
 enum class UiTheme : int {
@@ -77,8 +78,38 @@ struct FontSettings {
   bool crispScaling{true};
 };
 
+// Optional fine-tuning knobs for Dear ImGui style.
+//
+// These apply on top of the base theme and the effective UI scale.
+// They are intentionally "simple" so they can be persisted without having to
+// serialize all of ImGuiStyle.
+struct StyleOverrides {
+  bool enabled{false};
+
+  // Global alpha multiplier applied to the whole UI.
+  // NOTE: When multi-viewport is enabled, the app may ignore this to avoid
+  // semi-transparent OS windows.
+  float globalAlpha{1.0f};
+
+  // Scales padding/spacing/rounding/borders relative to the base theme.
+  // 1.0 = default, <1 = compact, >1 = roomy.
+  float density{1.0f};
+
+  // Multiplier applied to rounding values (WindowRounding, FrameRounding, ...)
+  // after density/scale.
+  float rounding{1.0f};
+
+  // Multiplier applied to border thickness (WindowBorderSize, FrameBorderSize, ...).
+  float borderScale{1.0f};
+
+  // Accent tint (blends selected interactive colors toward accentColor).
+  bool accentEnabled{false};
+  float accentColor[3]{0.26f, 0.59f, 0.98f};
+  float accentStrength{0.35f};
+};
+
 struct UiSettings {
-  int version{2};
+  int version{3};
 
   // Dear ImGui .ini file used for window positions/docking layout.
   // By default this is "imgui.ini" in the working directory.
@@ -103,6 +134,9 @@ struct UiSettings {
   FontSettings font{};
 
   DockSettings dock{};
+
+  // Optional fine tuning for style.
+  StyleOverrides style{};
 };
 
 // Default config file path (relative to the working directory).

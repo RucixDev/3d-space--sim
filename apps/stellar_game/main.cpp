@@ -86,6 +86,7 @@
 #include "stellar/sim/Universe.h"
 
 #include "ControlsConfig.h"
+#include "ActionWheel.h"
 #include "CommandPalette.h"
 #include "ControlsWindow.h"
 #include "ConsoleWindow.h"
@@ -939,6 +940,20 @@ int main(int argc, char** argv) {
 
   ui::UiTheme uiTheme = uiSettings.theme;
 
+  // Style overrides (fine-tuning, persisted in ui_settings.txt)
+  bool uiStyleOverridesEnabled = uiSettings.style.enabled;
+  float uiStyleGlobalAlpha = uiSettings.style.globalAlpha;
+  float uiStyleDensity = uiSettings.style.density;
+  float uiStyleRounding = uiSettings.style.rounding;
+  float uiStyleBorderScale = uiSettings.style.borderScale;
+  bool uiStyleAccentEnabled = uiSettings.style.accentEnabled;
+  float uiStyleAccentColor[3] = {
+    uiSettings.style.accentColor[0],
+    uiSettings.style.accentColor[1],
+    uiSettings.style.accentColor[2],
+  };
+  float uiStyleAccentStrength = uiSettings.style.accentStrength;
+
   // Fonts
   // NOTE: Font rebuilding (for crisp scaling) is handled later, once ImGui
   // backends are initialized.
@@ -1036,6 +1051,67 @@ int main(int argc, char** argv) {
       st.WindowRounding = 0.0f;
       st.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
+
+    // Optional style overrides (fine-tuning).
+    if (uiStyleOverridesEnabled) {
+      const float density = std::clamp(uiStyleDensity, 0.70f, 1.40f);
+      if (std::abs(density - 1.0f) > 0.001f) {
+        st.ScaleAllSizes(density);
+      }
+
+      const float roundingMul = std::clamp(uiStyleRounding, 0.00f, 3.00f);
+      st.WindowRounding *= roundingMul;
+      st.ChildRounding *= roundingMul;
+      st.PopupRounding *= roundingMul;
+      st.FrameRounding *= roundingMul;
+      st.ScrollbarRounding *= roundingMul;
+      st.GrabRounding *= roundingMul;
+      st.TabRounding *= roundingMul;
+
+      const float borderMul = std::clamp(uiStyleBorderScale, 0.00f, 3.00f);
+      st.WindowBorderSize *= borderMul;
+      st.FrameBorderSize *= borderMul;
+      st.PopupBorderSize *= borderMul;
+      st.TabBorderSize *= borderMul;
+
+      // Global alpha.
+      float alpha = std::clamp(uiStyleGlobalAlpha, 0.20f, 1.00f);
+      // Transparent platform windows are poorly supported: when viewports are
+      // enabled, keep OS windows fully opaque (matches upstream examples).
+      if (uiViewportsEnabled) alpha = 1.0f;
+      st.Alpha *= alpha;
+
+      // Accent tint for interactive UI elements.
+      if (uiStyleAccentEnabled) {
+        const float t = std::clamp(uiStyleAccentStrength, 0.0f, 1.0f);
+        if (t > 0.001f) {
+          const ImVec4 accent(uiStyleAccentColor[0], uiStyleAccentColor[1], uiStyleAccentColor[2], 1.0f);
+          auto tint = [&](ImGuiCol idx) {
+            ImVec4 c = st.Colors[idx];
+            c.x = c.x * (1.0f - t) + accent.x * t;
+            c.y = c.y * (1.0f - t) + accent.y * t;
+            c.z = c.z * (1.0f - t) + accent.z * t;
+            st.Colors[idx] = c;
+          };
+
+          tint(ImGuiCol_CheckMark);
+          tint(ImGuiCol_SliderGrab);
+          tint(ImGuiCol_SliderGrabActive);
+          tint(ImGuiCol_ButtonHovered);
+          tint(ImGuiCol_ButtonActive);
+          tint(ImGuiCol_HeaderHovered);
+          tint(ImGuiCol_HeaderActive);
+          tint(ImGuiCol_SeparatorHovered);
+          tint(ImGuiCol_SeparatorActive);
+          tint(ImGuiCol_ResizeGripHovered);
+          tint(ImGuiCol_ResizeGripActive);
+          tint(ImGuiCol_TabHovered);
+          tint(ImGuiCol_TabSelected);
+          tint(ImGuiCol_TextSelectedBg);
+        }
+      }
+    }
+
     ImGui::GetStyle() = st;
   };
 
@@ -1117,6 +1193,18 @@ int main(int argc, char** argv) {
     uiSettings.dock.rightRatio = uiDockRightRatio;
     uiSettings.dock.bottomRatio = uiDockBottomRatio;
 #endif
+
+    // Style overrides
+    uiSettings.style.enabled = uiStyleOverridesEnabled;
+    uiSettings.style.globalAlpha = uiStyleGlobalAlpha;
+    uiSettings.style.density = uiStyleDensity;
+    uiSettings.style.rounding = uiStyleRounding;
+    uiSettings.style.borderScale = uiStyleBorderScale;
+    uiSettings.style.accentEnabled = uiStyleAccentEnabled;
+    uiSettings.style.accentColor[0] = uiStyleAccentColor[0];
+    uiSettings.style.accentColor[1] = uiStyleAccentColor[1];
+    uiSettings.style.accentColor[2] = uiStyleAccentColor[2];
+    uiSettings.style.accentStrength = uiStyleAccentStrength;
   };
 
   auto applyUiSettingsToRuntime = [&](const ui::UiSettings& s, bool loadImGuiIni) {
@@ -1153,6 +1241,18 @@ int main(int argc, char** argv) {
     uiDockRightRatio = s.dock.rightRatio;
     uiDockBottomRatio = s.dock.bottomRatio;
 #endif
+
+    // Style overrides
+    uiStyleOverridesEnabled = s.style.enabled;
+    uiStyleGlobalAlpha = s.style.globalAlpha;
+    uiStyleDensity = s.style.density;
+    uiStyleRounding = s.style.rounding;
+    uiStyleBorderScale = s.style.borderScale;
+    uiStyleAccentEnabled = s.style.accentEnabled;
+    uiStyleAccentColor[0] = s.style.accentColor[0];
+    uiStyleAccentColor[1] = s.style.accentColor[1];
+    uiStyleAccentColor[2] = s.style.accentColor[2];
+    uiStyleAccentStrength = s.style.accentStrength;
 
     recomputeUiDpiScale();
     recomputeUiScale();
@@ -2049,6 +2149,19 @@ int main(int argc, char** argv) {
   double radarRangeKm = 220000.0;
   int radarMaxBlips = 72;
 
+  // HUD palette / cosmetics (colors + overlay opacity). These map to HudSettings (v2).
+  float hudOverlayBgAlpha = 0.35f;
+  float hudOverlayBgAlphaEdit = 0.45f;
+  bool hudTintRadarIcons = false;
+  bool hudTintTacticalIcons = false;
+
+  ui::Color4f hudColorPrimary{0.82f, 0.90f, 1.00f, 1.00f};
+  ui::Color4f hudColorAccent{1.00f, 0.70f, 0.35f, 1.00f};
+  ui::Color4f hudColorDanger{1.00f, 0.25f, 0.25f, 1.00f};
+  ui::Color4f hudColorGrid{0.47f, 0.55f, 0.67f, 1.00f};
+  ui::Color4f hudColorText{0.90f, 0.90f, 0.94f, 1.00f};
+  ui::Color4f hudColorBackground{0.00f, 0.00f, 0.00f, 1.00f};
+
   // Pirate demand HUD (threat/tribute): this HUD can appear contextually when pirates
   // extort you. Keep a master toggle so players can disable it.
   bool hudThreatOverlayEnabled = true;
@@ -2159,6 +2272,18 @@ int main(int argc, char** argv) {
     hudSettings.tacticalShowCargo = tacticalShowCargo;
     hudSettings.tacticalShowAsteroids = tacticalShowAsteroids;
     hudSettings.tacticalShowSignals = tacticalShowSignals;
+
+    // Style / colors
+    hudSettings.overlayBgAlpha = hudOverlayBgAlpha;
+    hudSettings.overlayBgAlphaEdit = hudOverlayBgAlphaEdit;
+    hudSettings.tintRadarIcons = hudTintRadarIcons;
+    hudSettings.tintTacticalIcons = hudTintTacticalIcons;
+    hudSettings.colorPrimary = hudColorPrimary;
+    hudSettings.colorAccent = hudColorAccent;
+    hudSettings.colorDanger = hudColorDanger;
+    hudSettings.colorGrid = hudColorGrid;
+    hudSettings.colorText = hudColorText;
+    hudSettings.colorBackground = hudColorBackground;
   };
 
   auto applyHudSettingsToRuntime = [&](const ui::HudSettings& s) {
@@ -2202,11 +2327,26 @@ int main(int argc, char** argv) {
     tacticalShowCargo = s.tacticalShowCargo;
     tacticalShowAsteroids = s.tacticalShowAsteroids;
     tacticalShowSignals = s.tacticalShowSignals;
+
+    // Style / colors
+    hudOverlayBgAlpha = s.overlayBgAlpha;
+    hudOverlayBgAlphaEdit = s.overlayBgAlphaEdit;
+    hudTintRadarIcons = s.tintRadarIcons;
+    hudTintTacticalIcons = s.tintTacticalIcons;
+    hudColorPrimary = s.colorPrimary;
+    hudColorAccent = s.colorAccent;
+    hudColorDanger = s.colorDanger;
+    hudColorGrid = s.colorGrid;
+    hudColorText = s.colorText;
+    hudColorBackground = s.colorBackground;
   };
 
   auto hudSettingsEquivalent = [&](const ui::HudSettings& a, const ui::HudSettings& b) -> bool {
     auto deq = [](double x, double y, double eps = 1e-6) { return std::fabs(x - y) <= eps; };
     auto feq = [](float x, float y, float eps = 1e-4f) { return std::fabs(x - y) <= eps; };
+    auto ceq = [&](const ui::Color4f& x, const ui::Color4f& y) {
+      return feq(x.r, y.r) && feq(x.g, y.g) && feq(x.b, y.b) && feq(x.a, y.a);
+    };
     return a.autoSaveOnExit == b.autoSaveOnExit
         && a.showRadarHud == b.showRadarHud
         && a.objectiveHudEnabled == b.objectiveHudEnabled
@@ -2239,7 +2379,17 @@ int main(int argc, char** argv) {
         && a.tacticalShowContacts == b.tacticalShowContacts
         && a.tacticalShowCargo == b.tacticalShowCargo
         && a.tacticalShowAsteroids == b.tacticalShowAsteroids
-        && a.tacticalShowSignals == b.tacticalShowSignals;
+        && a.tacticalShowSignals == b.tacticalShowSignals
+        && feq(a.overlayBgAlpha, b.overlayBgAlpha)
+        && feq(a.overlayBgAlphaEdit, b.overlayBgAlphaEdit)
+        && a.tintRadarIcons == b.tintRadarIcons
+        && a.tintTacticalIcons == b.tintTacticalIcons
+        && ceq(a.colorPrimary, b.colorPrimary)
+        && ceq(a.colorAccent, b.colorAccent)
+        && ceq(a.colorDanger, b.colorDanger)
+        && ceq(a.colorGrid, b.colorGrid)
+        && ceq(a.colorText, b.colorText)
+        && ceq(a.colorBackground, b.colorBackground);
   };
 
   // Load HUD settings (if present). Missing file -> keep runtime defaults/layout-driven toggles.
@@ -2403,6 +2553,12 @@ int main(int argc, char** argv) {
   // UI: command palette (Ctrl+P by default)
   game::CommandPaletteState commandPalette;
   std::vector<game::PaletteItem> commandPaletteItems;
+
+  // UI: action wheel (radial quick-actions overlay).
+  game::ActionWheelState actionWheel;
+  std::vector<game::ActionWheelItem> actionWheelItems;
+  bool actionWheelPrevMouseSteer = false;
+  bool actionWheelSuppressedMouseSteer = false;
 
   // Wire the toast history sink now that timeDays + storage exist.
   setToastHistorySink(&toastHistory, &timeDays);
@@ -3724,6 +3880,23 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         if (game::handleControlsRebindKeydown(
                 controlsWindow, event.key, controls, controlsDirty,
                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
+          continue;
+        }
+
+        // Radial action wheel: hold to open, release to activate.
+        if (key(controls.actions.actionWheel) && !actionWheel.open && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
+          game::openActionWheel(actionWheel);
+
+          // If mouse-steer is enabled, temporarily release the cursor so the wheel can be used.
+          actionWheelPrevMouseSteer = mouseSteer;
+          actionWheelSuppressedMouseSteer = false;
+          if (mouseSteer) {
+            mouseSteer = false;
+            actionWheelSuppressedMouseSteer = true;
+            SDL_SetRelativeMouseMode(SDL_FALSE);
+            SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+          }
+
           continue;
         }
 
@@ -5265,6 +5438,14 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               toast(toasts, "Target a station (T) before docking.", 2.5);
             }
           }
+        }
+      }
+
+      if (event.type == SDL_KEYUP && !event.key.repeat) {
+        // If the action wheel is open, releasing its key closes the wheel.
+        // The actual activation is handled during the UI pass (so hover selection is up-to-date).
+        if (actionWheel.open && event.key.keysym.scancode == controls.actions.actionWheel.scancode) {
+          actionWheel.requestClose = true;
         }
       }
 
@@ -10713,6 +10894,15 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     syncHudSettingsFromRuntime();
     hudSettingsDirty = !hudSettingsEquivalent(hudSettings, hudSettingsSaved);
 
+    auto hudU32 = [&](const ui::Color4f& c, float alphaMul = 1.0f) -> ImU32 {
+      auto toByte = [](float v) -> int {
+        return (int)std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f);
+      };
+      const float a = std::clamp(c.a * alphaMul, 0.0f, 1.0f);
+      return IM_COL32(toByte(c.r), toByte(c.g), toByte(c.b), toByte(a));
+    };
+
+
     // Menu bar + (optional) DockSpace layout.
     // When built against Dear ImGui's docking branch/tag, we create a fullscreen dockspace and
     // seed a sensible default layout. Without docking support, windows simply float as before.
@@ -11618,9 +11808,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
                          IM_COL32(0, 0, 0, (int)(100.0f * retA)));
           draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
-                         IM_COL32(210, 230, 255, (int)(255.0f * retA)));
+                         hudU32(hudColorPrimary, retA));
         } else {
-          const ImU32 col = IM_COL32(160,160,170, (int)(200.0f * retA));
+          const ImU32 col = hudU32(hudColorText, (200.0f/255.0f) * retA);
           draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, col, 1.0f);
           draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, col, 1.0f);
         }
@@ -11693,8 +11883,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       } else {
         // Minimal crosshair if the combat HUD is disabled.
-        draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, IM_COL32(160,160,170,140), 1.0f);
-        draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, IM_COL32(160,160,170,140), 1.0f);
+        draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, hudU32(hudColorText, (140.0f/255.0f)), 1.0f);
+        draw->AddLine({center.x, center.y - 8}, {center.x, center.y + 8}, hudU32(hudColorText, (140.0f/255.0f)), 1.0f);
       }
 
       // Flight path marker (velocity vector) - useful with Newtonian drift.
@@ -11723,12 +11913,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const ImVec2 p1(drawP.x + sz * 0.5f, drawP.y + sz * 0.5f);
 
             draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(0,0,0,120));
-            draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(120, 220, 255, 210));
+            draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), hudU32(hudColorPrimary, (210.0f/255.0f)));
 
             if (io.KeyShift) {
               char buf[64];
               std::snprintf(buf, sizeof(buf), "v %.2f km/s", spd);
-              draw->AddText(ImVec2(drawP.x + sz * 0.58f, drawP.y - 7.0f), IM_COL32(160, 240, 255, 200), buf);
+              draw->AddText(ImVec2(drawP.x + sz * 0.58f, drawP.y - 7.0f), hudU32(hudColorText, (200.0f/255.0f)), buf);
             }
           }
         }
@@ -11789,7 +11979,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImVec2 px{};
         if (projectToScreen(toRenderPosU(*tgtKm), view, proj, w, h, px)) {
           const double distKm = (*tgtKm - ship.positionKm()).length();
-          draw->AddCircle({px.x, px.y}, 14.0f, IM_COL32(255,170,80,190), 1.5f);
+          draw->AddCircle({px.x, px.y}, 14.0f, hudU32(hudColorAccent, (190.0f/255.0f)), 1.5f);
 
           const float iconSize = 18.0f;
           float textX = px.x + 18.0f;
@@ -11800,12 +11990,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const ImVec2 p1(textX + iconSize, px.y - iconSize * 0.55f + iconSize);
             draw->AddImage((ImTextureID)(intptr_t)tex.handle(), p0, p1,
                            ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
-                           IM_COL32(255,255,255,235));
+                           (hudTintTacticalIcons ? hudU32(hudColorText, (235.0f/255.0f)) : IM_COL32(255,255,255,235)));
             textX = p1.x + 6.0f;
           }
 
           std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
-          draw->AddText({textX, px.y - 8}, IM_COL32(255,210,170,210), s.c_str());
+          draw->AddText({textX, px.y - 8}, hudU32(hudColorAccent, (210.0f/255.0f)), s.c_str());
 
           // Combat HUD: projectile lead indicator (contacts only).
           if (hudCombatHud && hudShowLeadIndicator && tgtVelKmS && target.kind == TargetKind::Contact && !docked) {
@@ -11898,7 +12088,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const ImVec2 p1(base.x + perp.x * (arrowW * 0.5f), base.y + perp.y * (arrowW * 0.5f));
             const ImVec2 p2(base.x - perp.x * (arrowW * 0.5f), base.y - perp.y * (arrowW * 0.5f));
 
-            draw->AddTriangleFilled(tip, p1, p2, IM_COL32(255,170,80,200));
+            draw->AddTriangleFilled(tip, p1, p2, hudU32(hudColorAccent, (200.0f/255.0f)));
             draw->AddTriangle(tip, p1, p2, IM_COL32(15, 15, 15, 220), 1.2f);
 
             // Small icon + distance label near the arrow.
@@ -11913,11 +12103,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               const auto& tex = hudAtlas.texture();
               draw->AddImage((ImTextureID)(intptr_t)tex.handle(), i0, i1,
                              ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
-                             IM_COL32(255,255,255,235));
+                             (hudTintTacticalIcons ? hudU32(hudColorText, (235.0f/255.0f)) : IM_COL32(255,255,255,235)));
             }
 
             const std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
-            draw->AddText({iconC.x + 14.0f, iconC.y - 7.0f}, IM_COL32(255,210,170,210), s.c_str());
+            draw->AddText({iconC.x + 14.0f, iconC.y - 7.0f}, hudU32(hudColorAccent, (210.0f/255.0f)), s.c_str());
           }
         }
       }
@@ -12154,18 +12344,18 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           const ImVec2 p1(m.px.x + szF * 0.5f, m.px.y + szF * 0.5f);
           draw->AddImage((ImTextureID)(intptr_t)tex.handle(), p0, p1,
                          ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
-                         IM_COL32(255,255,255,235));
+                         (hudTintTacticalIcons ? hudU32(hudColorText, (235.0f/255.0f)) : IM_COL32(255,255,255,235)));
 
           if (m.kind == target.kind && m.index == target.index) {
-            draw->AddCircle(m.px, szF * 0.62f, IM_COL32(255,170,80,170), 16, 1.5f);
+            draw->AddCircle(m.px, szF * 0.62f, hudU32(hudColorAccent, (170.0f/255.0f)), 16, 1.5f);
           }
           if (i == hovered && !io.WantCaptureMouse) {
-            draw->AddCircle(m.px, szF * 0.62f, IM_COL32(255,255,255,110), 16, 1.25f);
+            draw->AddCircle(m.px, szF * 0.62f, hudU32(hudColorText, (110.0f/255.0f)), 16, 1.25f);
           }
 
           if (tacticalShowLabels) {
             const std::string label = m.label + "  " + std::to_string((int)std::llround(m.distKm)) + " km";
-            draw->AddText({m.px.x + szF * 0.55f + 4.0f, m.px.y - szF * 0.52f}, IM_COL32(230,230,240,190), label.c_str());
+            draw->AddText({m.px.x + szF * 0.55f + 4.0f, m.px.y - szF * 0.52f}, hudU32(hudColorText, (190.0f/255.0f)), label.c_str());
           }
         }
 
@@ -12201,9 +12391,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         const int bgA = (int)std::llround(150.0f * a);
         const int fgA = (int)std::llround(230.0f * a);
-        draw->AddRectFilled(r0, r1, IM_COL32(12, 12, 16, bgA), 4.0f);
-        draw->AddRect(r0, r1, IM_COL32(255, 255, 255, (int)std::llround(42.0f * a)), 4.0f);
-        draw->AddText(p0, IM_COL32(240, 240, 240, fgA), t.text.c_str());
+        draw->AddRectFilled(r0, r1, hudU32(hudColorBackground, (float)bgA / 255.0f), 4.0f);
+        draw->AddRect(r0, r1, hudU32(hudColorGrid, (42.0f/255.0f) * a), 4.0f);
+        draw->AddText(p0, hudU32(hudColorText, (float)fgA / 255.0f), t.text.c_str());
 
         y += textSz.y + pad.y * 2.0f + 4.0f;
       }
@@ -12349,7 +12539,7 @@ if (showRadarHud && currentSystem) {
   const float winSide = (baseRad * 2.0f + 22.0f) * uiScale;
   const ImVec2 winSize(winSide, winSide);
 
-  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha);
   hudSetNextWindowPosFromLayout(ui::HudWidgetId::Radar);
   ImGui::SetNextWindowSize(winSize, ImGuiCond_Always);
 
@@ -12382,18 +12572,18 @@ if (showRadarHud && currentSystem) {
   const ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
 
   // Background + rings
-  draw->AddCircleFilled(c, rad, IM_COL32(0, 0, 0, 120));
-  draw->AddCircle(c, rad, IM_COL32(120, 140, 170, 160), 0, 1.2f * std::max(0.75f, uiScale));
-  draw->AddCircle(c, rad * 0.50f, IM_COL32(120, 140, 170, 70), 0, 1.0f);
-  draw->AddCircle(c, rad * 0.25f, IM_COL32(120, 140, 170, 50), 0, 1.0f);
-  draw->AddLine(ImVec2(c.x - rad, c.y), ImVec2(c.x + rad, c.y), IM_COL32(120, 140, 170, 70), 1.0f * std::max(0.75f, uiScale));
-  draw->AddLine(ImVec2(c.x, c.y - rad), ImVec2(c.x, c.y + rad), IM_COL32(120, 140, 170, 70), 1.0f * std::max(0.75f, uiScale));
+  draw->AddCircleFilled(c, rad, hudU32(hudColorBackground, (120.0f/255.0f)));
+  draw->AddCircle(c, rad, hudU32(hudColorGrid, (160.0f/255.0f)), 0, 1.2f * std::max(0.75f, uiScale));
+  draw->AddCircle(c, rad * 0.50f, hudU32(hudColorGrid, (70.0f/255.0f)), 0, 1.0f);
+  draw->AddCircle(c, rad * 0.25f, hudU32(hudColorGrid, (50.0f/255.0f)), 0, 1.0f);
+  draw->AddLine(ImVec2(c.x - rad, c.y), ImVec2(c.x + rad, c.y), hudU32(hudColorGrid, (70.0f/255.0f)), 1.0f * std::max(0.75f, uiScale));
+  draw->AddLine(ImVec2(c.x, c.y - rad), ImVec2(c.x, c.y + rad), hudU32(hudColorGrid, (70.0f/255.0f)), 1.0f * std::max(0.75f, uiScale));
 
   // Ship marker (always centered)
   draw->AddTriangleFilled(ImVec2(c.x, c.y - 6 * uiScale),
                           ImVec2(c.x - 5 * uiScale, c.y + 7 * uiScale),
                           ImVec2(c.x + 5 * uiScale, c.y + 7 * uiScale),
-                          IM_COL32(230, 230, 240, 210));
+                          hudU32(hudColorPrimary, (210.0f/255.0f)));
   draw->AddTriangle(ImVec2(c.x, c.y - 6 * uiScale),
                     ImVec2(c.x - 5 * uiScale, c.y + 7 * uiScale),
                     ImVec2(c.x + 5 * uiScale, c.y + 7 * uiScale),
@@ -12404,7 +12594,7 @@ if (showRadarHud && currentSystem) {
   {
     const std::string rTxt = std::to_string((int)std::round(radarRangeKm)) + " km";
     draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p1.y - 18.0f * uiScale),
-                  IM_COL32(200, 210, 230, 170), rTxt.c_str());
+                  hudU32(hudColorText, (170.0f/255.0f)), rTxt.c_str());
   }
 
   struct Blip {
@@ -12592,7 +12782,9 @@ if (showRadarHud && currentSystem) {
     // Draw icon (atlas-batched)
     const auto uv = hudAtlas.get(iKind, iSeed);
     const auto& tex = hudAtlas.texture();
-    const ImU32 tint = b.force ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 215);
+    const ImU32 tint = hudTintRadarIcons
+        ? hudU32(hudColorText, b.force ? 1.0f : (215.0f/255.0f))
+        : (b.force ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 215));
     draw->AddImage((ImTextureID)(intptr_t)tex.handle(), b0, b1,
                    ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
                    tint);
@@ -12600,7 +12792,7 @@ if (showRadarHud && currentSystem) {
     if (b.force) {
       draw->AddCircle(bp,
                       iconSz * 0.65f + 5.0f * uiScale,
-                      IM_COL32(255, 180, 90, 210),
+                      hudU32(hudColorAccent, (210.0f/255.0f)),
                       0,
                       1.5f * std::max(0.75f, uiScale));
     }
@@ -12608,7 +12800,7 @@ if (showRadarHud && currentSystem) {
     // Vertical hint for off-plane objects (up/down)
     if (std::abs(local.y) > 2500.0) {
       const char* sym = (local.y > 0.0) ? "^" : "v";
-      draw->AddText(ImVec2(bp.x + iconSz * 0.30f, bp.y - iconSz * 0.65f), IM_COL32(230, 230, 240, 190), sym);
+      draw->AddText(ImVec2(bp.x + iconSz * 0.30f, bp.y - iconSz * 0.65f), hudU32(hudColorText, (190.0f/255.0f)), sym);
     }
   }
 
@@ -12652,7 +12844,7 @@ if (objectiveHudEnabled) {
     auto& wLay = hudLayout.widget(ui::HudWidgetId::Objective);
     const float uiScale = std::max(0.50f, wLay.scale);
 
-    ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+    ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha);
     hudSetNextWindowPosFromLayout(ui::HudWidgetId::Objective);
     if (hudLayoutEditMode) {
       ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
@@ -12776,7 +12968,7 @@ if (hudThreatOverlayEnabled && pirateDemand.active && pirateDemand.requiredValue
   auto& wLay = hudLayout.widget(ui::HudWidgetId::Threat);
   const float uiScale = std::max(0.50f, wLay.scale);
 
-  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.35f);
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha);
   hudSetNextWindowPosFromLayout(ui::HudWidgetId::Threat);
   if (hudLayoutEditMode) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
@@ -12815,7 +13007,7 @@ if (hudJumpOverlay && fsdState != FsdState::Idle) {
   auto& wLay = hudLayout.widget(ui::HudWidgetId::Jump);
   const float uiScale = std::max(0.50f, wLay.scale);
 
-  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.45f : 0.28f);
+  ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : (hudOverlayBgAlpha * 0.8f));
   hudSetNextWindowPosFromLayout(ui::HudWidgetId::Jump);
   if (hudLayoutEditMode) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
@@ -16045,8 +16237,8 @@ if (showScanner) {
           const ImVec2 starP = worldToScreen({0.0, 0.0});
 
           // Axes
-          draw->AddLine(ImVec2(p0.x, starP.y), ImVec2(p1.x, starP.y), IM_COL32(120, 140, 170, 50), 1.0f);
-          draw->AddLine(ImVec2(starP.x, p0.y), ImVec2(starP.x, p1.y), IM_COL32(120, 140, 170, 50), 1.0f);
+          draw->AddLine(ImVec2(p0.x, starP.y), ImVec2(p1.x, starP.y), hudU32(hudColorGrid, (50.0f/255.0f)), 1.0f);
+          draw->AddLine(ImVec2(starP.x, p0.y), ImVec2(starP.x, p1.y), hudU32(hudColorGrid, (50.0f/255.0f)), 1.0f);
 
           // Concentric circles
           for (int i = 1; i <= 12; ++i) {
@@ -20483,6 +20675,122 @@ if (showContacts) {
           if (uiTheme == ui::UiTheme::HighContrast) {
             ImGui::TextDisabled("High contrast mode targets readability on dark backgrounds.");
           }
+
+          ImGui::Separator();
+
+          // ---- Style overrides ----
+          bool styleChanged = false;
+          if (ImGui::Checkbox("Enable style overrides", &uiStyleOverridesEnabled)) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+
+          if (!uiStyleOverridesEnabled) ImGui::BeginDisabled();
+
+          // Alpha is problematic with detached platform windows (multi-viewport).
+          if (uiViewportsEnabled) {
+            ImGui::BeginDisabled();
+          }
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Global alpha", &uiStyleGlobalAlpha, 0.35f, 1.00f, "%.2f")) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+          if (uiViewportsEnabled) {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(disabled with viewports)");
+            if (ImGui::IsItemHovered()) {
+              ImGui::SetTooltip("Platform windows don't support transparent backgrounds well.\nKeeping OS windows opaque avoids rendering quirks.");
+            }
+          }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Density", &uiStyleDensity, 0.75f, 1.25f, "%.2f")) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Compact")) {
+            uiStyleDensity = 0.85f;
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Default")) {
+            uiStyleDensity = 1.00f;
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Rounding", &uiStyleRounding, 0.00f, 2.00f, "%.2f")) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+
+          ImGui::SetNextItemWidth(260.0f);
+          if (ImGui::SliderFloat("Border scale", &uiStyleBorderScale, 0.00f, 2.00f, "%.2f")) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+
+          if (ImGui::Checkbox("Accent tint", &uiStyleAccentEnabled)) {
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+          if (uiStyleAccentEnabled) {
+            if (ImGui::ColorEdit3("Accent color", uiStyleAccentColor, ImGuiColorEditFlags_Float)) {
+              styleChanged = true;
+              uiSettingsDirty = true;
+            }
+            ImGui::SetNextItemWidth(260.0f);
+            if (ImGui::SliderFloat("Accent strength", &uiStyleAccentStrength, 0.00f, 1.00f, "%.2f")) {
+              styleChanged = true;
+              uiSettingsDirty = true;
+            }
+          }
+
+          if (ImGui::Button("Reset style overrides")) {
+            uiStyleGlobalAlpha = 1.0f;
+            uiStyleDensity = 1.0f;
+            uiStyleRounding = 1.0f;
+            uiStyleBorderScale = 1.0f;
+            uiStyleAccentEnabled = false;
+            uiStyleAccentColor[0] = 0.26f;
+            uiStyleAccentColor[1] = 0.59f;
+            uiStyleAccentColor[2] = 0.98f;
+            uiStyleAccentStrength = 0.35f;
+            styleChanged = true;
+            uiSettingsDirty = true;
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Preview:");
+          ImGui::BeginChild("##ui_style_preview", ImVec2(0.0f, 140.0f), true);
+          {
+            static bool p_check = true;
+            static float p_slider = 0.62f;
+            static int p_combo = 1;
+            static char p_text[64] = "Type here...";
+            ImGui::Button("Primary");
+            ImGui::SameLine();
+            ImGui::Button("Secondary");
+            ImGui::Checkbox("Checkbox", &p_check);
+            ImGui::SliderFloat("Slider", &p_slider, 0.0f, 1.0f);
+            const char* items[] = {"One", "Two", "Three"};
+            ImGui::Combo("Combo", &p_combo, items, IM_ARRAYSIZE(items));
+            ImGui::InputText("Input", p_text, sizeof(p_text));
+          }
+          ImGui::EndChild();
+
+          if (!uiStyleOverridesEnabled) ImGui::EndDisabled();
+
+          if (styleChanged) {
+            rebuildUiStyle(uiTheme, uiScale);
+            io.FontGlobalScale = uiFontCrispScaling ? 1.0f : uiScale;
+            uiScaleApplied = uiScale;
+          }
         }
 
         if (ImGui::CollapsingHeader("Fonts", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -21292,6 +21600,136 @@ if (showContacts) {
           ImGui::TextDisabled("(drag overlays; right-click radar for quick tweaks)");
         }
 
+        if (ImGui::CollapsingHeader("Style / Colors", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::SliderFloat("Overlay background alpha", &hudOverlayBgAlpha, 0.0f, 1.0f, "%.2f");
+          ImGui::SliderFloat("Overlay background alpha (edit mode)", &hudOverlayBgAlphaEdit, 0.0f, 1.0f, "%.2f");
+          ImGui::Checkbox("Tint radar icons", &hudTintRadarIcons);
+          ImGui::SameLine();
+          ImGui::Checkbox("Tint tactical icons", &hudTintTacticalIcons);
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Color presets (applied immediately):");
+
+          auto applyPreset = [&](int preset) {
+            switch (preset) {
+              default:
+              case 0: { // Cyan (default)
+                hudColorPrimary   = ui::Color4f{0.82f, 0.90f, 1.00f, 1.00f};
+                hudColorAccent    = ui::Color4f{1.00f, 0.70f, 0.35f, 1.00f};
+                hudColorDanger    = ui::Color4f{1.00f, 0.25f, 0.25f, 1.00f};
+                hudColorGrid      = ui::Color4f{0.47f, 0.55f, 0.67f, 1.00f};
+                hudColorText      = ui::Color4f{0.90f, 0.90f, 0.94f, 1.00f};
+                hudColorBackground= ui::Color4f{0.00f, 0.00f, 0.00f, 1.00f};
+              } break;
+              case 1: { // Green phosphor
+                hudColorPrimary   = ui::Color4f{0.30f, 1.00f, 0.45f, 1.00f};
+                hudColorAccent    = ui::Color4f{1.00f, 0.85f, 0.30f, 1.00f};
+                hudColorDanger    = ui::Color4f{1.00f, 0.25f, 0.25f, 1.00f};
+                hudColorGrid      = ui::Color4f{0.30f, 0.80f, 0.45f, 1.00f};
+                hudColorText      = ui::Color4f{0.75f, 1.00f, 0.85f, 1.00f};
+                hudColorBackground= ui::Color4f{0.00f, 0.00f, 0.00f, 1.00f};
+              } break;
+              case 2: { // Amber
+                hudColorPrimary   = ui::Color4f{1.00f, 0.78f, 0.25f, 1.00f};
+                hudColorAccent    = ui::Color4f{1.00f, 0.45f, 0.20f, 1.00f};
+                hudColorDanger    = ui::Color4f{1.00f, 0.18f, 0.18f, 1.00f};
+                hudColorGrid      = ui::Color4f{0.80f, 0.62f, 0.30f, 1.00f};
+                hudColorText      = ui::Color4f{1.00f, 0.95f, 0.85f, 1.00f};
+                hudColorBackground= ui::Color4f{0.00f, 0.00f, 0.00f, 1.00f};
+              } break;
+              case 3: { // Red alert
+                hudColorPrimary   = ui::Color4f{1.00f, 0.32f, 0.32f, 1.00f};
+                hudColorAccent    = ui::Color4f{1.00f, 0.78f, 0.25f, 1.00f};
+                hudColorDanger    = ui::Color4f{1.00f, 0.15f, 0.15f, 1.00f};
+                hudColorGrid      = ui::Color4f{0.75f, 0.35f, 0.35f, 1.00f};
+                hudColorText      = ui::Color4f{1.00f, 0.85f, 0.85f, 1.00f};
+                hudColorBackground= ui::Color4f{0.00f, 0.00f, 0.00f, 1.00f};
+              } break;
+              case 4: { // Monochrome
+                hudColorPrimary   = ui::Color4f{0.92f, 0.92f, 0.96f, 1.00f};
+                hudColorAccent    = ui::Color4f{1.00f, 1.00f, 1.00f, 1.00f};
+                hudColorDanger    = ui::Color4f{1.00f, 1.00f, 1.00f, 1.00f};
+                hudColorGrid      = ui::Color4f{0.60f, 0.60f, 0.66f, 1.00f};
+                hudColorText      = ui::Color4f{0.95f, 0.95f, 0.98f, 1.00f};
+                hudColorBackground= ui::Color4f{0.00f, 0.00f, 0.00f, 1.00f};
+              } break;
+            }
+          };
+
+          if (ImGui::Button("Cyan")) {
+            applyPreset(0);
+            toast(toasts, "HUD colors: Cyan", 1.2);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Green")) {
+            applyPreset(1);
+            toast(toasts, "HUD colors: Green phosphor", 1.2);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Amber")) {
+            applyPreset(2);
+            toast(toasts, "HUD colors: Amber", 1.2);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Red")) {
+            applyPreset(3);
+            toast(toasts, "HUD colors: Red alert", 1.2);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Mono")) {
+            applyPreset(4);
+            toast(toasts, "HUD colors: Monochrome", 1.2);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Reset palette")) {
+            const ui::HudSettings def = ui::makeDefaultHudSettings();
+            hudColorPrimary = def.colorPrimary;
+            hudColorAccent = def.colorAccent;
+            hudColorDanger = def.colorDanger;
+            hudColorGrid = def.colorGrid;
+            hudColorText = def.colorText;
+            hudColorBackground = def.colorBackground;
+            hudOverlayBgAlpha = def.overlayBgAlpha;
+            hudOverlayBgAlphaEdit = def.overlayBgAlphaEdit;
+            hudTintRadarIcons = def.tintRadarIcons;
+            hudTintTacticalIcons = def.tintTacticalIcons;
+            toast(toasts, "HUD palette reset to defaults.", 1.4);
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Palette (RGBA):");
+          ImGui::ColorEdit4("Primary", &hudColorPrimary.r, ImGuiColorEditFlags_Float);
+          ImGui::ColorEdit4("Accent", &hudColorAccent.r, ImGuiColorEditFlags_Float);
+          ImGui::ColorEdit4("Danger", &hudColorDanger.r, ImGuiColorEditFlags_Float);
+          ImGui::ColorEdit4("Grid", &hudColorGrid.r, ImGuiColorEditFlags_Float);
+          ImGui::ColorEdit4("Text", &hudColorText.r, ImGuiColorEditFlags_Float);
+          ImGui::ColorEdit4("Background", &hudColorBackground.r, ImGuiColorEditFlags_Float);
+
+          ImGui::TextDisabled("Preview:");
+          ImGui::BeginChild("##hudColorPreview", ImVec2(0, 130), true, ImGuiWindowFlags_NoScrollbar);
+          {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImGui::Dummy(avail);
+
+            const ImVec2 p1(p0.x + avail.x, p0.y + avail.y);
+            const ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
+
+            dl->AddRectFilled(p0, p1, hudU32(hudColorBackground, 0.30f), 6.0f);
+            dl->AddCircle(c, 32.0f, hudU32(hudColorGrid, 0.55f), 0, 2.0f);
+            dl->AddLine(ImVec2(c.x - 18.0f, c.y), ImVec2(c.x + 18.0f, c.y), hudU32(hudColorPrimary, 0.90f), 2.0f);
+            dl->AddLine(ImVec2(c.x, c.y - 18.0f), ImVec2(c.x, c.y + 18.0f), hudU32(hudColorPrimary, 0.90f), 2.0f);
+
+            dl->AddCircle(ImVec2(c.x + 90.0f, c.y), 12.0f, hudU32(hudColorAccent, 0.80f), 0, 2.0f);
+            dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 10.0f), hudU32(hudColorText, 0.90f), "HUD Preview");
+            dl->AddText(ImVec2(p0.x + 10.0f, p0.y + 28.0f), hudU32(hudColorDanger, 0.85f), "WARNING");
+          }
+          ImGui::EndChild();
+
+          ImGui::TextDisabled("Note: hud_settings.txt accepts both 0..1 and 0..255 RGBA values for colors.");
+        }
+
         if (ImGui::CollapsingHeader("Radar", ImGuiTreeNodeFlags_DefaultOpen)) {
           const double minKm = 25000.0;
           const double maxKm = 1200000.0;
@@ -21634,6 +22072,152 @@ if (showContacts) {
     // Draw palette last so it appears above other windows.
 draw_command_palette:
     (void)game::drawCommandPalette(commandPalette, commandPaletteItems);
+
+    // ---- Action Wheel (radial quick-actions overlay) ----
+    // Hold to open, release to activate. Scroll changes pages.
+    if (actionWheel.open) {
+      // Two-page wheel:
+      //   Page 1: Windows toggles
+      //   Page 2: Context actions (Navigation while in flight, Station while docked)
+
+      const bool stationContext = docked;
+      const int pageCount = 2;
+      if (actionWheel.page < 0) actionWheel.page = 0;
+      if (actionWheel.page >= pageCount) actionWheel.page = 0;
+
+      // Mouse wheel cycles pages while the wheel is open.
+      if (std::abs(io.MouseWheel) > 0.01f) {
+        const int dir = (io.MouseWheel < 0.0f) ? 1 : -1;
+        actionWheel.page = (actionWheel.page + dir + pageCount) % pageCount;
+      }
+
+      const bool windowsPage = (actionWheel.page == 0);
+      const char* pageName = windowsPage ? "Windows" : (stationContext ? "Station" : "Navigation");
+
+      actionWheelItems.clear();
+      actionWheelItems.reserve(8);
+
+      auto pushChord = [&](const game::KeyChord& chord) {
+        if (!chord.bound()) return;
+        SDL_Event ev{};
+        ev.type = SDL_KEYDOWN;
+        ev.key.keysym.scancode = chord.scancode;
+        ev.key.keysym.mod = chord.mods;
+        ev.key.repeat = 0;
+        SDL_PushEvent(&ev);
+      };
+
+      auto windowOpenState = [&](bool open) {
+        return open ? std::string("Open") : std::string("Closed");
+      };
+
+      auto toggleWindow = [&](std::string_view key) {
+        if (auto* w = uiWindows.find(key)) {
+          const bool now = w->open ? *w->open : false;
+          uiWindows.setOpen(key, !now, true);
+        }
+      };
+
+      auto addItem = [&](std::string label,
+                         std::string detail,
+                         std::string shortcut,
+                         bool enabled,
+                         std::function<void()> onSelected) {
+        game::ActionWheelItem it;
+        it.label = std::move(label);
+        it.detail = std::move(detail);
+        it.shortcut = std::move(shortcut);
+        it.enabled = enabled;
+        it.action = std::move(onSelected);
+        actionWheelItems.push_back(std::move(it));
+      };
+
+      if (windowsPage) {
+        // Order matters: the wheel starts at the top and goes clockwise.
+        addItem("Galaxy", windowOpenState(showGalaxy), game::chordLabel(controls.actions.toggleGalaxy), true,
+                [&]() { toggleWindow("Galaxy"); });
+        addItem("Ship", windowOpenState(showShip), game::chordLabel(controls.actions.toggleShip), true,
+                [&]() { toggleWindow("Ship"); });
+        addItem("Market", windowOpenState(showMarket), game::chordLabel(controls.actions.toggleMarket), true,
+                [&]() { toggleWindow("Market"); });
+        addItem("Missions", windowOpenState(showMissions), game::chordLabel(controls.actions.toggleMissions), true,
+                [&]() { toggleWindow("Missions"); });
+        addItem("Contacts", windowOpenState(showContacts), game::chordLabel(controls.actions.toggleContacts), true,
+                [&]() { toggleWindow("Contacts"); });
+        addItem("Scanner", windowOpenState(showScanner), game::chordLabel(controls.actions.toggleScanner), true,
+                [&]() { toggleWindow("Scanner"); });
+        addItem("Trade", windowOpenState(showTrade), game::chordLabel(controls.actions.toggleTrade), true,
+                [&]() { toggleWindow("Trade"); });
+        addItem("Guide", windowOpenState(showGuide), game::chordLabel(controls.actions.toggleGuide), true,
+                [&]() { toggleWindow("Guide"); });
+      } else {
+        if (stationContext) {
+          addItem("Undock", "Leave station", game::chordLabel(controls.actions.dockOrUndock), true,
+                  [&]() { pushChord(controls.actions.dockOrUndock); });
+          addItem("Hangar", windowOpenState(showHangar), game::chordLabel(controls.actions.toggleHangar), true,
+                  [&]() { toggleWindow("Hangar"); });
+          addItem("Market", windowOpenState(showMarket), game::chordLabel(controls.actions.toggleMarket), true,
+                  [&]() { toggleWindow("Market"); });
+          addItem("Missions", windowOpenState(showMissions), game::chordLabel(controls.actions.toggleMissions), true,
+                  [&]() { toggleWindow("Missions"); });
+          addItem("Trade", windowOpenState(showTrade), game::chordLabel(controls.actions.toggleTrade), true,
+                  [&]() { toggleWindow("Trade"); });
+          addItem("Ship", windowOpenState(showShip), game::chordLabel(controls.actions.toggleShip), true,
+                  [&]() { toggleWindow("Ship"); });
+          addItem("Quick Save", "Write quicksave", game::chordLabel(controls.actions.quicksave), true,
+                  [&]() { pushChord(controls.actions.quicksave); });
+          addItem("Quick Load", "Restore quicksave", game::chordLabel(controls.actions.quickload), true,
+                  [&]() { pushChord(controls.actions.quickload); });
+        } else {
+          // Navigation / flight helpers.
+          const bool canAct = (!docked);
+          addItem("FSD Jump", "Jump to plotted route", game::chordLabel(controls.actions.fsdJump), canAct,
+                  [&]() { pushChord(controls.actions.fsdJump); });
+          addItem("Supercruise", "Enter/Exit", game::chordLabel(controls.actions.supercruise), canAct,
+                  [&]() { pushChord(controls.actions.supercruise); });
+          addItem("Autopilot", (autopilotEnabled ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleAutopilot), canAct,
+                  [&]() { pushChord(controls.actions.toggleAutopilot); });
+          addItem("Dock", "Dock/Undock", game::chordLabel(controls.actions.dockOrUndock), canAct,
+                  [&]() { pushChord(controls.actions.dockOrUndock); });
+          addItem("Clearance", "Request docking", game::chordLabel(controls.actions.requestDockingClearance), canAct,
+                  [&]() { pushChord(controls.actions.requestDockingClearance); });
+          addItem("Approach", "Nav Assist", game::chordLabel(controls.actions.navAssistApproach), canAct,
+                  [&]() { pushChord(controls.actions.navAssistApproach); });
+          addItem("Match Vel", "Nav Assist", game::chordLabel(controls.actions.navAssistMatchVelocity), canAct,
+                  [&]() { pushChord(controls.actions.navAssistMatchVelocity); });
+          addItem("Tactical", (showTacticalOverlay ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleTacticalOverlay), canAct,
+                  [&]() { pushChord(controls.actions.toggleTacticalOverlay); });
+        }
+      }
+
+      const int clickConfirm = game::drawActionWheelOverlay(actionWheel, actionWheelItems, pageName, actionWheel.page, pageCount);
+
+      auto runIndex = [&](int idx) {
+        if (idx < 0 || idx >= (int)actionWheelItems.size()) return;
+        auto& it = actionWheelItems[(std::size_t)idx];
+        if (!it.enabled || !it.action) return;
+        it.action();
+      };
+
+      if (clickConfirm >= 0) {
+        runIndex(clickConfirm);
+        game::closeActionWheel(actionWheel);
+      } else if (actionWheel.requestClose) {
+        runIndex(actionWheel.hovered);
+        game::closeActionWheel(actionWheel);
+      }
+
+      if (!actionWheel.open) {
+        // Restore mouse-steer if we temporarily released it for the wheel.
+        if (actionWheelSuppressedMouseSteer && actionWheelPrevMouseSteer && !docked) {
+          mouseSteer = true;
+          SDL_SetRelativeMouseMode(SDL_TRUE);
+          SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+        }
+        actionWheelPrevMouseSteer = false;
+        actionWheelSuppressedMouseSteer = false;
+      }
+    }
 
     // ---- Offscreen hangar preview render (render-to-texture -> ImGui) ----
     // Render AFTER building UI so the preview uses the latest yaw/pitch/zoom (drag UI)

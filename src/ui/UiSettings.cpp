@@ -77,6 +77,16 @@ bool saveUiSettingsToFile(const UiSettings& s, const std::string& path) {
   f << "dockRightRatio " << s.dock.rightRatio << "\n";
   f << "dockBottomRatio " << s.dock.bottomRatio << "\n";
 
+  // Style overrides (optional fine-tuning)
+  f << "styleOverridesEnabled " << (s.style.enabled ? 1 : 0) << "\n";
+  f << "styleAlpha " << s.style.globalAlpha << "\n";
+  f << "styleDensity " << s.style.density << "\n";
+  f << "styleRounding " << s.style.rounding << "\n";
+  f << "styleBorderScale " << s.style.borderScale << "\n";
+  f << "styleAccentEnabled " << (s.style.accentEnabled ? 1 : 0) << "\n";
+  f << "styleAccentColor " << s.style.accentColor[0] << " " << s.style.accentColor[1] << " " << s.style.accentColor[2] << "\n";
+  f << "styleAccentStrength " << s.style.accentStrength << "\n";
+
   return true;
 }
 
@@ -174,6 +184,32 @@ bool loadUiSettingsFromFile(const std::string& path, UiSettings& out) {
       ss >> s.dock.rightRatio;
     } else if (key == "dockbottomratio") {
       ss >> s.dock.bottomRatio;
+    } else if (key == "styleoverridesenabled" || key == "styleenabled" || key == "style_overrides_enabled") {
+      int v = 0;
+      ss >> v;
+      s.style.enabled = (v != 0);
+    } else if (key == "stylealpha" || key == "style_global_alpha" || key == "styleopacity") {
+      ss >> s.style.globalAlpha;
+    } else if (key == "styledensity" || key == "style_density") {
+      ss >> s.style.density;
+    } else if (key == "stylerounding" || key == "style_rounding") {
+      ss >> s.style.rounding;
+    } else if (key == "styleborderscale" || key == "style_border_scale" || key == "styleborder") {
+      ss >> s.style.borderScale;
+    } else if (key == "styleaccentenabled" || key == "style_accent_enabled") {
+      int v = 0;
+      ss >> v;
+      s.style.accentEnabled = (v != 0);
+    } else if (key == "styleaccentcolor" || key == "style_accent_color") {
+      float r = s.style.accentColor[0];
+      float g = s.style.accentColor[1];
+      float b = s.style.accentColor[2];
+      ss >> r >> g >> b;
+      s.style.accentColor[0] = r;
+      s.style.accentColor[1] = g;
+      s.style.accentColor[2] = b;
+    } else if (key == "styleaccentstrength" || key == "style_accent_strength") {
+      ss >> s.style.accentStrength;
     }
   }
 
@@ -184,6 +220,14 @@ bool loadUiSettingsFromFile(const std::string& path, UiSettings& out) {
   s.dock.leftRatio = std::clamp(s.dock.leftRatio, 0.10f, 0.45f);
   s.dock.rightRatio = std::clamp(s.dock.rightRatio, 0.10f, 0.45f);
   s.dock.bottomRatio = std::clamp(s.dock.bottomRatio, 0.10f, 0.45f);
+
+  // Style overrides
+  s.style.globalAlpha = std::clamp(s.style.globalAlpha, 0.20f, 1.00f);
+  s.style.density = std::clamp(s.style.density, 0.70f, 1.40f);
+  s.style.rounding = std::clamp(s.style.rounding, 0.00f, 3.00f);
+  s.style.borderScale = std::clamp(s.style.borderScale, 0.00f, 3.00f);
+  s.style.accentStrength = std::clamp(s.style.accentStrength, 0.00f, 1.00f);
+  for (float& c : s.style.accentColor) c = std::clamp(c, 0.0f, 1.0f);
 
   out = s;
   return true;
