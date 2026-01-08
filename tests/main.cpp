@@ -30,6 +30,7 @@ int test_police_scan();
 int test_faction_profile();
 int test_security_model();
 int test_distress();
+int test_derelict();
 int test_resource_field();
 int test_signals();
 int test_docking();
@@ -107,6 +108,7 @@ int main() {
   fails += test_faction_profile();
   fails += test_security_model();
   fails += test_distress();
+  fails += test_derelict();
   fails += test_resource_field();
   fails += test_signals();
   fails += test_docking();

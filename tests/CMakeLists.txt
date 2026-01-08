@@ -31,6 +31,7 @@ add_executable(stellar_tests
   test_faction_profile.cpp
   test_security_model.cpp
   test_distress.cpp
+  test_derelict.cpp
   test_resource_field.cpp
   test_signals.cpp
   test_docking.cpp

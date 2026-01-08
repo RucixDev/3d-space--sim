@@ -3,6 +3,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/Units.h"
 #include "stellar/sim/WorldIds.h"
@@ -76,6 +77,9 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
   // (We keep this scheme here so it can be shared when the game integrates this module.)
   const core::u64 sysKey = core::hashCombine(universeSeed, static_cast<core::u64>(system.stub.id));
 
+  // Derive compact system-level security knobs used to shape derelict content.
+  const auto sec = systemSecurityProfile(universeSeed, system);
+
   // --- Persistent resource fields ---
   if (params.resourceFieldCount > 0) {
     out.resourceFields = generateResourceFields(universeSeed, system.stub.id, anchorPosKm, anchorCommsKm, params.resourceFieldCount);
@@ -106,6 +110,17 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
     s.posKm = anchorPosKm + dir * (anchorCommsKm * 1.6 + 190000.0);
     s.expireDay = (double)dayStamp + 1.0;
     s.resolved = isSignalResolved(resolvedSignalIds, id);
+
+    s.hasDerelictPlan = true;
+    s.derelict = planDerelictEncounter(universeSeed,
+                                       system.stub.id,
+                                       id,
+                                       anchorTimeDays,
+                                       sec.piracy01,
+                                       sec.security01,
+                                       sec.contest01,
+                                       /*missionSite=*/false,
+                                       /*includeDayStamp=*/true);
     out.sites.push_back(s);
   }
 
@@ -177,6 +192,18 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
     s.expireDay = timeDays + ttl;
     s.resolved = false;
     s.missionId = m.id;
+
+    // Mission salvage sites should keep their content stable across time (don't mix the day).
+    s.hasDerelictPlan = true;
+    s.derelict = planDerelictEncounter(universeSeed,
+                                       system.stub.id,
+                                       s.id,
+                                       anchorTimeDays,
+                                       sec.piracy01,
+                                       sec.security01,
+                                       sec.contest01,
+                                       /*missionSite=*/true,
+                                       /*includeDayStamp=*/false);
 
     out.sites.push_back(s);
   }

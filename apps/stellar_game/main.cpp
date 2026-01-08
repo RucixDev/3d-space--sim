@@ -680,6 +680,15 @@ struct Contact {
   // Escort-mission convoy marker (leader ship). Used only for UI/logic; not saved.
   bool escortConvoy{false};
 
+  // --- Traffic convoy encounters (physicalized lane traffic) ---
+  // Spawned when resolving a Traffic Convoy signal in normal space.
+  // These are transient and do NOT mutate station inventories on arrival.
+  bool trafficConvoy{false};
+  core::u64 trafficConvoyId{0}; // stable id (matches signal id / convoy.id)
+  sim::StationId trafficFromStationId{0};
+  sim::StationId trafficToStationId{0};
+  double trafficArriveDay{0.0}; // schedule end; used for despawn
+
   // --- Distress / rescue (signal encounters) ---
   // Distressed civilian ship that can be helped by delivering cargo.
   // Triggered via a normal contact scan (scanner action).
@@ -763,6 +772,10 @@ struct SignalSource {
   sim::ResourceFieldKind fieldKind{sim::ResourceFieldKind::OreBelt};
   math::Vec3d posKm{0,0,0};
   double expireDay{0.0};
+
+  // Optional: deterministic derelict loot/threat plan (generated in sim::Signals).
+  bool hasDerelictPlan{false};
+  sim::DerelictPlan derelict{};
 
   // Deterministic plan for distress calls (victim request + optional ambush parameters).
   // Filled at spawn time so scan / resolution UI can display stable info.
@@ -2886,6 +2899,11 @@ int main(int argc, char** argv) {
     s.posKm = site.posKm;
     s.expireDay = site.expireDay;
     s.resolved = site.resolved;
+
+    s.hasDerelictPlan = site.hasDerelictPlan;
+    if (s.hasDerelictPlan) {
+      s.derelict = site.derelict;
+    }
 
     s.hasDistressPlan = site.hasDistressPlan;
     if (s.hasDistressPlan) {
@@ -7641,6 +7659,31 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
       double dtStep = dtSim;
 
+      // Traffic convoys are time-bounded lane shipments. If we've advanced past their scheduled
+      // arrival (e.g., after leaving/re-entering the system), despawn the contact and clean up
+      // any attached escorts/raiders so they don't become "orphan" hostiles.
+      if (c.trafficConvoy && c.trafficArriveDay > 0.0 && timeDays > c.trafficArriveDay + (10.0 / 86400.0)) {
+        const core::u64 convoyId = c.id;
+        c.alive = false;
+        c.tradeUnits = 0.0;
+        c.tradeCargoValueCr = 0.0;
+        c.cargoValueCr = 0.0;
+
+        for (auto& other : contacts) {
+          if (!other.alive) continue;
+          if (other.followId == convoyId) {
+            other.followId = 0;
+            if (other.role == ContactRole::Police && !other.hostileToPlayer) other.alive = false;
+          }
+          if (other.attackTargetId == convoyId) {
+            other.attackTargetId = 0;
+            if (other.role == ContactRole::Pirate && !other.hostileToPlayer && !other.missionTarget) other.alive = false;
+          }
+        }
+
+        continue;
+      }
+
       const bool fleeing = (timeDays < c.fleeUntilDays);
       if (fleeing) {
         // Run away from player.
@@ -7690,6 +7733,31 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
           if (arrived && timeDays >= c.tradeCooldownUntilDays) {
             auto& stEcon = universe.stationEconomy(st, timeDays);
+
+            if (c.trafficConvoy) {
+              // Traffic convoys are physicalized lane shipments. The economic effects have already
+              // been applied by the background traffic simulation, so we do NOT mutate station
+              // inventories here. Once the convoy reaches its destination, despawn it and its
+              // attached escorts/raiders.
+              c.tradeUnits = 0.0;
+              c.tradeCargoValueCr = 0.0;
+              c.cargoValueCr = 0.0;
+              c.alive = false;
+
+              // Clear any followers/attackers that were specifically tied to this convoy.
+              for (auto& other : contacts) {
+                if (!other.alive) continue;
+                if (other.followId == c.id) {
+                  other.followId = 0;
+                  if (other.role == ContactRole::Police && !other.hostileToPlayer) other.alive = false;
+                }
+                if (other.attackTargetId == c.id) {
+                  other.attackTargetId = 0;
+                  if (other.role == ContactRole::Pirate && !other.hostileToPlayer && !other.missionTarget) other.alive = false;
+                }
+              }
+              continue;
+            }
 
             if (c.escortConvoy) {
               // Mission convoys don't directly mutate station inventories. We reserve goods when
@@ -8464,7 +8532,27 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               scanLabel.clear();
               scanLockedTarget = Target{};
             } else {
-              completeScan("Scan complete.", 1.6);
+              // Trader scans reveal cargo + route, enabling piracy/protection gameplay loops.
+              if (c.role == ContactRole::Trader && c.tradeUnits > 0.0 && currentSystem) {
+                const auto def = econ::commodityDef(c.tradeCommodity);
+
+                const std::string fromName = (c.homeStationIndex < currentSystem->stations.size())
+                                               ? currentSystem->stations[c.homeStationIndex].name
+                                               : std::string("Station");
+                const std::string toName = (c.tradeDestStationIndex < currentSystem->stations.size())
+                                             ? currentSystem->stations[c.tradeDestStationIndex].name
+                                             : std::string("Station");
+
+                std::string tag = c.trafficConvoy ? "TRAFFIC CONVOY" : "TRADER";
+                const int units = (int)std::llround(c.tradeUnits);
+                const int valueCr = (int)std::llround(std::max(0.0, c.cargoValueCr));
+
+                completeScan(tag + ": " + def.name + "  (" + std::to_string(units) + "u)  " +
+                               fromName + " -> " + toName + "   est " + std::to_string(valueCr) + " cr",
+                             3.2);
+              } else {
+                completeScan("Scan complete.", 1.6);
+              }
             }
           }
         }
@@ -8567,9 +8655,46 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              if (s.type == SignalType::TrafficConvoy) value = 220.0;
 	              explorationDataCr += value;
 
-	              // Derelicts sometimes still hold an intact data core you can scoop.
-	              if (s.type == SignalType::Derelict) {
-	                spawnCargoPod(econ::CommodityId::Electronics, 1.0, s.posKm, {0,0,0}, 0.25);
+
+	              // Derelict scans reveal the deterministic salvage plan (loot + ambush risk).
+	              // Some derelicts still hold an intact data core you can scoop.
+	              if (s.type == SignalType::Derelict && currentSystem) {
+	                if (!s.hasDerelictPlan) {
+	                  const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+	                  s.hasDerelictPlan = true;
+	                  // Mission sites are seeded via the Signals module; if we somehow
+	                  // lack a plan here, treat it as non-mission and day-stable.
+	                  s.derelict = sim::planDerelictEncounter(universe.seed(),
+	                                                         currentSystem->stub.id,
+	                                                         s.id,
+	                                                         timeDays,
+	                                                         sec.piracy01,
+	                                                         sec.security01,
+	                                                         sec.contest01,
+	                                                         /*missionSite=*/false,
+	                                                         /*includeDayStamp=*/true);
+	                }
+
+	                if (s.hasDerelictPlan) {
+	                  const auto& dp = s.derelict;
+	                  if (dp.hasSalvage) {
+	                    const auto def = econ::commodityDef(dp.salvageCommodity);
+	                    const int u = std::max(1, (int)std::llround(dp.salvageUnits));
+	                    const int riskPct = (int)std::llround(std::clamp(dp.risk, 0.0, 1.0) * 100.0);
+	                    toast(toasts,
+	                          std::string("Derelict analysis: ") + sim::derelictScenarioName(dp.scenario) +
+	                            " " + sim::derelictWreckClassName(dp.wreckClass) + " wreck | salvage ~" +
+	                            std::to_string(u) + " " + def.name + " | risk " + std::to_string(riskPct) + "%",
+	                          3.9);
+	                  }
+	                  if (dp.hasDataCore && dp.dataUnits > 0.0) {
+	                    spawnCargoPod(dp.dataCommodity, dp.dataUnits, s.posKm, {0,0,0}, 0.25);
+	                    toast(toasts, "Intact data core recovered (scoop to sell).", 2.9);
+	                  }
+	                  if (dp.ambush) {
+	                    toast(toasts, "Warning: salvage trap suspected.", 3.1);
+	                  }
+	                }
 	              }
 
 	              completeScan(std::string("Signal scan logged (+data ") + std::to_string((int)value) + " cr).", 2.5);
@@ -8826,19 +8951,248 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	            if (s.type == SignalType::TrafficConvoy) {
               if (s.hasTrafficConvoy && currentSystem) {
                 auto stationNameById = [&](sim::StationId id) -> std::string {
-                  for (const auto& st : currentSystem->stations) { if (st.id == id) return st.name; }
+                  for (const auto& st : currentSystem->stations) {
+                    if (st.id == id) return st.name;
+                  }
                   return std::string("Station ") + std::to_string((long long)id);
                 };
+
+                auto stationIndexById = [&](sim::StationId id) -> std::size_t {
+                  for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+                    if (currentSystem->stations[i].id == id) return i;
+                  }
+                  return 0;
+                };
+
+                auto stationPtrById = [&](sim::StationId id) -> const sim::Station* {
+                  for (const auto& st : currentSystem->stations) {
+                    if (st.id == id) return &st;
+                  }
+                  return nullptr;
+                };
+
                 const auto def = econ::commodityDef(s.trafficConvoy.commodity);
                 toast(toasts,
                       std::string("Traffic convoy acquired: ") + def.name +
                         " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
                         stationNameById(s.trafficConvoy.fromStation) + " -> " + stationNameById(s.trafficConvoy.toStation),
                       3.2);
+
+                // Spawn a physical encounter the first time we resolve this traffic convoy in normal space.
+                // This is a key missing piece of the "living economy" loop: you can now actually pirate
+                // or protect the shipments that were previously just moving map markers.
+                constexpr int kMaxTrafficConvoyContacts = 4;
+                int activeTrafficConvoys = 0;
+                bool alreadySpawned = false;
+                for (const auto& c : contacts) {
+                  if (!c.alive) continue;
+                  if (!c.trafficConvoy) continue;
+                  ++activeTrafficConvoys;
+                  if (c.trafficConvoyId == s.id) alreadySpawned = true;
+                }
+
+                if (!alreadySpawned && activeTrafficConvoys < kMaxTrafficConvoyContacts) {
+                  const sim::Station* fromSt = stationPtrById(s.trafficConvoy.fromStation);
+                  const sim::Station* toSt = stationPtrById(s.trafficConvoy.toStation);
+
+                  if (fromSt && toSt) {
+                    // Estimate cargo value using the origin station market (mid price).
+                    const double units = std::max(0.0, s.trafficConvoy.units);
+                    double cargoValueCr = 0.0;
+                    {
+                      auto& fromEcon = universe.stationEconomy(*fromSt, timeDays);
+                      const auto q = econ::quote(fromEcon, fromSt->economyModel, s.trafficConvoy.commodity, 0.10);
+                      cargoValueCr = std::max(0.0, units * q.mid);
+                    }
+
+                    const sim::SystemSecurityProfile sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+                    const double value01 = std::clamp(cargoValueCr / 25000.0, 0.0, 1.0);
+
+                    // Local RNG for this encounter so we don't perturb unrelated spawn ordering too much.
+                    core::SplitMix64 crng(core::hashCombine(universe.seed() ^ core::fnv1a64("traffic_convoy_spawn"), s.id));
+                    auto randUnitLocal = [&]() -> math::Vec3d {
+                      math::Vec3d v{crng.range(-1.0, 1.0), crng.range(-1.0, 1.0), crng.range(-1.0, 1.0)};
+                      const double L = v.length();
+                      if (L < 1e-6) return math::Vec3d{1, 0, 0};
+                      return v / L;
+                    };
+
+                    const math::Vec3d basePos = s.posKm + randUnitLocal() * crng.range(3000.0, 12000.0);
+                    const math::Vec3d baseVel = s.trafficState.velKmS;
+
+                    // Convoy leader (trader) carrying the shipment's cargo.
+                    Contact convoy{};
+                    convoy.alive = true;
+                    convoy.id = s.id; // stable: ties contact to the lane convoy id (prevents duplicate spawns)
+                    convoy.role = ContactRole::Trader;
+                    convoy.groupId = s.id;
+                    convoy.factionId = (s.trafficConvoy.factionId != 0) ? s.trafficConvoy.factionId : currentSystem->stub.factionId;
+
+                    convoy.trafficConvoy = true;
+                    convoy.trafficConvoyId = s.id;
+                    convoy.trafficFromStationId = s.trafficConvoy.fromStation;
+                    convoy.trafficToStationId = s.trafficConvoy.toStation;
+                    convoy.trafficArriveDay = s.trafficConvoy.arriveDay;
+
+                    convoy.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
+                    convoy.tradeDestStationIndex = stationIndexById(s.trafficConvoy.toStation);
+
+                    convoy.name = "Traffic Convoy";
+                    convoy.tradeCommodity = s.trafficConvoy.commodity;
+                    convoy.tradeUnits = units;
+                    convoy.tradeCapacityKg = std::max(80.0, units * def.massKg);
+                    convoy.tradeCargoValueCr = cargoValueCr;
+                    convoy.cargoValueCr = cargoValueCr;
+
+                    convoy.tradeSupercruiseSpeedKmS = std::clamp(s.trafficState.speedKmS, 250.0, 18000.0);
+                    convoy.tradeSupercruiseDropDistKm = 90000.0;
+
+                    const int thrMk = 1 + (value01 > 0.65);
+                    const int shieldMk = 1 + (sec.security01 > 0.55);
+                    const int distMk = 1 + (sec.security01 > 0.75);
+
+                    configureContactLoadout(convoy,
+                                            ShipHullClass::Hauler,
+                                            thrMk,
+                                            shieldMk,
+                                            distMk,
+                                            WeaponType::MiningLaser,
+                                            /*hullMul=*/0.70 + 0.10 * value01,
+                                            /*shieldMul=*/0.70 + 0.08 * value01,
+                                            /*regenMul=*/0.0,
+                                            /*accelMul=*/0.78,
+                                            /*aiSkill=*/0.42);
+                    convoy.pips = {4, 1, 1};
+                    sim::normalizePips(convoy.pips);
+
+                    convoy.ship.setPositionKm(basePos);
+                    convoy.ship.setVelocityKmS(baseVel);
+                    convoy.ship.setOrientation(quatFromTo({0, 0, 1}, s.trafficState.dir));
+
+                    const core::u64 convoyId = convoy.id;
+                    contacts.push_back(std::move(convoy));
+
+                    // Escorts scale with system security and cargo value (none in anarchy).
+                    int escortCount = 0;
+                    if (currentSystem->stub.factionId != 0) {
+                      if (sec.security01 > 0.70) escortCount = 2;
+                      else if (sec.security01 > 0.55) escortCount = 1;
+                      if (value01 > 0.85 && escortCount < 3 && crng.nextUnit() < 0.55) ++escortCount;
+                    }
+                    escortCount = std::clamp(escortCount, 0, 3);
+
+                    core::u64 escortLeaderId = 0;
+                    for (int ei = 0; ei < escortCount; ++ei) {
+                      Contact p{};
+                      p.alive = true;
+                      p.id = allocWorldId();
+                      if (ei == 0) escortLeaderId = p.id;
+
+                      p.role = ContactRole::Police;
+                      p.groupId = convoyId;
+                      p.leaderId = (ei == 0) ? 0 : escortLeaderId;
+                      p.followId = convoyId;
+                      p.factionId = currentSystem->stub.factionId;
+                      p.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
+                      p.name = (ei == 0) ? "Convoy Escort" : "Escort";
+
+                      const int tier = std::clamp(1 + (value01 > 0.65) + (sec.security01 > 0.75), 1, 3);
+                      const WeaponType w = (tier >= 3 && ei == 0) ? WeaponType::Railgun : WeaponType::PulseLaser;
+
+                      const int tMk = 2;
+                      const int sMk = 1;
+                      const int dMk = tier;
+
+                      const sim::ShipDerivedStats dsTmp = sim::computeShipDerivedStats(ShipHullClass::Scout, tMk, sMk, dMk);
+                      const double regenPerSimMin = npcShieldRegenPerSec * 60.0;
+                      const double targetRegenPerSimMin = regenPerSimMin * (1.0 + 0.12 * (double)(tier - 1));
+                      const double regenMul =
+                          (dsTmp.shieldRegenPerSimMin > 1e-9) ? (targetRegenPerSimMin / dsTmp.shieldRegenPerSimMin) : 0.0;
+
+                      configureContactLoadout(p,
+                                              ShipHullClass::Scout,
+                                              tMk,
+                                              sMk,
+                                              dMk,
+                                              w,
+                                              /*hullMul=*/0.86 * (1.0 + 0.10 * (double)(tier - 1)),
+                                              /*shieldMul=*/0.88 * (1.0 + 0.10 * (double)(tier - 1)),
+                                              /*regenMul=*/regenMul,
+                                              /*accelMul=*/0.80 * (1.0 + 0.10 * (double)(tier - 1)),
+                                              /*aiSkill=*/(ei == 0) ? 0.70 : 0.60);
+                      p.pips = {2, 2, 2};
+                      sim::normalizePips(p.pips);
+
+                      p.ship.setPositionKm(basePos + randUnitLocal() * crng.range(14000.0, 24000.0));
+                      p.ship.setVelocityKmS(baseVel + randUnitLocal() * crng.range(0.0, 0.6));
+                      contacts.push_back(std::move(p));
+                    }
+
+                    // Raiders scale with piracy and cargo value.
+                    int alivePiratesNow = 0;
+                    for (const auto& c : contacts) {
+                      if (c.alive && c.role == ContactRole::Pirate) ++alivePiratesNow;
+                    }
+
+                    const double risk01 = std::clamp(0.12 + 0.65 * sec.piracy01 + 0.35 * value01 - 0.55 * sec.security01, 0.0, 0.90);
+                    if (alivePiratesNow < 10 && crng.nextUnit() < risk01) {
+                      int count = 2 + (crng.nextUnit() < 0.55);
+                      if (risk01 > 0.60 && crng.nextUnit() < 0.45) ++count;
+                      if (risk01 > 0.82 && crng.nextUnit() < 0.25) ++count;
+                      count = std::clamp(count, 2, 5);
+
+                      core::u64 leaderId = 0;
+                      for (int i = 0; i < count; ++i) {
+                        Contact p{};
+                        p.alive = true;
+                        p.id = allocWorldId();
+                        if (i == 0) leaderId = p.id;
+
+                        p.role = ContactRole::Pirate;
+                        p.groupId = convoyId;
+                        p.leaderId = (i == 0) ? 0 : leaderId;
+                        p.hostileToPlayer = true;
+                        p.attackTargetId = convoyId;
+                        p.name = (i == 0) ? "Raid Leader" : "Raider";
+
+                        const bool leader = (i == 0);
+                        const double statMul = leader ? 1.22 : (0.88 + 0.22 * crng.nextUnit());
+                        const int tMk = leader ? 2 : 1;
+                        const int dMk = leader ? 2 : 1;
+
+                        WeaponType w = WeaponType::Cannon;
+                        const double r = crng.nextUnit();
+                        if (leader) w = (r < 0.55) ? WeaponType::Railgun : WeaponType::Cannon;
+                        else w = (r < 0.55) ? WeaponType::Cannon : WeaponType::BeamLaser;
+
+                        configureContactLoadout(p,
+                                                ShipHullClass::Fighter,
+                                                tMk,
+                                                /*sMk=*/1,
+                                                dMk,
+                                                w,
+                                                /*hullMul=*/0.95 * statMul,
+                                                /*shieldMul=*/0.67 * statMul,
+                                                /*regenMul=*/leader ? 0.70 : 0.63,
+                                                /*accelMul=*/leader ? 0.72 : 0.70,
+                                                /*aiSkill=*/leader ? 0.68 : 0.55);
+                        p.pips = {1, 3, 2};
+                        sim::normalizePips(p.pips);
+
+                        p.ship.setPositionKm(basePos + randUnitLocal() * crng.range(52000.0, 90000.0));
+                        p.ship.setVelocityKmS(baseVel + randUnitLocal() * crng.range(0.0, 1.2));
+                        contacts.push_back(std::move(p));
+                      }
+
+                      toast(toasts, "Ambush! Raiders drop on a traffic convoy.", 3.0);
+                    }
+                  }
+                }
               } else {
                 toast(toasts, "Traffic convoy acquired.", 2.6);
               }
             }
+
 
             if (s.type == SignalType::Resource) {
 	              if (!s.fieldSpawned) {
@@ -8894,13 +9248,112 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                toast(toasts, "Derelict located. Salvage pods drifting nearby.", 3.0);
 	              }
 
-	              // Spawn generic salvage pods once (reduced if this is a mission site so it doesn't overpay).
-	              const int genericPods = salvageM ? (1 + rng.range(0, 2)) : (2 + rng.range(0, 3));
-	              for (int i = 0; i < genericPods; ++i) {
-	                const econ::CommodityId table[] = {econ::CommodityId::Machinery, econ::CommodityId::Electronics, econ::CommodityId::Metals, econ::CommodityId::Luxury};
-	                const auto cid = table[rng.range(0, (int)std::size(table) - 1)];
-	                const double units = rng.range(2.0, 10.0);
-	                spawnCargoPod(cid, units, s.posKm + randUnit() * rng.range(1500.0, 9000.0), {0,0,0}, 0.35);
+	              // Ensure a deterministic derelict plan exists (older save runs / modded spawners may not fill it).
+	              if (!s.hasDerelictPlan && currentSystem) {
+	                const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+	                const bool missionSite = (salvageM != nullptr);
+	                s.hasDerelictPlan = true;
+	                s.derelict = sim::planDerelictEncounter(universe.seed(),
+	                                                       currentSystem->stub.id,
+	                                                       s.id,
+	                                                       timeDays,
+	                                                       sec.piracy01,
+	                                                       sec.security01,
+	                                                       sec.contest01,
+	                                                       missionSite,
+	                                                       /*includeDayStamp=*/!missionSite);
+	              }
+
+	              // Spawn salvage pods from the plan. For mission sites, this is treated as a
+	              // smaller "bonus" haul on top of the guaranteed mission cargo burst.
+	              if (s.hasDerelictPlan && s.derelict.hasSalvage) {
+	                const auto& dp = s.derelict;
+	                const int pods = std::clamp(dp.salvagePods, 1, 6);
+	                const double totalUnits = std::max(0.0, dp.salvageUnits) * (salvageM ? 0.55 : 1.0);
+	                if (totalUnits > 0.0) {
+	                  const double per = totalUnits / (double)pods;
+	                  double remaining = totalUnits;
+	                  for (int i = 0; i < pods; ++i) {
+	                    double u = (i == pods - 1) ? remaining : (per * rng.range(0.75, 1.25));
+	                    u = std::max(0.0, std::min(u, remaining));
+	                    remaining -= u;
+	                    spawnCargoPod(dp.salvageCommodity,
+	                                  u,
+	                                  s.posKm + randUnit() * rng.range(1500.0, 9000.0),
+	                                  {0,0,0},
+	                                  0.35);
+	                  }
+	                }
+
+	                // Salvage ambush: pirates lying in wait.
+	                if (dp.ambush && dp.pirateCount > 0) {
+	                  const int pirates = std::clamp(dp.pirateCount, 1, 5);
+	
+	                  // Avoid spawning an unreasonable pile if the system is already crowded.
+	                  int alivePirates = 0;
+	                  for (const auto& c : contacts) {
+	                    if (c.alive && c.role == ContactRole::Pirate) ++alivePirates;
+	                  }
+	                  if (alivePirates < 12) {
+	                    const core::u64 groupId = std::max<core::u64>(1ull, allocWorldId());
+	                    core::u64 leaderId = 0;
+	
+	                    toast(toasts, "Ambush! Pirate signatures inbound.", 3.2);
+	
+	                    for (int i = 0; i < pirates; ++i) {
+	                      Contact p;
+	                      p.id = allocWorldId();
+	                      p.role = ContactRole::Pirate;
+	                      p.name = (i == 0) ? "Salvage Raider" : ("Raider " + std::to_string(i + 1));
+	                      p.factionId = 0;
+	                      p.hostileToPlayer = true;
+	                      p.groupId = groupId;
+	                      if (i == 0) leaderId = p.id;
+	                      else p.leaderId = leaderId;
+
+	                      p.ship = sim::Ship{};
+	                      p.ship.setPositionKm(s.posKm + randUnit() * rng.range(80000.0, 140000.0));
+	                      p.ship.setVelocityKmS({0,0,0});
+	                      p.ship.setOrientation(ship.orientation());
+	                      p.ship.setAngularVelocityRadS({0,0,0});
+
+	                      const bool leader = (i == 0);
+	                      const double r = std::clamp(dp.risk, 0.0, 1.0);
+	                      const int thrMk = (r > 0.66) ? 2 : 1;
+	                      const int shMk = (r > 0.72) ? 2 : 1;
+	                      const int distMk = (r > 0.58) ? 2 : 1;
+	                      WeaponType w = WeaponType::BeamLaser;
+	                      if (leader && r > 0.78) w = WeaponType::Railgun;
+	                      else if (r > 0.55) w = WeaponType::Cannon;
+	                      else if (rng.nextUnit() < 0.55) w = WeaponType::PulseLaser;
+
+	                      configureContactLoadout(p,
+	                                              ShipHullClass::Fighter,
+	                                              thrMk,
+	                                              shMk,
+	                                              distMk,
+	                                              w,
+	                                              /*hullMul=*/0.95 + 0.25 * r,
+	                                              /*shieldMul=*/0.85 + 0.35 * r,
+	                                              /*regenMul=*/0.85,
+	                                              /*accelMul=*/0.92 + 0.12 * r,
+	                                              /*aiSkill=*/0.55 + 0.30 * r);
+
+	                      p.pips = sim::Pips{1,3,2};
+	                      sim::normalizePips(p.pips);
+	                      contacts.push_back(p);
+	                    }
+	                  }
+	                }
+	              } else {
+	                // Fallback: spawn a small amount of generic salvage.
+	                const int genericPods = salvageM ? (1 + rng.range(0, 2)) : (2 + rng.range(0, 3));
+	                for (int i = 0; i < genericPods; ++i) {
+	                  const econ::CommodityId table[] = {econ::CommodityId::Machinery, econ::CommodityId::Electronics, econ::CommodityId::Metals, econ::CommodityId::Luxury};
+	                  const auto cid = table[rng.range(0, (int)std::size(table) - 1)];
+	                  const double units = rng.range(2.0, 10.0);
+	                  spawnCargoPod(cid, units, s.posKm + randUnit() * rng.range(1500.0, 9000.0), {0,0,0}, 0.35);
+	                }
 	              }
 	            } else if (s.type == SignalType::Distress) {
 	              // Ensure a deterministic plan exists (older save runs / modded spawners may not fill it).
@@ -19314,6 +19767,7 @@ if (showContacts) {
     std::string tag = std::string("[") + contactRoleName(c.role) + "]";
     if (c.missionTarget) tag += " [BOUNTY]";
     if (c.escortConvoy) tag += " [CONVOY]";
+    if (c.trafficConvoy) tag += " [TRAFFIC]";
     if (c.followId != 0 && c.role == ContactRole::Police) tag += " [ESCORT]";
     if (c.groupId != 0) {
       tag += (c.leaderId == 0) ? " [LEAD]" : " [WING]";

@@ -2,6 +2,7 @@
 
 #include "stellar/core/Types.h"
 #include "stellar/math/Vec3.h"
+#include "stellar/sim/Derelict.h"
 #include "stellar/sim/Distress.h"
 #include "stellar/sim/ResourceField.h"
 #include "stellar/sim/System.h"
@@ -38,6 +39,10 @@ struct SignalSite {
 
   // Optional payloads (only valid for specific kinds)
   ResourceFieldKind fieldKind{ResourceFieldKind::OreBelt};
+
+  // Optional: deterministic derelict loot/threat plan.
+  bool hasDerelictPlan{false};
+  DerelictPlan derelict{};
 
   bool hasDistressPlan{false};
   DistressPlan distress{};
