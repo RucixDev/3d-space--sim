@@ -10,14 +10,20 @@ namespace stellar::econ {
 static constexpr std::size_t idx(CommodityId id) { return static_cast<std::size_t>(id); }
 
 void StationEconomyState::clampToCapacity(const StationEconomyModel& model) {
-  for (std::size_t i = 0; i < kCommodityCount; ++i) {
-    inventory[i] = std::max(0.0, inventory[i]);
-    inventory[i] = std::min(inventory[i], model.capacity[i]);
-  }
+    for (std::size_t i = 0; i < kCommodityCount; ++i) {
+        double& inv = inventory[i];
+        const double cap = model.capacity[i];
+        // avoids redundant writes
+        if (inv < 0.0) {
+            inv = 0.0;
+        } else if (inv > cap) {
+            inv = cap;
+        }
+    }
 }
 
 static void setAll(std::array<double, kCommodityCount>& a, double v) {
-  for (double& x : a) x = v;
+    std::fill(a.begin(), a.end(), v); // compilers will auto-vectorize this and no manual loop 
 }
 
 StationEconomyModel makeEconomyModel(StationType type, double bias) {
