@@ -1,5 +1,4 @@
 # StellarForge — Procedural Space Sim Prototype (C++20)
-![Uploading Screenshot 2026-01-07 202804.png…]()
 
 A small C++20 procedural space-sim framework + an SDL2/OpenGL **3D prototype** you can evolve toward a Pioneer / Elite-style loop.
 
