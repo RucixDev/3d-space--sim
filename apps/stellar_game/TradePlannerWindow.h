@@ -1,7 +1,9 @@
 #pragma once
 
 #include "stellar/core/JobSystem.h"
+#include "stellar/core/Types.h"
 #include "stellar/sim/System.h"
+#include "stellar/sim/IndustryScanner.h"
 #include "stellar/sim/TradeLoopScanner.h"
 #include "stellar/sim/TradeRunPlanner.h"
 #include "stellar/sim/Universe.h"
@@ -24,6 +26,7 @@ struct TradePlannerWindowState {
   enum class Mode : int {
     Runs = 0,
     Loops = 1,
+    Industry = 2,
   };
 
   // Window mode (multi-leg runs vs loops).
@@ -62,6 +65,9 @@ struct TradePlannerWindowState {
   // Loops settings.
   int loopLegs{2};
 
+  // Industry settings.
+  int industryPerStationLimit{1};
+
   // Performance.
   bool useParallel{true};
   int threads{0};      // 0 = auto
@@ -83,6 +89,7 @@ struct TradePlannerWindowState {
 
   std::vector<stellar::sim::TradeRun> runs;
   std::vector<stellar::sim::TradeLoop> loops;
+  std::vector<stellar::sim::IndustryTradeOpportunity> industryOps;
 
   std::unique_ptr<stellar::core::JobSystem> jobs;
   std::size_t jobsThreadCount{0};
@@ -103,6 +110,9 @@ struct TradePlannerContext {
 
   // Fee model used to produce realistic net profits.
   std::function<double(const stellar::sim::Station&)> effectiveFeeRate;
+
+  // Optional: faction reputation lookup (used by industry quotes).
+  std::function<double(stellar::core::u32)> reputationForFaction;
 
   // UI callbacks.
   std::function<void(stellar::sim::SystemId, stellar::sim::StationId)> routeToStation;

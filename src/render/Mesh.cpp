@@ -7,6 +7,47 @@
 
 namespace stellar::render {
 
+namespace {
+
+struct MeshBuilder {
+  std::vector<VertexPNUT> v;
+  std::vector<std::uint32_t> i;
+
+  void addFace(float nx, float ny, float nz,
+               float x0,float y0,float z0,
+               float x1,float y1,float z1,
+               float x2,float y2,float z2,
+               float x3,float y3,float z3) {
+    const std::uint32_t base = static_cast<std::uint32_t>(v.size());
+    v.push_back({x0,y0,z0,nx,ny,nz,0,0});
+    v.push_back({x1,y1,z1,nx,ny,nz,1,0});
+    v.push_back({x2,y2,z2,nx,ny,nz,1,1});
+    v.push_back({x3,y3,z3,nx,ny,nz,0,1});
+    i.insert(i.end(), {base+0, base+1, base+2, base+0, base+2, base+3});
+  }
+
+  void addBox(float minX, float maxX, float minY, float maxY, float minZ, float maxZ) {
+    const float x0 = minX, x1 = maxX;
+    const float y0 = minY, y1 = maxY;
+    const float z0 = minZ, z1 = maxZ;
+    // +Z
+    addFace(0,0,1,  x0,y0,z1,  x1,y0,z1,  x1,y1,z1,  x0,y1,z1);
+    // -Z
+    addFace(0,0,-1, x1,y0,z0,  x0,y0,z0,  x0,y1,z0,  x1,y1,z0);
+    // +X
+    addFace(1,0,0,  x1,y0,z1,  x1,y0,z0,  x1,y1,z0,  x1,y1,z1);
+    // -X
+    addFace(-1,0,0, x0,y0,z0,  x0,y0,z1,  x0,y1,z1,  x0,y1,z0);
+    // +Y
+    addFace(0,1,0,  x0,y1,z1,  x1,y1,z1,  x1,y1,z0,  x0,y1,z0);
+    // -Y
+    addFace(0,-1,0, x0,y0,z0,  x1,y0,z0,  x1,y0,z1,  x0,y0,z1);
+  }
+};
+
+} // namespace
+
+
 Mesh::~Mesh() { destroy(); }
 
 Mesh::Mesh(Mesh&& o) noexcept {
@@ -244,6 +285,92 @@ Mesh Mesh::makeRing(int segments, float innerRadius, float outerRadius, bool dou
 
   Mesh m;
   m.upload(v, idx);
+  return m;
+}
+
+
+Mesh Mesh::makeShipScout() {
+  // Compact exploration ship. Built from a few simple boxes so we avoid external assets.
+  MeshBuilder b;
+  b.v.reserve(24 * 6);
+  b.i.reserve(36 * 6);
+
+  // Main fuselage
+  b.addBox(-0.10f, 0.10f,  -0.06f, 0.06f,  -0.40f, 0.20f);
+
+  // Tapered nose
+  b.addBox(-0.05f, 0.05f,  -0.04f, 0.04f,   0.20f, 0.55f);
+
+  // Wings
+  b.addBox(-0.30f, -0.10f, -0.02f, 0.02f,  -0.10f, 0.25f);
+  b.addBox( 0.10f,  0.30f, -0.02f, 0.02f,  -0.10f, 0.25f);
+
+  // Tail fin
+  b.addBox(-0.02f, 0.02f,   0.06f, 0.18f,  -0.40f, -0.20f);
+
+  // Engine pods
+  b.addBox(-0.14f, -0.06f, -0.04f, 0.04f,  -0.55f, -0.40f);
+  b.addBox( 0.06f,  0.14f, -0.04f, 0.04f,  -0.55f, -0.40f);
+
+  Mesh m;
+  m.upload(b.v, b.i);
+  return m;
+}
+
+Mesh Mesh::makeShipHauler() {
+  // Chunky cargo hauler: wide body + side tanks + big engines.
+  MeshBuilder b;
+  b.v.reserve(24 * 7);
+  b.i.reserve(36 * 7);
+
+  // Cargo block
+  b.addBox(-0.28f, 0.28f,  -0.14f, 0.14f,  -0.50f, 0.10f);
+
+  // Cockpit section
+  b.addBox(-0.14f, 0.14f,  -0.08f, 0.12f,   0.10f, 0.45f);
+
+  // Nose extension
+  b.addBox(-0.08f, 0.08f,  -0.06f, 0.10f,   0.45f, 0.65f);
+
+  // Side pods / cargo clamps
+  b.addBox(-0.42f, -0.28f, -0.10f, 0.10f,  -0.35f, 0.05f);
+  b.addBox( 0.28f,  0.42f, -0.10f, 0.10f,  -0.35f, 0.05f);
+
+  // Rear engines
+  b.addBox(-0.24f, -0.06f, -0.08f, 0.08f,  -0.70f, -0.50f);
+  b.addBox( 0.06f,  0.24f, -0.08f, 0.08f,  -0.70f, -0.50f);
+
+  Mesh m;
+  m.upload(b.v, b.i);
+  return m;
+}
+
+Mesh Mesh::makeShipFighter() {
+  // Sleek combat craft with wide wings and aggressive nose.
+  MeshBuilder b;
+  b.v.reserve(24 * 8);
+  b.i.reserve(36 * 8);
+
+  // Central fuselage
+  b.addBox(-0.12f, 0.12f,  -0.07f, 0.07f,  -0.50f, 0.25f);
+
+  // Nose
+  b.addBox(-0.06f, 0.06f,  -0.05f, 0.05f,   0.25f, 0.60f);
+
+  // Main wings
+  b.addBox(-0.42f, -0.12f, -0.02f, 0.02f,  -0.20f, 0.18f);
+  b.addBox( 0.12f,  0.42f, -0.02f, 0.02f,  -0.20f, 0.18f);
+
+  // Tail fins
+  b.addBox(-0.10f, -0.06f,  0.07f, 0.20f,  -0.50f, -0.25f);
+  b.addBox( 0.06f,  0.10f,  0.07f, 0.20f,  -0.50f, -0.25f);
+
+  // Engine pods
+  b.addBox(-0.20f, -0.12f, -0.05f, 0.05f,  -0.72f, -0.50f);
+  b.addBox( 0.12f,  0.20f, -0.05f, 0.05f,  -0.72f, -0.50f);
+
+  Mesh m;
+  m.upload(b.v, b.i);
   return m;
 }
 

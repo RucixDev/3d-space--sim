@@ -116,7 +116,11 @@ struct ContrabandEnforcementResult {
   // Reputation penalty to apply (negative).
   double repPenalty{0.0};
 
-  // Suggested bounty to add (unpaid portion).
+  // Suggested bounty to add.
+  //
+  // For contraband compliance, this is intentionally *not* set to the unpaid fine;
+  // callers can track unpaidCr as a fine debt (payable later) and only mint a
+  // bounty/warrant when a fine becomes overdue or when the player evades.
   double bountyAddedCr{0.0};
 
   // Suggested local security escalation knobs (prototype tuning).

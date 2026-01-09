@@ -82,6 +82,9 @@ struct MissionTickResult {
 
 struct MissionDockResult {
   int completed{0};
+
+  // Number of missions that advanced from a via stop to the final leg.
+  // Used by MultiDelivery and Passenger "tour" contracts.
   int progressedMultiLeg{0};
 };
 

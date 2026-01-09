@@ -23,7 +23,13 @@ int cacheStampFor(double timeDays) {
 }
 
 const char* modeLabel(TradePlannerWindowState::Mode m) {
-  return (m == TradePlannerWindowState::Mode::Runs) ? "Runs" : "Loops";
+  using M = TradePlannerWindowState::Mode;
+  switch (m) {
+    case M::Runs: return "Runs";
+    case M::Loops: return "Loops";
+    case M::Industry: return "Industry";
+    default: return "Mode";
+  }
 }
 
 const char* scoreModeLabel(stellar::sim::TradeRunScoreMode m) {
@@ -121,6 +127,63 @@ bool exportLoopsCsv(const char* path, const std::vector<stellar::sim::TradeLoop>
   return true;
 }
 
+bool exportIndustryCsv(const char* path, const std::vector<stellar::sim::IndustryTradeOpportunity>& ideas) {
+  std::ofstream f(path, std::ios::out | std::ios::trunc);
+  if (!f) return false;
+
+  f << "index,to_system_id,to_station_id,to_system_name,to_station_name,distance_ly,recipe_id,recipe_code,recipe_name,batches,inputA,inputAUnits,inputAAsk,inputACostCr,inputB,inputBUnits,inputBAsk,inputBCostCr,output,outputUnits,outputBid,outputRevenueCr,serviceFeeCr,timeDays,outputMassKg,netProfitCr,netProfitPerKg,netProfitPerDay,capitalRequiredCr\n";
+  for (std::size_t i = 0; i < ideas.size(); ++i) {
+    const auto& t = ideas[i];
+    const auto* def = stellar::sim::findIndustryRecipe(t.recipe);
+
+    auto esc = [](std::string s) {
+      for (char& c : s) {
+        if (c == '"') c = '\'';
+      }
+      return s;
+    };
+
+    const std::string sysName = esc(t.toSystemName);
+    const std::string stName = esc(t.toStationName);
+    const std::string recipeCode = esc(def ? std::string(def->code) : std::string("RECIPE"));
+    const std::string recipeName = esc(def ? std::string(def->name) : std::string("Recipe"));
+
+    const double capital = t.inputACostCr + t.inputBCostCr + t.serviceFeeCr;
+
+    f << i
+      << "," << (unsigned long long)t.toSystem
+      << "," << (unsigned long long)t.toStation
+      << ",\"" << sysName << "\""
+      << ",\"" << stName << "\""
+      << "," << t.distanceLy
+      << "," << (unsigned long long)static_cast<std::size_t>(t.recipe)
+      << ",\"" << recipeCode << "\""
+      << ",\"" << recipeName << "\""
+      << "," << t.batches
+      << "," << stellar::econ::commodityCode(t.inputA)
+      << "," << t.inputAUnits
+      << "," << t.inputAAsk
+      << "," << t.inputACostCr
+      << "," << stellar::econ::commodityCode(t.inputB)
+      << "," << t.inputBUnits
+      << "," << t.inputBAsk
+      << "," << t.inputBCostCr
+      << "," << stellar::econ::commodityCode(t.output)
+      << "," << t.outputUnits
+      << "," << t.outputBid
+      << "," << t.outputRevenueCr
+      << "," << t.serviceFeeCr
+      << "," << t.timeDays
+      << "," << t.outputMassKg
+      << "," << t.netProfitCr
+      << "," << t.netProfitPerKg
+      << "," << t.netProfitPerDay
+      << "," << capital
+      << "\n";
+  }
+  return true;
+}
+
 void toastMaybe(const TradePlannerContext& ctx, std::string_view msg, double ttl) {
   if (ctx.toast) ctx.toast(msg, ttl);
 }
@@ -214,11 +277,13 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
   // Mode selector.
   {
     int modeInt = (int)st.mode;
-    const char* items[] = {"Runs (multi-leg)", "Loops (cycle)"};
+    const char* items[] = {"Runs (multi-leg)", "Loops (cycle)", "Industrial (process + haul)"};
     if (ImGui::Combo("Mode", &modeInt, items, IM_ARRAYSIZE(items))) {
       st.mode = (TradePlannerWindowState::Mode)modeInt;
     }
   }
+
+  const bool isIndustry = (st.mode == TradePlannerWindowState::Mode::Industry);
 
   // Origin station.
   if (!originStation) {
@@ -288,23 +353,34 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
       st.bidAskSpread = std::clamp((double)spread, 0.0, 0.5);
     }
 
+    ImGui::BeginDisabled(isIndustry);
+
     float stepKg = (float)st.stepKg;
     if (ImGui::SliderFloat("Manifest step (kg)", &stepKg, 0.1f, 5.0f, "%.1f")) {
       st.stepKg = std::max(0.05, (double)stepKg);
     }
 
     ImGui::Checkbox("Simulate price impact", &st.simulatePriceImpact);
+    ImGui::EndDisabled();
+
+    if (isIndustry) {
+      ImGui::TextDisabled("Industrial scan uses quoted prices; manifest step/impact are not used.");
+    }
   }
 
   // ---- Profit filters ----
   {
-    float minLeg = (float)st.minLegProfitCr;
-    if (ImGui::SliderFloat("Min leg profit (cr)", &minLeg, 0.0f, 20000.0f, "%.0f")) {
-      st.minLegProfitCr = std::max(0.0, (double)minLeg);
+    if (!isIndustry) {
+      float minLeg = (float)st.minLegProfitCr;
+      if (ImGui::SliderFloat("Min leg profit (cr)", &minLeg, 0.0f, 20000.0f, "%.0f")) {
+        st.minLegProfitCr = std::max(0.0, (double)minLeg);
+      }
     }
 
     float minTotal = (float)st.minTotalProfitCr;
-    if (ImGui::SliderFloat("Min total profit (cr)", &minTotal, 0.0f, 80000.0f, "%.0f")) {
+    const char* totalLabel = isIndustry ? "Min net profit (cr)" : "Min total profit (cr)";
+    const float maxTotal = isIndustry ? 200000.0f : 80000.0f;
+    if (ImGui::SliderFloat(totalLabel, &minTotal, 0.0f, maxTotal, "%.0f")) {
       st.minTotalProfitCr = std::max(0.0, (double)minTotal);
     }
 
@@ -358,20 +434,37 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
       ImGui::SameLine();
       ImGui::TextDisabled("(%s)", scoreModeLabel(modes[idx]));
     }
-  } else {
+  } else if (st.mode == TradePlannerWindowState::Mode::Loops) {
     int legs = std::clamp(st.loopLegs, 2, 3);
     if (ImGui::SliderInt("Loop legs", &legs, 2, 3)) st.loopLegs = legs;
+  } else {
+    int per = std::clamp(st.industryPerStationLimit, 1, 4);
+    if (ImGui::SliderInt("Ideas / station", &per, 1, 4)) st.industryPerStationLimit = per;
+
+    double rep = 0.0;
+    if (ctx.reputationForFaction) rep = ctx.reputationForFaction(originStation->factionId);
+    ImGui::TextDisabled("Processing rep (origin faction): %.1f", rep);
+    ImGui::TextDisabled("Industrial scan = buy inputs, process here, sell output elsewhere.");
   }
 
   ImGui::Separator();
 
   // ---- Performance ----
   {
+    const bool parallelSupported = (st.mode != TradePlannerWindowState::Mode::Industry);
+
+    ImGui::BeginDisabled(!parallelSupported);
     ImGui::Checkbox("Use parallel scan", &st.useParallel);
+    ImGui::EndDisabled();
+
     ImGui::SameLine();
     ImGui::Checkbox("Auto refresh", &st.autoRefresh);
 
-    if (st.useParallel) {
+    if (!parallelSupported) {
+      ImGui::TextDisabled("Industrial scan is currently single-threaded.");
+    }
+
+    if (parallelSupported && st.useParallel) {
       int th = st.threads;
       if (ImGui::SliderInt("Threads (0=auto)", &th, 0, 16)) {
         st.threads = std::max(0, th);
@@ -412,6 +505,7 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
   if (ImGui::Button("Clear")) {
     st.runs.clear();
     st.loops.clear();
+    st.industryOps.clear();
     st.cacheStamp = -999999;
     st.cacheSystemId = 0;
   }
@@ -431,8 +525,10 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
       bool ok = false;
       if (st.mode == TradePlannerWindowState::Mode::Runs) {
         ok = exportRunsCsv(st.exportPath, st.runs);
-      } else {
+      } else if (st.mode == TradePlannerWindowState::Mode::Loops) {
         ok = exportLoopsCsv(st.exportPath, st.loops);
+      } else {
+        ok = exportIndustryCsv(st.exportPath, st.industryOps);
       }
       if (ok) {
         toastMaybe(ctx, std::string("Exported ") + modeLabel(st.mode) + " to '" + st.exportPath + "'.", 3.0);
@@ -444,84 +540,90 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
 
   // ---- Execute scan (synchronously; uses internal parallelism if enabled) ----
   if (doScan && canScan) {
-    // Build manifest params.
-    stellar::econ::CargoManifestParams mp;
+    auto start = std::chrono::steady_clock::now();
+
+    auto feeFn = [&](const stellar::sim::Station& s) {
+      return ctx.effectiveFeeRate ? ctx.effectiveFeeRate(s) : 0.0;
+    };
+
     const double freeKg = std::max(0.0, ctx.cargoCapacityKg - ctx.cargoUsedKg);
-    mp.cargoCapacityKg = st.useFreeHold ? freeKg : ctx.cargoCapacityKg;
-    mp.bidAskSpread = st.bidAskSpread;
-    mp.stepKg = st.stepKg;
-    mp.simulatePriceImpact = st.simulatePriceImpact;
-    mp.maxBuyCreditsCr = (st.limitByCredits ? ctx.playerCreditsCr : 0.0);
+    const double effectiveCargoKg = st.useFreeHold ? freeKg : ctx.cargoCapacityKg;
 
-    // If there is effectively no free capacity, bail quickly.
-    if (mp.cargoCapacityKg <= 1e-6) {
-      toastMaybe(ctx, "No free cargo capacity for trade planning.", 3.0);
-    } else {
-      auto start = std::chrono::steady_clock::now();
+    bool didCompute = false;
 
-      auto feeFn = [&](const stellar::sim::Station& s) {
-        return ctx.effectiveFeeRate ? ctx.effectiveFeeRate(s) : 0.0;
-      };
-
-      if (st.useParallel) ensureJobSystem(st);
-
-      if (st.mode == TradePlannerWindowState::Mode::Runs) {
-        stellar::sim::TradeRunScanParams p;
-        p.legs = (std::size_t)std::clamp(st.runLegs, 1, 6);
-        p.beamWidth = (std::size_t)std::clamp(st.beamWidth, 1, 256);
-        p.maxLegCandidates = (std::size_t)std::clamp(st.maxLegCandidates, 1, 256);
-        p.loopless = st.loopless;
-        p.includeSameSystem = st.includeSameSystem;
-        p.maxResults = (std::size_t)std::clamp(st.maxResults, 1, 128);
-        p.maxStations = (std::size_t)std::clamp(st.maxStations, 2, 4096);
-
-        p.minLegProfitCr = st.minLegProfitCr;
-        p.minRunProfitCr = st.minTotalProfitCr;
-
-        p.jumpRangeLy = st.enforceJumpRange ? std::max(0.1, st.jumpRangeLy) : 0.0;
-        p.routeCostPerJump = std::max(0.0, st.routeCostPerJump);
-        p.routeCostPerLy = std::max(0.0, st.routeCostPerLy);
-
-        using SM = stellar::sim::TradeRunScoreMode;
-        const SM modes[] = {SM::TotalProfit, SM::ProfitPerLy, SM::ProfitPerHop, SM::ProfitPerCost};
-        const int idx = std::clamp(st.scoreMode, 0, (int)(IM_ARRAYSIZE(modes) - 1));
-        p.scoreMode = modes[idx];
-
-        p.manifest = mp;
-
-        if (st.useParallel && st.jobs) {
-          st.runs = stellar::sim::planTradeRunsParallel(*st.jobs,
-                                                       ctx.universe,
-                                                       originStub,
-                                                       *originStation,
-                                                       ctx.timeDays,
-                                                       st.radiusLy,
-                                                       (std::size_t)std::max(8, st.maxSystems),
-                                                       p,
-                                                       feeFn);
-        } else {
-          st.runs = stellar::sim::planTradeRuns(ctx.universe,
-                                               originStub,
-                                               *originStation,
-                                               ctx.timeDays,
-                                               st.radiusLy,
-                                               (std::size_t)std::max(8, st.maxSystems),
-                                               p,
-                                               feeFn);
-        }
-        st.loops.clear();
+    if (st.mode == TradePlannerWindowState::Mode::Industry) {
+      // Industrial: buy inputs at origin, process, sell output.
+      if (effectiveCargoKg <= 1e-6) {
+        toastMaybe(ctx, "No free cargo capacity for industrial planning.", 3.0);
       } else {
-        stellar::sim::TradeLoopScanParams p;
-        p.legs = (std::size_t)std::clamp(st.loopLegs, 2, 3);
-        p.includeSameSystem = st.includeSameSystem;
+        stellar::sim::IndustryTradeScanParams p;
+        p.radiusLy = st.radiusLy;
+        p.maxSystems = (std::size_t)std::max(8, st.maxSystems);
         p.maxResults = (std::size_t)std::clamp(st.maxResults, 1, 128);
-        p.maxStations = (std::size_t)std::clamp(st.maxStations, 2, 4096);
-        p.minLegProfitCr = st.minLegProfitCr;
-        p.minLoopProfitCr = st.minTotalProfitCr;
-        p.manifest = mp;
+        p.perStationLimit = (std::size_t)std::clamp(st.industryPerStationLimit, 1, 8);
+        p.cargoCapacityKg = ctx.cargoCapacityKg;
+        p.cargoUsedKg = ctx.cargoUsedKg;
+        p.useFreeHold = st.useFreeHold;
+        p.bidAskSpread = st.bidAskSpread;
+        p.maxBuyCreditsCr = (st.limitByCredits ? ctx.playerCreditsCr : 0.0);
+        p.minNetProfit = st.minTotalProfitCr;
+        p.includeSameSystem = st.includeSameSystem;
 
-        if (st.useParallel && st.jobs) {
-          st.loops = stellar::sim::scanTradeLoopsParallel(*st.jobs,
+        double rep = 0.0;
+        if (ctx.reputationForFaction) rep = ctx.reputationForFaction(originStation->factionId);
+        p.processingRep = rep;
+
+        st.industryOps = stellar::sim::scanIndustryTradeOpportunities(ctx.universe,
+                                                                     originStub,
+                                                                     *originStation,
+                                                                     ctx.timeDays,
+                                                                     p,
+                                                                     feeFn);
+        st.runs.clear();
+        st.loops.clear();
+        didCompute = true;
+      }
+    } else {
+      // Trade (cargo manifests).
+      stellar::econ::CargoManifestParams mp;
+      mp.cargoCapacityKg = effectiveCargoKg;
+      mp.bidAskSpread = st.bidAskSpread;
+      mp.stepKg = st.stepKg;
+      mp.simulatePriceImpact = st.simulatePriceImpact;
+      mp.maxBuyCreditsCr = (st.limitByCredits ? ctx.playerCreditsCr : 0.0);
+
+      // If there is effectively no free capacity, bail quickly.
+      if (mp.cargoCapacityKg <= 1e-6) {
+        toastMaybe(ctx, "No free cargo capacity for trade planning.", 3.0);
+      } else {
+        if (st.useParallel) ensureJobSystem(st);
+
+        if (st.mode == TradePlannerWindowState::Mode::Runs) {
+          stellar::sim::TradeRunScanParams p;
+          p.legs = (std::size_t)std::clamp(st.runLegs, 1, 6);
+          p.beamWidth = (std::size_t)std::clamp(st.beamWidth, 1, 256);
+          p.maxLegCandidates = (std::size_t)std::clamp(st.maxLegCandidates, 1, 256);
+          p.loopless = st.loopless;
+          p.includeSameSystem = st.includeSameSystem;
+          p.maxResults = (std::size_t)std::clamp(st.maxResults, 1, 128);
+          p.maxStations = (std::size_t)std::clamp(st.maxStations, 2, 4096);
+
+          p.minLegProfitCr = st.minLegProfitCr;
+          p.minRunProfitCr = st.minTotalProfitCr;
+          p.manifest = mp;
+
+          p.enforceJumpRange = st.enforceJumpRange;
+          p.jumpRangeLy = st.jumpRangeLy;
+          p.routeCostPerHop = st.routeCostPerJump;
+          p.routeCostPerLy = st.routeCostPerLy;
+
+          using M = stellar::sim::TradeRunScoreMode;
+          const M modes[] = {M::TotalProfit, M::ProfitPerLy, M::ProfitPerHop, M::ProfitPerCost};
+          const int idx = std::clamp(st.scoreMode, 0, (int)(IM_ARRAYSIZE(modes) - 1));
+          p.scoreMode = modes[idx];
+
+          if (st.useParallel && st.jobs) {
+            st.runs = stellar::sim::planTradeRunsParallel(*st.jobs,
                                                          ctx.universe,
                                                          originStub,
                                                          *originStation,
@@ -530,8 +632,8 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
                                                          (std::size_t)std::max(8, st.maxSystems),
                                                          p,
                                                          feeFn);
-        } else {
-          st.loops = stellar::sim::scanTradeLoops(ctx.universe,
+          } else {
+            st.runs = stellar::sim::planTradeRuns(ctx.universe,
                                                  originStub,
                                                  *originStation,
                                                  ctx.timeDays,
@@ -539,10 +641,47 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
                                                  (std::size_t)std::max(8, st.maxSystems),
                                                  p,
                                                  feeFn);
-        }
-        st.runs.clear();
-      }
+          }
+          st.loops.clear();
+        } else {
+          stellar::sim::TradeLoopScanParams p;
+          p.legs = (std::size_t)std::clamp(st.loopLegs, 2, 3);
+          p.includeSameSystem = st.includeSameSystem;
+          p.maxResults = (std::size_t)std::clamp(st.maxResults, 1, 128);
+          p.maxStations = (std::size_t)std::clamp(st.maxStations, 2, 4096);
+          p.minLegProfitCr = st.minLegProfitCr;
+          p.minLoopProfitCr = st.minTotalProfitCr;
+          p.manifest = mp;
 
+          if (st.useParallel && st.jobs) {
+            st.loops = stellar::sim::scanTradeLoopsParallel(*st.jobs,
+                                                           ctx.universe,
+                                                           originStub,
+                                                           *originStation,
+                                                           ctx.timeDays,
+                                                           st.radiusLy,
+                                                           (std::size_t)std::max(8, st.maxSystems),
+                                                           p,
+                                                           feeFn);
+          } else {
+            st.loops = stellar::sim::scanTradeLoops(ctx.universe,
+                                                   originStub,
+                                                   *originStation,
+                                                   ctx.timeDays,
+                                                   st.radiusLy,
+                                                   (std::size_t)std::max(8, st.maxSystems),
+                                                   p,
+                                                   feeFn);
+          }
+          st.runs.clear();
+        }
+
+        st.industryOps.clear();
+        didCompute = true;
+      }
+    }
+
+    if (didCompute) {
       const auto end = std::chrono::steady_clock::now();
       st.lastComputeMs = std::chrono::duration<double, std::milli>(end - start).count();
 
@@ -556,7 +695,6 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
       toastMaybe(ctx, std::string("Trade ") + modeLabel(st.mode) + " scan complete.", 2.2);
     }
   }
-
   ImGui::Separator();
 
   // ---- Results ----
@@ -652,7 +790,7 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
         ImGui::EndTable();
       }
     }
-  } else {
+  } else if (st.mode == TradePlannerWindowState::Mode::Loops) {
     ImGui::Text("Loops: %d", (int)st.loops.size());
     if (st.loops.empty()) {
       ImGui::TextDisabled("No loops found.");
@@ -721,7 +859,115 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
         ImGui::EndTable();
       }
     }
+
+  } else {
+    ImGui::Text("Industrial routes: %d", (int)st.industryOps.size());
+    if (st.industryOps.empty()) {
+      ImGui::TextDisabled("No routes found.");
+    } else {
+      if (ImGui::BeginTable("industry_routes", 7,
+                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                            ImVec2(0, 260))) {
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+        ImGui::TableSetupColumn("Profit", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("/day", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Dist (ly)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Recipe", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Output", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("To", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        for (std::size_t i = 0; i < st.industryOps.size(); ++i) {
+          const auto& t = st.industryOps[i];
+          ImGui::TableNextRow();
+
+          ImGui::TableNextColumn();
+          const std::string nodeId = "##ind_" + std::to_string(i);
+          const bool open = ImGui::TreeNodeEx(nodeId.c_str(),
+                                              ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen,
+                                              "%zu", i + 1);
+
+          ImGui::TableNextColumn();
+          ImGui::Text("%.0f", t.netProfitCr);
+
+          ImGui::TableNextColumn();
+          ImGui::Text("%.0f", t.netProfitPerDay);
+
+          ImGui::TableNextColumn();
+          ImGui::Text("%.1f", t.distanceLy);
+
+          ImGui::TableNextColumn();
+          const auto* rdef = stellar::sim::findIndustryRecipe(t.recipe);
+          const char* rcode = (rdef ? rdef->code : "RECIPE");
+          ImGui::TextUnformatted(rcode);
+
+          ImGui::TableNextColumn();
+          ImGui::Text("%s x%.0f", stellar::econ::commodityCode(t.output).c_str(), t.outputUnits);
+
+          ImGui::TableNextColumn();
+          ImGui::Text("%s:%s", t.toSystemName.c_str(), t.toStationName.c_str());
+          if (ctx.routeToStation) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(("Plot##ind" + std::to_string(i)).c_str())) {
+              ctx.routeToStation(t.toSystem, t.toStation);
+            }
+          }
+
+          if (open) {
+            ImGui::TreePush(nodeId.c_str());
+            ImGui::Separator();
+
+            const double capital = t.inputACostCr + t.inputBCostCr + t.serviceFeeCr;
+            ImGui::TextDisabled("Batches: %d | Process: %.2f days | Capital: %.0f cr", t.batches, t.timeDays, capital);
+
+            if (rdef) {
+              ImGui::Text("%s - %s", rdef->code, rdef->name);
+            }
+
+            ImGui::Text("Inputs:");
+            ImGui::BulletText("%s x%.0f  (ask %.0f)  cost %.0f cr",
+                              stellar::econ::commodityCode(t.inputA).c_str(), t.inputAUnits, t.inputAAsk, t.inputACostCr);
+            if (t.inputBUnits > 0.0) {
+              ImGui::BulletText("%s x%.0f  (ask %.0f)  cost %.0f cr",
+                                stellar::econ::commodityCode(t.inputB).c_str(), t.inputBUnits, t.inputBAsk, t.inputBCostCr);
+            }
+            ImGui::BulletText("Service fee %.0f cr", t.serviceFeeCr);
+
+            ImGui::Text("Output:");
+            ImGui::BulletText("%s x%.0f  (bid %.0f)  revenue %.0f cr",
+                              stellar::econ::commodityCode(t.output).c_str(), t.outputUnits, t.outputBid, t.outputRevenueCr);
+
+            ImGui::TextDisabled("Net: %.0f cr  |  %.0f cr/kg  |  %.0f cr/day",
+                                t.netProfitCr, t.netProfitPerKg, t.netProfitPerDay);
+
+            if (ImGui::SmallButton(("Copy##ind" + std::to_string(i)).c_str())) {
+              std::ostringstream oss;
+              oss << t.toSystemName << ":" << t.toStationName << "\n";
+              if (rdef) {
+                oss << rdef->code << " - " << rdef->name << "\n";
+              }
+              oss << "Batches: " << t.batches << " | Process: " << t.timeDays << " days\n";
+              oss << "Net: " << t.netProfitCr << " cr\n";
+              oss << "Capital: " << capital << " cr\n";
+              oss << "InputA: " << stellar::econ::commodityCode(t.inputA) << " x" << t.inputAUnits << " (ask " << t.inputAAsk << ") cost " << t.inputACostCr << "\n";
+              if (t.inputBUnits > 0.0) {
+                oss << "InputB: " << stellar::econ::commodityCode(t.inputB) << " x" << t.inputBUnits << " (ask " << t.inputBAsk << ") cost " << t.inputBCostCr << "\n";
+              }
+              oss << "Service fee: " << t.serviceFeeCr << "\n";
+              oss << "Output: " << stellar::econ::commodityCode(t.output) << " x" << t.outputUnits << " (bid " << t.outputBid << ") revenue " << t.outputRevenueCr << "\n";
+              ImGui::SetClipboardText(oss.str().c_str());
+              toastMaybe(ctx, "Industrial route copied to clipboard.", 1.8);
+            }
+
+            ImGui::TreePop();
+          }
+        }
+
+        ImGui::EndTable();
+      }
+    }
   }
+
 
   ImGui::End();
 }

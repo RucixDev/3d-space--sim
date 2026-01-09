@@ -219,6 +219,12 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
     f << "bounty " << b.factionId << " " << b.bountyCr << "\n";
   }
 
+  // Fines (minor offenses, payable later)
+  f << "fines " << s.fines.size() << "\n";
+  for (const auto& fi : s.fines) {
+    f << "fine " << fi.factionId << " " << fi.fineCr << " " << fi.dueDay << "\n";
+  }
+
   // Bounty vouchers (earned from destroying criminals; redeemed later)
   f << "bounty_vouchers " << s.bountyVouchers.size() << "\n";
   for (const auto& v : s.bountyVouchers) {
@@ -252,6 +258,21 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << sh.speedKmS
       << "\n";
   }
+
+  // Recently disrupted traffic convoys (anti-farm + economy impact persistence).
+  f << "trafficInterdictions " << s.trafficInterdictions.size() << "\n";
+  for (const auto& d : s.trafficInterdictions) {
+    f << "interdict "
+      << d.convoyId << " "
+      << d.systemId << " "
+      << d.fromStation << " "
+      << d.toStation << " "
+      << static_cast<int>(d.commodity) << " "
+      << d.units << " "
+      << d.expireDay
+      << "\n";
+  }
+
 
   // Station warehouse / cargo storage (player-owned, per station).
   f << "station_storage " << s.stationStorage.size() << "\n";
@@ -795,6 +816,30 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (!(f >> b.factionId >> b.bountyCr)) break;
         out.bounties.push_back(std::move(b));
       }
+    } else if (key == "fines") {
+      std::size_t n = 0;
+      f >> n;
+      out.fines.clear();
+      out.fines.reserve(n);
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "fine") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        FactionFine fi{};
+        if (!(f >> fi.factionId >> fi.fineCr)) break;
+        // dueDay is optional for forward/backward compatibility.
+        if (!(f >> fi.dueDay)) {
+          f.clear();
+          fi.dueDay = 0.0;
+        }
+        out.fines.push_back(std::move(fi));
+      }
     } else if (key == "bounty_vouchers") {
       std::size_t n = 0;
       f >> n;
@@ -883,6 +928,55 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (sh.id != 0 && sh.systemId != 0 && sh.fromStation != 0 && sh.toStation != 0) {
           if (!seenIds.insert(sh.id).second) continue;
           out.trafficShipments.push_back(std::move(sh));
+        }
+      }
+    
+    } else if (key == "trafficInterdictions") {
+      std::size_t n = 0;
+      f >> n;
+      out.trafficInterdictions.clear();
+      out.trafficInterdictions.reserve(std::min<std::size_t>(n, 100000));
+
+      // Defensive: allow corrupted or hand-edited save files to contain duplicate
+      // convoy ids. These can otherwise allow re-spawning / farming.
+      std::unordered_set<core::u64> seenIds;
+      seenIds.reserve(std::min<std::size_t>(n, 4096) * 2 + 1);
+
+      // Robustness strategy: if the count is stale/corrupt, stop when we no longer
+      // see "interdict" and continue parsing later top-level keys.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "interdict") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        TrafficInterdictionState d{};
+        int commodity = 0;
+
+        // Mandatory fields.
+        if (!(iss >> d.convoyId
+                  >> d.systemId
+                  >> d.fromStation
+                  >> d.toStation
+                  >> commodity
+                  >> d.units
+                  >> d.expireDay)) {
+          continue;
+        }
+
+        d.commodity = static_cast<econ::CommodityId>(std::clamp(commodity, 0, (int)econ::kCommodityCount - 1));
+
+        if (d.convoyId != 0 && d.systemId != 0 && d.toStation != 0) {
+          if (!seenIds.insert(d.convoyId).second) continue;
+          out.trafficInterdictions.push_back(std::move(d));
         }
       }
     } else if (key == "station_storage") {

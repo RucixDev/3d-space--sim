@@ -402,6 +402,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Bribe", a.bribe);
   addAction("Toggle Cargo Scoop", a.toggleCargoScoop);
   addAction("Deploy Countermeasure", a.deployCountermeasure);
+  addAction("Deploy Chaff", a.deployChaff);
 
   auto addHold = [&](const char* name, SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return;
@@ -788,6 +789,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Bribe", controls.actions.bribe, ad.bribe);
     add("Toggle Cargo Scoop", controls.actions.toggleCargoScoop, ad.toggleCargoScoop);
     add("Deploy Countermeasure", controls.actions.deployCountermeasure, ad.deployCountermeasure);
+    add("Deploy Chaff", controls.actions.deployChaff, ad.deployChaff);
 
     std::vector<ActionRow> filtered;
     filtered.reserve(rows.size());

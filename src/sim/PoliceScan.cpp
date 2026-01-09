@@ -148,7 +148,7 @@ ContrabandEnforcementResult enforceContraband(const LawProfile& law,
   r.creditsAfter = std::max(0.0, credits) - r.paidCr;
 
   r.repPenalty = law.contrabandRepPenalty(v);
-  r.bountyAddedCr = r.unpaidCr;
+  r.bountyAddedCr = 0.0;
 
   // Prototype escalation tuning.
   r.policeAlertSeconds = 90.0;

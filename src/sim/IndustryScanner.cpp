@@ -63,6 +63,37 @@ static int maxBatchesByInputInventory(econ::StationEconomyState& fromEcon,
   return std::max(0, std::min(maxA, maxB));
 }
 
+// Compute max batches allowed by a capital (credits) budget.
+// This estimates the upfront spend as: buy inputs at origin (ask+fees) + service fee.
+// It does not simulate price impact; use this only as a soft feasibility cap.
+static int maxBatchesByCredits(econ::StationEconomyState& fromEcon,
+                               const econ::StationEconomyModel& fromModel,
+                               const IndustryQuote& q1,
+                               double bidAskSpread,
+                               double feeFrom,
+                               double maxCredits) {
+  if (!std::isfinite(maxCredits)) maxCredits = 0.0;
+  maxCredits = std::max(0.0, maxCredits);
+  if (maxCredits <= 1e-9) return 1'000'000;
+
+  double costPerBatch = std::max(0.0, q1.serviceFeeCr);
+
+  if (q1.inputAUnits > 1e-9) {
+    const auto qa = econ::quote(fromEcon, fromModel, q1.inputA, bidAskSpread);
+    costPerBatch += std::max(0.0, qa.ask) * q1.inputAUnits * (1.0 + feeFrom);
+  }
+  if (q1.inputBUnits > 1e-9) {
+    const auto qb = econ::quote(fromEcon, fromModel, q1.inputB, bidAskSpread);
+    costPerBatch += std::max(0.0, qb.ask) * q1.inputBUnits * (1.0 + feeFrom);
+  }
+
+  if (!std::isfinite(costPerBatch)) costPerBatch = 0.0;
+  costPerBatch = std::max(0.0, costPerBatch);
+  if (costPerBatch <= 1e-9) return 1'000'000;
+
+  return (int)std::floor(maxCredits / costPerBatch + 1e-9);
+}
+
 static int maxBatchesByOutputCargo(double capKg, const IndustryQuote& q1) {
   if (capKg <= 1e-9) return 0;
   if (q1.outputUnits <= 1e-9) return 0;
@@ -124,6 +155,7 @@ std::vector<IndustryTradeOpportunity> scanIndustryTradeOpportunities(Universe& u
     IndustryQuote q1{}; // 1 batch quote (includes yield/speed/fee mods)
     int maxByInputs{0};
     int maxByCargo{0};
+    int maxByCredits{0};
     int maxOverall{0};
   };
 
@@ -149,7 +181,8 @@ std::vector<IndustryTradeOpportunity> scanIndustryTradeOpportunities(Universe& u
 
     rc.maxByInputs = maxBatchesByInputInventory(fromEcon, originStation.economyModel, rc.q1, params.bidAskSpread);
     rc.maxByCargo = maxBatchesByOutputCargo(capKg, rc.q1);
-    rc.maxOverall = std::max(0, std::min(rc.maxByInputs, rc.maxByCargo));
+    rc.maxByCredits = maxBatchesByCredits(fromEcon, originStation.economyModel, rc.q1, params.bidAskSpread, feeFrom, params.maxBuyCreditsCr);
+    rc.maxOverall = std::max(0, std::min({rc.maxByInputs, rc.maxByCargo, rc.maxByCredits}));
     if (rc.maxOverall <= 0) continue;
 
     caps.push_back(rc);

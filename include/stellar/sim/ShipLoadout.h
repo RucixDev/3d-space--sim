@@ -36,6 +36,7 @@ enum class WeaponType : core::u8 {
   Railgun     = 3,
   MiningLaser = 4,
   HomingMissile = 5,
+  RadarMissile = 6,
 };
 
 struct HullDef {
@@ -110,6 +111,7 @@ inline constexpr WeaponDef kWeaponDefs[] = {
   {WeaponType::Railgun,     "Railgun",      9800.0,  1.65,  7.5, 45.0, 320000.0, 240.0, false, false,  0.0,   0.0,  0.60f, 0.90f, 1.00f},
   {WeaponType::MiningLaser, "Mining Laser", 6500.0,  0.22,  1.6,  3.0, 180000.0,   0.0,  true,  false,  0.0,   0.0,  0.30f, 1.00f, 0.35f},
   {WeaponType::HomingMissile, "Homing Missile", 12000.0, 2.80, 6.2, 60.0, 300000.0, 150.0, false, true,  5200.0, 0.55,  1.00f, 0.35f, 0.10f},
+  {WeaponType::RadarMissile,  "Radar Missile",  14500.0, 3.20, 6.8, 58.0, 340000.0, 175.0, false, true,  5200.0, 0.70,  0.25f, 0.65f, 1.00f},
 };
 
 // ---- Derived stat helpers ----

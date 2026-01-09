@@ -119,6 +119,80 @@ int test_police_scan() {
     }
   }
 
+  // --- Station-specific contraband overlays ---------------------------------
+  {
+    const core::u32 base = illegalCommodityMask(seed, factionId);
+
+    // Determinism + superset property.
+    {
+      const StationId stId = 1234ull;
+      const core::u32 m1 = illegalCommodityMaskForStation(seed, factionId, stId, StationType::Shipyard);
+      const core::u32 m2 = illegalCommodityMaskForStation(seed, factionId, stId, StationType::Shipyard);
+      if (m1 != m2) {
+        std::cerr << "[test_police_scan] station contraband mask should be deterministic\n";
+        ++fails;
+      }
+      if ((m1 & base) != base) {
+        std::cerr << "[test_police_scan] station contraband mask should be a superset of faction mask\n";
+        ++fails;
+      }
+    }
+
+    // Find at least one station ID where the overlay adds a restriction beyond the faction mask.
+    core::u32 stationMask = base;
+    StationId foundId = 0;
+    for (StationId sid = 1; sid < 5000; ++sid) {
+      const core::u32 m = illegalCommodityMaskForStation(seed, factionId, sid, StationType::Shipyard);
+      if ((m & base) != base) {
+        std::cerr << "[test_police_scan] station mask lost faction bits\n";
+        ++fails;
+        break;
+      }
+      if (m != base) { stationMask = m; foundId = sid; break; }
+    }
+    if (foundId == 0) {
+      std::cerr << "[test_police_scan] expected at least one station to add an extra contraband restriction\n";
+      ++fails;
+    } else {
+      const core::u32 extra = (stationMask & ~base);
+      std::size_t extraIdx = kCommodityCount;
+      for (std::size_t i = 0; i < kCommodityCount; ++i) {
+        if ((extra & ((core::u32)1u << (core::u32)i)) != 0u) { extraIdx = i; break; }
+      }
+
+      if (extraIdx == kCommodityCount) {
+        std::cerr << "[test_police_scan] failed to find an added contraband bit\n";
+        ++fails;
+      } else {
+        std::array<double, kCommodityCount> cargo{};
+        cargo.fill(0.0);
+        cargo[extraIdx] = 7.0;
+
+        std::array<double, kCommodityCount> mid{};
+        for (std::size_t i = 0; i < kCommodityCount; ++i) {
+          mid[i] = commodityDef((CommodityId)i).basePrice;
+        }
+        mid[extraIdx] = 123.0;
+
+        // Under the faction mask alone, the extra commodity should scan as legal.
+        const auto rBase = scanIllegalCargoMask(base, cargo, &mid);
+        if (rBase.illegalValueCr > 1e-9) {
+          std::cerr << "[test_police_scan] expected extra commodity to be legal under faction mask\n";
+          ++fails;
+        }
+
+        // Under the station mask, it should scan as illegal.
+        const auto rStation = scanIllegalCargoMask(stationMask, cargo, &mid);
+        const double expected = 7.0 * 123.0;
+        if (!nearly(rStation.illegalValueCr, expected, 1e-6)) {
+          std::cerr << "[test_police_scan] expected station scan illegalValueCr=" << expected
+                    << " got=" << rStation.illegalValueCr << "\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
   // --- Scan rates / durations ------------------------------------------------
   {
     LawProfile law{};
@@ -237,8 +311,8 @@ int test_police_scan() {
       ++fails;
     }
 
-    if (!nearly(res.bountyAddedCr, std::max(0.0, expectedUnpaid), 1e-9)) {
-      std::cerr << "[test_police_scan] expected bountyAddedCr==unpaid\n";
+    if (!nearly(res.bountyAddedCr, 0.0, 1e-9)) {
+      std::cerr << "[test_police_scan] expected bountyAddedCr==0 for compliance (track unpaidCr as fines)\n";
       ++fails;
     }
   }

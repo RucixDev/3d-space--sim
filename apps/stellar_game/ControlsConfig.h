@@ -112,6 +112,7 @@ struct ActionBinds {
   KeyChord bribe;
   KeyChord toggleCargoScoop;
   KeyChord deployCountermeasure;
+  KeyChord deployChaff;
 };
 
 struct ControlsConfig {
@@ -320,6 +321,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.bribe = {SDL_SCANCODE_C, KMOD_NONE};
   c.actions.toggleCargoScoop = {SDL_SCANCODE_O, KMOD_NONE};
   c.actions.deployCountermeasure = {SDL_SCANCODE_BACKSPACE, KMOD_NONE};
+  c.actions.deployChaff = {SDL_SCANCODE_BACKSPACE, KMOD_SHIFT};
 
   return c;
 }
@@ -411,6 +413,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "Bribe", a.bribe);
   saveKeyChord(f, "ToggleCargoScoop", a.toggleCargoScoop);
   saveKeyChord(f, "DeployCountermeasure", a.deployCountermeasure);
+  saveKeyChord(f, "DeployChaff", a.deployChaff);
 
   return true;
 }
@@ -479,6 +482,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("Bribe", &a.bribe);
     addB("ToggleCargoScoop", &a.toggleCargoScoop);
     addB("DeployCountermeasure", &a.deployCountermeasure);
+    addB("DeployChaff", &a.deployChaff);
 
     auto addA = [&](const char* n, AxisPair* p) { axisMap[lowerAscii(n)] = p; };
     addA("ThrustForward", &cfg.axes.thrustForward);

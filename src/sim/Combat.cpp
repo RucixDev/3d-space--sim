@@ -522,6 +522,24 @@ FireResult tryFireWeapon(Ship& shooter,
     m.dmg = w.dmg;
     m.blastRadiusKm = std::max(0.0, w.blastRadiusKm);
     m.turnRateRadS = std::max(0.0, w.turnRateRadS);
+
+    // Seeker tuning (decoys + field-of-view).
+    // Heat seekers can be lured by flares; radar seekers by chaff.
+    // These parameters intentionally remain simple and deterministic.
+    if (weapon == WeaponType::RadarMissile) {
+      m.seeker = MissileSeekerType::Radar;
+      // Narrower seeker cone (radians -> cosine).
+      m.seekerFovCos = std::cos(0.80);
+      // Slightly resistant to chaff, but can still be fooled.
+      m.decoyResistance = 0.92;
+    } else {
+      // Default guided weapon: heat seeker.
+      m.seeker = MissileSeekerType::Heat;
+      // Wider cone than radar.
+      m.seekerFovCos = std::cos(0.95);
+      // Easier to decoy with flares.
+      m.decoyResistance = 0.80;
+    }
     m.fromPlayer = fromPlayer;
     m.shooterId = shooterId;
 

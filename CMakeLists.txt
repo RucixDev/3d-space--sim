@@ -141,6 +141,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SupercruiseComputer.cpp
   src/sim/Interdiction.cpp
   src/sim/EncounterDirector.cpp
+  src/sim/SquadTactics.cpp
   src/sim/SecurityModel.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
@@ -152,6 +153,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/Distress.cpp
   src/sim/Derelict.cpp
   src/sim/ResourceField.cpp
+  src/sim/Mining.cpp
+  src/sim/TrafficEscort.cpp
   src/sim/Signals.cpp
   src/sim/Industry.cpp
   src/sim/IndustryService.cpp

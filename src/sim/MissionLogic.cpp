@@ -768,18 +768,88 @@ void refreshMissionOffers(Universe& universe,
       }
     } else if (type == MissionType::Passenger) {
       // Ship-fit: only offer passenger party sizes that the player can accept right now.
-      const int maxParty = std::min(6, freeSeats);
+      // Let larger ships see larger charters (capped so passenger jobs don't dominate).
+      const int maxParty = std::min(std::max(0, freeSeats), 12);
       if (maxParty <= 0) {
         m.type = MissionType::Courier;
         m.reward = 340.0 + distLy * 118.0;
       } else {
         m.type = MissionType::Passenger;
+
         // units is interpreted as "passenger count" for Passenger missions.
-        m.units = (double)mrng.range(1, maxParty);
-        // Reward scales with distance and party size.
-        m.reward = 450.0 + distLy * 125.0 + (double)m.units * 85.0;
-        // Slightly tighter deadline than courier to encourage routing decisions.
-        m.deadlineDay = timeDays + 0.9 + distLy / 24.0;
+        // Weight toward small parties, with occasional larger charters when capacity allows.
+        int party = 1;
+        if (maxParty <= 2) {
+          party = mrng.range(1, maxParty);
+        } else {
+          // 70% small (1..min(4,maxParty)), 30% larger (min(5,maxParty)..maxParty)
+          if (mrng.nextUnit() < 0.70) {
+            party = mrng.range(1, std::min(4, maxParty));
+          } else {
+            party = mrng.range(std::min(5, maxParty), maxParty);
+          }
+        }
+        m.units = (double)party;
+
+        // Optional "tour" (multi-stop) passenger contracts.
+        // These reuse viaSystem/viaStation/leg like MultiDelivery.
+        bool isTour = false;
+        SystemStub viaStub{};
+        const Station* viaSt = nullptr;
+        double routeLy = distLy;
+
+        if (dests.size() >= 2 && distLy >= 25.0 && mrng.nextUnit() < 0.28) {
+          const double directLy = std::max(1e-6, distLy);
+          for (int tries = 0; tries < 18; ++tries) {
+            const auto candStub = dests[(std::size_t)(mrng.nextU32() % (core::u32)dests.size())];
+            if (candStub.id == destStub.id) continue;
+
+            const double d1 = (candStub.posLy - currentSystem.stub.posLy).length();
+            const double d2 = (destStub.posLy - candStub.posLy).length();
+            const double route = d1 + d2;
+            const double detour = route / directLy;
+            if (detour > 2.35) continue;
+
+            const auto& candSys = universe.getSystem(candStub.id, &candStub);
+            if (candSys.stations.empty()) continue;
+            const auto& candSt = candSys.stations[(std::size_t)(mrng.nextU32() % (core::u32)candSys.stations.size())];
+
+            if (!viaSt || route < routeLy) {
+              viaStub = candStub;
+              viaSt = &candSt;
+              routeLy = route;
+              isTour = true;
+            }
+          }
+        }
+
+        if (isTour && viaSt) {
+          m.viaSystem = viaStub.id;
+          m.viaStation = viaSt->id;
+          m.leg = 0;
+        }
+
+        // Reward scales with (route) distance and party size.
+        // Tours pay a premium for the extra stop; express jobs pay for time pressure.
+        const bool express = (mrng.nextUnit() < 0.18);
+        const double base = 460.0 + routeLy * 125.0 + (double)party * 82.0;
+        double reward = base;
+        if (isTour) reward *= 1.18;
+        if (express) reward *= 1.15;
+        reward += mrng.range(0.0, 120.0);
+
+        m.reward = reward;
+
+        // Deadline: passenger contracts are slightly tighter than courier to encourage routing decisions.
+        // Tours get more slack than express.
+        if (express) {
+          m.deadlineDay = timeDays + 0.70 + routeLy / 28.0;
+        } else if (isTour) {
+          m.deadlineDay = timeDays + 1.15 + routeLy / 21.5;
+        } else {
+          m.deadlineDay = timeDays + 0.90 + routeLy / 24.0;
+        }
+
         m.cargoProvided = false;
       }
     } else if (type == MissionType::Smuggle) {
@@ -1056,7 +1126,11 @@ MissionDockResult tryCompleteMissionsAtDock(Universe& universe,
         ++r.completed;
       }
     } else if (m.type == MissionType::Passenger) {
-      if (atFinal) {
+      // Passenger jobs can optionally include a via stop (tour / stopover).
+      if (m.viaSystem != 0 && m.leg == 0 && atVia) {
+        m.leg = 1;
+        ++r.progressedMultiLeg;
+      } else if (atFinal && (m.viaSystem == 0 || m.leg > 0)) {
         m.completed = true;
         ioSave.credits += m.reward;
         addReputation(ioSave, m.factionId, repRewardOnComplete);

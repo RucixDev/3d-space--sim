@@ -46,6 +46,14 @@ public:
                        float outerRadius = 1.25f,
                        bool doubleSided = true);
 
+  // Lightweight procedural ship meshes (unit scale, forward +Z).
+  //
+  // These are intentionally simple, low-poly meshes used for ships in the
+  // prototype so we don't rely on external model assets.
+  static Mesh makeShipScout();
+  static Mesh makeShipHauler();
+  static Mesh makeShipFighter();
+
 private:
   void destroy();
 

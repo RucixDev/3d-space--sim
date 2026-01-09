@@ -603,6 +603,66 @@ int test_missions() {
     }
   }
 
+
+  // Passenger tours (multi-stop): require a via stop before completion.
+  {
+    const auto candidates = u.queryNearby(sys.stub.posLy, 200.0, 64);
+    const SystemStub* destStub = nullptr;
+    for (const auto& cs : candidates) {
+      if (cs.id != sys.stub.id && cs.stationCount > 0) { destStub = &cs; break; }
+    }
+
+    if (!destStub) {
+      std::cerr << "[test_missions] no destination system for passenger tour test\n";
+      ++fails;
+    } else {
+      const auto& destSys = u.getSystem(destStub->id, destStub);
+      const auto& destStation = destSys.stations.front();
+
+      SaveGame p = s;
+      p.credits = 0.0;
+      p.passengerSeats = 10;
+      setReputation(p, station.factionId, 0.0);
+
+      Mission m{};
+      m.id = 100;
+      m.type = MissionType::Passenger;
+      m.factionId = station.factionId;
+      m.fromSystem = sys.stub.id;
+      m.fromStation = station.id;
+      // Use the origin station as the via stop for a simple deterministic test.
+      m.viaSystem = sys.stub.id;
+      m.viaStation = station.id;
+      m.toSystem = destSys.stub.id;
+      m.toStation = destStation.id;
+      m.units = 4.0;
+      m.reward = 500.0;
+      m.deadlineDay = p.timeDays + 5.0;
+      p.missions = {m};
+
+      const auto viaRes = tryCompleteMissionsAtDock(u, sys, station, p.timeDays, p);
+      if (viaRes.progressedMultiLeg != 1) {
+        std::cerr << "[test_missions] expected progressedMultiLeg == 1 for passenger tour via\n";
+        ++fails;
+      }
+      if (p.missions.front().leg != 1 || p.missions.front().completed) {
+        std::cerr << "[test_missions] expected passenger tour to advance to leg 1 without completing\n";
+        ++fails;
+      }
+
+      const double creditsBefore = p.credits;
+      const auto finRes = tryCompleteMissionsAtDock(u, destSys, destStation, p.timeDays, p);
+      if (finRes.completed != 1 || !p.missions.front().completed) {
+        std::cerr << "[test_missions] expected passenger tour completion at final station\n";
+        ++fails;
+      }
+      if (p.credits <= creditsBefore) {
+        std::cerr << "[test_missions] expected credits to increase on passenger tour completion\n";
+        ++fails;
+      }
+    }
+  }
+
   // Bounty missions: complete on scan or kill events (shared logic).
   {
     SaveGame p = s;

@@ -1,3 +1,53 @@
+## 2026-01-09: Industrial Trade Planner + Capital-Aware Industry Scans
+
+This round makes the **industry** layer much more playable by exposing it inside the Trade Planner and
+making the scanner respect **capital constraints**.
+
+### What’s new
+
+- **Trade Planner**: new mode **Industrial (process + haul)**
+  - scans for profitable routes that: **buy inputs at the origin station → run an industry recipe → sell the output** at another station
+  - shows per-route breakdown (inputs, service fee, output revenue) and key metrics (net profit, profit/day, profit/kg)
+  - adds CSV export for industrial routes, plus quick **Plot** + **Copy** actions
+
+- **Headless IndustryScanner**: optional **credits/budget cap**
+  - new `IndustryTradeScanParams::maxBuyCreditsCr` caps batch count so the estimated upfront spend
+    (inputs + service fee) fits within the budget
+  - wired to the Trade Planner’s existing **Limit by credits** toggle
+
+---
+
+## 2026-01-09: Traffic Convoys – Escort Contracts (Protect, Not Just Interdict)
+
+This round adds a lightweight, **ambient escort contract** loop to make the traffic layer something
+you can actively **protect** in addition to interdicting.
+
+### What’s new
+
+- New headless `sim::TrafficEscort` planner:
+  - deterministically computes an escort contract plan (duration, range band, reward, rep) from convoy
+    cargo value and the system security profile.
+  - provides a per-raider kill **bonus** rate for “convoy attackers”.
+
+- Game integration:
+  - When a **Traffic Convoy** signal has been physically resolved (the convoy exists in normal space),
+    the System Map action panel exposes an **Accept Escort Contract** button.
+  - While active, a small HUD overlay shows range, time remaining, and payout (including bonus for
+    raiders you destroy while they are targeting the convoy).
+  - Contracts succeed after a short, time-bounded window (or when the convoy docks) and fail if you
+    stray too far or the convoy is destroyed.
+
+- Tests: added `test_traffic_escort` for determinism and basic monotonicity.
+
+## 2026-01-08: Crime Loop – Fines vs Bounties (Persistent Fine Ledger)
+
+- Contraband compliance now issues **fines** that can be paid later (stored per-faction with a due date).
+- Overdue fines automatically convert into **bounties** (warrants) with a late fee + mild reputation hit.
+- Station **Legal** services now show fines and allow paying them down; major stations (Trade Hubs / Shipyards)
+  also offer an **Interstellar Factors** service to clear other-jurisdiction fines for a surcharge.
+- Core PoliceScan: `enforceContraband()` no longer automatically recommends minting a bounty for unpaid fines
+  (tests updated). Unpaid amounts are surfaced as `unpaidCr` for the fine ledger instead.
+
 ## 2026-01-07 (Patch) - Trajectory Encounter / Impact Analysis (Segment-Sphere)
 
 This round adds a robust preview-time trajectory analysis pass that finds **closest approaches** and detects

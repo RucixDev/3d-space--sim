@@ -37,6 +37,11 @@ struct IndustryTradeScanParams {
   // Market assumptions.
   double bidAskSpread{0.10};
 
+  // Capital limit (optional). If > 0, the scanner will cap batches so the
+  // estimated upfront spend (inputs + service fee) fits within this budget.
+  // This uses quoted ask prices and does not simulate price impact.
+  double maxBuyCreditsCr{0.0};
+
   // Optional player rep at the *processing* station (affects quote yield/speed).
   double processingRep{0.0};
 

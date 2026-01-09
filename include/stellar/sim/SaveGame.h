@@ -31,6 +31,15 @@ struct FactionBounty {
   double bountyCr{0.0};
 };
 
+// Persistent fine record (per faction id).
+// Fines are issued for minor offenses and can be paid later at stations.
+// If a fine becomes overdue, it may convert into a bounty.
+struct FactionFine {
+  core::u32 factionId{0};
+  double fineCr{0.0};
+  double dueDay{0.0};
+};
+
 // Persistent day-stamp for deterministic "background" traffic simulation.
 // Only systems the player has visited need to be tracked.
 struct SystemTrafficStamp {
@@ -48,6 +57,7 @@ struct SystemTrafficStamp {
 //  - Preserve stable IDs so TrafficConvoy signals remain consistent across save/load.
 struct TrafficShipmentState {
   core::u64 id{0};
+
   SystemId systemId{0};
   int dayStamp{0};
 
@@ -63,6 +73,28 @@ struct TrafficShipmentState {
   double arriveDay{0.0};
   double distKm{0.0};
   double speedKmS{0.0};
+};
+
+// Persisted record of a disrupted / interdicted traffic convoy.
+//
+// When a traffic convoy is destroyed in the simulation, stellar_game can record
+// the convoy id here to prevent re-spawning it on system re-entry (anti-farming)
+// and to allow markets to reflect lost cargo.
+//
+// This is intentionally small and only needs to cover a short window (similar to
+// TrafficLedger keepDays).
+struct TrafficInterdictionState {
+  core::u64 convoyId{0};
+  SystemId systemId{0};
+
+  StationId fromStation{0};
+  StationId toStation{0};
+
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  double units{0.0};
+
+  // When this convoy would have naturally expired (usually arriveDay). Used for pruning.
+  double expireDay{0.0};
 };
 
 // Player-owned cargo stored at a specific station.
@@ -220,7 +252,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{22};
+  int version{24};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -324,6 +356,9 @@ struct SaveGame {
 
   // Law / bounties
   std::vector<FactionBounty> bounties{};
+
+  // Outstanding fines (minor offenses), payable later.
+  std::vector<FactionFine> fines{};
   // Bounty vouchers earned for destroying criminals (redeem at stations).
   std::vector<FactionBounty> bountyVouchers{};
 
@@ -335,6 +370,9 @@ struct SaveGame {
   // This is used to restore the in-memory TrafficLedger on load so that
   // TrafficConvoy signals remain consistent across save/load.
   std::vector<TrafficShipmentState> trafficShipments{};
+
+  // Recently disrupted traffic convoys (anti-farm + economy impact persistence).
+  std::vector<TrafficInterdictionState> trafficInterdictions{};
 
   // Player station storage / warehouse entries.
   std::vector<StationStorage> stationStorage{};

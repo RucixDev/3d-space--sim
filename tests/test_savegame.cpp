@@ -236,6 +236,30 @@ int test_savegame() {
     s.trafficShipments.push_back(sh);
   }
 
+  // Recently interdicted traffic convoys (anti-farm + economy impact persistence).
+  {
+    TrafficInterdictionState d{};
+    d.convoyId = 0x70000000000000A1ull;
+    d.systemId = 10;
+    d.fromStation = 111;
+    d.toStation = 222;
+    d.commodity = econ::CommodityId::Food;
+    d.units = 12.5;
+    d.expireDay = 41.32;
+    s.trafficInterdictions.push_back(d);
+  }
+  {
+    TrafficInterdictionState d{};
+    d.convoyId = 0x70000000000000A2ull;
+    d.systemId = 10;
+    d.fromStation = 222;
+    d.toStation = 333;
+    d.commodity = econ::CommodityId::Metals;
+    d.units = 3.75;
+    d.expireDay = 42.22;
+    s.trafficInterdictions.push_back(d);
+  }
+
   // Station economy overrides (cached economies persisted).
   {
     StationEconomyOverride ov{};
@@ -455,6 +479,27 @@ int test_savegame() {
       }
       if (a.commodity != b.commodity || !nearly(a.units, b.units) || !nearly(a.departDay, b.departDay) || !nearly(a.arriveDay, b.arriveDay)) {
         std::cerr << "[test_savegame] trafficShipments fields mismatch\n";
+        ++fails;
+        break;
+      }
+    }
+  }
+
+  // Traffic convoy interdiction persistence.
+  if (l.trafficInterdictions.size() != s.trafficInterdictions.size()) {
+    std::cerr << "[test_savegame] trafficInterdictions size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.trafficInterdictions.size(); ++i) {
+      const auto& a = l.trafficInterdictions[i];
+      const auto& b = s.trafficInterdictions[i];
+      if (a.convoyId != b.convoyId || a.systemId != b.systemId || a.fromStation != b.fromStation || a.toStation != b.toStation) {
+        std::cerr << "[test_savegame] trafficInterdictions entry mismatch\n";
+        ++fails;
+        break;
+      }
+      if (a.commodity != b.commodity || !nearly(a.units, b.units) || !nearly(a.expireDay, b.expireDay)) {
+        std::cerr << "[test_savegame] trafficInterdictions fields mismatch\n";
         ++fails;
         break;
       }
@@ -687,6 +732,62 @@ int test_savegame() {
             }
             if (x.stationOverrides.size() != s.stationOverrides.size()) {
               std::cerr << "[test_savegame] duplicate trafficShipments broke parsing of later keys (station_overrides)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If the trafficInterdictions count is wrong, the loader should stop when it no longer sees
+      // "interdict" and continue parsing later keys (e.g. station_overrides).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "trafficInterdictions", s.trafficInterdictions.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_traffic_interdictions.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt trafficInterdictions save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale trafficInterdictions count\n";
+            ++fails;
+          } else {
+            if (x.trafficInterdictions.size() != s.trafficInterdictions.size()) {
+              std::cerr << "[test_savegame] stale trafficInterdictions count changed parsed entry count\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] stale trafficInterdictions count broke parsing of later keys (station_overrides)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // Defensive: if trafficInterdictions lines are duplicated (same convoy id), the loader should
+      // de-dup them.
+      {
+        bool duplicated = false;
+        const std::string corrupt = duplicateSecondLineWithPrefix(original, "interdict ", duplicated);
+        const std::string p = "savegame_test_corrupt_traffic_interdictions_dup.sav";
+        if (!duplicated || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write duplicate trafficInterdictions save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on duplicate trafficInterdictions entries\n";
+            ++fails;
+          } else {
+            if (x.trafficInterdictions.size() != s.trafficInterdictions.size() - 1) {
+              std::cerr << "[test_savegame] duplicate trafficInterdictions lines were not deduped\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] duplicate trafficInterdictions broke parsing of later keys (station_overrides)\n";
               ++fails;
             }
           }

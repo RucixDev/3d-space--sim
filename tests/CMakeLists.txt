@@ -34,6 +34,8 @@ add_executable(stellar_tests
   test_derelict.cpp
   test_resource_field.cpp
   test_signals.cpp
+  test_mining.cpp
+  test_traffic_escort.cpp
   test_docking.cpp
   test_docking_clearance.cpp
   test_thermal.cpp
@@ -63,6 +65,7 @@ add_executable(stellar_tests
   test_ballistics.cpp
   test_supercruise.cpp
   test_encounter_director.cpp
+  test_squad_tactics.cpp
   test_bookmarks.cpp
   test_fuzzy_search.cpp
   test_log_sinks.cpp
