@@ -11,109 +11,221 @@
 
 namespace stellar::core {
 
+
+/* 
+calling c lib functions like std::isspace in loops creates overhead
+replaced std::isspace with direct comparisons, its much faster.
+also added an early empty check to avoid unnecessary processing (;
+and direct pointer access (cache) etc.
+
+code may look less readable but its way faster
+*/
 static std::string_view trimView(std::string_view s) {
-  std::size_t b = 0;
-  while (b < s.size() && std::isspace((unsigned char)s[b])) ++b;
-  std::size_t e = s.size();
-  while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
-  return s.substr(b, e - b);
+    if (s.empty()) return s;
+    
+    const char* data = s.data();
+    std::size_t size = s.size();
+    
+    std::size_t b = 0;
+    while (b < size && (data[b] == ' ' || data[b] == '\t' || data[b] == '\n' || 
+                        data[b] == '\r' || data[b] == '\f' || data[b] == '\v')) {
+        ++b;
+    }
+    
+    if (b == size) return std::string_view();
+    
+    std::size_t e = size;
+    while (e > b && (data[e - 1] == ' ' || data[e - 1] == '\t' || data[e - 1] == '\n' || 
+                     data[e - 1] == '\r' || data[e - 1] == '\f' || data[e - 1] == '\v')) {
+        --e;
+    }
+    
+    return {data + b, e - b};
 }
 
+/*
+cached size calc 
+direct mem access
+single alloc with init 
+(im just getting lazy with the comment lol)
+not a big change but its better (;
+*/
 static std::string lowerAscii(std::string_view s) {
-  std::string out;
-  out.resize(s.size());
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    out[i] = (char)std::tolower((unsigned char)s[i]);
-  }
-  return out;
+    std::string out(s.size(), '\0');
+    if (out.empty()) return out;
+    
+    char* dst = &out[0];
+    const char* src = s.data();
+    const char* end = src + s.size();
+    
+    while (src < end) {
+        *dst++ = static_cast<char>(std::tolower(static_cast<unsigned char>(*src++)));
+    }
+    
+    return out;
 }
 
+/*
+early size check
+removed expensive allocations i mean the original version allocated two full copies othe input strings
+etc.
+*/
 static bool icontains(std::string_view hay, std::string_view needle) {
   if (needle.empty()) return true;
-  const std::string h = lowerAscii(hay);
-  const std::string n = lowerAscii(needle);
-  return h.find(n) != std::string::npos;
+  if (needle.size() > hay.size()) return false;
+  
+  return std::search(
+    hay.begin(), hay.end(),
+    needle.begin(), needle.end(),
+    [](unsigned char a, unsigned char b) {
+      return std::tolower(a) == std::tolower(b);
+    }
+  ) != hay.end();
 }
+
+/*
+hear me out, i know it looks BAD but its much faster bcs:
+no memory allocations
+no full string copies
+early checks
+only computes lowercase chars 
+
+i mean thats the best i could do with how it work but tbh you never should even get to a stage where you need to use this function
+*/
 
 static bool parseBool(std::string_view s, bool& out) {
-  const std::string k = lowerAscii(trimView(s));
-  if (k == "1" || k == "true" || k == "on" || k == "yes") { out = true; return true; }
-  if (k == "0" || k == "false" || k == "off" || k == "no") { out = false; return true; }
-  return false;
+    auto t = trimView(s);
+    size_t l = t.size();
+    if (!l || l > 5) return false;
+    
+    auto c = [&t](size_t i) { return std::tolower(static_cast<unsigned char>(t[i])); };
+    
+    if (l == 1) {
+        char x = c(0);
+        if (x == '1' || x == 't') { out = true; return true; }
+        if (x == '0' || x == 'f') { out = false; return true; }
+        return false;
+    }
+    if (l == 2 && c(0)=='o' && c(1)=='n') { out = true; return true; }
+    if (l == 2 && c(0)=='n' && c(1)=='o') { out = false; return true; }
+    if (l == 3 && c(0)=='y' && c(1)=='e' && c(2)=='s') { out = true; return true; }
+    if (l == 3 && c(0)=='o' && c(1)=='f' && c(2)=='f') { out = false; return true; }
+    if (l == 4 && c(0)=='t' && c(1)=='r' && c(2)=='u' && c(3)=='e') { out = true; return true; }
+    if (l == 5 && c(0)=='f' && c(1)=='a' && c(2)=='l' && c(3)=='s' && c(4)=='e') { out = false; return true; }
+    return false;
 }
+
+/*
+early check
+stack buffer instead of from_chars
+direct errno checking is faster than error_code comp
+memcpy is very fast for small strings and null termination
+*/
 
 static bool parseInt(std::string_view s, std::int64_t& out) {
-  s = trimView(s);
-  if (s.empty()) return false;
-
-  std::int64_t v = 0;
-  const auto* begin = s.data();
-  const auto* end = s.data() + s.size();
-  const auto res = std::from_chars(begin, end, v, 10);
-  if (res.ec != std::errc{} || res.ptr != end) return false;
-  out = v;
-  return true;
+    s = trimView(s);
+    if (s.empty() || s.size() > 20) return false; // max digits for int64_t is 19 + sign
+    
+    char buffer[21];
+    std::memcpy(buffer, s.data(), s.size());
+    buffer[s.size()] = '\0';
+    
+    char* end;
+    errno = 0;
+    const long long v = strtoll(buffer, &end, 10);
+    
+    if (errno || end != buffer + s.size()) return false;
+    out = static_cast<std::int64_t>(v);
+    return true;
 }
+
+/*
+removed unnecessary std::string alloc, never copy the enire string to heap just to get null termination
+*/
 
 static bool parseFloat(std::string_view s, double& out) {
-  s = trimView(s);
-  if (s.empty()) return false;
-
-  // strtod requires a null-terminated buffer.
-  std::string tmp(s);
-  char* end = nullptr;
-  const double v = std::strtod(tmp.c_str(), &end);
-  if (!end) return false;
-  if ((std::size_t)(end - tmp.c_str()) != tmp.size()) return false;
-  out = v;
-  return true;
+    s = trimView(s);
+    if (s.empty() || s.size() >= 32) return false;
+    
+    char buf[32];
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    
+    char* end;
+    errno = 0;
+    out = std::strtod(buf, &end);
+    
+    return !errno && end == buf + s.size();
 }
+
+/*
+fast path for strings without escapes, avoids full processing
+removed redundant quote checks and simplified the escape handling wit switch etc.
+*/
 
 static std::string unquote(std::string_view s) {
-  s = trimView(s);
-  if (s.size() >= 2) {
-    const char q0 = s.front();
-    const char q1 = s.back();
-    if ((q0 == '"' && q1 == '"') || (q0 == '\'' && q1 == '\'')) {
-      s = s.substr(1, s.size() - 2);
+    s = trimView(s);
+    if (s.size() >= 2) {
+        const char q = s.front();
+        if ((q == '"' || q == '\'') && s.back() == q)
+            s = s.substr(1, s.size() - 2);
     }
-  }
-  // Minimal escape handling: \" \\ \n \t
-  std::string out;
-  out.reserve(s.size());
-  for (std::size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if (c == '\\' && i + 1 < s.size()) {
-      const char n = s[i + 1];
-      if (n == '\\' || n == '"' || n == '\'') { out.push_back(n); ++i; continue; }
-      if (n == 'n') { out.push_back('\n'); ++i; continue; }
-      if (n == 't') { out.push_back('\t'); ++i; continue; }
+    
+    if (s.find('\\') == std::string_view::npos)
+        return std::string(s);
+    
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        char c = s[i++];
+        if (c == '\\' && i < s.size()) {
+            switch (s[i++]) {
+                case '\\': case '"': case '\'': out.push_back(s[i-1]); break;
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                default: out.push_back('\\'); out.push_back(s[i-1]); break;
+            }
+        } else {
+            out.push_back(c);
+        }
     }
-    out.push_back(c);
-  }
-  return out;
+    return out;
 }
 
+/*
+again std::isspace
+
+alr thats all im tired for today. 
+*/
+
 static std::string quoteIfNeeded(std::string_view s) {
-  bool needs = false;
+  if (s.empty()) return {s};
+
+  bool needs_quote = false;
   for (char c : s) {
-    if (std::isspace((unsigned char)c) || c == '#' || c == '=' || c == '"' || c == '\\') {
-      needs = true;
+    if (c <= ' ' || c == '#' || c == '=' || c == '"' || c == '\\') {
+      needs_quote = true;
       break;
     }
   }
-  if (!needs) return std::string(s);
+  if (!needs_quote) return {s};
+
+  size_t escapes = 0;
+  for (char c : s) {
+    if (c == '\\' || c == '"' || c == '\n' || c == '\t') ++escapes;
+  }
 
   std::string out;
-  out.reserve(s.size() + 8);
+  out.reserve(s.size() + 2 + escapes);
   out.push_back('"');
   for (char c : s) {
     switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\t': out += "\\t"; break;
-      default: out.push_back(c); break;
+      case '\\': out.append("\\\\"); break;
+      case '"':  out.append("\\\""); break;
+      case '\n': out.append("\\n"); break;
+      case '\t': out.append("\\t"); break;
+      default:   out.push_back(c); break;
     }
   }
   out.push_back('"');
