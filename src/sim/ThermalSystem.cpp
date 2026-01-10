@@ -27,6 +27,7 @@ ThermalStepResult stepThermal(double currentHeat,
     if (in.supercruiseActive) heatIn += params.heatPerSupercruiseSec;
     if (in.fsd == ThermalFsdState::Charging) heatIn += params.heatPerFsdChargeSec;
     if (in.fsd == ThermalFsdState::Jumping) heatIn += params.heatPerFsdJumpSec;
+    heatIn += std::max(0.0, in.externalHeatPerSec);
   }
 
   // Cooling rate scales with ship cooling stat.

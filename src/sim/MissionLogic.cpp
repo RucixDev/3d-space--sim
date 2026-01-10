@@ -8,6 +8,8 @@
 #include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/SecurityModel.h"
+#include "stellar/sim/SystemSecurityDynamics.h"
+#include "stellar/sim/SystemEvents.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -243,7 +245,27 @@ void refreshMissionOffers(Universe& universe,
   //
   // This lets the board "feel" different in pirate-heavy frontier space vs.
   // stable core systems, without requiring any non-deterministic simulation.
-  const SystemSecurityProfile localSec = systemSecurityProfile(universe.seed(), currentSystem);
+  SystemSecurityProfile localSec = systemSecurityProfile(universe.seed(), currentSystem);
+
+  // Apply persistent, decaying system-security deltas (if any) so mission boards
+  // react to recent events in this system (pirate raids, crackdowns, trade booms, etc.).
+  if (!ioSave.systemSecurityDeltas.empty()) {
+    for (const auto& d : ioSave.systemSecurityDeltas) {
+      if (d.systemId == currentSystem.stub.id) {
+        const SystemSecurityDynamicsParams dynParams{};
+        localSec = applySystemSecurityDelta(localSec, d, timeDays, dynParams);
+        break;
+      }
+    }
+  }
+
+  // Apply deterministic, time-based system events on top of baseline+deltas.
+  {
+    const SystemEventParams evParams{};
+    const SystemEvent ev = generateSystemEvent(universe.seed(), currentSystem.stub.id, timeDays, localSec, evParams);
+    localSec = applySystemEventToProfile(localSec, ev);
+  }
+
   const FactionProfile issuerTraits = factionProfile(universe.seed(), dockedStation.factionId);
 
   // Precompute cumulative weight thresholds once (the RNG is deterministic per board seed).
@@ -360,7 +382,14 @@ void refreshMissionOffers(Universe& universe,
       const auto* st = &sys.stations[(std::size_t)(mrng.nextU32() % (core::u32)sys.stations.size())];
       const double distLy = (stub.posLy - currentSystem.stub.posLy).length();
 
-      const SystemSecurityProfile sp = systemSecurityProfile(universe.seed(), sys);
+      SystemSecurityProfile sp = systemSecurityProfile(universe.seed(), sys);
+
+        // Destination "weather": deterministic event modifiers for this system too.
+        {
+          const SystemEventParams evParams{};
+          const SystemEvent ev = generateSystemEvent(universe.seed(), sys.stub.id, timeDays, sp, evParams);
+          sp = applySystemEventToProfile(sp, ev);
+        }
       const FactionProfile stTraits = factionProfile(universe.seed(), st->factionId);
 
       const double rel = relationScore(dockedStation.factionId, st->factionId);

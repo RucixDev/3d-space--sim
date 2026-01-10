@@ -30,6 +30,7 @@ add_executable(stellar_tests
   test_police_scan.cpp
   test_faction_profile.cpp
   test_security_model.cpp
+  test_system_security_dynamics.cpp
   test_distress.cpp
   test_derelict.cpp
   test_resource_field.cpp
@@ -39,6 +40,8 @@ add_executable(stellar_tests
   test_docking.cpp
   test_docking_clearance.cpp
   test_thermal.cpp
+  test_fuel_scoop.cpp
+  test_system_events.cpp
   test_nav.cpp
   test_k_routes.cpp
   test_args.cpp
@@ -66,6 +69,7 @@ add_executable(stellar_tests
   test_supercruise.cpp
   test_encounter_director.cpp
   test_squad_tactics.cpp
+  test_missile_defense.cpp
   test_bookmarks.cpp
   test_fuzzy_search.cpp
   test_log_sinks.cpp

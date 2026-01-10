@@ -113,6 +113,31 @@ int test_savegame() {
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Metals)] = 5.5;
   s.cargo[static_cast<std::size_t>(econ::CommodityId::Food)] = 12.0;
   s.scannedKeys = {111, 222, 333};
+
+  // Logbook (scan history + exploration data brokerage state).
+  {
+    LogbookEntry e{};
+    e.key = 0xABC1;
+    e.kind = LogbookEntryKind::StarScan;
+    e.systemId = s.currentSystem;
+    e.discoveredDay = 42.10;
+    e.valueCr = 125.0;
+    e.sold = false;
+    s.logbook.push_back(e);
+  }
+  {
+    LogbookEntry e{};
+    e.key = 0xABC2;
+    e.kind = LogbookEntryKind::AsteroidProspect;
+    e.systemId = 10;
+    e.objectId = 0x20000000000000AAull;
+    e.commodity = econ::CommodityId::Metals;
+    e.units = 42.25;
+    e.discoveredDay = 42.20;
+    e.valueCr = 0.0;
+    e.sold = true;
+    s.logbook.push_back(e);
+  }
   s.resolvedSignalIds = {0x2000000000000001ull, 0x2000000000000002ull};
   s.asteroidStates.push_back({0x20000000000000AAull, 42.25});
   s.asteroidStates.push_back({0x20000000000000BBull, 0.0});
@@ -247,6 +272,47 @@ int test_savegame() {
     d.units = 12.5;
     d.expireDay = 41.32;
     s.trafficInterdictions.push_back(d);
+  }
+
+  // Ambient traffic escort contract + settlements (anti-farm).
+  {
+    s.trafficEscort.active = true;
+    s.trafficEscort.convoyId = 0x6000000000000E11ull;
+    s.trafficEscort.payerFactionId = 7;
+    s.trafficEscort.toStationId = 222;
+    s.trafficEscort.startDays = 42.40;
+    s.trafficEscort.untilDays = 42.46;
+    s.trafficEscort.maxRangeKm = 155000.0;
+    s.trafficEscort.tooFarSec = 4.25;
+    s.trafficEscort.rewardCr = 1200.0;
+    s.trafficEscort.bonusPerPirateCr = 220.0;
+    s.trafficEscort.repReward = 3.5;
+    s.trafficEscort.piratesKilled = 2;
+    s.trafficEscort.piratesPresentAtStart = true;
+  }
+  {
+    s.trafficEscortSettlements.push_back(TrafficEscortSettlementState{0x6000000000000E12ull, 41.95});
+    s.trafficEscortSettlements.push_back(TrafficEscortSettlementState{0x6000000000000E13ull, 42.10});
+  }
+
+  // Per-system security deltas (dynamic world state layered on top of SecurityModel).
+  {
+    SystemSecurityDeltaState d{};
+    d.systemId = 10;
+    d.securityDelta = 0.12;
+    d.piracyDelta = -0.08;
+    d.trafficDelta = 0.03;
+    d.lastUpdateDay = 41.0;
+    s.systemSecurityDeltas.push_back(d);
+  }
+  {
+    SystemSecurityDeltaState d{};
+    d.systemId = 999001;
+    d.securityDelta = -0.04;
+    d.piracyDelta = 0.11;
+    d.trafficDelta = -0.02;
+    d.lastUpdateDay = 42.25;
+    s.systemSecurityDeltas.push_back(d);
   }
   {
     TrafficInterdictionState d{};
@@ -442,6 +508,27 @@ int test_savegame() {
     }
   }
 
+  // Logbook persistence.
+  if (l.logbook.size() != s.logbook.size()) {
+    std::cerr << "[test_savegame] logbook size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.logbook.size(); ++i) {
+      const auto& a = l.logbook[i];
+      const auto& b = s.logbook[i];
+      if (a.key != b.key || a.kind != b.kind || a.systemId != b.systemId || a.objectId != b.objectId) {
+        std::cerr << "[test_savegame] logbook entry mismatch\n";
+        ++fails;
+        break;
+      }
+      if (a.commodity != b.commodity || !nearly(a.units, b.units) || !nearly(a.discoveredDay, b.discoveredDay) || a.sold != b.sold) {
+        std::cerr << "[test_savegame] logbook entry fields mismatch\n";
+        ++fails;
+        break;
+      }
+    }
+  }
+
   // Mission board persistence.
   if (l.missionOffersStationId != s.missionOffersStationId || l.missionOffersDayStamp != s.missionOffersDayStamp) {
     std::cerr << "[test_savegame] mission offers header mismatch\n";
@@ -500,6 +587,69 @@ int test_savegame() {
       }
       if (a.commodity != b.commodity || !nearly(a.units, b.units) || !nearly(a.expireDay, b.expireDay)) {
         std::cerr << "[test_savegame] trafficInterdictions fields mismatch\n";
+        ++fails;
+        break;
+      }
+    }
+  }
+
+  // Ambient traffic escort contract persistence.
+  if (l.trafficEscort.active != s.trafficEscort.active ||
+      l.trafficEscort.convoyId != s.trafficEscort.convoyId ||
+      l.trafficEscort.payerFactionId != s.trafficEscort.payerFactionId ||
+      l.trafficEscort.toStationId != s.trafficEscort.toStationId) {
+    std::cerr << "[test_savegame] trafficEscort header mismatch\n";
+    ++fails;
+  } else {
+    if (!nearly(l.trafficEscort.startDays, s.trafficEscort.startDays) ||
+        !nearly(l.trafficEscort.untilDays, s.trafficEscort.untilDays) ||
+        !nearly(l.trafficEscort.maxRangeKm, s.trafficEscort.maxRangeKm) ||
+        !nearly(l.trafficEscort.tooFarSec, s.trafficEscort.tooFarSec) ||
+        !nearly(l.trafficEscort.rewardCr, s.trafficEscort.rewardCr) ||
+        !nearly(l.trafficEscort.bonusPerPirateCr, s.trafficEscort.bonusPerPirateCr) ||
+        !nearly(l.trafficEscort.repReward, s.trafficEscort.repReward) ||
+        l.trafficEscort.piratesKilled != s.trafficEscort.piratesKilled ||
+        l.trafficEscort.piratesPresentAtStart != s.trafficEscort.piratesPresentAtStart) {
+      std::cerr << "[test_savegame] trafficEscort fields mismatch\n";
+      ++fails;
+    }
+  }
+
+  if (l.trafficEscortSettlements.size() != s.trafficEscortSettlements.size()) {
+    std::cerr << "[test_savegame] trafficEscortSettlements size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.trafficEscortSettlements.size(); ++i) {
+      const auto& a = l.trafficEscortSettlements[i];
+      const auto& b = s.trafficEscortSettlements[i];
+      if (a.convoyId != b.convoyId || !nearly(a.settledDay, b.settledDay)) {
+        std::cerr << "[test_savegame] trafficEscortSettlements entry mismatch\n";
+        ++fails;
+        break;
+      }
+    }
+  }
+
+  // System security delta persistence.
+  if (l.systemSecurityDeltas.size() != s.systemSecurityDeltas.size()) {
+    std::cerr << "[test_savegame] systemSecurityDeltas size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < l.systemSecurityDeltas.size(); ++i) {
+      const auto& a = l.systemSecurityDeltas[i];
+      const auto& b = s.systemSecurityDeltas[i];
+      if (a.systemId != b.systemId) {
+        std::cerr << "[test_savegame] systemSecurityDeltas systemId mismatch\n";
+        ++fails;
+        break;
+      }
+      if (!nearly(a.securityDelta, b.securityDelta) || !nearly(a.piracyDelta, b.piracyDelta) || !nearly(a.trafficDelta, b.trafficDelta)) {
+        std::cerr << "[test_savegame] systemSecurityDeltas value mismatch\n";
+        ++fails;
+        break;
+      }
+      if (!nearly(a.lastUpdateDay, b.lastUpdateDay)) {
+        std::cerr << "[test_savegame] systemSecurityDeltas lastUpdateDay mismatch\n";
         ++fails;
         break;
       }
@@ -760,6 +910,62 @@ int test_savegame() {
             }
             if (x.stationOverrides.size() != s.stationOverrides.size()) {
               std::cerr << "[test_savegame] stale trafficInterdictions count broke parsing of later keys (station_overrides)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // If the systemSecurityDeltas count is wrong, the loader should stop when it no longer sees
+      // "secDelta" and continue parsing later keys (e.g. station_overrides).
+      {
+        bool replaced = false;
+        const std::string corrupt = replaceCountLine(original, "systemSecurityDeltas", s.systemSecurityDeltas.size() + 5, replaced);
+        const std::string p = "savegame_test_corrupt_system_security_deltas.sav";
+        if (!replaced || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write corrupt systemSecurityDeltas save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on stale systemSecurityDeltas count\n";
+            ++fails;
+          } else {
+            if (x.systemSecurityDeltas.size() != s.systemSecurityDeltas.size()) {
+              std::cerr << "[test_savegame] stale systemSecurityDeltas count changed parsed entry count\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] stale systemSecurityDeltas count broke parsing of later keys (station_overrides)\n";
+              ++fails;
+            }
+          }
+          std::filesystem::remove(p);
+        }
+      }
+
+      // Defensive: if systemSecurityDeltas lines are duplicated (same system id), the loader should
+      // de-dup them.
+      {
+        bool duplicated = false;
+        const std::string corrupt = duplicateSecondLineWithPrefix(original, "secDelta ", duplicated);
+        const std::string p = "savegame_test_corrupt_system_security_deltas_dup.sav";
+        if (!duplicated || !writeAllText(p, corrupt)) {
+          std::cerr << "[test_savegame] failed to write duplicate systemSecurityDeltas save\n";
+          ++fails;
+        } else {
+          SaveGame x{};
+          if (!loadFromFile(p, x)) {
+            std::cerr << "[test_savegame] loadFromFile failed on duplicate systemSecurityDeltas entries\n";
+            ++fails;
+          } else {
+            if (x.systemSecurityDeltas.size() != s.systemSecurityDeltas.size() - 1) {
+              std::cerr << "[test_savegame] duplicate systemSecurityDeltas lines were not deduped\n";
+              ++fails;
+            }
+            if (x.stationOverrides.size() != s.stationOverrides.size()) {
+              std::cerr << "[test_savegame] duplicate systemSecurityDeltas broke parsing of later keys (station_overrides)\n";
               ++fails;
             }
           }

@@ -66,6 +66,10 @@ struct ThermalInputs {
   // Applied before cooling/heating integration.
   double heatImpulse{0.0};
 
+  // Continuous external heat input (heat units per real second).
+  // Used for star proximity heating, fuel scooping, etc.
+  double externalHeatPerSec{0.0};
+
   // Ship cooling stat (see ShipLoadout::ShipDerivedStats::heatCoolRate).
   // Values around 10..15 for early-game ships.
   double heatCoolRate{10.0};

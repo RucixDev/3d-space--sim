@@ -46,6 +46,7 @@ struct PlayerShipEconomyState {
   int passengerSeats{2};
   double fsdRangeLy{18.0};
   int smuggleHoldMk{0};
+  int fuelScoopMk{0};
 };
 
 struct ShipValueBreakdown {

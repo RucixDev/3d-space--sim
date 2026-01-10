@@ -5,6 +5,9 @@
 #include "stellar/math/Vec3.h"
 #include "stellar/sim/Celestial.h"
 #include "stellar/sim/Industry.h"
+#include "stellar/sim/Logbook.h"
+#include "stellar/sim/TrafficEscort.h"
+#include "stellar/sim/SystemSecurityDynamics.h"
 
 #include <array>
 #include <string>
@@ -252,7 +255,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{24};
+  int version{29};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -275,6 +278,7 @@ struct SaveGame {
   // Exploration
   double explorationDataCr{0.0};
   std::vector<core::u64> scannedKeys{};
+  std::vector<LogbookEntry> logbook{};
 
   // World state (in-system signals / resource depletion)
   //
@@ -291,6 +295,14 @@ struct SaveGame {
   double hull{1.0}; // 0..1
   double shield{1.0}; // 0..1
   double heat{0.0}; // gameplay heat (0..~120)
+
+  // Countermeasures (ammo / consumables)
+  //
+  // These are intentionally simple counts of "bursts" available.
+  // Gameplay code clamps these to the per-hull maximum on load.
+  core::u8 cmFlares{6};
+  core::u8 cmChaff{4};
+  core::u8 cmHeatSinks{1};
   // Power distributor state
   int pipsEng{2};
   int pipsWep{2};
@@ -328,6 +340,9 @@ struct SaveGame {
 
   // Smuggling / stealth: reduces chance of cargo scans when carrying contraband.
   core::u8 smuggleHoldMk{0}; // 0..3
+
+  // Fuel scoop module (0 = none, 1..3 = Mk1..Mk3)
+  core::u8 fuelScoopMk{0};
 
   // Missions
   core::u64 nextMissionId{1};
@@ -373,6 +388,19 @@ struct SaveGame {
 
   // Recently disrupted traffic convoys (anti-farm + economy impact persistence).
   std::vector<TrafficInterdictionState> trafficInterdictions{};
+
+  // Ambient traffic escort contracts (accepted on-grid via the System Scanner).
+  //
+  // These were previously purely runtime state. Persisting them makes the
+  // traffic layer feel more like a real, consistent game system:
+  //  - Mid-contract quicksave/quickload no longer insta-fails the escort.
+  //  - Completed convoys can't be repeatedly re-escorted after reload.
+  TrafficEscortContractState trafficEscort{};
+  std::vector<TrafficEscortSettlementState> trafficEscortSettlements{};
+
+  // Per-system dynamic deltas applied to sim::SystemSecurityProfile.
+  // These decay over time back toward the deterministic baseline.
+  std::vector<SystemSecurityDeltaState> systemSecurityDeltas{};
 
   // Player station storage / warehouse entries.
   std::vector<StationStorage> stationStorage{};

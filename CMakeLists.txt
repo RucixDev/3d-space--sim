@@ -109,6 +109,7 @@ set(STELLAR_CORE_SOURCES
   src/ui/LogBuffer.cpp
   src/ui/HudLayout.cpp
   src/ui/HudSettings.cpp
+  src/ui/AudioSettings.cpp
   src/ui/Livery.cpp
   src/ui/UiLayoutProfiles.cpp
   src/ui/UiSettings.cpp
@@ -136,6 +137,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
   src/sim/Countermeasures.cpp
+  src/sim/MissileDefense.cpp
   src/sim/FlightController.cpp
   src/sim/NavAssistComputer.cpp
   src/sim/SupercruiseComputer.cpp
@@ -143,10 +145,13 @@ set(STELLAR_CORE_SOURCES
   src/sim/EncounterDirector.cpp
   src/sim/SquadTactics.cpp
   src/sim/SecurityModel.cpp
+  src/sim/SystemSecurityDynamics.cpp
+  src/sim/SystemEvents.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
   src/sim/DockingClearanceService.cpp
   src/sim/ThermalSystem.cpp
+  src/sim/FuelScoopSystem.cpp
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
@@ -162,6 +167,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Warehouse.cpp
   src/sim/ShipyardService.cpp
   src/sim/Insurance.cpp
+  src/sim/Logbook.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
   src/sim/TrafficLedger.cpp
@@ -235,9 +241,11 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
   add_executable(stellar_game
     apps/stellar_game/main.cpp
     apps/stellar_game/ActionWheel.cpp
+    apps/stellar_game/AudioEngine.cpp
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
     apps/stellar_game/MarketDashboardWindow.cpp
+  apps/stellar_game/LogbookWindow.cpp
     apps/stellar_game/TradePlannerWindow.cpp
     apps/stellar_game/ConsoleWindow.cpp
     apps/stellar_game/LogWindow.cpp

@@ -111,8 +111,10 @@ struct ActionBinds {
   KeyChord complyOrSubmit;
   KeyChord bribe;
   KeyChord toggleCargoScoop;
+  KeyChord toggleFuelScoop;
   KeyChord deployCountermeasure;
   KeyChord deployChaff;
+  KeyChord deployHeatSink;
 };
 
 struct ControlsConfig {
@@ -320,8 +322,10 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.complyOrSubmit = {SDL_SCANCODE_I, KMOD_NONE};
   c.actions.bribe = {SDL_SCANCODE_C, KMOD_NONE};
   c.actions.toggleCargoScoop = {SDL_SCANCODE_O, KMOD_NONE};
+  c.actions.toggleFuelScoop = {SDL_SCANCODE_O, KMOD_SHIFT};
   c.actions.deployCountermeasure = {SDL_SCANCODE_BACKSPACE, KMOD_NONE};
   c.actions.deployChaff = {SDL_SCANCODE_BACKSPACE, KMOD_SHIFT};
+  c.actions.deployHeatSink = {SDL_SCANCODE_BACKSPACE, KMOD_CTRL};
 
   return c;
 }
@@ -412,8 +416,10 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "ComplyOrSubmit", a.complyOrSubmit);
   saveKeyChord(f, "Bribe", a.bribe);
   saveKeyChord(f, "ToggleCargoScoop", a.toggleCargoScoop);
+  saveKeyChord(f, "ToggleFuelScoop", a.toggleFuelScoop);
   saveKeyChord(f, "DeployCountermeasure", a.deployCountermeasure);
   saveKeyChord(f, "DeployChaff", a.deployChaff);
+  saveKeyChord(f, "DeployHeatSink", a.deployHeatSink);
 
   return true;
 }
@@ -481,8 +487,10 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("ComplyOrSubmit", &a.complyOrSubmit);
     addB("Bribe", &a.bribe);
     addB("ToggleCargoScoop", &a.toggleCargoScoop);
+    addB("ToggleFuelScoop", &a.toggleFuelScoop);
     addB("DeployCountermeasure", &a.deployCountermeasure);
     addB("DeployChaff", &a.deployChaff);
+    addB("DeployHeatSink", &a.deployHeatSink);
 
     auto addA = [&](const char* n, AxisPair* p) { axisMap[lowerAscii(n)] = p; };
     addA("ThrustForward", &cfg.axes.thrustForward);

@@ -36,6 +36,7 @@
 #include "stellar/render/PostFX.h"
 #include "stellar/ui/HudLayout.h"
 #include "stellar/ui/HudSettings.h"
+#include "stellar/ui/AudioSettings.h"
 #include "stellar/ui/Livery.h"
 #include "stellar/ui/UiSettings.h"
 #include "stellar/ui/UiLayoutProfiles.h"
@@ -69,6 +70,7 @@
 #include "stellar/sim/ShipLoadout.h"
 #include "stellar/sim/Combat.h"
 #include "stellar/sim/Countermeasures.h"
+#include "stellar/sim/MissileDefense.h"
 #include "stellar/sim/Ballistics.h"
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
@@ -78,10 +80,13 @@
 #include "stellar/sim/EncounterDirector.h"
 #include "stellar/sim/SquadTactics.h"
 #include "stellar/sim/SecurityModel.h"
+#include "stellar/sim/SystemSecurityDynamics.h"
+#include "stellar/sim/SystemEvents.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
 #include "stellar/sim/DockingClearanceService.h"
 #include "stellar/sim/ThermalSystem.h"
+#include "stellar/sim/FuelScoopSystem.h"
 #include "stellar/sim/Traffic.h"
 #include "stellar/sim/TrafficLedger.h"
 #include "stellar/sim/TrafficConvoyLayer.h"
@@ -90,11 +95,13 @@
 
 #include "ControlsConfig.h"
 #include "ActionWheel.h"
+#include "AudioEngine.h"
 #include "CommandPalette.h"
 #include "ControlsWindow.h"
 #include "ConsoleWindow.h"
 #include "CVarWindow.h"
 #include "MarketDashboardWindow.h"
+#include "LogbookWindow.h"
 #include "TradePlannerWindow.h"
 #include "ProfilerWindow.h"
 #include "FlightRecorderWindow.h"
@@ -644,6 +651,17 @@ struct Contact {
   // Short "under fire" window for basic behavior tuning (e.g., morale / evasion).
   double underFireUntilDays{0.0};
 
+  // --- Missile defense (NPC) ---
+  // Light-weight, non-persisted counters that allow NPCs to react to inbound
+  // missiles: deploy countermeasures and apply short evasive strafe bursts.
+  int cmBursts{0};
+  bool cmHasChaff{false};
+  double cmCooldownUntilDays{0.0};
+
+  double evadeUntilDays{0.0};
+  double evadeDirRefreshUntilDays{0.0};
+  math::Vec3d evadeDirWorld{0, 0, 0};
+
   // Behavior flags
   bool hostileToPlayer{false}; // police become hostile when you're wanted / shoot them
   double fleeUntilDays{0.0};   // traders flee after being attacked
@@ -887,7 +905,7 @@ int main(int argc, char** argv) {
   SDL_SetMainReady();
 #endif
 
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
     core::log(core::LogLevel::Error, std::string("SDL_Init failed: ") + SDL_GetError());
     return 1;
   }
@@ -944,6 +962,26 @@ int main(int argc, char** argv) {
   bool showUiSettingsWindow = false;
 
   (void)ui::loadUiSettingsFromFile(uiSettingsPath, uiSettings);
+
+  // ---- Audio settings (persistent) ----
+  // Stored separately so you can adjust audio mix without touching savegames/UI layout.
+  const std::string audioSettingsPath = ui::defaultAudioSettingsPath();
+  ui::AudioSettings audioSettings = ui::makeDefaultAudioSettings();
+  bool audioSettingsDirty = false;
+  bool showAudioSettingsWindow = false;
+  bool audioSettingsAutoSaveOnExit = true;
+
+  (void)ui::loadAudioSettingsFromFile(audioSettingsPath, audioSettings);
+  // ---- Procedural audio ----
+  // Uses SDL2's audio callback and runtime synthesis (no external assets).
+  game::AudioEngine audio;
+  (void)audio.init();
+  audio.setEnabled(audioSettings.enabled);
+  audio.setMaster(audioSettings.master);
+  audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+  audio.setSpatialize(audioSettings.spatialize);
+
+
 
   // ---- UI workspaces (persistent) ----
   // Workspaces let users quickly switch between different window sets and
@@ -1770,6 +1808,7 @@ int main(int argc, char** argv) {
   int shieldMk = 1;
   int distributorMk = 1;
   int smuggleHoldMk = 0; // 0..3 hidden compartments for contraband
+  int fuelScoopMk = 0; // 0..3 fuel scoop module (0 = none)
   WeaponType weaponPrimary = WeaponType::BeamLaser;
   WeaponType weaponSecondary = WeaponType::Cannon;
 
@@ -1851,6 +1890,62 @@ int main(int argc, char** argv) {
     sim::normalizePips(c.pips);
     c.distributorCfg = sim::distributorConfig(c.hullClass, c.distributorMk);
     c.distributorState = sim::makeFull(c.distributorCfg);
+
+    // Missile defense kit (non-persisted): number of countermeasure bursts and
+    // whether the ship carries radar chaff in addition to heat flares.
+    // (Flares are assumed to always be available if any bursts exist.)
+    c.cmCooldownUntilDays = 0.0;
+    c.evadeUntilDays = 0.0;
+    c.evadeDirRefreshUntilDays = 0.0;
+    c.evadeDirWorld = {0, 0, 0};
+
+    c.cmBursts = 0;
+    c.cmHasChaff = false;
+    if (c.role == ContactRole::Police) {
+      c.cmBursts = 4 + ((c.distributorMk >= 3) ? 1 : 0);
+      c.cmHasChaff = true;
+    } else if (c.role == ContactRole::Pirate) {
+      c.cmBursts = 2 + ((c.leaderId == 0) ? 1 : 0);
+      c.cmHasChaff = (c.leaderId == 0) && (c.aiSkill > 0.65);
+    } else if (c.role == ContactRole::Trader) {
+      c.cmBursts = 2;
+      c.cmHasChaff = false;
+    }
+  };
+
+  // Player countermeasures are modeled as a small number of "bursts".
+  // (A single burst spawns several decoys but consumes 1 ammo.)
+  struct CountermeasureCaps {
+    int flares{0};
+    int chaff{0};
+    int heatSinks{0};
+  };
+
+  auto countermeasureCapsForHull = [&](ShipHullClass h) -> CountermeasureCaps {
+    switch (h) {
+      case ShipHullClass::Scout:   return {6, 4, 1};
+      case ShipHullClass::Hauler:  return {8, 6, 2};
+      case ShipHullClass::Fighter: return {10, 8, 2};
+    }
+    return {6, 4, 1};
+  };
+
+  int cmFlares = countermeasureCapsForHull(shipHullClass).flares;
+  int cmChaff = countermeasureCapsForHull(shipHullClass).chaff;
+  int cmHeatSinks = countermeasureCapsForHull(shipHullClass).heatSinks;
+
+  auto clampCountermeasureAmmo = [&]() {
+    const auto cap = countermeasureCapsForHull(shipHullClass);
+    cmFlares = std::clamp(cmFlares, 0, cap.flares);
+    cmChaff = std::clamp(cmChaff, 0, cap.chaff);
+    cmHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
+  };
+
+  auto restockCountermeasureAmmo = [&]() {
+    const auto cap = countermeasureCapsForHull(shipHullClass);
+    cmFlares = cap.flares;
+    cmChaff = cap.chaff;
+    cmHeatSinks = cap.heatSinks;
   };
 
   auto recalcPlayerStats = [&]() {
@@ -1885,6 +1980,9 @@ int main(int argc, char** argv) {
 
     playerHull = std::clamp(playerHull, 0.0, playerHullMax);
     playerShield = std::clamp(playerShield, 0.0, playerShieldMax);
+
+    // Ensure consumables stay within hull capacity after upgrades/downgrades.
+    clampCountermeasureAmmo();
   };
 
   recalcPlayerStats();
@@ -1959,6 +2057,74 @@ int main(int argc, char** argv) {
 
   double policeAlertUntilDays = 0.0;
   double policeHeat = 0.0; // soft pursuit intensity (drives police escalation / spawn rate)
+
+  // System-level security dynamics (persistent deltas layered on deterministic baseline).
+  //
+  // These deltas are saved/loaded (see sim::SaveGame::systemSecurityDeltas) and are applied
+  // on top of the deterministic sim::systemSecurityProfile(...) baseline.
+  sim::SystemSecurityDynamicsParams systemSecurityDynParams{};
+  std::unordered_map<sim::SystemId, sim::SystemSecurityDeltaState> systemSecurityDeltaBySystem;
+
+// Helper: apply an impulse to a system's security dynamics state (and keep the map pruned).
+//
+// Design intent:
+//  - Player actions should nudge the "feel" of a system (encounter cadence + mission boards).
+//  - Effects are persistent but decay (see SystemSecurityDynamicsParams).
+auto applySystemSecurityImpulseTo = [&](sim::SystemId sysId,
+                                       double dSecurity,
+                                       double dPiracy,
+                                       double dTraffic) {
+  if (sysId == 0) return;
+  auto& st = systemSecurityDeltaBySystem[sysId];
+  st.systemId = sysId;
+  sim::applySystemSecurityImpulse(st, timeDays, dSecurity, dPiracy, dTraffic, systemSecurityDynParams);
+  if (sim::isSystemSecurityDeltaNegligible(st, timeDays, systemSecurityDynParams)) {
+    systemSecurityDeltaBySystem.erase(sysId);
+  }
+};
+
+auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dTraffic) {
+  if (!currentSystem) return;
+  applySystemSecurityImpulseTo(currentSystem->stub.id, dSecurity, dPiracy, dTraffic);
+};
+
+  // Deterministic system events ("weather") layered on top of baseline + player-driven dynamics.
+  sim::SystemEventParams systemEventParams{};
+
+  struct SystemConditionsSnapshot {
+    sim::SystemSecurityProfile base{};
+    sim::SystemSecurityProfile afterDynamics{};
+    sim::SystemSecurityProfile effective{};
+    bool hasDynamics{false};
+    sim::SystemSecurityDeltaState dynamicsNow{};
+    sim::SystemEvent event{};
+  };
+
+  auto snapshotSystemConditions = [&](const sim::StarSystem& sys) -> SystemConditionsSnapshot {
+    SystemConditionsSnapshot snap{};
+    snap.base = sim::systemSecurityProfile(universe.seed(), sys);
+    snap.afterDynamics = snap.base;
+    snap.dynamicsNow = sim::SystemSecurityDeltaState{};
+
+    if (const auto itD = systemSecurityDeltaBySystem.find(sys.stub.id);
+        itD != systemSecurityDeltaBySystem.end()) {
+      snap.hasDynamics = true;
+      snap.afterDynamics = sim::applySystemSecurityDelta(snap.base, itD->second, timeDays, systemSecurityDynParams);
+      snap.dynamicsNow = sim::decayedSystemSecurityDelta(itD->second, timeDays, systemSecurityDynParams);
+    }
+
+    snap.event = sim::generateSystemEvent(universe.seed(), sys.stub.id, timeDays, snap.afterDynamics, systemEventParams);
+    snap.effective = sim::applySystemEventToProfile(snap.afterDynamics, snap.event);
+    return snap;
+  };
+
+  auto effectiveSystemSecurityProfile = [&](const sim::StarSystem& sys,
+                                           sim::SystemEvent* outEvent = nullptr) -> sim::SystemSecurityProfile {
+    const SystemConditionsSnapshot snap = snapshotSystemConditions(sys);
+    if (outEvent) *outEvent = snap.event;
+    return snap.effective;
+  };
+
 
   // When police/stations scan you while wanted, you get a short "submit or fight" window.
   struct PoliceDemand {
@@ -2038,29 +2204,12 @@ int main(int argc, char** argv) {
   BribeOffer bribeOffer;
 
   // Ambient, optional escort contracts offered by physicalized traffic convoys.
-  // This is not part of the formal mission system: it's a lightweight way to
-  // make the "traffic layer" something you can actively protect (not just interdict).
-  struct TrafficEscortContract {
-    bool active{false};
-    core::u64 convoyId{0};
-    core::u32 payerFactionId{0};
-    sim::StationId toStationId{0};
+  // Persisted in SaveGame so quicksave/quickload doesn't void the contract.
+  sim::TrafficEscortContractState trafficEscort;
 
-    double startDays{0.0};
-    double untilDays{0.0};
-
-    double maxRangeKm{0.0};
-    double tooFarSec{0.0};
-
-    double rewardCr{0.0};
-    double bonusPerPirateCr{0.0};
-    double repReward{0.0};
-    int piratesKilled{0};
-
-    bool piratesPresentAtStart{false};
-  };
-  TrafficEscortContract trafficEscort;
-  std::unordered_set<core::u64> trafficEscortPaidConvoys;
+  // Anti-farm: convoys already paid out for escorting (retained for a while).
+  // Value = settledDay.
+  std::unordered_map<core::u64, double> trafficEscortSettledDayByConvoy;
 
   // Cargo scans (contraband)
   enum class CargoScanSourceKind { Station, Police };
@@ -2077,6 +2226,7 @@ int main(int argc, char** argv) {
 
   // Exploration / discovery
   std::unordered_set<core::u64> scannedKeys; // scanned bodies/stations in the universe (player-local)
+  std::vector<sim::LogbookEntry> logbook; // persistent scan history (per save)
 
   // Cached mission board offers (regenerated when docking / day changes)
   std::vector<sim::Mission> missionOffers;
@@ -2143,6 +2293,8 @@ int main(int argc, char** argv) {
 
   // Salvage / mining / signal sources
   bool cargoScoopDeployed = true;
+  bool fuelScoopDeployed = false;
+  sim::FuelScoopRates fuelScoopDbg{};
   double cargoFullToastCooldownUntilDays = 0.0;
   double incomingMissileToastCooldownUntilDays = 0.0;
 
@@ -2245,6 +2397,7 @@ int main(int argc, char** argv) {
   bool showScanner = true;
   bool showTrade = true;
   game::MarketDashboardWindowState marketDashboardWindow{};
+  game::LogbookWindowState logbookWindow{};
   game::TradePlannerWindowState tradePlannerWindow{};
   bool showGuide = true;
   bool showSprites = false;
@@ -2800,6 +2953,8 @@ int main(int argc, char** argv) {
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleTrade); }});
     uiWindows.add(WindowBinding{WindowDesc{"TradePlanner", "Trade Planner", "Main", 95, false, true}, &tradePlannerWindow.open,
                                 {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Logbook", "Logbook", "Main", 95, false, true}, &logbookWindow.open,
+                                {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"Guide", "Pilot Guide", "Main", 90, true, true}, &showGuide,
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleGuide); }});
     uiWindows.add(WindowBinding{WindowDesc{"Hangar", "Hangar / Livery", "Station", 90, false, true}, &showHangar,
@@ -2846,6 +3001,8 @@ int main(int argc, char** argv) {
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"AudioSettings", "Audio", "UI", 55, false, true}, &showAudioSettingsWindow,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"HudLayout", "HUD Layout", "HUD", 55, false, true}, &showHudLayoutWindow,
                                 {}, {}, {}});
@@ -3875,6 +4032,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     fsdTravelRemainingSec = 0.0;
     fsdTravelTotalSec = 0.0;
     fsdState = FsdState::Charging;
+    audio.play(game::AudioEngine::Sfx::FsdCharge, 0.9f, 0.0f);
 
     autopilot = false;
     scanning = false;
@@ -4036,15 +4194,41 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
 
     // Force a near-term refresh so the scanner list updates promptly.
-    nextTrafficConvoyRefreshDays = std::min(nextTrafficConvoyRefreshDays, timeDays);
-  };
+  nextTrafficConvoyRefreshDays = std::min(nextTrafficConvoyRefreshDays, timeDays);
+
+  // System security dynamics: disrupting legitimate traffic reduces local trade flow and
+  // emboldens piracy. Scale slightly with shipment value so big hits matter more.
+  if (d.systemId != 0 && d.units > 0.0) {
+    const double valueCr = std::max(0.0, d.units) * econ::commodityDef(d.commodity).basePrice;
+    const double mag = std::clamp(valueCr / 8000.0, 0.35, 2.25);
+    applySystemSecurityImpulseTo(d.systemId,
+                                 -0.004 * mag,
+                                 +0.010 * mag,
+                                 -0.012 * mag);
+  }
+};
 
   // ---------------------------------------------------------------------------
   // Traffic Convoy Escort Contracts
   // ---------------------------------------------------------------------------
   // These are lightweight, time-bounded "help the convoy" objectives that can be
   // accepted on-grid (via the System Scanner) once a traffic convoy has been
-  // physicalized. They are intentionally not persisted in SaveGame yet.
+  // physicalized.
+
+  // Prevent repeated payouts if the player save-scums or re-enters the system.
+  // Retain settlements for a while; convoy ids are stable and unlikely to collide.
+  constexpr double kTrafficEscortSettlementRetainDays = 45.0;
+  auto isTrafficEscortSettled = [&](core::u64 convoyId) -> bool {
+    if (convoyId == 0) return true;
+    auto it = trafficEscortSettledDayByConvoy.find(convoyId);
+    if (it == trafficEscortSettledDayByConvoy.end()) return false;
+    // Prune very old entries lazily.
+    if (timeDays - it->second > kTrafficEscortSettlementRetainDays) {
+      trafficEscortSettledDayByConvoy.erase(it);
+      return false;
+    }
+    return true;
+  };
 
   auto failTrafficEscort = [&](const std::string& reason, double repPenalty) {
     if (!trafficEscort.active) return;
@@ -4052,8 +4236,17 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     if (trafficEscort.payerFactionId != 0 && repPenalty != 0.0) {
       addRep(trafficEscort.payerFactionId, repPenalty);
     }
+// System security dynamics: failed escorts hurt local trade confidence.
+if (currentSystem) {
+  const double mag = std::clamp(std::abs(repPenalty) / 5.0, 0.6, 2.0);
+  applySystemSecurityImpulseTo(currentSystem->stub.id,
+                               -0.006 * mag,
+                               +0.006 * mag,
+                               -0.010 * mag);
+}
 
-    trafficEscort = TrafficEscortContract{};
+
+    trafficEscort = sim::TrafficEscortContractState{};
     if (!reason.empty()) toast(toasts, reason, 3.8);
   };
 
@@ -4061,7 +4254,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     if (!trafficEscort.active) return;
 
     const core::u64 convoyId = trafficEscort.convoyId;
-    if (convoyId != 0) trafficEscortPaidConvoys.insert(convoyId);
+    if (convoyId != 0) trafficEscortSettledDayByConvoy[convoyId] = timeDays;
 
     const double bonus = std::clamp(trafficEscort.bonusPerPirateCr * (double)trafficEscort.piratesKilled,
                                     0.0,
@@ -4079,7 +4272,16 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       toast(toasts, buf, 4.0);
     }
 
-    trafficEscort = TrafficEscortContract{};
+// System security dynamics: successful escorts improve traffic flow and suppress piracy.
+if (currentSystem) {
+  const double mag = std::clamp(1.0 + 0.12 * (double)trafficEscort.piratesKilled, 0.8, 2.5);
+  applySystemSecurityImpulseTo(currentSystem->stub.id,
+                               +0.008 * mag,
+                               -0.006 * mag,
+                               +0.012 * mag);
+}
+
+    trafficEscort = sim::TrafficEscortContractState{};
   };
 
   auto startTrafficEscort = [&](core::u64 convoyId) -> bool {
@@ -4088,7 +4290,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       toast(toasts, "Already escorting a convoy", 2.6);
       return false;
     }
-    if (trafficEscortPaidConvoys.find(convoyId) != trafficEscortPaidConvoys.end()) {
+    if (isTrafficEscortSettled(convoyId)) {
       toast(toasts, "Escort contract already settled", 2.6);
       return false;
     }
@@ -4128,7 +4330,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       if (c.attackTargetId == convoy->id) { piratesPresent = true; break; }
     }
 
-    const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+    const auto sec = effectiveSystemSecurityProfile(*currentSystem);
     const double tta = std::max(0.0, convoy->trafficArriveDay - timeDays);
 
     const auto plan = sim::planTrafficEscortContract(universe.seed(), currentSystem->stub.id, convoyId,
@@ -4141,7 +4343,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       return false;
     }
 
-    trafficEscort = TrafficEscortContract{};
+    trafficEscort = sim::TrafficEscortContractState{};
     trafficEscort.active = true;
     trafficEscort.convoyId = convoyId;
     trafficEscort.payerFactionId = payerFactionId;
@@ -4235,6 +4437,18 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         particles.spawnExplosion(toRenderPosU(deadPos), toRenderVelU(deadVel), eBase);
       }
 
+      // SFX: explosion on destruction (stereo panned by relative direction).
+      {
+        const math::Vec3d rel = deadPos - ship.positionKm();
+        const double distKm = rel.length();
+        const math::Vec3d dir = (distKm > 1e-6) ? (rel / distKm) : math::Vec3d{0,0,0};
+        const float pan = (float)std::clamp(math::dot(dir, ship.right()), -1.0, 1.0);
+        const double x = distKm / 35.0;
+        const float gain = (float)std::clamp(1.35 / (1.0 + x * x), 0.0, 1.35);
+        audio.play(game::AudioEngine::Sfx::Explosion, gain, pan);
+      }
+
+
       if (deadRole == ContactRole::Pirate) {
         // If we're actively escorting a traffic convoy, count kills against raiders
         // that were specifically targeting that convoy.
@@ -4253,6 +4467,16 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           credits += bountyCr;
           toast(toasts, "Pirate destroyed. +" + std::to_string((int)bountyCr) + " cr", 2.5);
         }
+
+// System security dynamics: killing pirates modestly reduces piracy pressure and
+// improves perceived security/traffic. Scale up for higher-profile kills.
+{
+  double mag = 1.0;
+  if (hit.missionTarget) mag *= 1.35;
+  if (trafficEscort.active && trafficEscort.convoyId != 0 && hit.attackTargetId == trafficEscort.convoyId) mag *= 1.25;
+  mag = std::clamp(mag, 0.6, 2.5);
+  applyLocalSecurityImpulse(+0.003 * mag, -0.004 * mag, +0.002 * mag);
+}
 
         // Salvage: pirates drop a few cargo pods.
         static constexpr econ::CommodityId kPirateLoot[] = {
@@ -4293,10 +4517,19 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         hit.cargoValueCr = 0.0;
 
         toast(toasts, "Trader destroyed. Cargo pods ejected. (WANTED!)", 3.0);
-        commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+commitCrime(deadFaction, 1200.0, -18.0, "Murder of trader");
+
+// System security dynamics: civilian kills increase piracy pressure and suppress traffic.
+// (Traffic convoys are handled in interdictTrafficConvoy() to scale with shipment value.)
+if (!hit.trafficConvoy) {
+  applyLocalSecurityImpulse(-0.004, +0.007, -0.008);
+}
       } else if (deadRole == ContactRole::Police) {
         toast(toasts, "Security destroyed. (WANTED!)", 3.0);
-        commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+commitCrime(deadFaction, 2500.0, -35.0, "Murder of security");
+
+// System security dynamics: killing security forces destabilizes the system.
+applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
       }
 
       // Bounty kill missions (pirate targets)
@@ -4503,6 +4736,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           s.hull = std::clamp(playerHull / std::max(1e-6, playerHullMax), 0.0, 1.0);
           s.shield = std::clamp(playerShield / std::max(1e-6, playerShieldMax), 0.0, 1.0);
           s.heat = std::clamp(heat, 0.0, 200.0);
+
+          // Countermeasures (ammo)
+          s.cmFlares = core::clampCast<core::u8>(cmFlares, 0, 255);
+          s.cmChaff = core::clampCast<core::u8>(cmChaff, 0, 255);
+          s.cmHeatSinks = core::clampCast<core::u8>(cmHeatSinks, 0, 255);
+
           // Power distributor
           s.pipsEng = distributorPips.eng;
           s.pipsWep = distributorPips.wep;
@@ -4530,6 +4769,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	          s.weaponPrimary = (core::u8)std::clamp((int)weaponPrimary, 0, maxWeaponIdx);
 	          s.weaponSecondary = (core::u8)std::clamp((int)weaponSecondary, 0, maxWeaponIdx);
           s.smuggleHoldMk = (core::u8)std::clamp(smuggleHoldMk, 0, 3);
+          s.fuelScoopMk = (core::u8)std::clamp(fuelScoopMk, 0, 3);
 
           s.nextMissionId = nextMissionId;
           s.missions = missions;
@@ -4619,6 +4859,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	          // Exploration / law
 	          s.explorationDataCr = explorationDataCr;
 	          s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
+	          s.logbook = logbook;
 
 	          // Procedural world persistence (signals / mining depletion)
 	          s.resolvedSignalIds.assign(resolvedSignalIds.begin(), resolvedSignalIds.end());
@@ -4718,6 +4959,57 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                       return a.convoyId < b.convoyId;
                     });
 
+          // Ambient traffic escort contract + anti-farm settlements.
+          //
+          // Persisting this makes the traffic layer feel consistent:
+          //  - mid-contract quicksave/quickload doesn't void the contract
+          //  - completed convoys can't be repeatedly re-escorted after reload
+          s.trafficEscort = trafficEscort;
+          if (docked || fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle) {
+            // The runtime contract auto-aborts in these states anyway; avoid saving
+            // a "zombie" contract that would just fail instantly after load.
+            s.trafficEscort = sim::TrafficEscortContractState{};
+          }
+          s.trafficEscortSettlements.clear();
+          s.trafficEscortSettlements.reserve(trafficEscortSettledDayByConvoy.size());
+          for (const auto& kv : trafficEscortSettledDayByConvoy) {
+            const core::u64 convoyId = kv.first;
+            const double settledDay = kv.second;
+            if (convoyId == 0) continue;
+            if (timeDays - settledDay > kTrafficEscortSettlementRetainDays) continue;
+            s.trafficEscortSettlements.push_back(sim::TrafficEscortSettlementState{convoyId, settledDay});
+          }
+          std::sort(s.trafficEscortSettlements.begin(), s.trafficEscortSettlements.end(),
+                    [](const sim::TrafficEscortSettlementState& a, const sim::TrafficEscortSettlementState& b) {
+                      if (a.settledDay != b.settledDay) return a.settledDay < b.settledDay;
+                      return a.convoyId < b.convoyId;
+                    });
+
+          // System security dynamics deltas (decay-to-now + prune before saving).
+          s.systemSecurityDeltas.clear();
+          {
+            // Decay existing deltas to the save time and prune negligible entries to keep saves compact.
+            for (auto it = systemSecurityDeltaBySystem.begin(); it != systemSecurityDeltaBySystem.end(); /*manual*/) {
+              auto& st = it->second;
+              st.systemId = it->first;
+              sim::decaySystemSecurityDeltaInPlace(st, timeDays, systemSecurityDynParams);
+              if (sim::isSystemSecurityDeltaNegligible(st, timeDays, systemSecurityDynParams)) {
+                it = systemSecurityDeltaBySystem.erase(it);
+                continue;
+              }
+              ++it;
+            }
+
+            s.systemSecurityDeltas.reserve(systemSecurityDeltaBySystem.size());
+            for (const auto& kv : systemSecurityDeltaBySystem) {
+              s.systemSecurityDeltas.push_back(kv.second);
+            }
+            std::sort(s.systemSecurityDeltas.begin(), s.systemSecurityDeltas.end(),
+                      [](const sim::SystemSecurityDeltaState& a, const sim::SystemSecurityDeltaState& b) {
+                        return a.systemId < b.systemId;
+                      });
+          }
+
           if (sim::saveToFile(s, savePath)) {
             toast(toasts, "Saved to " + savePath, 2.5);
           }
@@ -4760,12 +5052,19 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	            weaponPrimary = (WeaponType)std::clamp((int)s.weaponPrimary, 0, maxWeaponIdx);
 	            weaponSecondary = (WeaponType)std::clamp((int)s.weaponSecondary, 0, maxWeaponIdx);
             smuggleHoldMk = std::clamp((int)s.smuggleHoldMk, 0, 3);
+            fuelScoopMk = std::clamp((int)s.fuelScoopMk, 0, 3);
             recalcPlayerStats();
 
             playerHull = std::clamp(s.hull, 0.0, 1.0) * playerHullMax;
             playerShield = std::clamp(s.shield, 0.0, 1.0) * playerShieldMax;
             heat = std::clamp(s.heat, 0.0, 200.0);
             heatImpulse = 0.0;
+
+            // Countermeasures (ammo)
+            cmFlares = (int)s.cmFlares;
+            cmChaff = (int)s.cmChaff;
+            cmHeatSinks = (int)s.cmHeatSinks;
+            clampCountermeasureAmmo();
 
             // Power distributor
             distributorPips.eng = std::clamp(s.pipsEng, 0, 4);
@@ -4796,6 +5095,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 	            explorationDataCr = s.explorationDataCr;
 	            scannedKeys.clear();
 	            for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
+	            logbook = s.logbook;
 
 	            // Procedural world persistence (signals / mining depletion)
 	            resolvedSignalIds.clear();
@@ -4856,6 +5156,26 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                   if (d.convoyId == 0) continue;
                   if (timeDays > d.expireDay + 1.0) continue;
                   trafficInterdictionsById[d.convoyId] = d;
+                }
+
+                // Ambient traffic escort contract + anti-farm settlements.
+                trafficEscort = s.trafficEscort;
+                if (!trafficEscort.active || trafficEscort.convoyId == 0) {
+                  trafficEscort = sim::TrafficEscortContractState{};
+                }
+                trafficEscortSettledDayByConvoy.clear();
+                for (const auto& e : s.trafficEscortSettlements) {
+                  if (e.convoyId == 0) continue;
+                  if (timeDays - e.settledDay > kTrafficEscortSettlementRetainDays) continue;
+                  auto& slot = trafficEscortSettledDayByConvoy[e.convoyId];
+                  slot = std::max(slot, e.settledDay);
+                }
+
+                // System security dynamics deltas.
+                systemSecurityDeltaBySystem.clear();
+                for (const auto& d : s.systemSecurityDeltas) {
+                  if (d.systemId == 0) continue;
+                  systemSecurityDeltaBySystem[d.systemId] = d;
                 }
 
                 // Station storage / warehouse
@@ -5423,11 +5743,37 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                 1.8);
         }
 
-        if (key(controls.actions.deployCountermeasure) && !io.WantCaptureKeyboard && !docked) {
-          // Simple flare burst (heat-seeker decoy). The sim is headless/deterministic;
-          // the game builds decoy SphereTargets and missiles may bias toward them.
+        if (key(controls.actions.toggleFuelScoop) && !io.WantCaptureKeyboard) {
+          if (fuelScoopMk <= 0) {
+            toast(toasts,
+                  std::string("No fuel scoop installed. (Visit a shipyard) [") +
+                    game::chordLabel(controls.actions.toggleFuelScoop) + "]",
+                  2.2);
+          } else if (docked && !fuelScoopDeployed) {
+            toast(toasts, "Cannot deploy fuel scoop while docked.", 1.8);
+          } else if ((supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) && !fuelScoopDeployed) {
+            toast(toasts, "Cannot deploy fuel scoop while in supercruise/FSD.", 2.0);
+          } else {
+            fuelScoopDeployed = !fuelScoopDeployed;
+            toast(toasts,
+                  std::string("Fuel scoop ") + (fuelScoopDeployed ? "DEPLOYED" : "RETRACTED") + " (" +
+                    game::chordLabel(controls.actions.toggleFuelScoop) + ")",
+                  1.8);
+          }
+        }
+
+        if (key(controls.actions.deployCountermeasure) && !io.WantCaptureKeyboard) {
+          // Flare burst (heat-seeker decoy). Player countermeasures are consumables.
           const double cdDays = 1.2 / 86400.0;
-          if (timeDays >= countermeasureCooldownUntilDays) {
+          if (docked) {
+            toast(toasts, "Cannot deploy countermeasures while docked.", 1.6);
+          } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+            toast(toasts, "Cannot deploy countermeasures while in supercruise/FSD.", 2.0);
+          } else if (cmFlares <= 0) {
+            toast(toasts, "Out of flares. Restock at a station.", 1.8);
+          } else if (timeDays < countermeasureCooldownUntilDays) {
+            toast(toasts, "Countermeasure launcher cooling down.", 1.0);
+          } else {
             sim::CountermeasureBurstParams p{};
             p.count = 10;
             p.ttlSimSec = 7.0;
@@ -5446,19 +5792,27 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                                           ship.forward(),
                                           p);
 
+            cmFlares = std::max(0, cmFlares - 1);
             countermeasureCooldownUntilDays = timeDays + cdDays;
             toast(toasts,
-                  std::string("Flares deployed (") + game::chordLabel(controls.actions.deployCountermeasure) + ")",
-                  1.6);
-          } else {
-            toast(toasts, "Countermeasure launcher cooling down.", 1.0);
+                  std::string("Flares deployed (x1) [") + game::chordLabel(controls.actions.deployCountermeasure) + "] " +
+                    std::to_string(cmFlares) + " remaining",
+                  1.8);
           }
         }
 
-        if (key(controls.actions.deployChaff) && !io.WantCaptureKeyboard && !docked) {
+        if (key(controls.actions.deployChaff) && !io.WantCaptureKeyboard) {
           // Chaff burst (radar-seeker decoy). Shares the launcher cooldown with flares.
           const double cdDays = 1.2 / 86400.0;
-          if (timeDays >= countermeasureCooldownUntilDays) {
+          if (docked) {
+            toast(toasts, "Cannot deploy countermeasures while docked.", 1.6);
+          } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+            toast(toasts, "Cannot deploy countermeasures while in supercruise/FSD.", 2.0);
+          } else if (cmChaff <= 0) {
+            toast(toasts, "Out of chaff. Restock at a station.", 1.8);
+          } else if (timeDays < countermeasureCooldownUntilDays) {
+            toast(toasts, "Countermeasure launcher cooling down.", 1.0);
+          } else {
             sim::CountermeasureBurstParams p{};
             p.count = 14;
             p.ttlSimSec = 6.0;
@@ -5477,12 +5831,59 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                                           ship.forward(),
                                           p);
 
+            cmChaff = std::max(0, cmChaff - 1);
             countermeasureCooldownUntilDays = timeDays + cdDays;
             toast(toasts,
-                  std::string("Chaff deployed (") + game::chordLabel(controls.actions.deployChaff) + ")",
-                  1.6);
-          } else {
+                  std::string("Chaff deployed (x1) [") + game::chordLabel(controls.actions.deployChaff) + "] " +
+                    std::to_string(cmChaff) + " remaining",
+                  1.8);
+          }
+        }
+
+        if (key(controls.actions.deployHeatSink) && !io.WantCaptureKeyboard) {
+          // Heat sink: dumps ship heat immediately and produces a powerful thermal decoy.
+          // Shares the launcher cooldown with flares/chaff.
+          const double cdDays = 1.8 / 86400.0;
+          if (docked) {
+            toast(toasts, "Cannot deploy heat sink while docked.", 1.6);
+          } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+            toast(toasts, "Cannot deploy heat sink while in supercruise/FSD.", 2.0);
+          } else if (cmHeatSinks <= 0) {
+            toast(toasts, "No heat sinks remaining. Restock at a station.", 2.0);
+          } else if (timeDays < countermeasureCooldownUntilDays) {
             toast(toasts, "Countermeasure launcher cooling down.", 1.0);
+          } else {
+            const double heatBefore = heat;
+            // Dump most of the heat, but leave a tiny residual so we don't go negative.
+            heat = std::max(0.0, heat - 65.0);
+
+            sim::CountermeasureBurstParams p{};
+            p.count = 12;
+            p.ttlSimSec = 10.0;
+            p.radiusKm = 0.26;
+            p.ejectSpeedKmS = 0.13;
+            p.spread = 0.38;
+            p.heatStrength = 18.0;
+
+            sim::spawnCountermeasureBurst(countermeasures,
+                                          nextCountermeasureId,
+                                          sim::CountermeasureType::Flare,
+                                          ship.positionKm(),
+                                          ship.velocityKmS(),
+                                          ship.right(),
+                                          ship.up(),
+                                          ship.forward(),
+                                          p);
+
+            cmHeatSinks = std::max(0, cmHeatSinks - 1);
+            countermeasureCooldownUntilDays = timeDays + cdDays;
+
+            const double dumped = std::max(0.0, heatBefore - heat);
+            toast(toasts,
+                  std::string("Heat sink deployed (-") + std::to_string((int)std::llround(dumped)) + " heat) [" +
+                    game::chordLabel(controls.actions.deployHeatSink) + "] " +
+                    std::to_string(cmHeatSinks) + " remaining",
+                  2.2);
           }
         }
 
@@ -5868,17 +6269,23 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
             if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
               toast(toasts, "Docking clearance already granted.", 2.0);
+              audio.play(game::AudioEngine::Sfx::UiConfirm, 0.8f, 0.0f);
             } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
               toast(toasts, "Out of comms range for clearance.", 2.5);
+              audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
             } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
               toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
+              audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
             } else if (dec.status == sim::DockingClearanceStatus::Granted) {
               toast(toasts, "Docking clearance GRANTED.", 3.0);
+              audio.play(game::AudioEngine::Sfx::UiConfirm, 1.0f, 0.0f);
             } else {
               toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
+              audio.play(game::AudioEngine::Sfx::UiError, 1.0f, 0.0f);
             }
           } else {
             toast(toasts, "No station targeted for clearance.", 2.0);
+            audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
           }
         }
 
@@ -5903,6 +6310,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               docked = false;
               dockedStationId = 0;
               toast(toasts, "Undocked.", 2.0);
+              audio.play(game::AudioEngine::Sfx::Undocked, 1.0f, 0.0f);
 
               // Start any pending escort missions from this station by spawning their convoy
               // contacts (plus a small police escort wing). The mission tracks the convoy via
@@ -6091,6 +6499,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
                 ship.setAngularVelocityRadS({0,0,0});
 
                 toast(toasts, "Docked at " + st.name, 2.5);
+                audio.play(game::AudioEngine::Sfx::Docked, 1.0f, 0.0f);
               }
             } else {
               toast(toasts, "Target a station (T) before docking.", 2.5);
@@ -6203,6 +6612,21 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
               hudLastFiredPrimary = primary;
 
               heatImpulse += fr.heatDelta;
+              // SFX: weapon shot (procedural).
+              {
+                game::AudioEngine::Sfx sfx = game::AudioEngine::Sfx::WeaponLaser;
+                switch (wType) {
+                  case WeaponType::BeamLaser: sfx = game::AudioEngine::Sfx::WeaponLaser; break;
+                  case WeaponType::PulseLaser: sfx = game::AudioEngine::Sfx::WeaponPulse; break;
+                  case WeaponType::Cannon: sfx = game::AudioEngine::Sfx::WeaponCannon; break;
+                  case WeaponType::Railgun: sfx = game::AudioEngine::Sfx::WeaponRailgun; break;
+                  case WeaponType::MiningLaser: sfx = game::AudioEngine::Sfx::WeaponMining; break;
+                  case WeaponType::HomingMissile:
+                  case WeaponType::RadarMissile: sfx = game::AudioEngine::Sfx::WeaponMissile; break;
+                }
+                audio.play(sfx, 1.0f, 0.0f);
+              }
+
 
               if (fr.hasBeam) {
                 beams.push_back({toRenderPosU(fr.beam.aKm), toRenderPosU(fr.beam.bKm), fr.beam.r, fr.beam.g, fr.beam.b, 0.10});
@@ -7063,6 +7487,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           // Consume fuel at the moment we enter hyperspace.
           fuel = std::clamp(fuel - fsdFuelCost, 0.0, fuelMax);
           fsdState = FsdState::Jumping;
+          audio.play(game::AudioEngine::Sfx::FsdJump, 1.0f, 0.0f);
           fsdTravelTotalSec = 1.25 + fsdJumpDistanceLy * 0.08;
           fsdTravelRemainingSec = fsdTravelTotalSec;
           toast(toasts, "FSD: entering hyperspace...", 1.8);
@@ -7138,6 +7563,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
 
 
           toast(toasts, std::string("Arrived in ") + currentSystem->stub.name + ".", 2.0);
+          audio.play(game::AudioEngine::Sfx::FsdArrive, 0.95f, 0.0f);
 
           fsdState = FsdState::Idle;
           fsdTargetSystem = 0;
@@ -7374,6 +7800,18 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           ship.setVelocityKmS(stV);
           ship.setOrientation(stQ * math::Quatd::fromAxisAngle({0,1,0}, math::kPi)); // face outward-ish
         }
+      }
+
+
+      // Audio: continuous ship engine/thrusters (procedural).
+      {
+        const float engine01 = (float)std::clamp(input.thrustLocal.z, 0.0, 1.0);
+        const float thruster01 = (float)std::clamp(input.thrustLocal.length(), 0.0, 1.0);
+        const float angular01 = (float)std::clamp(input.torqueLocal.length(), 0.0, 1.0);
+        const float boost01 = input.boost ? (float)boostAppliedFrac : 0.0f;
+        const float speed01 = (float)std::clamp(ship.velocityKmS().length() / 1.8, 0.0, 1.0);
+        const bool inHyperspace = (fsdState == FsdState::Jumping || supercruiseState != SupercruiseState::Idle);
+        audio.setShipParams(engine01, boost01, thruster01, angular01, speed01, docked, inHyperspace);
       }
 
       // VFX: thruster plume.
@@ -7837,7 +8275,9 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   double sysPiracy01 = ectx.piracy01;
   double sysTraffic01 = ectx.traffic01;
   if (currentSystem) {
-    const auto sprof = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+    sim::SystemEvent sysEv{};
+    const auto sprof = effectiveSystemSecurityProfile(*currentSystem, &sysEv);
+
     sysSecurity01 = sprof.security01;
     sysPiracy01 = sprof.piracy01;
     sysTraffic01 = sprof.traffic01;
@@ -8274,6 +8714,75 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     }
   }
 
+  // --- NPC combat helpers ----------------------------------------------------
+  // NPCs share the same distributor model as the player, but historically NPC
+  // boost was "free". We gate boost by ENG capacitor here (same as the player),
+  // which also enables short boost-jinks for missile evasion.
+  sim::MissileThreatParams npcMissileThreatParams{};
+  npcMissileThreatParams.minApproachCos = 0.12;
+  npcMissileThreatParams.minClosingKmS = 0.02;
+  npcMissileThreatParams.maxConsiderDistKm = 260000.0;
+
+  auto stepContactShip = [&](Contact& c, double dt, sim::ShipInput in, bool allowGravity) {
+    if (dt <= 0.0) return;
+
+    const double boostFrac = in.boost ? sim::consumeBoostFraction(c.distributorState, c.distributorCfg, dt) : 0.0;
+    if (boostFrac > 1e-6) {
+      const double dtBoost = dt * boostFrac;
+      const double dtNo = dt - dtBoost;
+
+      if (dtBoost > 0.0) {
+        sim::ShipInput b = in;
+        b.boost = true;
+        stepShipMaybeGravity(c.ship, dtBoost, b, allowGravity);
+      }
+      if (dtNo > 0.0) {
+        sim::ShipInput n = in;
+        n.boost = false;
+        stepShipMaybeGravity(c.ship, dtNo, n, allowGravity);
+      }
+    } else {
+      in.boost = false;
+      stepShipMaybeGravity(c.ship, dt, in, allowGravity);
+    }
+  };
+
+  auto applyMissileEvasion = [&](Contact& c, sim::ShipInput& ai, const sim::MissileThreatSummary& threat) {
+    if (timeDays >= c.evadeUntilDays) return;
+    if (c.evadeDirWorld.lengthSq() < 1e-12) return;
+
+    double close01 = 0.45;
+    if (threat.inbound && threat.ttiSec > 1e-6) {
+      const double tRef = 3.0;
+      close01 = std::clamp(1.0 - threat.ttiSec / tRef, 0.0, 1.0);
+    }
+
+    const double base = 0.22 + 0.58 * c.aiSkill;
+    const double strength = std::clamp(base * (0.35 + 0.65 * close01), 0.0, 1.0);
+
+    const math::Vec3d eW = c.evadeDirWorld.normalized();
+    const math::Vec3d rW = c.ship.right().normalized();
+    const math::Vec3d uW = c.ship.up().normalized();
+    const math::Vec3d fW = c.ship.forward().normalized();
+
+    math::Vec3d eL{math::dot(rW, eW), math::dot(uW, eW), math::dot(fW, eW)};
+    eL.z = 0.0;
+    const double mag = std::sqrt(eL.x * eL.x + eL.y * eL.y);
+    if (mag > 1e-6) {
+      eL.x /= mag;
+      eL.y /= mag;
+    }
+
+    ai.thrustLocal.x = std::clamp(ai.thrustLocal.x + eL.x * strength, -1.0, 1.0);
+    ai.thrustLocal.y = std::clamp(ai.thrustLocal.y + eL.y * strength, -1.0, 1.0);
+
+    // Panic-boost if the threat is very close. Boost is still ENG-cap limited by stepContactShip.
+    if (threat.inbound && threat.ttiSec > 0.0) {
+      const double boostTti = std::max(0.65, 1.55 - 0.75 * c.aiSkill);
+      if (threat.ttiSec < boostTti) ai.boost = true;
+    }
+  };
+
   // Contacts AI + combat
   for (auto& c : contacts) {
     if (!c.alive) continue;
@@ -8299,6 +8808,83 @@ auto spawnPolicePack = [&](int maxCount) -> int {
           c.shield = std::min(c.shieldMax, c.shield + actual);
           if (costPerPt > 0.0) c.distributorState.sys = std::max(0.0, c.distributorState.sys - actual * costPerPt);
         }
+      }
+    }
+
+    // Missile threat / defense (NPC): deploy countermeasures + apply short evasive strafes.
+    const sim::MissileThreatSummary missileThreat = sim::nearestInboundMissile(
+      missiles.data(),
+      missiles.size(),
+      sim::CombatTargetKind::Ship,
+      c.id,
+      c.ship.positionKm(),
+      c.ship.velocityKmS(),
+      npcMissileThreatParams
+    );
+
+    if (missileThreat.inbound) {
+      // Consider "under fire" for a short time to bias decisions (morale / flee).
+      c.underFireUntilDays = std::max(c.underFireUntilDays, timeDays + (8.0 / 86400.0));
+
+      // Start / extend an evasion window.
+      const double evadeWindowSec = 2.2 + 1.6 * c.aiSkill;
+      c.evadeUntilDays = std::max(c.evadeUntilDays, timeDays + evadeWindowSec / 86400.0);
+
+      // Refresh a perpendicular evade direction occasionally.
+      if (timeDays >= c.evadeDirRefreshUntilDays && missileThreat.missileIndex < missiles.size()) {
+        const auto& m = missiles[missileThreat.missileIndex];
+
+        const math::Vec3d mvDir = (m.velKmS.lengthSq() > 1e-12) ? m.velKmS.normalized() : math::Vec3d{0, 0, 1};
+        const math::Vec3d toTgt = c.ship.positionKm() - m.posKm;
+        const math::Vec3d toDir = (toTgt.lengthSq() > 1e-12) ? toTgt.normalized() : math::Vec3d{0, 0, 1};
+
+        math::Vec3d evade = math::cross(mvDir, toDir);
+        if (evade.lengthSq() < 1e-12) evade = math::cross(mvDir, math::Vec3d{0, 1, 0});
+        if (evade.lengthSq() < 1e-12) evade = math::cross(mvDir, math::Vec3d{1, 0, 0});
+        if (evade.lengthSq() > 1e-12) evade = evade.normalized();
+
+        // Deterministic sign flip so two ships don't always dodge the same way.
+        const core::u64 phase = (core::u64)std::floor((timeDays * 86400.0) / 0.75);
+        const core::u64 h = core::hashCombine(core::hashCombine(universe.seed(), c.id), core::hashCombine(m.shooterId, phase));
+        if ((h & 1ull) != 0ull) evade *= -1.0;
+
+        c.evadeDirWorld = evade;
+
+        const double refreshSec = 0.55 + 1.05 * (1.0 - c.aiSkill);
+        c.evadeDirRefreshUntilDays = timeDays + refreshSec / 86400.0;
+      }
+
+      // Countermeasure deployment: skilled pilots deploy earlier.
+      const double deployTtiSec = 0.85 + 2.35 * c.aiSkill;
+      if (c.cmBursts > 0 && timeDays >= c.cmCooldownUntilDays && missileThreat.ttiSec > 1e-6 && missileThreat.ttiSec < deployTtiSec) {
+        sim::CountermeasureType type = sim::CountermeasureType::Flare;
+        if (missileThreat.seeker == sim::MissileSeekerType::Radar && c.cmHasChaff) type = sim::CountermeasureType::Chaff;
+
+        sim::CountermeasureBurstParams p{};
+        p.count = 6 + (int)std::round(5.0 * std::clamp(c.aiSkill, 0.0, 1.0));
+        p.ttlSimSec = 5.0 + 2.5 * std::clamp(c.aiSkill, 0.0, 1.0);
+        p.radiusKm = 0.15;
+        p.ejectSpeedKmS = 0.10 + 0.06 * std::clamp(c.aiSkill, 0.0, 1.0);
+        p.spread = 0.35;
+        p.heatStrength = 7.0 + 6.0 * std::clamp(c.aiSkill, 0.0, 1.0);
+        p.radarStrength = 7.0 + 6.0 * std::clamp(c.aiSkill, 0.0, 1.0);
+
+        sim::spawnCountermeasureBurst(
+          countermeasures,
+          nextCountermeasureId,
+          type,
+          c.ship.positionKm(),
+          c.ship.velocityKmS(),
+          c.ship.right(),
+          c.ship.up(),
+          c.ship.forward(),
+          p
+        );
+
+        c.cmBursts = std::max(0, c.cmBursts - 1);
+
+        const double cdSec = 7.5 + 3.5 * (1.0 - std::clamp(c.aiSkill, 0.0, 1.0));
+        c.cmCooldownUntilDays = timeDays + cdSec / 86400.0;
       }
     }
 
@@ -8329,7 +8915,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                      /*desiredDistKm=*/baseR * 0.65,
                      /*tangentialStrength=*/0.26,
                      /*maxAccelFrac=*/1.4);
-          stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
+          applyMissileEvasion(c, ai, missileThreat);
+          stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
           continue;
         }
       }
@@ -8360,7 +8947,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
         const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
         chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 240000.0, ship.velocityKmS(), 0.0, 0.28, 1.3);
-        stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
+        applyMissileEvasion(c, ai, missileThreat);
+        stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
         continue;
       }
 
@@ -8392,7 +8980,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       }
 
       chaseTargetFace(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8, (aimPointKm - c.ship.positionKm()), /*allowBoost*/false);
-      stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
+      applyMissileEvasion(c, ai, missileThreat);
+      stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
 
       // Fire if aligned and we have weapon capacitor.
       const math::Vec3d to = tgtPos - c.ship.positionKm();
@@ -8544,7 +9133,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
       // Distress victims are "disabled": keep them stationary until the player helps.
       if (c.distressVictim && c.distressNeedUnits > 1e-6) {
-        stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
+        stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
         continue;
       }
 
@@ -8710,7 +9299,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         }
       }
 
-      stepShipMaybeGravity(c.ship, dtStep, ai, /*allowGravity=*/true);
+      applyMissileEvasion(c, ai, missileThreat);
+      stepContactShip(c, dtStep, ai, /*allowGravity=*/true);
       continue;
     }
 
@@ -8788,7 +9378,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        chaseTarget(c.ship, ai, stPos + offset, sim::stationVelKmS(st, timeDays), baseR * 0.6, 0.20, 1.6);
 	      }
 
-	      stepShipMaybeGravity(c.ship, dtSim, ai, /*allowGravity=*/true);
+	      applyMissileEvasion(c, ai, missileThreat);
+	      stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
 
 	      // Fire if aligned at the chosen target.
 	      if (engageShip && (shootPlayer || engageContact)) {
@@ -9492,6 +10083,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	                c.distressVictim = false;
 	                c.tradeCooldownUntilDays = timeDays; // allow normal trader behavior again
+// System security dynamics: successful rescues help stabilize the local area.
+{
+  const double valueCr = moved * econ::commodityDef(needCid).basePrice;
+  const double mag = std::clamp(valueCr / 2500.0, 0.4, 2.0);
+  applyLocalSecurityImpulse(+0.003 * mag, -0.002 * mag, +0.003 * mag);
+}
+
 	
 	                const std::string repStr = (c.distressPayerFactionId != 0 && c.distressRepReward != 0.0)
 	                  ? (" | rep +" + std::to_string((int)std::llround(c.distressRepReward)))
@@ -9580,6 +10178,22 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
               const double value = 180.0 + (double)st.type * 40.0;
               explorationDataCr += value;
+
+              {
+                sim::LogbookEntry e{};
+                e.key = key;
+                e.kind = sim::LogbookEntryKind::StationScan;
+                e.subKind = static_cast<core::u8>(st.type);
+                e.systemId = currentSystem->stub.id;
+                e.stationId = st.id;
+                e.objectId = (core::u64)st.id;
+                e.discoveredDay = timeDays;
+                e.valueCr = value;
+                e.sold = false;
+                logbook.push_back(e);
+                sim::pruneLogbook(logbook);
+              }
+
               completeScan("Station scan logged (+data " + std::to_string((int)value) + " cr).", 2.5);
             } else {
               completeScan("Station already scanned.", 1.8);
@@ -9613,6 +10227,21 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const double value = base * typeMul + (p.orbit.semiMajorAxisAU * 22.0);
             explorationDataCr += value;
 
+            {
+              sim::LogbookEntry e{};
+              e.key = key;
+              e.kind = sim::LogbookEntryKind::PlanetScan;
+              e.subKind = static_cast<core::u8>(p.type);
+              e.systemId = currentSystem->stub.id;
+              e.stationId = 0;
+              e.objectId = static_cast<core::u64>(scanLockedTarget.index);
+              e.discoveredDay = timeDays;
+              e.valueCr = value;
+              e.sold = false;
+              logbook.push_back(e);
+              sim::pruneLogbook(logbook);
+            }
+
             completeScan("Planet scan logged (+data " + std::to_string((int)value) + " cr).", 2.5);
           } else {
             completeScan("Planet already scanned.", 1.8);
@@ -9633,6 +10262,21 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	          const double value = 220.0 + (double)static_cast<int>(currentSystem->star.cls) * 80.0;
 	          explorationDataCr += value;
+
+	          {
+	            sim::LogbookEntry e{};
+	            e.key = key;
+	            e.kind = sim::LogbookEntryKind::StarScan;
+	            e.subKind = static_cast<core::u8>(currentSystem->star.cls);
+	            e.systemId = currentSystem->stub.id;
+	            e.stationId = 0;
+	            e.objectId = 0;
+	            e.discoveredDay = timeDays;
+	            e.valueCr = value;
+	            e.sold = false;
+	            logbook.push_back(e);
+	            sim::pruneLogbook(logbook);
+	          }
 	          completeScan("Star scan logged (+data " + std::to_string((int)value) + " cr).", 2.2);
 	        } else {
 	          completeScan("Star already scanned.", 1.8);
@@ -9660,12 +10304,35 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              if (s.type == SignalType::TrafficConvoy) value = 220.0;
 	              explorationDataCr += value;
 
+	              {
+	                sim::SignalKind sk = sim::SignalKind::ResourceField;
+	                switch (s.type) {
+	                  case SignalType::Resource: sk = sim::SignalKind::ResourceField; break;
+	                  case SignalType::Derelict: sk = sim::SignalKind::Derelict; break;
+	                  case SignalType::Distress: sk = sim::SignalKind::Distress; break;
+	                  case SignalType::TrafficConvoy: sk = sim::SignalKind::TrafficConvoy; break;
+	                }
+	
+	                sim::LogbookEntry e{};
+	                e.key = key;
+	                e.kind = sim::LogbookEntryKind::SignalScan;
+	                e.subKind = static_cast<core::u8>(sk);
+	                e.systemId = currentSystem->stub.id;
+	                e.stationId = 0;
+	                e.objectId = s.id;
+	                e.discoveredDay = timeDays;
+	                e.valueCr = value;
+	                e.sold = false;
+	                logbook.push_back(e);
+	                sim::pruneLogbook(logbook);
+	              }
+
 
 	              // Derelict scans reveal the deterministic salvage plan (loot + ambush risk).
 	              // Some derelicts still hold an intact data core you can scoop.
 	              if (s.type == SignalType::Derelict && currentSystem) {
 	                if (!s.hasDerelictPlan) {
-	                  const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+	                  const auto sec = effectiveSystemSecurityProfile(*currentSystem);
 	                  s.hasDerelictPlan = true;
 	                  // Mission sites are seeded via the Signals module; if we somehow
 	                  // lack a plan here, treat it as non-mission and day-stable.
@@ -9816,6 +10483,23 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              if (itF != resourceFieldIndexById.end() && itF->second < resourceFieldSites.size()) {
 	                fk = resourceFieldSites[itF->second].kind;
 	              }
+
+	              {
+	                sim::LogbookEntry e{};
+	                e.key = key;
+	                e.kind = sim::LogbookEntryKind::AsteroidProspect;
+	                e.subKind = static_cast<core::u8>(fk);
+	                e.systemId = currentSystem->stub.id;
+	                e.stationId = 0;
+	                e.objectId = a.id;
+	                e.commodity = a.yield;
+	                e.units = a.remainingUnits;
+	                e.discoveredDay = timeDays;
+	                e.valueCr = value;
+	                e.sold = false;
+	                logbook.push_back(e);
+	                sim::pruneLogbook(logbook);
+	              }
 	              const int rem = (int)std::round(a.remainingUnits);
 	              const int cap = (int)std::round(a.baseUnits);
 	              std::string msg = "Prospect readout: ";
@@ -9857,6 +10541,21 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           scannedKeys.insert(compKey);
           const double bonus = 600.0 + 90.0 * (double)currentSystem->planets.size() + 120.0 * (double)currentSystem->stations.size();
           explorationDataCr += bonus;
+
+	          {
+	            sim::LogbookEntry e{};
+	            e.key = compKey;
+	            e.kind = sim::LogbookEntryKind::SystemSurveyBonus;
+	            e.subKind = 0;
+	            e.systemId = currentSystem->stub.id;
+	            e.stationId = 0;
+	            e.objectId = 0;
+	            e.discoveredDay = timeDays;
+	            e.valueCr = bonus;
+	            e.sold = false;
+	            logbook.push_back(e);
+	            sim::pruneLogbook(logbook);
+	          }
           const core::u32 lf = currentSystem ? currentSystem->stub.factionId : 0;
           if (lf != 0) addRep(lf, +1.0);
           toast(toasts, "System survey complete! Bonus data +" + std::to_string((int)bonus) + " cr.", 3.0);
@@ -10122,7 +10821,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                       cargoValueCr = std::max(0.0, units * q.mid);
                     }
 
-                    const sim::SystemSecurityProfile sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+                    const sim::SystemSecurityProfile sec = effectiveSystemSecurityProfile(*currentSystem);
                     const double value01 = std::clamp(cargoValueCr / 25000.0, 0.0, 1.0);
 
                     // Local RNG for this encounter so we don't perturb unrelated spawn ordering too much.
@@ -10356,7 +11055,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	              // Ensure a deterministic derelict plan exists (older save runs / modded spawners may not fill it).
 	              if (!s.hasDerelictPlan && currentSystem) {
-	                const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+	                const auto sec = effectiveSystemSecurityProfile(*currentSystem);
 	                const bool missionSite = (salvageM != nullptr);
 	                s.hasDerelictPlan = true;
 	                s.derelict = sim::planDerelictEncounter(universe.seed(),
@@ -10608,7 +11307,32 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        }
 	      }
 
-	      // --- Heat model (real-time) ---
+	      // --- Fuel scooping (primary star) ---
+      // Fuel gain is treated as a sim-time resource change; heat feedback is applied in the
+      // real-time thermal model via ThermalInputs::externalHeatPerSec.
+      {
+        fuelScoopDbg = sim::FuelScoopRates{};
+        if (currentSystem && !docked) {
+          const double distKm = ship.positionKm().length();
+
+          // Scooping is only allowed in normal space.
+          const bool canScoop = (fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
+          fuelScoopDbg = sim::computeFuelScoopRates(
+              currentSystem->star,
+              distKm,
+              fuelScoopMk,
+              fuelScoopDeployed && canScoop);
+
+          if (canScoop && fuelScoopDeployed && fuelScoopDbg.active && fuel < fuelMax - 1e-4) {
+            const double df = fuelScoopDbg.fuelPerSimSec * std::max(0.0, dtSim);
+            if (df > 0.0) {
+              fuel = std::min(fuelMax, fuel + df);
+            }
+          }
+        }
+      }
+
+      // --- Heat model (real-time) ---
       {
         sim::ThermalInputs tin{};
         tin.dtReal = dtReal;
@@ -10621,6 +11345,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         tin.heatImpulse = heatImpulse;
         tin.heatCoolRate = playerHeatCoolRate;
         tin.hullMax = playerHullMax;
+        tin.externalHeatPerSec = 0.0;
+        if (currentSystem && !docked) {
+          tin.externalHeatPerSec += fuelScoopDbg.starHeatPerSec;
+          const bool scoopingNow = (fuelScoopDeployed && fuelScoopDbg.active && fuel < fuelMax - 1e-4);
+          if (scoopingNow) tin.externalHeatPerSec += fuelScoopDbg.scoopHeatPerSec;
+        }
 
         const auto tr = sim::stepThermal(heat, tin);
         heat = tr.heat;
@@ -10895,24 +11625,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (docked || fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle) {
           failTrafficEscort("Escort aborted.", 0.0);
         } else if (!currentSystem) {
-          trafficEscort = TrafficEscortContract{};
+          trafficEscort = sim::TrafficEscortContractState{};
         } else {
-          Contact* convoy = nullptr;
+          // Prefer the physical convoy contact when present. If it's not yet
+          // resolved (e.g. quickload slightly outside the signal resolve radius),
+          // fall back to the deterministic convoy signal marker (posKm tracks
+          // the convoy's current position via the TrafficLedger).
+          math::Vec3d convoyPosKm{0,0,0};
+          bool haveConvoyPos = false;
+
           for (auto& c : contacts) {
             if (!c.alive) continue;
             if (!c.trafficConvoy) continue;
             if (c.role != ContactRole::Trader) continue;
             if (c.id == trafficEscort.convoyId || c.trafficConvoyId == trafficEscort.convoyId) {
-              convoy = &c;
+              convoyPosKm = c.ship.positionKm();
+              haveConvoyPos = true;
               break;
             }
           }
 
-          if (!convoy) {
+          if (!haveConvoyPos) {
+            for (const auto& ssrc : signals) {
+              if (ssrc.type == SignalType::TrafficConvoy && ssrc.id == trafficEscort.convoyId) {
+                convoyPosKm = ssrc.posKm;
+                haveConvoyPos = true;
+                break;
+              }
+            }
+          }
+
+          if (!haveConvoyPos) {
             const double repPenalty = -std::max(0.5, trafficEscort.repReward * 0.35);
             failTrafficEscort("Escort failed: convoy lost.", repPenalty);
           } else {
-            const double distKm = (ship.positionKm() - convoy->ship.positionKm()).length();
+            const double distKm = (ship.positionKm() - convoyPosKm).length();
             if (distKm > trafficEscort.maxRangeKm) {
               trafficEscort.tooFarSec += dtSim;
             } else {
@@ -11276,6 +12023,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       econShip.weaponPrimary = weaponPrimary;
       econShip.weaponSecondary = weaponSecondary;
       econShip.smuggleHoldMk = smuggleHoldMk;
+      econShip.fuelScoopMk = fuelScoopMk;
       econShip.cargoCapacityKg = cargoCapacityKg;
       econShip.fuelMax = fuelMax;
       econShip.passengerSeats = passengerSeats;
@@ -11291,6 +12039,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         weaponPrimary = econShip.weaponPrimary;
         weaponSecondary = econShip.weaponSecondary;
         smuggleHoldMk = econShip.smuggleHoldMk;
+        fuelScoopMk = econShip.fuelScoopMk;
+        fuelScoopDeployed = false;
         cargoCapacityKg = econShip.cargoCapacityKg;
         fuelMax = econShip.fuelMax;
         passengerSeats = econShip.passengerSeats;
@@ -11339,6 +12089,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       fsdTravelTotalSec = 0.0;
       navAutoRun = false;
       incomingMissileToastCooldownUntilDays = 0.0;
+
+      // Re-arm countermeasures on rebuy (fresh ship in hangar).
+      restockCountermeasureAmmo();
+      countermeasureCooldownUntilDays = 0.0;
 
   miningToastPendingUnits.fill(0.0);
   miningToastCooldownUntilDays = 0.0;
@@ -12606,6 +13360,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::Separator();
         ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
         ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        ImGui::MenuItem("Audio Settings", nullptr, &showAudioSettingsWindow);
         if (ImGui::MenuItem("Photo Mode", nullptr, &photoModeWindow.open)) { if (photoModeWindow.open) photoModeWindow.focusDir = true; }
         if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
         if (ImGui::MenuItem("Log", nullptr, &logWindow.open)) { if (logWindow.open) logWindow.focusFilter = true; }
@@ -12671,6 +13426,25 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
         ImGui::EndMenu();
       }
+
+      if (ImGui::BeginMenu("Audio")) {
+        ImGui::MenuItem("Audio settings...", nullptr, &showAudioSettingsWindow);
+        ImGui::Separator();
+        const char* muteLabel = audioSettings.enabled ? "Mute" : "Unmute";
+        if (ImGui::MenuItem(muteLabel)) {
+          audioSettings.enabled = !audioSettings.enabled;
+          audioSettingsDirty = true;
+          if (audioSettings.enabled && !audio.active()) {
+            if (!audio.init()) {
+              audioSettings.enabled = false;
+              toast(toasts, "Audio init failed (see log).", 2.0);
+            }
+          }
+          audio.setEnabled(audioSettings.enabled);
+        }
+        ImGui::EndMenu();
+      }
+
 
       if (ImGui::BeginMenu("Controls")) {
         ImGui::MenuItem(withKey("Controls window", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
@@ -14696,6 +15470,15 @@ if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruise
   double distKm = -1.0;
   if (convoy) {
     distKm = (convoy->ship.positionKm() - ship.positionKm()).length();
+  } else {
+    // Fall back to the deterministic convoy signal position so the HUD remains
+    // useful after quickload or if the physical convoy isn't currently resolved.
+    for (const auto& ssrc : signals) {
+      if (ssrc.type != SignalType::TrafficConvoy) continue;
+      if (ssrc.id != trafficEscort.convoyId) continue;
+      distKm = (ssrc.posKm - ship.positionKm()).length();
+      break;
+    }
   }
 
   const double bonusCr = std::max(0.0, trafficEscort.bonusPerPirateCr) * (double)std::max(0, trafficEscort.piratesKilled);
@@ -14705,6 +15488,8 @@ if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruise
   ImGui::Separator();
   if (convoy) {
     ImGui::Text("Convoy: %s", convoy->name.c_str());
+  } else if (distKm >= 0.0) {
+    ImGui::Text("Convoy: (signal)");
   } else {
     ImGui::Text("Convoy: (not in sensors)");
   }
@@ -15120,6 +15905,14 @@ if (showShip) {
 
   ImGui::Text("Credits: %.0f | Exploration data: %.0f cr", credits, explorationDataCr);
   ImGui::Text("Fuel: %.1f | Ship heat: %.0f", fuel, heat);
+
+  {
+    const auto cap = countermeasureCapsForHull(shipHullClass);
+    ImGui::Text("Countermeasures: Flares %d/%d | Chaff %d/%d | Heat sinks %d/%d",
+                cmFlares, cap.flares,
+                cmChaff, cap.chaff,
+                cmHeatSinks, cap.heatSinks);
+  }
 
   // Gravity / orbit diagnostics (useful while tuning supercruise drops & close approaches).
   if (currentSystem) {
@@ -16180,6 +16973,25 @@ if (showShip) {
 	  ImGui::Text(
 	      "Cargo scoop (%s): %s | Floating pods: %d", game::chordLabel(controls.actions.toggleCargoScoop).c_str(),
 	      cargoScoopDeployed ? "DEPLOYED" : "RETRACTED", (int)floatingCargo.size());
+
+	  if (fuelScoopMk > 0) {
+	    const double fuelRate = (fuelScoopDeployed && fuelScoopDbg.active) ? fuelScoopDbg.fuelPerSimSec : 0.0;
+	    const double heatRate =
+	      fuelScoopDbg.starHeatPerSec + ((fuelScoopDeployed && fuelScoopDbg.active) ? fuelScoopDbg.scoopHeatPerSec : 0.0);
+
+	    ImGui::Text(
+	        "Fuel scoop (%s): Mk%d | %s | +%.3f fuel/sim s | Heat +%.1f/s",
+	        game::chordLabel(controls.actions.toggleFuelScoop).c_str(),
+	        fuelScoopMk,
+	        fuelScoopDeployed ? "DEPLOYED" : "RETRACTED",
+	        fuelRate,
+	        heatRate);
+	  } else {
+	    ImGui::TextDisabled(
+	        "Fuel scoop (%s): none (buy at shipyard)",
+	        game::chordLabel(controls.actions.toggleFuelScoop).c_str());
+	  }
+
 
 	  {
 	    double totalVouchers = 0.0;
@@ -17766,16 +18578,19 @@ if (showScanner) {
 
 	  ImGui::Separator();
 	  ImGui::Text("Exploration data bank: %.0f cr", explorationDataCr);
-  if (docked && selectedStationIndex >= 0 && selectedStationIndex < (int)currentSystem->stations.size()) {
-    if (explorationDataCr > 0.0) {
-      if (ImGui::Button("Sell exploration data here")) {
-        credits += explorationDataCr;
-        toast(toasts, "Sold exploration data +" + std::to_string((int)explorationDataCr) + " cr.", 2.5);
-        explorationDataCr = 0.0;
-      }
-    } else {
-      ImGui::TextDisabled("No data to sell.");
-    }
+  if (currentSystem && docked && selectedStationIndex >= 0 && selectedStationIndex < (int)currentSystem->stations.size()) {
+    auto& saleStation = currentSystem->stations[selectedStationIndex];
+    game::drawExplorationDataBrokerPanel(logbookWindow.broker,
+                                         universe,
+                                         *currentSystem,
+                                         saleStation,
+                                         timeDays,
+                                         /*canSellHere=*/true,
+                                         logbook,
+                                         explorationDataCr,
+                                         credits,
+                                         [&](std::string_view msg, double ttl) { toast(toasts, std::string(msg), ttl); },
+                                         addRep);
   } else {
     ImGui::TextDisabled("Dock at a station to sell exploration data.");
   }
@@ -18867,7 +19682,7 @@ if (showScanner) {
               ImGui::TextDisabled("Escort contract: unavailable (reach the convoy signal to make it physical).");
             } else {
               // Preview contract parameters (same logic as the accept path).
-              const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+              const auto sec = effectiveSystemSecurityProfile(*currentSystem);
               bool piratesPresent = false;
               for (const auto& c : contacts) {
                 if (!c.alive || c.role != ContactRole::Pirate) continue;
@@ -18878,6 +19693,8 @@ if (showScanner) {
               const auto plan = sim::planTrafficEscortContract(universe.seed(), currentSystem->stub.id, ssrc.id, timeDays, tta,
                                                               convoy->tradeCargoValueCr, sec.piracy01, sec.security01, sec.contest01,
                                                               piratesPresent);
+
+              const bool alreadySettled = isTrafficEscortSettled(ssrc.id);
 
               const bool offerable = (plan.offer && plan.durationDays > 0.0);
               if (offerable) {
@@ -18893,7 +19710,10 @@ if (showScanner) {
                   failTrafficEscort("Escort contract cancelled.", 0.0);
                 }
               } else {
-                ImGui::BeginDisabled(trafficEscort.active || !offerable);
+                if (alreadySettled) {
+                  ImGui::TextDisabled("Status: settled");
+                }
+                ImGui::BeginDisabled(trafficEscort.active || !offerable || alreadySettled);
                 if (ImGui::Button("Accept escort contract")) {
                   (void)startTrafficEscort(ssrc.id);
                 }
@@ -19095,6 +19915,100 @@ if (showScanner) {
           }
           ImGui::SameLine();
           ImGui::TextDisabled("(%.1f units, %.0f cr)", fuelBuy, fuelCost);
+
+          // Countermeasures restock service.
+          {
+            ImGui::Separator();
+            ImGui::Text("Countermeasures");
+
+            const auto cap = countermeasureCapsForHull(shipHullClass);
+            const int wantFlares = std::clamp(cmFlares, 0, cap.flares);
+            const int wantChaff = std::clamp(cmChaff, 0, cap.chaff);
+            const int wantHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
+
+            // Keep state clamped even if a save was edited.
+            cmFlares = wantFlares;
+            cmChaff = wantChaff;
+            cmHeatSinks = wantHeatSinks;
+
+            ImGui::TextDisabled("Flares %d/%d   Chaff %d/%d   Heat sinks %d/%d",
+                               wantFlares, cap.flares,
+                               wantChaff, cap.chaff,
+                               wantHeatSinks, cap.heatSinks);
+
+            const double priceMult = (1.0 + feeEff);
+            const double flareUnit = 85.0;
+            const double chaffUnit = 95.0;
+            const double heatSinkUnit = 360.0;
+
+            const int needF = std::max(0, cap.flares - wantFlares);
+            const int needC = std::max(0, cap.chaff - wantChaff);
+            const int needH = std::max(0, cap.heatSinks - wantHeatSinks);
+
+            const double costF = needF * flareUnit * priceMult;
+            const double costC = needC * chaffUnit * priceMult;
+            const double costH = needH * heatSinkUnit * priceMult;
+            const double costAll = costF + costC + costH;
+
+            ImGui::BeginDisabled(needF + needC + needH <= 0);
+            if (ImGui::Button("Restock all")) {
+              if (credits >= costAll) {
+                credits -= costAll;
+                cmFlares = cap.flares;
+                cmChaff = cap.chaff;
+                cmHeatSinks = cap.heatSinks;
+                toast(toasts, "Countermeasures restocked.", 2.0);
+              } else {
+                toast(toasts, "Not enough credits to restock countermeasures.", 2.0);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f cr)", costAll);
+
+            // Individual restock buttons (useful when saving credits).
+            ImGui::BeginDisabled(needF <= 0);
+            if (ImGui::SmallButton("Restock flares")) {
+              if (credits >= costF) {
+                credits -= costF;
+                cmFlares = cap.flares;
+                toast(toasts, "Flares restocked.", 1.8);
+              } else {
+                toast(toasts, "Not enough credits.", 1.6);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d, %.0f cr)", needF, costF);
+
+            ImGui::BeginDisabled(needC <= 0);
+            if (ImGui::SmallButton("Restock chaff")) {
+              if (credits >= costC) {
+                credits -= costC;
+                cmChaff = cap.chaff;
+                toast(toasts, "Chaff restocked.", 1.8);
+              } else {
+                toast(toasts, "Not enough credits.", 1.6);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d, %.0f cr)", needC, costC);
+
+            ImGui::BeginDisabled(needH <= 0);
+            if (ImGui::SmallButton("Restock heat sinks")) {
+              if (credits >= costH) {
+                credits -= costH;
+                cmHeatSinks = cap.heatSinks;
+                toast(toasts, "Heat sinks restocked.", 1.8);
+              } else {
+                toast(toasts, "Not enough credits.", 1.6);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d, %.0f cr)", needH, costH);
+          }
 
           // Insurance debt service: pay down emergency loan at any station.
           if (insuranceDebtCr > 0.01) {
@@ -19374,6 +20288,31 @@ if (showScanner) {
               }
             }
 
+            // Fuel scoop module (enables star refuelling at heat risk).
+            {
+              if (fuelScoopMk >= 3) {
+                ImGui::TextDisabled("Fuel scoop: Mk3 (max)");
+              } else {
+                const auto q = sim::quoteFuelScoopUpgrade(universe.seed(), station, shipyardModel, fuelScoopMk);
+                const int nextMk = (q.nextMk > 0) ? q.nextMk : (fuelScoopMk + 1);
+                std::string label = std::string("Fuel scoop Mk") + std::to_string(nextMk);
+
+                ImGui::BeginDisabled(!q.ok || credits + 1e-6 < q.costCr);
+                if (ImGui::Button(label.c_str())) {
+                  if (sim::applyFuelScoopUpgrade(credits, fuelScoopMk, q)) {
+                    fuelScoopDeployed = false;
+                    toast(toasts, "Fuel scoop installed.", 2.0);
+                  } else {
+                    toast(toasts, "Not enough credits.", 2.0);
+                  }
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.0f cr) Enables refuelling near the system star.", q.costCr);
+              }
+            }
+
             {
               const auto q = sim::quoteFuelTankUpgrade(universe.seed(), station, shipyardModel);
               ImGui::BeginDisabled(!q.ok || credits + 1e-6 < q.costCr);
@@ -19624,17 +20563,17 @@ if (showScanner) {
 if (canTrade) {
   ImGui::Separator();
   ImGui::Text("Exploration Data");
-  ImGui::Text("Bank: %.0f cr", explorationDataCr);
-  if (explorationDataCr > 0.0) {
-    if (ImGui::Button("Sell all exploration data")) {
-      credits += explorationDataCr;
-      toast(toasts, "Sold exploration data +" + std::to_string((int)explorationDataCr) + " cr.", 2.5);
-      explorationDataCr = 0.0;
-      addRep(station.factionId, +0.5);
-    }
-  } else {
-    ImGui::TextDisabled("No scan data to sell.");
-  }
+  game::drawExplorationDataBrokerPanel(logbookWindow.broker,
+                                       universe,
+                                       *currentSystem,
+                                       station,
+                                       timeDays,
+                                       /*canSellHere=*/true,
+                                       logbook,
+                                       explorationDataCr,
+                                       credits,
+                                       [&](std::string_view msg, double ttl) { toast(toasts, std::string(msg), ttl); },
+                                       addRep);
 
   ImGui::Separator();
   ImGui::Text("Legal");
@@ -20179,6 +21118,23 @@ if (canTrade) {
       };
 
       game::drawTradePlannerWindow(tradePlannerWindow, tctx);
+    }
+
+    if (logbookWindow.open) {
+      game::LogbookContext lctx{universe, currentSystem, timeDays, logbook};
+      lctx.explorationDataBankCr = explorationDataCr;
+      lctx.plotRouteToSystem = [&](sim::SystemId sysId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        return plotRouteToSystem(sysId, /*showToast=*/true);
+      };
+      lctx.targetStationById = [&](sim::StationId stId) {
+        if (stId != 0) tryTargetStationById(stId);
+      };
+      lctx.toast = [&](std::string_view msg, double ttlSec) {
+        toast(toasts, std::string(msg), ttlSec);
+      };
+      game::drawLogbookWindow(logbookWindow, lctx);
     }
 
     if (showTrade) {
@@ -20769,6 +21725,27 @@ if (canTrade) {
             ImGui::TextDisabled("No missions accepted.");
           }
 
+          // Ambient traffic escort contract: shown alongside formal missions so it's
+          // discoverable and cancellable without forcing the player to use the scanner.
+          if (trafficEscort.active) {
+            ImGui::SeparatorText("Contracts");
+
+            const double leftSec = std::max(0.0, (trafficEscort.untilDays - timeDays) * 86400.0);
+            const double bonusCr = std::max(0.0, trafficEscort.bonusPerPirateCr) * (double)std::max(0, trafficEscort.piratesKilled);
+            const double totalCr = std::max(0.0, trafficEscort.rewardCr) + bonusCr;
+
+            ImGui::Text("Traffic Escort");
+            if (currentSystem && trafficEscort.toStationId != 0) {
+              ImGui::TextDisabled("Destination: %s", uiStationNameById(currentSystem->stub.id, trafficEscort.toStationId).c_str());
+            }
+            ImGui::TextDisabled("Time left: %.0f s | Reward: %.0f cr (%.0f + %.0f) | Raiders down: %d",
+                                leftSec, totalCr, trafficEscort.rewardCr, bonusCr, trafficEscort.piratesKilled);
+            if (ImGui::SmallButton("Cancel contract")) {
+              failTrafficEscort("Escort aborted.", 0.0);
+            }
+            ImGui::Separator();
+          }
+
           for (auto& m : missions) {
             ImGui::PushID((int)m.id);
             const bool active = !(m.completed || m.failed);
@@ -20899,13 +21876,60 @@ if (canTrade) {
               const auto& st = currentSystem->stations[(std::size_t)dockedIdx];
               const double rep = getRep(st.factionId);
               ImGui::Text("Station: %s", st.name.c_str());
-              ImGui::Text("Faction: %s (rep %.1f)", factionName(st.factionId).c_str(), rep);
+ImGui::Text("Faction: %s (rep %.1f)", factionName(st.factionId).c_str(), rep);
+
+// Local conditions: show the effective values that drive encounter cadence
+// and mission board weighting.
+{
+  const auto snap = snapshotSystemConditions(*currentSystem);
+
+  const double dSecDyn = snap.afterDynamics.security01 - snap.base.security01;
+  const double dPirDyn = snap.afterDynamics.piracy01 - snap.base.piracy01;
+  const double dTrfDyn = snap.afterDynamics.traffic01 - snap.base.traffic01;
+
+  ImGui::Separator();
+  ImGui::TextDisabled("Local conditions:");
+  ImGui::Text("Security %.2f | Piracy %.2f | Traffic %.2f",
+              snap.effective.security01, snap.effective.piracy01, snap.effective.traffic01);
+
+  if (snap.hasDynamics) {
+    ImGui::TextDisabled("Dynamics: ΔSec %+.2f | ΔPir %+.2f | ΔTrf %+.2f (decays)",
+                        dSecDyn, dPirDyn, dTrfDyn);
+  }
+
+  if (snap.event.active) {
+    ImGui::TextDisabled("Event: %s (sev %.2f)  ΔSec %+.2f | ΔPir %+.2f | ΔTrf %+.2f",
+                        sim::systemEventKindName(snap.event.kind),
+                        snap.event.severity01,
+                        snap.event.securityDelta,
+                        snap.event.piracyDelta,
+                        snap.event.trafficDelta);
+  }
+
+  ImGui::TextDisabled("Contest %.2f", snap.base.contest01);
+}
 
               // Mission board offers are generated by the shared headless mission module.
               // This keeps offer weights, accept rules, and future mission types consistent
               // between the prototype UI and unit tests.
               {
-                sim::SaveGame board{};
+sim::SaveGame board{};
+
+// Fill in the player's current ship constraints so the board doesn't
+// offer impossible jobs (too much cargo / not enough seats).
+board.cargoCapacityKg = cargoCapacityKg;
+board.cargo = cargo;
+board.passengerSeats = passengerSeats;
+
+// Provide this system's dynamic security delta (if any) so mission weights
+// reflect recent events (pirate waves, crackdowns, disrupted traffic, etc.).
+if (currentSystem) {
+  if (const auto itD = systemSecurityDeltaBySystem.find(currentSystem->stub.id);
+      itD != systemSecurityDeltaBySystem.end()) {
+    board.systemSecurityDeltas.clear();
+    board.systemSecurityDeltas.push_back(itD->second);
+  }
+}
                 board.missionOffersStationId = missionOffersStationId;
                 board.missionOffersDayStamp = missionOffersDayStamp;
                 board.missionOffers = missionOffers;
@@ -21348,6 +22372,25 @@ if (showContacts) {
 
       auto nearby = universe.queryNearby(center, radius, 256);
 
+      // Cache deterministic system security profiles for systems in view.
+      // We compute these lazily (budget per frame) to avoid hitching when the query radius is large.
+      static core::u64 mapSecurityCacheSeed = 0;
+      static std::unordered_map<sim::SystemId, sim::SystemSecurityProfile> mapSecurityCache;
+      if (mapSecurityCacheSeed != universe.seed()) {
+        mapSecurityCacheSeed = universe.seed();
+        mapSecurityCache.clear();
+      }
+      if (mapShowHeatmap) {
+        int budget = 12;
+        for (const auto& s : nearby) {
+          if (budget <= 0) break;
+          if (mapSecurityCache.find(s.id) != mapSecurityCache.end()) continue;
+          const sim::StarSystem& sys = universe.getSystem(s.id);
+          mapSecurityCache[s.id] = sim::systemSecurityProfile(universe.seed(), sys);
+          --budget;
+        }
+      }
+
       const double galaxyJrMaxLy = fsdBaseRangeLy();
       const double galaxyJrNowLy = fsdCurrentRangeLy();
       const double galaxyPlanMaxLy = navConstrainToCurrentFuelRange ? galaxyJrNowLy : galaxyJrMaxLy;
@@ -21443,6 +22486,13 @@ if (showContacts) {
       static bool mapShowJumpRings = true;
       static bool mapShowRoute = true;
 
+      // System conditions heatmap (Security / Piracy / Traffic / Danger).
+      static bool mapShowHeatmap = true;
+      static int mapHeatMode = 0; // 0=Security, 1=Piracy, 2=Traffic, 3=Danger
+      static bool mapHeatUseDynamic = true;
+      static bool mapHeatLegend = true;
+      static float mapHeatAlpha = 0.55f;
+
       if (mapLastSystemId != currentSystem->stub.id) {
         mapLastSystemId = currentSystem->stub.id;
         mapViewCenterLy = currentSystem->stub.posLy;
@@ -21466,6 +22516,20 @@ if (showContacts) {
           ImGui::Checkbox("Jump rings", &mapShowJumpRings);
 
           ImGui::Checkbox("Route overlay", &mapShowRoute);
+
+          ImGui::SeparatorText("Heatmap");
+          ImGui::Checkbox("Show heatmap", &mapShowHeatmap);
+          ImGui::SameLine();
+          {
+            const char* heatNames[] = {"Security", "Piracy", "Traffic", "Danger"};
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::Combo("Metric", &mapHeatMode, heatNames, 4);
+          }
+          ImGui::Checkbox("Use dynamic deltas", &mapHeatUseDynamic);
+          ImGui::SameLine();
+          ImGui::Checkbox("Legend", &mapHeatLegend);
+          ImGui::SetNextItemWidth(180.0f);
+          ImGui::SliderFloat("Heat alpha", &mapHeatAlpha, 0.05f, 1.0f, "%.2f");
 
           ImGui::SetNextItemWidth(180.0f);
           ImGui::SliderFloat("Zoom", &mapZoom, 0.25f, 8.0f, "%.2fx");
@@ -21550,6 +22614,64 @@ if (showContacts) {
           };
 
           draw->PushClipRect(canvasP0, canvasP1, true);
+
+          // Heatmap helper: map a 0..1 "goodness" value to a red->yellow->green color.
+          auto heatColor = [](float good01, float alpha01) -> ImU32 {
+            good01 = std::clamp(good01, 0.0f, 1.0f);
+            alpha01 = std::clamp(alpha01, 0.0f, 1.0f);
+            auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+
+            float r = 0, g = 0, b = 0;
+            if (good01 < 0.5f) {
+              const float t = good01 / 0.5f;
+              r = lerp(235.0f, 245.0f, t);
+              g = lerp(70.0f, 220.0f, t);
+              b = lerp(70.0f, 95.0f, t);
+            } else {
+              const float t = (good01 - 0.5f) / 0.5f;
+              r = lerp(245.0f, 70.0f, t);
+              g = lerp(220.0f, 235.0f, t);
+              b = lerp(95.0f, 120.0f, t);
+            }
+
+            const int ri = (int)std::clamp(r, 0.0f, 255.0f);
+            const int gi = (int)std::clamp(g, 0.0f, 255.0f);
+            const int bi = (int)std::clamp(b, 0.0f, 255.0f);
+            const int ai = (int)std::clamp(alpha01 * 255.0f, 0.0f, 255.0f);
+            return IM_COL32(ri, gi, bi, ai);
+          };
+
+          auto computeHeatGood01 = [&](sim::SystemId id) -> float {
+            // Default to "neutral" when the cache hasn't populated yet.
+            sim::SystemSecurityProfile prof{};
+            prof.security01 = 0.5;
+            prof.piracy01 = 0.5;
+            prof.traffic01 = 0.5;
+
+            if (const auto it = mapSecurityCache.find(id); it != mapSecurityCache.end()) {
+              prof = it->second;
+            }
+
+            if (mapHeatUseDynamic) {
+              if (const auto itD = systemSecurityDeltaBySystem.find(id); itD != systemSecurityDeltaBySystem.end()) {
+                prof = sim::applySystemSecurityDelta(prof, itD->second, timeDays, systemSecurityDynParams);
+              }
+            }
+
+            switch (mapHeatMode) {
+              case 0: // Security: higher is better
+                return (float)prof.security01;
+              case 1: // Piracy: lower is better
+                return (float)std::clamp(1.0 - prof.piracy01, 0.0, 1.0);
+              case 2: // Traffic: higher is better (more commerce)
+                return (float)prof.traffic01;
+              case 3: // Danger: "security vs piracy" balance (higher is safer)
+              default: {
+                const double v = 0.5 + (prof.security01 - prof.piracy01) * 0.80;
+                return (float)std::clamp(v, 0.0, 1.0);
+              }
+            }
+          };
 
           // Grid (nice step size) in view space.
           if (mapShowGrid) {
@@ -21793,6 +22915,15 @@ if (showContacts) {
             const auto uv = hudAtlas.get(render::SpriteKind::Star, core::hashCombine(core::fnv1a64("galaxy_star"), s.seed));
             const ImVec2 i0(p.x - iconSz * 0.5f, p.y - iconSz * 0.5f);
             const ImVec2 i1(p.x + iconSz * 0.5f, p.y + iconSz * 0.5f);
+
+            // Heatmap overlay ring behind the system icon.
+            if (mapShowHeatmap) {
+              const float good01 = computeHeatGood01(s.id);
+              const float a = std::clamp(mapHeatAlpha * alpha, 0.0f, 1.0f);
+              const float rHeat = iconSz * 0.72f;
+              draw->AddCircleFilled(p, rHeat, heatColor(good01, a), 24);
+              draw->AddCircle(p, rHeat, IM_COL32(20, 20, 30, (int)(a * 180.0f)), 24, 1.0f);
+            }
             draw->AddImage(atlasId, i0, i1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), starTint(s.primaryClass, alpha));
 
             // Bookmark marker: a small warm dot offset from the system icon.
@@ -21863,6 +22994,30 @@ if (showContacts) {
             ImGui::Text("Distance: %.1f ly", distLy);
             ImGui::Text("Stations: %d  |  Planets: %d", sys.stub.stationCount, sys.stub.planetCount);
             ImGui::Text("Faction: %s", factionName(sys.stub.factionId).c_str());
+
+            // System conditions (baseline + dynamics + events).
+            {
+              const auto snap = snapshotSystemConditions(sys);
+
+              ImGui::TextDisabled("Conditions:");
+              ImGui::Text("Security %.2f  Piracy %.2f  Traffic %.2f",
+                          snap.effective.security01, snap.effective.piracy01, snap.effective.traffic01);
+              if (snap.hasDynamics) {
+                ImGui::TextDisabled("Dynamics ΔSec %+0.3f  ΔPir %+0.3f  ΔTrf %+0.3f",
+                                    snap.dynamicsNow.securityDelta,
+                                    snap.dynamicsNow.piracyDelta,
+                                    snap.dynamicsNow.trafficDelta);
+              }
+              if (snap.event.active) {
+                ImGui::TextDisabled("Event: %s (sev %.2f)  ΔSec %+.3f  ΔPir %+.3f  ΔTrf %+.3f",
+                                    sim::systemEventKindName(snap.event.kind),
+                                    snap.event.severity01,
+                                    snap.event.securityDelta,
+                                    snap.event.piracyDelta,
+                                    snap.event.trafficDelta);
+              }
+            }
+
             ImGui::Separator();
             if (!inRange) {
               ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Direct jump: OUT OF RANGE");
@@ -21880,6 +23035,27 @@ if (showContacts) {
           draw->AddText(ImVec2(canvasP0.x + 8.0f, canvasP0.y + 8.0f),
                         IM_COL32(170, 170, 190, 170),
                         "Galaxy Map");
+
+          if (mapShowHeatmap && mapHeatLegend) {
+            const char* metricName = (mapHeatMode == 0) ? "Security"
+                                   : (mapHeatMode == 1) ? "Piracy"
+                                   : (mapHeatMode == 2) ? "Traffic"
+                                   : "Danger";
+
+            const float barW = 150.0f;
+            const float barH = 10.0f;
+            const ImVec2 barP0(canvasP0.x + 8.0f, canvasP0.y + 26.0f);
+            const int segments = 30;
+            for (int i = 0; i < segments; ++i) {
+              const float t0 = (float)i / (float)segments;
+              const float t1 = (float)(i + 1) / (float)segments;
+              const float x0 = barP0.x + t0 * barW;
+              const float x1 = barP0.x + t1 * barW;
+              draw->AddRectFilled(ImVec2(x0, barP0.y), ImVec2(x1, barP0.y + barH), heatColor(t0, 0.85f));
+            }
+            draw->AddRect(barP0, ImVec2(barP0.x + barW, barP0.y + barH), IM_COL32(40, 40, 50, 200));
+            draw->AddText(ImVec2(barP0.x, barP0.y + barH + 4.0f), IM_COL32(170, 170, 190, 170), metricName);
+          }
 
           draw->PopClipRect();
           ImGui::EndChild();
@@ -21990,6 +23166,97 @@ if (showContacts) {
           ImGui::Text("Distance: %.1f ly", distLy);
           ImGui::Text("Stations: %d  |  Planets: %d", selSys.stub.stationCount, selSys.stub.planetCount);
           ImGui::Text("Faction: %s", factionName(selSys.stub.factionId).c_str());
+
+          ImGui::SeparatorText("Conditions");
+          {
+            const auto snap = snapshotSystemConditions(selSys);
+
+            ImGui::Text("Security %.2f  Piracy %.2f  Traffic %.2f",
+                        snap.effective.security01, snap.effective.piracy01, snap.effective.traffic01);
+            ImGui::TextDisabled("Base    %.2f  Piracy %.2f  Traffic %.2f",
+                                snap.base.security01, snap.base.piracy01, snap.base.traffic01);
+
+            if (snap.hasDynamics) {
+              ImGui::TextDisabled("Dynamics ΔSec %+0.3f  ΔPir %+0.3f  ΔTrf %+0.3f  |  last %.1f d",
+                                  snap.dynamicsNow.securityDelta, snap.dynamicsNow.piracyDelta, snap.dynamicsNow.trafficDelta,
+                                  snap.dynamicsNow.lastUpdateDay);
+            } else {
+              ImGui::TextDisabled("No active dynamic delta for this system.");
+            }
+
+            if (snap.event.active) {
+              ImGui::TextDisabled("Event: %s (sev %.2f)  ΔSec %+.3f  ΔPir %+.3f  ΔTrf %+.3f",
+                                  sim::systemEventKindName(snap.event.kind), snap.event.severity01,
+                                  snap.event.securityDelta, snap.event.piracyDelta, snap.event.trafficDelta);
+            } else {
+              ImGui::TextDisabled("No active system event.");
+            }
+          }
+
+
+          if (ImGui::CollapsingHeader("System dynamics (debug)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("Persistent system deltas: %d system(s).", (int)systemSecurityDeltaBySystem.size());
+            if (ImGui::Button("Prune negligible deltas")) {
+              int pruned = 0;
+              for (auto it = systemSecurityDeltaBySystem.begin(); it != systemSecurityDeltaBySystem.end(); /*manual*/) {
+                if (sim::isSystemSecurityDeltaNegligible(it->second, timeDays, systemSecurityDynParams)) {
+                  it = systemSecurityDeltaBySystem.erase(it);
+                  ++pruned;
+                  continue;
+                }
+                ++it;
+              }
+              toast(toasts, "Pruned " + std::to_string(pruned) + " delta(s).", 1.6);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear ALL deltas")) {
+              systemSecurityDeltaBySystem.clear();
+              toast(toasts, "Cleared all system deltas.", 1.6);
+            }
+
+            ImGui::SeparatorText("Impulse");
+            static double impSec = 0.08;
+            static double impPir = -0.06;
+            static double impTrf = 0.00;
+            ImGui::InputDouble("ΔSecurity", &impSec, 0.01, 0.05, "%.3f");
+            ImGui::InputDouble("ΔPiracy", &impPir, 0.01, 0.05, "%.3f");
+            ImGui::InputDouble("ΔTraffic", &impTrf, 0.01, 0.05, "%.3f");
+
+            if (ImGui::Button("Apply impulse to selected")) {
+              auto& st = systemSecurityDeltaBySystem[selSys.stub.id];
+              if (st.systemId == 0) {
+                st.systemId = selSys.stub.id;
+                st.lastUpdateDay = timeDays;
+              }
+              sim::applySystemSecurityImpulse(st, timeDays, impSec, impPir, impTrf, systemSecurityDynParams);
+              if (sim::isSystemSecurityDeltaNegligible(st, timeDays, systemSecurityDynParams)) {
+                systemSecurityDeltaBySystem.erase(selSys.stub.id);
+                toast(toasts, "Impulse applied (delta pruned as negligible).", 1.6);
+              } else {
+                toast(toasts, "Impulse applied to " + selSys.stub.name + ".", 1.6);
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear selected delta")) {
+              const std::size_t n = systemSecurityDeltaBySystem.erase(selSys.stub.id);
+              if (n) toast(toasts, "Cleared delta for " + selSys.stub.name + ".", 1.6);
+              else toast(toasts, "No delta to clear for selected system.", 1.6);
+            }
+
+            ImGui::SeparatorText("Decay params");
+            ImGui::InputDouble("Security half-life (days)", &systemSecurityDynParams.securityHalfLifeDays, 1.0, 10.0, "%.2f");
+            ImGui::InputDouble("Piracy half-life (days)", &systemSecurityDynParams.piracyHalfLifeDays, 1.0, 10.0, "%.2f");
+            ImGui::InputDouble("Traffic half-life (days)", &systemSecurityDynParams.trafficHalfLifeDays, 1.0, 10.0, "%.2f");
+            ImGui::InputDouble("Max |delta|", &systemSecurityDynParams.maxAbsDelta, 0.05, 0.10, "%.2f");
+            ImGui::InputDouble("Prune epsilon", &systemSecurityDynParams.negligibleAbs, 0.001, 0.01, "%.4f");
+
+            // Clamp to sensible ranges (avoid NaN decay + negative half-life).
+            systemSecurityDynParams.securityHalfLifeDays = std::clamp(systemSecurityDynParams.securityHalfLifeDays, 1.0, 3650.0);
+            systemSecurityDynParams.piracyHalfLifeDays = std::clamp(systemSecurityDynParams.piracyHalfLifeDays, 1.0, 3650.0);
+            systemSecurityDynParams.trafficHalfLifeDays = std::clamp(systemSecurityDynParams.trafficHalfLifeDays, 1.0, 3650.0);
+            systemSecurityDynParams.maxAbsDelta = std::clamp(systemSecurityDynParams.maxAbsDelta, 0.05, 5.0);
+            systemSecurityDynParams.negligibleAbs = std::clamp(systemSecurityDynParams.negligibleAbs, 0.0, 0.25);
+          }
 
           ImGui::SeparatorText("Bookmarks");
           {
@@ -22576,6 +23843,129 @@ if (showContacts) {
           }
 
           ImGui::EndTable();
+        }
+      }
+      ImGui::End();
+    }
+
+    // ---- Audio Settings ----
+    if (showAudioSettingsWindow) {
+      ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Audio", &showAudioSettingsWindow)) {
+        ImGui::TextDisabled("Saved to %s", audioSettingsPath.c_str());
+        if (audioSettingsDirty) {
+          ImGui::SameLine();
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "*unsaved*");
+        }
+
+        if (!audio.active()) {
+          ImGui::Spacing();
+          ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Audio device inactive.");
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Try init")) {
+            if (!audio.init()) {
+              toast(toasts, "Audio init failed (see log).", 2.0);
+            } else {
+              audio.setEnabled(audioSettings.enabled);
+              audio.setMaster(audioSettings.master);
+              audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+              audio.setSpatialize(audioSettings.spatialize);
+              toast(toasts, "Audio initialized.", 1.6);
+            }
+          }
+        }
+
+        bool enabled = audioSettings.enabled;
+        if (ImGui::Checkbox("Enable audio", &enabled)) {
+          audioSettings.enabled = enabled;
+          audioSettingsDirty = true;
+          if (audioSettings.enabled && !audio.active()) {
+            if (!audio.init()) {
+              audioSettings.enabled = false;
+              toast(toasts, "Audio init failed (see log).", 2.0);
+            }
+          }
+          audio.setEnabled(audioSettings.enabled);
+        }
+
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::SliderFloat("Master", &audioSettings.master, 0.0f, 1.0f, "%.2f")) {
+          audioSettingsDirty = true;
+          audio.setMaster(audioSettings.master);
+        }
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::SliderFloat("Engine", &audioSettings.engine, 0.0f, 1.0f, "%.2f")) {
+          audioSettingsDirty = true;
+          audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+        }
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::SliderFloat("Weapons", &audioSettings.weapons, 0.0f, 1.0f, "%.2f")) {
+          audioSettingsDirty = true;
+          audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+        }
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::SliderFloat("UI", &audioSettings.ui, 0.0f, 1.0f, "%.2f")) {
+          audioSettingsDirty = true;
+          audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+        }
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::SliderFloat("World", &audioSettings.world, 0.0f, 1.0f, "%.2f")) {
+          audioSettingsDirty = true;
+          audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+        }
+
+        if (ImGui::Checkbox("Spatialize SFX (pan)", &audioSettings.spatialize)) {
+          audioSettingsDirty = true;
+          audio.setSpatialize(audioSettings.spatialize);
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Test UI click")) { audio.play(game::AudioEngine::Sfx::UiClick, 1.0f, 0.0f); }
+        ImGui::SameLine();
+        if (ImGui::Button("Test Laser")) { audio.play(game::AudioEngine::Sfx::WeaponLaser, 1.0f, 0.0f); }
+        ImGui::SameLine();
+        if (ImGui::Button("Test Explosion")) { audio.play(game::AudioEngine::Sfx::Explosion, 0.9f, 0.0f); }
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Save")) {
+          const bool ok = ui::saveAudioSettingsToFile(audioSettings, audioSettingsPath);
+          if (ok) audioSettingsDirty = false;
+          toast(toasts, ok ? "Saved audio settings." : "Failed to save audio settings.", 1.8);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reload")) {
+          ui::AudioSettings loaded = ui::makeDefaultAudioSettings();
+          if (ui::loadAudioSettingsFromFile(audioSettingsPath, loaded)) {
+            audioSettings = loaded;
+            audioSettingsDirty = false;
+            if (audioSettings.enabled && !audio.active()) {
+              (void)audio.init();
+            }
+            audio.setEnabled(audioSettings.enabled);
+            audio.setMaster(audioSettings.master);
+            audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+            audio.setSpatialize(audioSettings.spatialize);
+            toast(toasts, "Loaded audio settings.", 1.8);
+          } else {
+            toast(toasts, "No audio_settings.txt found.", 1.8);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Defaults")) {
+          audioSettings = ui::makeDefaultAudioSettings();
+          audioSettingsDirty = true;
+          audio.setEnabled(audioSettings.enabled);
+          audio.setMaster(audioSettings.master);
+          audio.setBus(audioSettings.engine, audioSettings.weapons, audioSettings.ui, audioSettings.world);
+          audio.setSpatialize(audioSettings.spatialize);
         }
       }
       ImGui::End();
@@ -24328,6 +25718,10 @@ draw_command_palette:
   }
 
   // Persist UI settings on exit (optional).
+      if (audioSettingsAutoSaveOnExit && audioSettingsDirty) {
+        (void)ui::saveAudioSettingsToFile(audioSettings, audioSettingsPath);
+      }
+
   if (uiSettingsAutoSaveOnExit && uiSettingsDirty) {
     syncUiSettingsFromRuntime();
     (void)ui::saveUiSettingsToFile(uiSettings, uiSettingsPath);
@@ -24340,6 +25734,7 @@ draw_command_palette:
   core::removeLogSink(uiLogSink);
 
   // Cleanup
+  audio.shutdown();
   spriteCache.clear();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();

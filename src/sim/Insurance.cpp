@@ -28,6 +28,15 @@ static double smuggleHoldValueCr(int mk) {
   return total;
 }
 
+static double fuelScoopValueCr(int mk) {
+  // Base prices used by ShipyardService (see quoteFuelScoopUpgrade).
+  static constexpr double kBaseCost[4] = {0.0, 6500.0, 12000.0, 19000.0};
+  const int m = clampInt(mk, 0, 3);
+  double total = 0.0;
+  for (int i = 1; i <= m; ++i) total += kBaseCost[i];
+  return total;
+}
+
 } // namespace
 
 ShipValueBreakdown computeShipValue(const PlayerShipEconomyState& s) {
@@ -62,8 +71,9 @@ ShipValueBreakdown computeShipValue(const PlayerShipEconomyState& s) {
   const double paxValue   = (double)paxUp * 3000.0;
   const double fsdValue   = (double)fsdUp * 9000.0;
   const double smuggleVal = smuggleHoldValueCr(s.smuggleHoldMk);
+  const double scoopVal = fuelScoopValueCr(s.fuelScoopMk);
 
-  out.upgradesCr = cargoValue + fuelValue + paxValue + fsdValue + smuggleVal;
+  out.upgradesCr = cargoValue + fuelValue + paxValue + fsdValue + smuggleVal + scoopVal;
 
   out.totalCr = out.hullCr + out.coreModulesCr + out.weaponsCr + out.upgradesCr;
   return out;

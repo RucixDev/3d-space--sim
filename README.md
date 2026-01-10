@@ -41,6 +41,8 @@ This repo contains:
 - Galaxy map jump overlay shows both **max jump range** (cargo-limited) and **current-fuel range**.
 - Route plotting supports **Min jumps**, **Min distance**, or **Min fuel** (A*), with an optional "constrain to current-fuel range" toggle.
 - System IDs encode their sector so `Universe::getSystem(id)` works without extra context (useful for saves + nav routes).
+- Galaxy map includes a **Conditions heatmap** (Security / Piracy / Traffic / Danger) and a per-system **Dynamics (debug)** panel to apply persistent deltas (saved with your game).
+- Systems also get a deterministic, time-based **System Events** ("weather") layer that nudges effective Security / Piracy / Traffic each cycle.
 
 ### FSD jump (early hyperspace loop)
 - Select a destination system in the **Galaxy** window and press **J** (or click the button).
@@ -68,6 +70,8 @@ This repo contains:
 - Dock/Undock: **G**
 - Autopilot approach: **P**
 - Cargo scoop: **O** deploy/retract (scoop floating cargo pods)
+- Fuel scoop: **Shift+O** deploy/retract (collect fuel from the star at high heat)
+- Countermeasures: **Backspace** flares | **Shift+Backspace** chaff | **Ctrl+Backspace** heat sink *(restock while docked: Market → Countermeasures)*
 - Cargo jettison: **Ship / Status → Cargo management** (spawns floating pods)
 - Fire primary/secondary: **Left Mouse / Right Mouse**
 - Supercruise: **H** engage/drop (assist auto-drops in SAFE window)
@@ -81,6 +85,7 @@ This repo contains:
 - Save/Load: **F5 / F9**
 - Pause: **Space**
 - Time scale: **[ / ]** cycle simulation speed
+- Audio settings: open **Audio** window (menu bar → Audio → Audio settings...) to adjust volumes (saved to `audio_settings.txt`).
 
 ## Build
 

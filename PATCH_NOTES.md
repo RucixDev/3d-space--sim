@@ -1,3 +1,70 @@
+## 2026-01-10 (Patch) - Countermeasure Ammo + Heat Sinks
+
+- Countermeasures are now **consumable bursts** for the player:
+  - **Flares** (heat-seeker decoys)
+  - **Chaff** (radar-seeker decoys)
+  - **Heat Sink** (dumps ship heat + produces a strong thermal decoy)
+- New control: **Deploy Heat Sink** (default: **Ctrl+Backspace**).
+- Added a docked **Countermeasures** restock service in **Market Details** (cost scales with station fees).
+- Save format bump: `SaveGame` v29 persists countermeasure ammo.
+
+## 2026-01-10 (Patch) - Deterministic System Events ("Weather")
+
+- Added a deterministic **System Events** layer that generates time-based events per system (no save bloat):
+  - **Trade Boom / Trade Bust**
+  - **Pirate Raid**
+  - **Security Crackdown**
+  - **Civil Unrest**
+  - **Research Breakthrough**
+- Events apply small, clamped deltas to **Security / Piracy / Traffic** and are layered on top of the existing player-driven, decaying deltas.
+- The **Encounter Director** and major signal/traffic generators now use the event-adjusted profile.
+- Mission boards and the Galaxy map side panels now display the active event and its deltas.
+- Tests: added `test_system_events`.
+
+## 2026-01-10 (Patch) - Fuel Scooping + Star Proximity Heat
+
+- New shipyard upgrade: **Fuel Scoop** Mk1..Mk3 (persisted in saves).
+- New control: **Toggle Fuel Scoop** (default: **Shift+O**). When deployed near the primary star, the ship
+  refuels over time, but heat rises quickly.
+- Thermal system now supports continuous **external heat input** (used for star proximity + active scooping).
+- Tests: added `test_fuel_scoop`.
+
+## 2026-01-10: Action-Driven System Security Dynamics
+
+- **Player actions now shift system conditions** via persistent, decaying security impulses:
+  - destroying pirates modestly improves Security/Traffic and reduces Piracy
+  - disrupting traders/convoys increases Piracy and reduces Traffic/Security (scaled by shipment value)
+  - killing security forces destabilizes the system (Security↓, Piracy↑, Traffic↓)
+  - traffic escort success/failure now nudges local conditions accordingly
+  - completing distress rescues provides a small stabilizing bump
+- **Mission boards now react to effective local conditions** (baseline + dynamic deltas) when weighting mission types.
+- Mission offer generation now respects the player ship’s **cargo capacity + passenger seats** (fewer “impossible” offers).
+- The station Mission Board shows a **Local conditions** summary so you can see the effects immediately.
+
+## 2026-01-09: Captain's Logbook + Exploration Data Broker
+
+- Added a persistent **Logbook** that records: star/planet/station scans, signal scans, asteroid prospecting, and full system survey bonuses.
+- New **Logbook** window (Main) to browse/filter/sort your discovery history, inspect entry details, and quickly **plot routes** back to the originating system.
+- Reworked the station **Exploration Data** sale flow into a broker-style panel:
+  - sell **selectively by system** (checkbox list)
+  - optional payout **premiums** driven by distance + same-jurisdiction interest (configurable + clamped)
+  - reputation gain scales with the amount of data sold (anti-exploit)
+- Save format bump: `SaveGame` v26 now persists the `logbook` section.
+
+## 2026-01-09: Galaxy Conditions Heatmap + System Security Dynamics UI
+
+- Added a **Conditions heatmap** overlay to the Galaxy map (Security / Piracy / Traffic / Danger) with an optional legend.
+- The selected system panel now shows baseline vs effective conditions and exposes a **System dynamics (debug)** editor:
+  - apply per-system impulses (ΔSecurity / ΔPiracy / ΔTraffic)
+  - prune/clear deltas, and tweak decay half-lives + clamp ranges
+- System deltas are now loaded/saved via `SaveGame::systemSecurityDeltas`, and the Encounter Director uses the effective profile (so patrol/pirate cadence reacts immediately).
+
+## 2026-01-09: Procedural Audio Synth + In-Flight SFX (No Assets)
+
+- Added a lightweight SDL2 audio engine with real-time procedural synthesis (engine hum, thrusters, UI beeps, weapons, explosions, FSD cues).
+- New **Audio** window (UI category) with persistent `audio_settings.txt` (master + per-bus volumes, spatialized panning toggle).
+- Hooked up core gameplay moments: docking clearance confirm/deny, dock/undock, weapon fire, destruction explosions, and FSD charge/jump/arrival.
+
 ## 2026-01-09: Industrial Trade Planner + Capital-Aware Industry Scans
 
 This round makes the **industry** layer much more playable by exposing it inside the Trade Planner and

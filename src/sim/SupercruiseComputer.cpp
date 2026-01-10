@@ -1,5 +1,8 @@
 #include "stellar/sim/SupercruiseComputer.h"
 
+#include "stellar/math/Math.h"
+#include "stellar/sim/Ballistics.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -9,6 +12,17 @@ static math::Vec3d clampMagnitude(const math::Vec3d& v, double maxLen) {
   const double len = v.length();
   if (len <= maxLen || len <= 1e-12) return v;
   return v * (maxLen / len);
+}
+
+static double safeAcos(double x) {
+  return std::acos(std::clamp(x, -1.0, 1.0));
+}
+
+static math::Vec3d nlerpDir(const math::Vec3d& a, const math::Vec3d& b, double t) {
+  const math::Vec3d v = a * (1.0 - t) + b * t;
+  const double len = v.length();
+  if (len <= 1e-12) return a;
+  return v * (1.0 / len);
 }
 
 SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
@@ -107,6 +121,10 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
   double desiredSpeed = 0.0;
   double speedLimit = params.maxSpeedKmS;
 
+  // Precompute a corridor metric from the current relative velocity. This is used
+  // by the optional corridor speed penalty, and is also exposed in the HUD.
+  const double latFrac = (closing > 1e-6) ? (lateral / std::max(1e-6, closing)) : 0.0;
+
   if (navAssistEnabled) {
     // Classic heuristic wants v ~= dist / safeTtaSec, but that ignores finite acceleration.
     // We keep the heuristic as the baseline, then optionally cap it by a braking-distance
@@ -123,6 +141,21 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
       speedLimit = std::min(speedLimit, vAllow);
       desiredSpeed = std::min(desiredSpeed, speedLimit);
     }
+
+    // Corridor-aware speed penalty: if we're sliding past the target (high
+    // lateral vs closing), temporarily cap the speed. This gives the controller
+    // more time to null lateral velocity before reaching the drop radius.
+    double corridorFactor = 1.0;
+    if (params.corridorSpeedPenalty && params.maxLateralFrac > 1e-6 && closing > params.minClosingKmS) {
+      if (latFrac > params.maxLateralFrac * 1.02) {
+        corridorFactor = params.maxLateralFrac / std::max(params.maxLateralFrac, latFrac);
+        corridorFactor = std::clamp(corridorFactor, params.corridorPenaltyMinFactor, 1.0);
+        corridorFactor = std::pow(corridorFactor, std::max(0.0, params.corridorPenaltyPower));
+        speedLimit = std::clamp(speedLimit * corridorFactor, params.assistSpeedMinKmS, params.maxSpeedKmS);
+        desiredSpeed = std::min(desiredSpeed, speedLimit);
+      }
+    }
+    out.hud.corridorFactor = corridorFactor;
   } else {
     desiredSpeed = std::clamp(dist * params.manualSpeedDistGain, params.manualSpeedMinKmS, params.maxSpeedKmS);
   }
@@ -130,8 +163,49 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
   out.hud.desiredSpeedKmS = desiredSpeed;
   out.hud.speedLimitKmS = speedLimit;
 
+  // --- Intercept-course lead direction (translation only) ---
+  //
+  // For moving destinations, computing a lead direction helps prevent the
+  // controller from constantly chasing the tail of the target's motion.
+  math::Vec3d approachDir = dir;
+  bool usedLead = false;
+  double leadTimeSec = 0.0;
+
+  if (params.interceptEnabled && desiredSpeed >= params.interceptMinSpeedKmS && destVelKmS.lengthSq() > 1e-12) {
+    const double solveSpeed = std::max(1e-6,
+      params.interceptUseMaxSpeedForSolve ? params.maxSpeedKmS : desiredSpeed);
+
+    const auto lead = solveProjectileLead(ship.positionKm(),
+                                         /*shooterVelKmS=*/{0, 0, 0},
+                                         destPosKm,
+                                         destVelKmS,
+                                         solveSpeed,
+                                         /*maxTimeSec=*/std::max(0.0, params.interceptMaxLeadTimeSec),
+                                         /*minTimeSec=*/1.0e-3);
+
+    if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
+      approachDir = lead->aimDirWorld.normalized();
+      usedLead = true;
+      leadTimeSec = lead->tSec;
+
+      // Clamp extreme lead angles.
+      const double maxAng = math::degToRad(std::max(0.0, params.interceptMaxAngleDeg));
+      if (maxAng > 1e-6) {
+        const double ang = safeAcos(math::dot(approachDir, dir));
+        if (ang > maxAng) {
+          const double t = std::clamp(maxAng / std::max(1e-6, ang), 0.0, 1.0);
+          approachDir = nlerpDir(dir, approachDir, t);
+        }
+      }
+    }
+  }
+
+  out.hud.leadUsed = usedLead;
+  out.hud.leadTimeSec = leadTimeSec;
+  out.hud.leadAngleDeg = math::radToDeg(safeAcos(math::dot(approachDir, dir)));
+
   // --- Translational control ---
-  const math::Vec3d desiredVel = destVelKmS + dir * desiredSpeed;
+  const math::Vec3d desiredVel = destVelKmS + approachDir * desiredSpeed;
   const math::Vec3d dv = desiredVel - ship.velocityKmS();
 
   math::Vec3d thrustWorld{0, 0, 0};

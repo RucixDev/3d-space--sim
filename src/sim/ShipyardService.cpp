@@ -209,6 +209,46 @@ bool applySmuggleHoldUpgrade(double& credits, int& smuggleHoldMk, const UpgradeQ
   return true;
 }
 
+UpgradeQuote quoteFuelScoopUpgrade(core::u64 universeSeed,
+                                    const Station& station,
+                                    const ShipyardPriceModel& model,
+                                    int currentMk) {
+  UpgradeQuote q{};
+  if (!requireShipyard(station, q)) return q;
+
+  const int cur = std::clamp(currentMk, 0, 3);
+  if (cur >= 3) {
+    q.ok = false;
+    q.reason = "max";
+    return q;
+  }
+
+  // Fuel scoops are common enough to be "Advanced" tier: tech affects the price,
+  // but they're not as exotic as FSD tuning.
+  static const double kBaseCost[4] = {0.0, 6500.0, 12000.0, 19000.0};
+  const int next = cur + 1;
+  q.ok = true;
+  q.nextMk = next;
+  q.delta = 1.0;
+
+  q.costCr = shipyardPrice(universeSeed,
+                           station.factionId,
+                           station.type,
+                           ShipyardItemTier::Advanced,
+                           kBaseCost[next],
+                           model);
+  return q;
+}
+
+bool applyFuelScoopUpgrade(double& credits, int& fuelScoopMk, const UpgradeQuote& q) {
+  if (!q.ok || q.costCr <= 0.0) return false;
+  if (credits + 1e-6 < q.costCr) return false;
+  if (q.nextMk <= 0) return false;
+  credits -= q.costCr;
+  fuelScoopMk = std::clamp(q.nextMk, 0, 3);
+  return true;
+}
+
 HullPurchaseQuote quoteHullPurchase(core::u64 universeSeed,
                                    const Station& station,
                                    const ShipyardPriceModel& model,

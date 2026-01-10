@@ -1,6 +1,7 @@
 add_executable(stellar_game
   main.cpp
   ActionWheel.cpp
+  AudioEngine.cpp
   CinematicCameraWindow.cpp
 )
 

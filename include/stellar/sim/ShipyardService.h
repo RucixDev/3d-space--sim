@@ -103,6 +103,12 @@ UpgradeQuote quoteSmuggleHoldUpgrade(core::u64 universeSeed,
                                     int currentMk);
 bool applySmuggleHoldUpgrade(double& credits, int& smuggleHoldMk, const UpgradeQuote& q);
 
+UpgradeQuote quoteFuelScoopUpgrade(core::u64 universeSeed,
+                                  const Station& station,
+                                  const ShipyardPriceModel& model,
+                                  int currentMk);
+bool applyFuelScoopUpgrade(double& credits, int& fuelScoopMk, const UpgradeQuote& q);
+
 // -----------------------------------------------------------------------------
 // Trade-in purchases (hulls/modules/weapons)
 // -----------------------------------------------------------------------------

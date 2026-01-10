@@ -401,8 +401,10 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Comply / submit", a.complyOrSubmit);
   addAction("Bribe", a.bribe);
   addAction("Toggle Cargo Scoop", a.toggleCargoScoop);
+  addAction("Toggle Fuel Scoop", a.toggleFuelScoop);
   addAction("Deploy Countermeasure", a.deployCountermeasure);
   addAction("Deploy Chaff", a.deployChaff);
+  addAction("Deploy Heat Sink", a.deployHeatSink);
 
   auto addHold = [&](const char* name, SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return;
@@ -788,6 +790,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Comply / submit", controls.actions.complyOrSubmit, ad.complyOrSubmit);
     add("Bribe", controls.actions.bribe, ad.bribe);
     add("Toggle Cargo Scoop", controls.actions.toggleCargoScoop, ad.toggleCargoScoop);
+    add("Toggle Fuel Scoop", controls.actions.toggleFuelScoop, ad.toggleFuelScoop);
     add("Deploy Countermeasure", controls.actions.deployCountermeasure, ad.deployCountermeasure);
     add("Deploy Chaff", controls.actions.deployChaff, ad.deployChaff);
 

@@ -14,8 +14,13 @@ namespace stellar::sim {
 // plan a lightweight escort contract around such a convoy (time window + reward).
 //
 // Like the other encounter planning helpers (Distress, Derelict), this module
-// intentionally does *not* spawn ships or manage runtime state; it only produces
-// a stable plan that the caller can interpret.
+// intentionally does *not* spawn ships or manage runtime behaviour; it only
+// produces a stable plan that the caller can interpret.
+//
+// The game does keep a small *serializable* runtime state for an accepted
+// escort contract (progress, bonuses, etc.). The structs below are plain data
+// containers so SaveGame + UI can persist/display contracts without coupling
+// to any rendering/engine types.
 
 struct TrafficEscortPlan {
   // When false, the caller should not offer a contract.
@@ -38,6 +43,42 @@ struct TrafficEscortPlan {
 
   // Reputation awarded with the payer faction on success.
   double repReward{0.0};
+};
+
+// -----------------------------------------------------------------------------
+// Serializable runtime state (no simulation logic)
+// -----------------------------------------------------------------------------
+
+// Active escort contract the player has accepted for a given traffic convoy.
+//
+// Notes:
+//  - This is a lightweight objective: stay within range for a short window.
+//  - The contract may be offered by the convoy's faction (or the local faction
+//    if the convoy is unaffiliated).
+struct TrafficEscortContractState {
+  bool active{false};
+  core::u64 convoyId{0};
+  core::u32 payerFactionId{0};
+  StationId toStationId{0};
+
+  double startDays{0.0};
+  double untilDays{0.0};
+  double maxRangeKm{160000.0};
+  double tooFarSec{0.0};
+
+  double rewardCr{0.0};
+  double bonusPerPirateCr{0.0};
+  double repReward{0.0};
+
+  int piratesKilled{0};
+  bool piratesPresentAtStart{false};
+};
+
+// Anti-farm record: convoys for which the player has already been paid.
+// The game may discard old entries after a retention window.
+struct TrafficEscortSettlementState {
+  core::u64 convoyId{0};
+  double settledDay{0.0};
 };
 
 // Plan an escort contract for a traffic convoy.

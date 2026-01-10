@@ -45,6 +45,34 @@ struct SupercruiseParams {
   double velTimeConstantSec{6.0}; // smaller = more aggressive
   double faceGain{1.6};           // yaw/pitch gain
 
+  // Intercept-course translation guidance.
+  //
+  // When the destination has significant lateral velocity (e.g. traffic convoys,
+  // stations in orbit), a naive pursuit controller can "tail chase" and carry
+  // excessive lateral velocity into the drop window.
+  //
+  // If enabled, supercruise will compute a constant-speed intercept lead
+  // direction (using the same closed-form solve as projectile lead) and use
+  // that direction for the *translation* velocity setpoint. The ship can still
+  // face the destination for a consistent visual/HUD experience.
+  bool interceptEnabled{true};
+  double interceptMaxLeadTimeSec{120.0};
+  double interceptMinSpeedKmS{150.0};
+  bool interceptUseMaxSpeedForSolve{true};
+
+  // Reject or clamp extreme lead angles (helps avoid looking "psychic" at long
+  // range, and prevents huge sideways slides).
+  double interceptMaxAngleDeg{18.0};
+
+  // Corridor-aware speed penalty.
+  //
+  // When the approach is off-corridor (high lateral/closing ratio), temporarily
+  // reduce the speed limit. This gives the controller more time to null lateral
+  // velocity and helps avoid overshoots/emergency drops.
+  bool corridorSpeedPenalty{true};
+  double corridorPenaltyMinFactor{0.10};
+  double corridorPenaltyPower{1.0};
+
   // If true, nav-assist uses a braking-distance speed limit so it can
   // realistically decelerate to the safe-drop speed at the drop radius.
   bool useBrakingDistanceLimit{true};
@@ -64,6 +92,14 @@ struct SupercruiseHud {
   // Diagnostics for tuning / UI.
   double desiredSpeedKmS{0.0};
   double speedLimitKmS{0.0};
+
+  // Optional intercept-course diagnostics.
+  bool leadUsed{false};
+  double leadTimeSec{0.0};
+  double leadAngleDeg{0.0};
+
+  // Corridor speed penalty applied to the speed limit (1.0 = none).
+  double corridorFactor{1.0};
 };
 
 struct SupercruiseGuidanceResult {

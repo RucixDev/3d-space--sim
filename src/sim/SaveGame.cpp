@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace stellar::sim {
@@ -41,6 +42,12 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "hull " << s.hull << "\n";
   f << "shield " << s.shield << "\n";
   f << "heat " << s.heat << "\n";
+
+  // Countermeasures (ammo / consumables)
+  f << "cmFlares " << (int)s.cmFlares << "\n";
+  f << "cmChaff " << (int)s.cmChaff << "\n";
+  f << "cmHeatSinks " << (int)s.cmHeatSinks << "\n";
+
   f << "pipsEng " << s.pipsEng << "\n";
   f << "pipsWep " << s.pipsWep << "\n";
   f << "pipsSys " << s.pipsSys << "\n";
@@ -72,6 +79,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "weaponPrimary " << (int)s.weaponPrimary << "\n";
   f << "weaponSecondary " << (int)s.weaponSecondary << "\n";
   f << "smuggleHoldMk " << (int)s.smuggleHoldMk << "\n";
+  f << "fuelScoopMk " << (int)s.fuelScoopMk << "\n";
 
   f << "cargo";
   for (double u : s.cargo) f << " " << u;
@@ -82,6 +90,23 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "scannedKeys " << s.scannedKeys.size() << "\n";
   for (core::u64 k : s.scannedKeys) {
     f << "scan " << k << "\n";
+  }
+
+  f << "logbook " << s.logbook.size() << "\n";
+  for (const auto& e : s.logbook) {
+    f << "log "
+      << e.key << " "
+      << static_cast<int>(e.kind) << " "
+      << static_cast<int>(e.subKind) << " "
+      << e.systemId << " "
+      << e.stationId << " "
+      << e.objectId << " "
+      << static_cast<int>(e.commodity) << " "
+      << e.units << " "
+      << e.discoveredDay << " "
+      << e.valueCr << " "
+      << (e.sold ? 1 : 0)
+      << "\n";
   }
 
   // World state (signals / mining depletion)
@@ -273,6 +298,46 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  // Ambient traffic escort contract (accepted on-grid from traffic convoys).
+  // Persisted so quicksave/quickload doesn't insta-fail the contract.
+  {
+    const auto& c = s.trafficEscort;
+    f << "trafficEscortContract "
+      << (c.active ? 1 : 0) << " "
+      << c.convoyId << " "
+      << c.payerFactionId << " "
+      << c.toStationId << " "
+      << c.startDays << " "
+      << c.untilDays << " "
+      << c.maxRangeKm << " "
+      << c.tooFarSec << " "
+      << c.rewardCr << " "
+      << c.bonusPerPirateCr << " "
+      << c.repReward << " "
+      << c.piratesKilled << " "
+      << (c.piratesPresentAtStart ? 1 : 0)
+      << "\n";
+  }
+
+  // Anti-farm record for completed traffic escorts.
+  f << "trafficEscortSettlements " << s.trafficEscortSettlements.size() << "\n";
+  for (const auto& e : s.trafficEscortSettlements) {
+    f << "escortSettled " << e.convoyId << " " << e.settledDay << "\n";
+  }
+
+  // Per-system dynamic security deltas.
+  // These are applied by stellar_game on top of the deterministic security model.
+  f << "systemSecurityDeltas " << s.systemSecurityDeltas.size() << "\n";
+  for (const auto& d : s.systemSecurityDeltas) {
+    f << "secDelta "
+      << d.systemId << " "
+      << d.securityDelta << " "
+      << d.piracyDelta << " "
+      << d.trafficDelta << " "
+      << d.lastUpdateDay
+      << "\n";
+  }
+
 
   // Station warehouse / cargo storage (player-owned, per station).
   f << "station_storage " << s.stationStorage.size() << "\n";
@@ -371,6 +436,18 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.shield;
     } else if (key == "heat") {
       f >> out.heat;
+    } else if (key == "cmFlares") {
+      int v = 0;
+      f >> v;
+      out.cmFlares = core::clampCast<core::u8>(v, 0, 255);
+    } else if (key == "cmChaff") {
+      int v = 0;
+      f >> v;
+      out.cmChaff = core::clampCast<core::u8>(v, 0, 255);
+    } else if (key == "cmHeatSinks") {
+      int v = 0;
+      f >> v;
+      out.cmHeatSinks = core::clampCast<core::u8>(v, 0, 255);
     } else if (key == "pipsEng") {
       f >> out.pipsEng;
       out.pipsEng = std::clamp(out.pipsEng, 0, 4);
@@ -458,6 +535,10 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       int v = 0;
       f >> v;
       out.smuggleHoldMk = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "fuelScoopMk") {
+      int v = 0;
+      f >> v;
+      out.fuelScoopMk = (core::u8)std::clamp(v, 0, 3);
     } else if (key == "cargo") {
       // Cargo line can grow over time as new commodities are added.
       // Read the rest of the line and fill missing entries with 0 so older saves stay loadable.
@@ -492,6 +573,42 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         core::u64 k = 0;
         if (!(f >> k)) break;
         out.scannedKeys.push_back(k);
+      }
+    } else if (key == "logbook") {
+      std::size_t n = 0;
+      f >> n;
+      out.logbook.clear();
+      out.logbook.reserve(std::min<std::size_t>(n, 50000));
+
+      // Robust read strategy similar to scannedKeys: stop when tag no longer matches.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "log") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        LogbookEntry e{};
+        int kind = 0;
+        int sub = 0;
+        int commodity = 0;
+        int sold = 0;
+
+        if (!(f >> e.key >> kind >> sub >> e.systemId >> e.stationId >> e.objectId
+              >> commodity >> e.units >> e.discoveredDay >> e.valueCr >> sold)) {
+          break;
+        }
+
+        e.kind = static_cast<LogbookEntryKind>(core::clampCast<core::u8>(kind, 0, (int)LogbookEntryKind::Count - 1));
+        e.subKind = core::clampCast<core::u8>(sub, 0, 255);
+        e.commodity = static_cast<econ::CommodityId>(core::clampCast<core::u8>(commodity, 0, (int)econ::kCommodityCount - 1));
+        e.units = std::max(0.0, e.units);
+        e.valueCr = std::max(0.0, e.valueCr);
+        e.sold = (sold != 0);
+        out.logbook.push_back(e);
       }
     } else if (key == "resolved_signals") {
       std::size_t n = 0;
@@ -977,6 +1094,124 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (d.convoyId != 0 && d.systemId != 0 && d.toStation != 0) {
           if (!seenIds.insert(d.convoyId).second) continue;
           out.trafficInterdictions.push_back(std::move(d));
+        }
+      }
+
+    } else if (key == "trafficEscortContract") {
+      // One-line record: contract state may be absent in older saves.
+      int active = 0;
+      TrafficEscortContractState c{};
+      if (!(f >> active
+              >> c.convoyId
+              >> c.payerFactionId
+              >> c.toStationId
+              >> c.startDays
+              >> c.untilDays
+              >> c.maxRangeKm
+              >> c.tooFarSec
+              >> c.rewardCr
+              >> c.bonusPerPirateCr
+              >> c.repReward
+              >> c.piratesKilled)) {
+        continue;
+      }
+      int piratesPresent = 0;
+      f >> piratesPresent;
+      c.active = (active != 0);
+      c.piratesPresentAtStart = (piratesPresent != 0);
+
+      // Basic sanity: avoid "active but empty" state when reading corrupted saves.
+      if (c.convoyId == 0 || c.maxRangeKm <= 0.0 || c.untilDays < c.startDays) {
+        c.active = false;
+        c.convoyId = 0;
+        c.tooFarSec = 0.0;
+      }
+
+      out.trafficEscort = std::move(c);
+
+    } else if (key == "trafficEscortSettlements") {
+      std::size_t n = 0;
+      f >> n;
+      out.trafficEscortSettlements.clear();
+      out.trafficEscortSettlements.reserve(std::min<std::size_t>(n, 200000));
+
+      // Defensive: allow duplicates; keep the latest settledDay per convoy id.
+      std::unordered_map<core::u64, double> latest;
+      latest.reserve(std::min<std::size_t>(n, 4096) * 2 + 1);
+
+      // Robustness: if the count is stale, stop when we no longer see "escortSettled".
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "escortSettled") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        TrafficEscortSettlementState e{};
+        if (!(f >> e.convoyId >> e.settledDay)) break;
+        if (e.convoyId == 0) continue;
+
+        const auto it = latest.find(e.convoyId);
+        if (it == latest.end() || e.settledDay > it->second) {
+          latest[e.convoyId] = e.settledDay;
+        }
+      }
+
+      out.trafficEscortSettlements.reserve(latest.size());
+      for (const auto& kv : latest) {
+        TrafficEscortSettlementState e{};
+        e.convoyId = kv.first;
+        e.settledDay = kv.second;
+        out.trafficEscortSettlements.push_back(e);
+      }
+      std::sort(out.trafficEscortSettlements.begin(), out.trafficEscortSettlements.end(),
+                [](const TrafficEscortSettlementState& a, const TrafficEscortSettlementState& b) {
+                  if (a.settledDay != b.settledDay) return a.settledDay < b.settledDay;
+                  return a.convoyId < b.convoyId;
+                });
+
+    } else if (key == "systemSecurityDeltas") {
+      std::size_t n = 0;
+      f >> n;
+      out.systemSecurityDeltas.clear();
+      out.systemSecurityDeltas.reserve(std::min<std::size_t>(n, 100000));
+
+      // Defensive: allow corrupted / hand-edited saves to contain duplicate system ids.
+      // Keep only the first occurrence so downstream systems don't double-apply impulses.
+      std::unordered_set<SystemId> seenIds;
+      seenIds.reserve(std::min<std::size_t>(n, 4096) * 2 + 1);
+
+      // Robustness strategy: if the count is stale/corrupt, stop when we no longer see
+      // "secDelta" and continue parsing later top-level keys.
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "secDelta") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        std::string line;
+        std::getline(f, line);
+        std::istringstream iss(line);
+
+        SystemSecurityDeltaState d{};
+        if (!(iss >> d.systemId
+                  >> d.securityDelta
+                  >> d.piracyDelta
+                  >> d.trafficDelta
+                  >> d.lastUpdateDay)) {
+          continue;
+        }
+
+        if (d.systemId != 0) {
+          if (!seenIds.insert(d.systemId).second) continue;
+          out.systemSecurityDeltas.push_back(std::move(d));
         }
       }
     } else if (key == "station_storage") {
