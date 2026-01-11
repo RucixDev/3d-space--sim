@@ -1,8 +1,8 @@
 #include "OrbitAnalyzerWindow.h"
 
 #include "stellar/math/Math.h"
+#include "stellar/sim/ManeuverProgramComputer.h"
 #include "stellar/sim/OrbitalMechanics.h"
-#include "stellar/sim/Units.h"
 
 #include "imgui.h"
 
@@ -101,59 +101,6 @@ static void computeRtnBasis(const stellar::math::Vec3d& relPosKm,
   }
 }
 
-
-static stellar::math::Vec3d rotateAroundAxis(const stellar::math::Vec3d& v,
-                                             const stellar::math::Vec3d& axisUnit,
-                                             double angleRad) {
-  // Rodrigues' rotation formula: v' = v c + (k×v) s + k (k·v) (1-c)
-  const double c = std::cos(angleRad);
-  const double s = std::sin(angleRad);
-  const auto k = axisUnit;
-  return (v * c) + (stellar::math::cross(k, v) * s) + (k * (stellar::math::dot(k, v) * (1.0 - c)));
-}
-
-static bool computePlaneAlignDvAtNode(const stellar::math::Vec3d& relPosKm,
-                                      const stellar::math::Vec3d& relVelKmS,
-                                      bool forcePrograde,
-                                      stellar::math::Vec3d& outDvKmS) {
-  outDvKmS = {0, 0, 0};
-
-  const auto h = stellar::math::cross(relPosKm, relVelKmS);
-  const double h2 = h.lengthSq();
-  if (h2 < 1e-18) return false;
-
-  const auto hHat = h * (1.0 / std::sqrt(h2));
-
-  stellar::math::Vec3d targetNormal{0, 0, 1};
-  if (!forcePrograde && hHat.z < 0.0) targetNormal = {0, 0, -1};
-
-  const double dotN = stellar::math::clamp(stellar::math::dot(hHat, targetNormal), -1.0, 1.0);
-  const double angle = std::acos(dotN);
-  if (angle < 1e-9) {
-    outDvKmS = {0, 0, 0};
-    return true;
-  }
-
-  stellar::math::Vec3d rHat = relPosKm;
-  const double r2 = rHat.lengthSq();
-  if (r2 > 1e-18) {
-    rHat *= 1.0 / std::sqrt(r2);
-  } else {
-    rHat = {1, 0, 0};
-  }
-
-  // Choose the sign that best aligns the rotated orbit normal to the target normal.
-  const auto hPlus = rotateAroundAxis(hHat, rHat, angle);
-  const auto hMinus = rotateAroundAxis(hHat, rHat, -angle);
-  const double dp = stellar::math::dot(hPlus, targetNormal);
-  const double dm = stellar::math::dot(hMinus, targetNormal);
-  const double signedAngle = (dp >= dm) ? angle : -angle;
-
-  const auto vDesired = rotateAroundAxis(relVelKmS, rHat, signedAngle);
-  outDvKmS = vDesired - relVelKmS;
-  return true;
-}
-
 static void writeNodeRtn(const OrbitAnalyzerBindings& b,
                          double nodeTimeSec,
                          const stellar::math::Vec3d& dvWorldKmS,
@@ -198,6 +145,14 @@ static const char* orbitTypeLabel(stellar::sim::TwoBodyOrbit::Type t) {
     case T::Parabolic: return "Parabolic";
     default: return "Invalid";
   }
+}
+
+static void writePlanToNodeControls(const OrbitAnalyzerBindings& bindings,
+                                   const stellar::sim::ManeuverProgramResult& res) {
+  if (!res.valid) return;
+  stellar::math::Vec3d radial{}, along{}, normal{};
+  computeRtnBasis(res.nodeRelPosKm, res.nodeRelVelKmS, radial, along, normal);
+  writeNodeRtn(bindings, res.timeToNodeSec, res.plan.deltaVWorldKmS, radial, along, normal);
 }
 
 } // namespace
@@ -275,7 +230,6 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
     ImGui::Text("Time since periapsis: %s", formatTime(std::abs(orb.timeSincePeriapsisSec)).c_str());
   }
 
-
   if (el.valid) {
     ImGui::SeparatorText("Elements");
     ImGui::Text("Inclination: %.2f deg", stellar::math::radToDeg(el.inclinationRad));
@@ -308,61 +262,44 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
   ImGui::InputFloat("Target apo alt (km)", &state.targetApoAltKm, 100.0f, 1000.0f, "%.0f");
   ImGui::InputFloat("Target peri alt (km)", &state.targetPeriAltKm, 100.0f, 1000.0f, "%.0f");
 
-  // Common basis vectors at the apses (two-body assumption)
-  stellar::math::Vec3d nHat = orb.angularMomentumKm2S;
-  if (nHat.lengthSq() > 1e-18) {
-    nHat = nHat.normalized();
-  } else {
-    nHat = {0, 0, 1};
-  }
+  // Planner gravity scaling: pass a gravityScale multiplier so headless planners
+  // produce numbers consistent with the game's effective gravity.
+  const double plannerGravityScale = state.useGravityScale ? gravityParams.scale : 1.0;
 
-  stellar::math::Vec3d periRad = relPosKm;
-  if (orb.eccentricityVec.lengthSq() > 1e-18) {
-    periRad = orb.eccentricityVec.normalized();
-  } else if (periRad.lengthSq() > 1e-18) {
-    periRad = periRad.normalized();
-  } else {
-    periRad = {1, 0, 0};
-  }
-
-  stellar::math::Vec3d apoRad = periRad * -1.0;
-
-  // --- Circularize at apses ---
   if (orb.type == stellar::sim::TwoBodyOrbit::Type::Elliptic) {
-    const double a = orb.semiMajorAxisKm;
-    const double rp = orb.periapsisKm;
-    const double ra = orb.apoapsisKm;
-
-    const double vpCur = (rp > 0.0 && a != 0.0) ? std::sqrt(mu * (2.0 / rp - 1.0 / a)) : 0.0;
-    const double vaCur = (ra > 0.0 && a != 0.0) ? std::sqrt(mu * (2.0 / ra - 1.0 / a)) : 0.0;
-
-    const double vpCirc = (rp > 0.0) ? std::sqrt(mu / rp) : 0.0;
-    const double vaCirc = (ra > 0.0) ? std::sqrt(mu / ra) : 0.0;
-
-    stellar::math::Vec3d periAlong = stellar::math::cross(nHat, periRad).normalized();
-    stellar::math::Vec3d apoAlong = stellar::math::cross(nHat, apoRad).normalized();
-
+    // --- Circularize at apses ---
     if (ImGui::Button("Set node: circularize @ peri")) {
-      const double dv = vpCirc - vpCur;
-      writeNodeRtn(bindings, orb.timeToPeriapsisSec, periAlong * dv, periRad, periAlong, nHat);
+      const auto res = stellar::sim::planCircularize(ship,
+                                                     timeDays,
+                                                     ref.body,
+                                                     stellar::sim::ManeuverProgramKind::CircularizeAtPeriapsis,
+                                                     plannerGravityScale);
+      writePlanToNodeControls(bindings, res);
     }
     ImGui::SameLine();
     if (ImGui::Button("Set node: circularize @ apo")) {
-      const double dv = vaCirc - vaCur;
-      writeNodeRtn(bindings, orb.timeToApoapsisSec, apoAlong * dv, apoRad, apoAlong, nHat);
+      const auto res = stellar::sim::planCircularize(ship,
+                                                     timeDays,
+                                                     ref.body,
+                                                     stellar::sim::ManeuverProgramKind::CircularizeAtApoapsis,
+                                                     plannerGravityScale);
+      writePlanToNodeControls(bindings, res);
     }
 
     ImGui::Spacing();
 
     // --- Adjust apoapsis (burn at periapsis) ---
     {
-      const double raTarget = std::max(rp, ref.body.radiusKm + (double)state.targetApoAltKm);
-      const double aNew = 0.5 * (rp + raTarget);
-      const double vpNew = (rp > 0.0 && aNew != 0.0) ? std::sqrt(mu * (2.0 / rp - 1.0 / aNew)) : vpCur;
-      const double dv = vpNew - vpCur;
+      const double raTargetReq = ref.body.radiusKm + (double)state.targetApoAltKm;
+      const double raTarget = std::max(orb.periapsisKm, raTargetReq);
 
       if (ImGui::Button("Set node: burn @ peri to target apo")) {
-        writeNodeRtn(bindings, orb.timeToPeriapsisSec, periAlong * dv, periRad, periAlong, nHat);
+        const auto res = stellar::sim::planSetApoapsisAtPeriapsis(ship,
+                                                                  timeDays,
+                                                                  ref.body,
+                                                                  raTarget,
+                                                                  plannerGravityScale);
+        writePlanToNodeControls(bindings, res);
       }
       ImGui::SameLine();
       ImGui::TextDisabled("(apo target %.0f km)", raTarget);
@@ -370,13 +307,16 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
 
     // --- Adjust periapsis (burn at apoapsis) ---
     {
-      const double rpTarget = std::min(ra, ref.body.radiusKm + (double)state.targetPeriAltKm);
-      const double aNew = 0.5 * (ra + rpTarget);
-      const double vaNew = (ra > 0.0 && aNew != 0.0) ? std::sqrt(mu * (2.0 / ra - 1.0 / aNew)) : vaCur;
-      const double dv = vaNew - vaCur;
+      const double rpTargetReq = ref.body.radiusKm + (double)state.targetPeriAltKm;
+      const double rpTarget = std::min(orb.apoapsisKm, rpTargetReq);
 
       if (ImGui::Button("Set node: burn @ apo to target peri")) {
-        writeNodeRtn(bindings, orb.timeToApoapsisSec, apoAlong * dv, apoRad, apoAlong, nHat);
+        const auto res = stellar::sim::planSetPeriapsisAtApoapsis(ship,
+                                                                  timeDays,
+                                                                  ref.body,
+                                                                  rpTarget,
+                                                                  plannerGravityScale);
+        writePlanToNodeControls(bindings, res);
       }
       ImGui::SameLine();
       ImGui::TextDisabled("(peri target %.0f km)", rpTarget);
@@ -386,86 +326,66 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
 
     // Escape at current radius (instantaneous)
     {
-      const double vEsc = (orb.rKm > 0.0) ? std::sqrt(2.0 * mu / orb.rKm) : 0.0;
-      const double dv = vEsc - orb.vKmS;
-      stellar::math::Vec3d radial{}, along{}, normal{};
-      computeRtnBasis(relPosKm, relVelKmS, radial, along, normal);
+      const auto esc = stellar::sim::planEscapeNow(ship, timeDays, ref.body, plannerGravityScale);
+      const double dvMs = esc.valid ? (esc.dvKmS * 1000.0) : 0.0;
 
       if (ImGui::Button("Set node: escape now")) {
-        writeNodeRtn(bindings, /*nodeTimeSec=*/0.0, along * dv, radial, along, normal);
+        writePlanToNodeControls(bindings, esc);
       }
       ImGui::SameLine();
-      ImGui::TextDisabled("(dv %.1f m/s)", dv * 1000.0);
+      if (esc.valid) {
+        ImGui::TextDisabled("(dv %.1f m/s)", dvMs);
+      } else {
+        ImGui::TextDisabled("(unavailable)");
+      }
     }
 
     ImGui::Spacing();
     ImGui::SeparatorText("Plane change (ref plane)");
     ImGui::Checkbox("Force prograde align", &state.planeAlignForcePrograde);
 
-    if (el.valid && !el.equatorial) {
-      auto wrap2pi = [](double a) {
-        const double twoPi = 2.0 * stellar::math::kPi;
-        a = std::fmod(a, twoPi);
-        if (a < 0.0) a += twoPi;
-        return a;
-      };
+    // Plane align is valid for non-equatorial bound orbits.
+    const auto asc = stellar::sim::planAlignPlaneAtAscendingNode(ship,
+                                                                 timeDays,
+                                                                 ref.body,
+                                                                 state.planeAlignForcePrograde,
+                                                                 plannerGravityScale);
 
-      const double nuAsc = wrap2pi(-el.argPeriapsisRad);
-      const double nuDesc = wrap2pi(stellar::math::kPi - el.argPeriapsisRad);
+    const auto desc = stellar::sim::planAlignPlaneAtDescendingNode(ship,
+                                                                   timeDays,
+                                                                   ref.body,
+                                                                   state.planeAlignForcePrograde,
+                                                                   plannerGravityScale);
 
-      const double dtAsc = stellar::sim::timeToTrueAnomalySecElliptic(el, nuAsc);
-      const double dtDesc = stellar::sim::timeToTrueAnomalySecElliptic(el, nuDesc);
-
-      stellar::math::Vec3d rAsc{}, vAsc{}, dvAsc{};
-      stellar::math::Vec3d rDesc{}, vDesc{}, dvDesc{};
-
-      const bool okAsc = (dtAsc >= 0.0) &&
-                         stellar::sim::stateFromClassicalOrbitElementsAtTrueAnomaly(el, nuAsc, rAsc, vAsc) &&
-                         computePlaneAlignDvAtNode(rAsc, vAsc, state.planeAlignForcePrograde, dvAsc);
-
-      const bool okDesc = (dtDesc >= 0.0) &&
-                          stellar::sim::stateFromClassicalOrbitElementsAtTrueAnomaly(el, nuDesc, rDesc, vDesc) &&
-                          computePlaneAlignDvAtNode(rDesc, vDesc, state.planeAlignForcePrograde, dvDesc);
-
-      if (okAsc) {
-        const double altNodeKm = rAsc.length() - ref.body.radiusKm;
-        ImGui::Text("Ascending node: in %s | alt %.0f km | dv %.1f m/s",
-                    formatTime(dtAsc).c_str(),
-                    altNodeKm,
-                    dvAsc.length() * 1000.0);
-      } else {
-        ImGui::TextDisabled("Ascending node: (unavailable)");
-      }
-
-      ImGui::BeginDisabled(!okAsc);
-      if (ImGui::Button("Set node: align plane @ AN")) {
-        stellar::math::Vec3d radial{}, along{}, normal{};
-        computeRtnBasis(rAsc, vAsc, radial, along, normal);
-        writeNodeRtn(bindings, dtAsc, dvAsc, radial, along, normal);
-      }
-      ImGui::EndDisabled();
-
-      if (okDesc) {
-        const double altNodeKm = rDesc.length() - ref.body.radiusKm;
-        ImGui::Text("Descending node: in %s | alt %.0f km | dv %.1f m/s",
-                    formatTime(dtDesc).c_str(),
-                    altNodeKm,
-                    dvDesc.length() * 1000.0);
-      } else {
-        ImGui::TextDisabled("Descending node: (unavailable)");
-      }
-
-      ImGui::BeginDisabled(!okDesc);
-      if (ImGui::Button("Set node: align plane @ DN")) {
-        stellar::math::Vec3d radial{}, along{}, normal{};
-        computeRtnBasis(rDesc, vDesc, radial, along, normal);
-        writeNodeRtn(bindings, dtDesc, dvDesc, radial, along, normal);
-      }
-      ImGui::EndDisabled();
-
+    if (asc.valid) {
+      ImGui::Text("Ascending node: in %s | alt %.0f km | dv %.1f m/s",
+                  formatTime(asc.timeToNodeSec).c_str(),
+                  asc.nodeAltitudeKm,
+                  asc.dvKmS * 1000.0);
     } else {
-      ImGui::TextDisabled("Plane align requires a non-equatorial bound orbit.");
+      ImGui::TextDisabled("Ascending node: (unavailable)");
     }
+
+    ImGui::BeginDisabled(!asc.valid);
+    if (ImGui::Button("Set node: align plane @ AN")) {
+      writePlanToNodeControls(bindings, asc);
+    }
+    ImGui::EndDisabled();
+
+    if (desc.valid) {
+      ImGui::Text("Descending node: in %s | alt %.0f km | dv %.1f m/s",
+                  formatTime(desc.timeToNodeSec).c_str(),
+                  desc.nodeAltitudeKm,
+                  desc.dvKmS * 1000.0);
+    } else {
+      ImGui::TextDisabled("Descending node: (unavailable)");
+    }
+
+    ImGui::BeginDisabled(!desc.valid);
+    if (ImGui::Button("Set node: align plane @ DN")) {
+      writePlanToNodeControls(bindings, desc);
+    }
+    ImGui::EndDisabled();
 
   } else {
     ImGui::TextDisabled("Planner actions require a bound (elliptic) orbit.");

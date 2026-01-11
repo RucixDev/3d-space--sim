@@ -7,6 +7,7 @@
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/Orbit.h"
+#include "stellar/sim/SystemConditions.h"
 #include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <cmath>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace stellar::sim {
@@ -245,26 +247,31 @@ void refreshMissionOffers(Universe& universe,
   //
   // This lets the board "feel" different in pirate-heavy frontier space vs.
   // stable core systems, without requiring any non-deterministic simulation.
-  SystemSecurityProfile localSec = systemSecurityProfile(universe.seed(), currentSystem);
-
-  // Apply persistent, decaying system-security deltas (if any) so mission boards
-  // react to recent events in this system (pirate raids, crackdowns, trade booms, etc.).
+  // Build a fast lookup table for any known system-security dynamics states.
+  //
+  // These are persisted in SaveGame::systemSecurityDeltas, but this refresh pass
+  // needs quick access both for:
+  //  - local mission weighting (current system)
+  //  - destination scoring (optional)
+  std::unordered_map<SystemId, const SystemSecurityDeltaState*> deltaBySystem;
   if (!ioSave.systemSecurityDeltas.empty()) {
+    deltaBySystem.reserve(ioSave.systemSecurityDeltas.size());
     for (const auto& d : ioSave.systemSecurityDeltas) {
-      if (d.systemId == currentSystem.stub.id) {
-        const SystemSecurityDynamicsParams dynParams{};
-        localSec = applySystemSecurityDelta(localSec, d, timeDays, dynParams);
-        break;
-      }
+      if (d.systemId == 0) continue;
+      deltaBySystem[d.systemId] = &d;
     }
   }
 
-  // Apply deterministic, time-based system events on top of baseline+deltas.
-  {
-    const SystemEventParams evParams{};
-    const SystemEvent ev = generateSystemEvent(universe.seed(), currentSystem.stub.id, timeDays, localSec, evParams);
-    localSec = applySystemEventToProfile(localSec, ev);
-  }
+  auto deltaForSystem = [&](SystemId id) -> const SystemSecurityDeltaState* {
+    const auto it = deltaBySystem.find(id);
+    if (it == deltaBySystem.end()) return nullptr;
+    return it->second;
+  };
+
+  const auto* localDelta = deltaForSystem(currentSystem.stub.id);
+  SystemSecurityProfile localSec =
+      effectiveSystemSecurityProfile(universe.seed(), currentSystem, timeDays, localDelta,
+                                     params.dynamicsParams, params.eventParams);
 
   const FactionProfile issuerTraits = factionProfile(universe.seed(), dockedStation.factionId);
 
@@ -382,14 +389,10 @@ void refreshMissionOffers(Universe& universe,
       const auto* st = &sys.stations[(std::size_t)(mrng.nextU32() % (core::u32)sys.stations.size())];
       const double distLy = (stub.posLy - currentSystem.stub.posLy).length();
 
-      SystemSecurityProfile sp = systemSecurityProfile(universe.seed(), sys);
-
-        // Destination "weather": deterministic event modifiers for this system too.
-        {
-          const SystemEventParams evParams{};
-          const SystemEvent ev = generateSystemEvent(universe.seed(), sys.stub.id, timeDays, sp, evParams);
-          sp = applySystemEventToProfile(sp, ev);
-        }
+      const auto* destDelta = (params.applyDestinationSecurityDeltas ? deltaForSystem(sys.stub.id) : nullptr);
+      SystemSecurityProfile sp =
+          effectiveSystemSecurityProfile(universe.seed(), sys, timeDays, destDelta,
+                                         params.dynamicsParams, params.eventParams);
       const FactionProfile stTraits = factionProfile(universe.seed(), st->factionId);
 
       const double rel = relationScore(dockedStation.factionId, st->factionId);

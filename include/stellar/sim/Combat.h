@@ -42,6 +42,23 @@ enum class MissileSeekerType : core::u8 {
   Radar = 1,
 };
 
+// Missile guidance mode.
+//
+// LeadPursuit:
+//  - Simple "lead solve" each frame + turn-rate-limited steering.
+//  - Works well for arcade feel and integrates nicely with decoy overrides.
+//
+// ProNav:
+//  - Proportional Navigation (PN / Pro-Nav) guidance using a navigation constant.
+//  - Tends to produce cleaner intercepts against maneuvering targets.
+//
+// NOTE: This is intentionally a small enum that is *not* persisted.
+// Keep explicit values stable anyway for safety.
+enum class MissileGuidance : core::u8 {
+  LeadPursuit = 0,
+  ProNav = 1,
+};
+
 struct SphereTarget {
   CombatTargetKind kind{CombatTargetKind::Ship};
   std::size_t index{0};
@@ -164,6 +181,12 @@ struct Missile {
   //   targetScore * decoyResistance
   // to override guidance.
   double decoyResistance{1.0};
+
+  // Guidance mode.
+  MissileGuidance guidance{MissileGuidance::LeadPursuit};
+  // Navigation constant for ProNav guidance (typical real-world values: ~3-5).
+  // Only used when guidance == ProNav.
+  double navConstant{3.5};
 
   bool fromPlayer{false};
   core::u64 shooterId{0};

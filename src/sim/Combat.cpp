@@ -139,6 +139,56 @@ static math::Vec3d rotateTowards(const math::Vec3d& fromDir,
   return (v * ca + v2 * sa).normalized();
 }
 
+// Simple 3D proportional navigation steering step.
+//
+// This is an "energy conserving" PN variant that produces an acceleration command
+// normal to the missile velocity (good fit for our constant-speed steering model).
+//
+// Reference (notation):
+//  - Omega = (R x Vr) / |R|^2  (line-of-sight rotation vector)
+//  - a = -N * |Vr| * (Vm_hat x Omega)
+// where R = Rt - Rm and Vr = Vt - Vm.
+static math::Vec3d proNavSteerDir(const math::Vec3d& vHat,
+                                 const math::Vec3d& missileVelKmS,
+                                 double missileSpeedKmS,
+                                 double turnRateRadS,
+                                 double dtSim,
+                                 const math::Vec3d& missilePosKm,
+                                 const SphereTarget& target,
+                                 double navConstant) {
+  const double sp = std::max(1e-9, missileSpeedKmS);
+  const double N = std::clamp(navConstant, 0.0, 12.0);
+  if (N <= 0.0) return vHat;
+
+  const math::Vec3d R = target.centerKm - missilePosKm;
+  const double r2 = R.lengthSq();
+  if (r2 < 1e-9) return vHat;
+
+  const math::Vec3d Vr = target.velKmS - missileVelKmS;
+  const double vrMag = Vr.length();
+  if (vrMag < 1e-9) return vHat;
+
+  // Line-of-sight rotation vector.
+  const math::Vec3d omega = math::cross(R, Vr) / r2;
+
+  // Energy-conserving PN acceleration (normal to missile velocity).
+  math::Vec3d aCmd = math::cross(vHat, omega) * (-N * vrMag);
+
+  // Convert to heading rate (rad/s): dvHat/dt = aCmd / |Vm|.
+  math::Vec3d dvHatDt = aCmd / sp;
+
+  // Clamp turn rate.
+  const double maxTurn = std::max(0.0, turnRateRadS);
+  const double turn = dvHatDt.length();
+  if (maxTurn > 0.0 && turn > maxTurn) {
+    dvHatDt *= (maxTurn / turn);
+  }
+
+  math::Vec3d vNew = vHat + dvHatDt * dtSim;
+  if (vNew.lengthSq() < 1e-12) return vHat;
+  return vNew.normalized();
+}
+
 void stepProjectiles(std::vector<Projectile>& projectiles,
                      double dtSim,
                      const SphereTarget* targets,
@@ -225,6 +275,7 @@ void stepMissiles(std::vector<Missile>& missiles,
 
     math::Vec3d desiredDir = v.normalized();
     const SphereTarget* tgt = nullptr;
+    const SphereTarget* guide = nullptr;
 
     // "Lock" score used to compare against decoys (inverse-square falloff).
     double targetScore = 0.0;
@@ -239,21 +290,6 @@ void stepMissiles(std::vector<Missile>& missiles,
       }
 
       if (tgt) {
-        // Lead solve (missile treated as constant-speed projectile).
-        const auto lead = solveProjectileLead(m.posKm,
-                                              /*shooterVelKmS=*/{0, 0, 0},
-                                              tgt->centerKm,
-                                              tgt->velKmS,
-                                              speed,
-                                              /*maxTimeSec=*/1.0e6,
-                                              /*minTimeSec=*/1.0e-3);
-        if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
-          desiredDir = lead->aimDirWorld;
-        } else {
-          const math::Vec3d to = tgt->centerKm - m.posKm;
-          if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
-        }
-
         const math::Vec3d toTgt = tgt->centerKm - m.posKm;
         targetScore = 1.0 / (toTgt.lengthSq() + 1.0e-9);
       }
@@ -290,27 +326,47 @@ void stepMissiles(std::vector<Missile>& missiles,
       }
 
       const double resist = std::max(0.0, m.decoyResistance);
-      if (bestDecoy && bestDecoyScore > targetScore * resist) {
-        const auto lead = solveProjectileLead(m.posKm,
-                                              /*shooterVelKmS=*/{0, 0, 0},
-                                              bestDecoy->centerKm,
-                                              bestDecoy->velKmS,
-                                              speed,
-                                              /*maxTimeSec=*/1.0e6,
-                                              /*minTimeSec=*/1.0e-3);
-        if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
-          desiredDir = lead->aimDirWorld;
-        } else {
-          const math::Vec3d to = bestDecoy->centerKm - m.posKm;
-          if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
-        }
+      guide = (bestDecoy && bestDecoyScore > targetScore * resist) ? bestDecoy : tgt;
+    }
+
+    // If we didn't find the locked target, keep flying forward.
+    if (!guide) guide = tgt;
+
+    // Desired direction used by LeadPursuit mode (and as a fallback).
+    if (guide) {
+      const auto lead = solveProjectileLead(m.posKm,
+                                            /*shooterVelKmS=*/{0, 0, 0},
+                                            guide->centerKm,
+                                            guide->velKmS,
+                                            speed,
+                                            /*maxTimeSec=*/1.0e6,
+                                            /*minTimeSec=*/1.0e-3);
+      if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
+        desiredDir = lead->aimDirWorld;
+      } else {
+        const math::Vec3d to = guide->centerKm - m.posKm;
+        if (to.lengthSq() > 1e-12) desiredDir = to.normalized();
       }
     }
 
 
-    const double maxTurn = std::max(0.0, m.turnRateRadS) * dtSim;
-    const math::Vec3d newDir = rotateTowards(v.normalized(), desiredDir, maxTurn);
-    m.velKmS = newDir * speed;
+    const math::Vec3d vHat = v.normalized();
+    const bool allowProNav = (m.guidance == MissileGuidance::ProNav) && guide && (guide->kind != CombatTargetKind::Decoy);
+    if (allowProNav) {
+      const math::Vec3d newDir = proNavSteerDir(vHat,
+                                               /*missileVelKmS=*/m.velKmS,
+                                               /*missileSpeedKmS=*/speed,
+                                               /*turnRateRadS=*/m.turnRateRadS,
+                                               dtSim,
+                                               m.posKm,
+                                               *guide,
+                                               m.navConstant);
+      m.velKmS = newDir * speed;
+    } else {
+      const double maxTurn = std::max(0.0, m.turnRateRadS) * dtSim;
+      const math::Vec3d newDir = rotateTowards(vHat, desiredDir, maxTurn);
+      m.velKmS = newDir * speed;
+    }
 
     const math::Vec3d b = m.posKm + m.velKmS * dtSim;
 
@@ -539,6 +595,17 @@ FireResult tryFireWeapon(Ship& shooter,
       m.seekerFovCos = std::cos(0.95);
       // Easier to decoy with flares.
       m.decoyResistance = 0.80;
+    }
+
+    // Guidance: radar missiles use proportional navigation for cleaner intercepts
+    // against maneuvering targets, while heat seekers keep the older lead-pursuit
+    // behavior (and remain more "flareable").
+    if (weapon == WeaponType::RadarMissile) {
+      m.guidance = MissileGuidance::ProNav;
+      m.navConstant = 4.0;
+    } else {
+      m.guidance = MissileGuidance::LeadPursuit;
+      m.navConstant = 3.5;
     }
     m.fromPlayer = fromPlayer;
     m.shooterId = shooterId;

@@ -78,6 +78,8 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "distributorMk " << (int)s.distributorMk << "\n";
   f << "weaponPrimary " << (int)s.weaponPrimary << "\n";
   f << "weaponSecondary " << (int)s.weaponSecondary << "\n";
+  f << "weaponAmmoPrimary " << (int)s.weaponAmmoPrimary << "\n";
+  f << "weaponAmmoSecondary " << (int)s.weaponAmmoSecondary << "\n";
   f << "smuggleHoldMk " << (int)s.smuggleHoldMk << "\n";
   f << "fuelScoopMk " << (int)s.fuelScoopMk << "\n";
 
@@ -531,6 +533,14 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       int v = 0;
       f >> v;
       out.weaponSecondary = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "weaponAmmoPrimary") {
+      int v = 255;
+      f >> v;
+      out.weaponAmmoPrimary = (core::u8)std::clamp(v, 0, 255);
+    } else if (key == "weaponAmmoSecondary") {
+      int v = 255;
+      f >> v;
+      out.weaponAmmoSecondary = (core::u8)std::clamp(v, 0, 255);
     } else if (key == "smuggleHoldMk") {
       int v = 0;
       f >> v;

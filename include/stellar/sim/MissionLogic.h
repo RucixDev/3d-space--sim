@@ -1,6 +1,8 @@
 #pragma once
 
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/SystemEvents.h"
+#include "stellar/sim/SystemSecurityDynamics.h"
 
 #include <cstddef>
 #include <string>
@@ -37,6 +39,19 @@ struct MissionBoardParams {
 
   // Reward scaling (positive rep only): reward *= 1 + (rep/100)*repRewardBonus
   double repRewardBonus{0.10};
+
+  // Mission board "context" parameters.
+  //
+  // These allow the board to use the same tuning as the live gameplay systems
+  // (encounter cadence, system conditions UI, etc.), instead of hardcoding
+  // defaults inside MissionLogic.
+  SystemSecurityDynamicsParams dynamicsParams{};
+  SystemEventParams eventParams{};
+
+  // If true, destination systems will incorporate any known persistent security
+  // deltas (SaveGame::systemSecurityDeltas) when scoring/picking targets.
+  // Deterministic system events are always considered.
+  bool applyDestinationSecurityDeltas{true};
 };
 
 // Forward decls (keep MissionLogic.h light).

@@ -253,6 +253,57 @@ int test_combat() {
     }
   }
 
+  // --- ProNav steering should match expected sign/magnitude in a simple case ---
+  {
+    // Geometry picked so the closed-form PN turn command is easy to reason about.
+    // Missile starts pointed +Z; target is offset +X,+Z and stationary.
+
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 0;
+    tgt.id = 42;
+    tgt.centerKm = {10, 0, 10};
+    tgt.velKmS = {0, 0, 0};
+    tgt.radiusKm = 1.0;
+
+    std::vector<sim::Missile> ms;
+    sim::Missile m{};
+    m.prevKm = {0, 0, 0};
+    m.posKm = {0, 0, 0};
+    m.velKmS = {0, 0, 10};
+    m.ttlSimSec = 30.0;
+    m.radiusKm = 0.1;
+    m.dmg = 1.0;
+    m.blastRadiusKm = 0.0;
+    m.turnRateRadS = 100.0; // keep unclamped for predictable turn
+
+    m.hasTarget = true;
+    m.targetKind = sim::CombatTargetKind::Ship;
+    m.targetId = 42;
+
+    m.guidance = sim::MissileGuidance::ProNav;
+    m.navConstant = 3.0;
+
+    ms.push_back(m);
+
+    std::vector<sim::MissileDetonation> dets;
+    std::vector<sim::MissileHit> hits;
+    sim::stepMissiles(ms, 0.1, &tgt, 1, dets, hits);
+
+    if (ms.empty()) {
+      std::cerr << "[test_combat] ProNav missile unexpectedly destroyed while testing steering.\n";
+      ++fails;
+    } else {
+      // Expected: a modest turn toward +X, ~sin(0.15) ≈ 0.149.
+      const auto d = ms[0].velKmS.normalized();
+      if (!approx(d.x, 0.148, 0.02) || !approx(d.y, 0.0, 0.02) || !approx(d.z, 0.989, 0.02)) {
+        std::cerr << "[test_combat] ProNav steering unexpected. dir=(" << d.x << "," << d.y << "," << d.z
+                  << ") expected approx (0.148,0,0.989)\n";
+        ++fails;
+      }
+    }
+  }
+
   if (fails == 0) {
     std::cout << "[test_combat] PASS\n";
   }

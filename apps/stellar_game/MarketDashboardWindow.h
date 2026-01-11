@@ -31,9 +31,14 @@ struct MarketDashboardRow {
   double capacity{0.0};
   double feeRate{0.0};
 
-  // Recent derivative of mid price (cr/unit/day), best-effort.
+  // Price trend computed over a recent window (see MarketDashboardWindowState::trendWindowDays).
+  // This is a regression slope (credits/unit/day), not a single-step derivative.
   double trendPerDay{0.0};
+  double trendR2{0.0}; // goodness-of-fit for regression (0..1)
+  double changePct{0.0}; // percent change over the trend window
+  double volatilityPerDay{0.0}; // stddev of log returns per day (e.g., 0.02 ~= 2%/day)
   double lastSampleDay{0.0};
+  bool trendValid{false};
 };
 
 struct MarketDashboardWindowState {
@@ -50,6 +55,10 @@ struct MarketDashboardWindowState {
   // 0=Best Buy (ask asc), 1=Best Sell (bid desc), 2=Distance, 3=Name
   int sortMode{0};
 
+  // Analytics tuning.
+  double trendWindowDays{7.0};    // window used to compute trend in table rows
+  double historyWindowDays{30.0}; // window used for the selected station's plot/stats
+
   bool showHistoryPanel{true};
   char filter[96]{};
 
@@ -64,6 +73,7 @@ struct MarketDashboardWindowState {
   double cacheRadiusLy{0.0};
   int cacheMaxSystems{0};
   bool cacheIncludeCurrentSystem{true};
+  double cacheTrendWindowDays{0.0};
 
   std::vector<MarketDashboardRow> rows;
 };

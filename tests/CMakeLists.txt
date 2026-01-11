@@ -17,6 +17,7 @@ add_executable(stellar_tests
   test_universe_cache.cpp
   test_proc.cpp
   test_economy.cpp
+  test_market_analysis.cpp
   test_traffic.cpp
 
   test_traffic_ledger.cpp
@@ -24,10 +25,14 @@ add_executable(stellar_tests
   test_traffic_convoy_layer.cpp
   test_route_planner.cpp
   test_manifest_planner.cpp
+  test_cargo_jettison_planner.cpp
   test_savegame.cpp
   test_missions.cpp
+  test_mission_assist.cpp
   test_law.cpp
   test_police_scan.cpp
+  test_extortion.cpp
+  test_npc_combat_ai.cpp
   test_faction_profile.cpp
   test_security_model.cpp
   test_system_security_dynamics.cpp
@@ -42,6 +47,7 @@ add_executable(stellar_tests
   test_thermal.cpp
   test_fuel_scoop.cpp
   test_system_events.cpp
+  test_system_conditions.cpp
   test_nav.cpp
   test_k_routes.cpp
   test_args.cpp

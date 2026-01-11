@@ -335,8 +335,12 @@ struct SaveGame {
   core::u8 thrusterMk{1};      // 1..3
   core::u8 shieldMk{1};        // 1..3
   core::u8 distributorMk{1};   // 1..3
-  core::u8 weaponPrimary{0};   // enum in gameplay (0=beam, 1=pulse, 2=cannon, 3=rail)
+  core::u8 weaponPrimary{0};   // WeaponType enum index (see ShipLoadout.h)
   core::u8 weaponSecondary{2}; // default cannon
+
+  // Guided weapons consume ammo; 255 is treated as "full" (backwards compat for older saves).
+  core::u8 weaponAmmoPrimary{255};
+  core::u8 weaponAmmoSecondary{255};
 
   // Smuggling / stealth: reduces chance of cargo scans when carrying contraband.
   core::u8 smuggleHoldMk{0}; // 0..3

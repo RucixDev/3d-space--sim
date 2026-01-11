@@ -1,5 +1,7 @@
 #include "stellar/sim/SaveGame.h"
 
+#include "stellar/sim/ShipLoadout.h"
+
 #include "stellar/econ/Commodity.h"
 
 #include <cmath>
@@ -106,6 +108,13 @@ int test_savegame() {
   s.navRouteHop = 1;
   s.pendingArrivalStation = 424242;
   s.navRoute = {1001, 1002, 1003, 1004};
+
+  // Loadout (ammo-bearing weapons are new as of this patch).
+  s.shipHull = (core::u8)ShipHullClass::Fighter;
+  s.weaponPrimary = (core::u8)WeaponType::HomingMissile;
+  s.weaponSecondary = (core::u8)WeaponType::BeamLaser;
+  s.weaponAmmoPrimary = 4;
+  s.weaponAmmoSecondary = 0;
 
   s.smuggleHoldMk = 2;
   s.hull = 0.75;
@@ -408,6 +417,20 @@ int test_savegame() {
 
   if (l.smuggleHoldMk != s.smuggleHoldMk) {
     std::cerr << "[test_savegame] smuggleHoldMk mismatch\n";
+    ++fails;
+  }
+
+  // Loadout fields (incl. missile ammo).
+  if (l.shipHull != s.shipHull) {
+    std::cerr << "[test_savegame] shipHull mismatch\n";
+    ++fails;
+  }
+  if (l.weaponPrimary != s.weaponPrimary || l.weaponSecondary != s.weaponSecondary) {
+    std::cerr << "[test_savegame] weapons mismatch\n";
+    ++fails;
+  }
+  if (l.weaponAmmoPrimary != s.weaponAmmoPrimary || l.weaponAmmoSecondary != s.weaponAmmoSecondary) {
+    std::cerr << "[test_savegame] weaponAmmo mismatch\n";
     ++fails;
   }
 

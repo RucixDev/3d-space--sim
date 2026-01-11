@@ -1,3 +1,10 @@
+## 2026-01-11 (Patch) - Missile Ammo + Ordnance Restock
+
+- **Guided weapons now consume ammo** (missiles are no longer infinite).
+- Added per-slot **missile capacity** (scales with ship hull size) and **ammo counts** for both player and NPCs.
+- Added a docked **Ordnance** service in **Market Details** to **rearm missiles** (cost scales with station fees).
+- Save format: `SaveGame` now persists `weaponAmmoPrimary` / `weaponAmmoSecondary` (missing keys default to full ammo for guided weapons).
+
 ## 2026-01-10 (Patch) - Countermeasure Ammo + Heat Sinks
 
 - Countermeasures are now **consumable bursts** for the player:
@@ -1446,3 +1453,20 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
   - Ascending node (z≈0) sanity
   - Circular-orbit degeneracy handling
 
+
+# Patch Notes (Jan 11, 2026) — Round 12
+
+## Market Dashboard: real trend analytics + interactive history
+- Market Dashboard now computes trend using a **linear regression** over a configurable **trend window** (instead of a last-two-samples derivative).
+  - Adds **% change**, **R^2 fit**, and **volatility (%/day)**.
+- The history panel was upgraded into a **Price analytics** panel:
+  - Selectable **history window** (quick presets + logarithmic slider)
+  - **Interactive plot** with hover tooltip and current-price reference line
+  - Window stats: **min/mean/max**, **slope**, **volatility**, and **z-score**
+  - Naive **1-day expected mid** forecast (mean shock = 0) + displayed **net flow** (production - consumption)
+
+## Core: MarketAnalysis
+- Added `sim::analyzePriceHistory(...)` and `sim::forecastMidPrice(...)` helpers for UI and lightweight gameplay logic.
+
+## Tests
+- Added `test_market_analysis` coverage for trend stats + forecast direction.

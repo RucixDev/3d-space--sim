@@ -145,6 +145,45 @@ inline const WeaponDef& weaponDef(WeaponType t) {
   return kWeaponDefs[idx];
 }
 
+
+inline bool weaponUsesAmmo(WeaponType t) {
+  return weaponDef(t).guided;
+}
+
+// For now, only guided weapons consume ammunition.
+// Capacity scales mildly with hull size so larger ships can carry more ordnance.
+inline int weaponAmmoMax(WeaponType t, ShipHullClass hullClass) {
+  if (!weaponUsesAmmo(t)) return 0;
+
+  switch (t) {
+    case WeaponType::HomingMissile:
+      switch (hullClass) {
+        case ShipHullClass::Scout:   return 8;
+        case ShipHullClass::Hauler:  return 10;
+        case ShipHullClass::Fighter: return 12;
+      }
+      return 8;
+
+    case WeaponType::RadarMissile:
+      switch (hullClass) {
+        case ShipHullClass::Scout:   return 6;
+        case ShipHullClass::Hauler:  return 8;
+        case ShipHullClass::Fighter: return 10;
+      }
+      return 6;
+
+    default:
+      return 0;
+  }
+}
+
+inline double weaponAmmoUnitPriceCr(WeaponType t) {
+  if (!weaponUsesAmmo(t)) return 0.0;
+  // Simple economy: ammo is a small fraction of the launcher purchase price.
+  return std::max(30.0, weaponDef(t).priceCr * 0.012);
+}
+
+
 // Mirrors the gameplay formula historically used by stellar_game.
 inline ShipDerivedStats computeShipDerivedStats(
   ShipHullClass hullClass,

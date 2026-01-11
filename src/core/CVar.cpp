@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cerrno>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -200,7 +202,7 @@ alr thats all im tired for today.
 */
 
 static std::string quoteIfNeeded(std::string_view s) {
-  if (s.empty()) return {s};
+  if (s.empty()) return std::string(s);
 
   bool needs_quote = false;
   for (char c : s) {
@@ -209,7 +211,7 @@ static std::string quoteIfNeeded(std::string_view s) {
       break;
     }
   }
-  if (!needs_quote) return {s};
+  if (!needs_quote) return std::string(s);
 
   size_t escapes = 0;
   for (char c : s) {

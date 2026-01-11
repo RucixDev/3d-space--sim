@@ -52,10 +52,14 @@
 #include "stellar/sim/ManeuverComputer.h"
 #include "stellar/sim/LambertSolver.h"
 #include "stellar/sim/LambertPlanner.h"
+#include "stellar/sim/MissionAssist.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/CargoJettisonPlanner.h"
 #include "stellar/sim/Law.h"
 #include "stellar/sim/PoliceScan.h"
+#include "stellar/sim/NpcCombatAI.h"
+#include "stellar/sim/Extortion.h"
 #include "stellar/sim/Distress.h"
 #include "stellar/sim/Signals.h"
 #include "stellar/sim/Mining.h"
@@ -82,6 +86,7 @@
 #include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
+#include "stellar/sim/SystemConditions.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
 #include "stellar/sim/DockingClearanceService.h"
@@ -107,6 +112,8 @@
 #include "FlightRecorderWindow.h"
 #include "CinematicCameraWindow.h"
 #include "OrbitAnalyzerWindow.h"
+#include "TrafficLanesWindow.h"
+#include "SystemConditionsWindow.h"
 #include "LogWindow.h"
 #include "Screenshot.h"
 #include "PhotoModeWindow.h"
@@ -673,6 +680,8 @@ struct Contact {
   int shieldMk{1};
   int distributorMk{1};
   WeaponType weapon{WeaponType::BeamLaser};
+  core::u8 weaponAmmo{255}; // guided weapons only (255 => treat as full)
+
 
   double shield{60.0};
   double shieldMax{60.0};
@@ -684,6 +693,7 @@ struct Contact {
 
   // Power distributor state (capacitors + pips).
   sim::Pips pips{2,2,2};
+  double pipsNextUpdateDays{0.0};
   sim::DistributorConfig distributorCfg{};
   sim::DistributorState distributorState{};
 
@@ -1811,6 +1821,10 @@ int main(int argc, char** argv) {
   int fuelScoopMk = 0; // 0..3 fuel scoop module (0 = none)
   WeaponType weaponPrimary = WeaponType::BeamLaser;
   WeaponType weaponSecondary = WeaponType::Cannon;
+core::u8 weaponAmmoPrimary = 255;   // guided weapons only (255 => treat as full)
+core::u8 weaponAmmoSecondary = 255; // guided weapons only (255 => treat as full)
+double weaponAmmoToastPrimaryUntilDays = 0.0;
+double weaponAmmoToastSecondaryUntilDays = 0.0;
 
   // Derived stats (recomputed from hull/modules)
   double playerHullMax = 100.0;
@@ -1869,6 +1883,11 @@ int main(int argc, char** argv) {
     c.shieldMk = std::clamp(sMk, 1, 3);
     c.distributorMk = std::clamp(dMk, 1, 3);
     c.weapon = weapon;
+    // NPC ordnance: guided weapons have finite ammo (scaled by hull size).
+    {
+      const int maxAmmo = sim::weaponAmmoMax(c.weapon, c.hullClass);
+      c.weaponAmmo = (maxAmmo > 0) ? (core::u8)maxAmmo : (core::u8)0;
+    }
     c.aiSkill = std::clamp(aiSkill, 0.05, 0.98);
 
     const sim::ShipDerivedStats ds = sim::computeShipDerivedStats(
@@ -1948,6 +1967,21 @@ int main(int argc, char** argv) {
     cmHeatSinks = cap.heatSinks;
   };
 
+  auto normalizeWeaponAmmo = [&](core::u8& ammo, WeaponType wt, ShipHullClass hullClass) {
+    const int maxAmmo = sim::weaponAmmoMax(wt, hullClass);
+    if (maxAmmo <= 0) {
+      ammo = 0;
+      return;
+    }
+    if (ammo == 255) ammo = (core::u8)maxAmmo; // backwards compat: 255 => "full"
+    ammo = (core::u8)std::clamp((int)ammo, 0, maxAmmo);
+  };
+
+  auto syncWeaponAmmo = [&]() {
+    normalizeWeaponAmmo(weaponAmmoPrimary, weaponPrimary, shipHullClass);
+    normalizeWeaponAmmo(weaponAmmoSecondary, weaponSecondary, shipHullClass);
+  };
+
   auto recalcPlayerStats = [&]() {
     const sim::ShipDerivedStats ds = sim::computeShipDerivedStats(
       shipHullClass, thrusterMk, shieldMk, distributorMk
@@ -1983,6 +2017,7 @@ int main(int argc, char** argv) {
 
     // Ensure consumables stay within hull capacity after upgrades/downgrades.
     clampCountermeasureAmmo();
+    syncWeaponAmmo();
   };
 
   recalcPlayerStats();
@@ -2089,40 +2124,24 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 };
 
   // Deterministic system events ("weather") layered on top of baseline + player-driven dynamics.
+  // Deterministic system events ("weather") layered on top of baseline + player-driven dynamics.
   sim::SystemEventParams systemEventParams{};
 
-  struct SystemConditionsSnapshot {
-    sim::SystemSecurityProfile base{};
-    sim::SystemSecurityProfile afterDynamics{};
-    sim::SystemSecurityProfile effective{};
-    bool hasDynamics{false};
-    sim::SystemSecurityDeltaState dynamicsNow{};
-    sim::SystemEvent event{};
-  };
-
-  auto snapshotSystemConditions = [&](const sim::StarSystem& sys) -> SystemConditionsSnapshot {
-    SystemConditionsSnapshot snap{};
-    snap.base = sim::systemSecurityProfile(universe.seed(), sys);
-    snap.afterDynamics = snap.base;
-    snap.dynamicsNow = sim::SystemSecurityDeltaState{};
-
-    if (const auto itD = systemSecurityDeltaBySystem.find(sys.stub.id);
-        itD != systemSecurityDeltaBySystem.end()) {
-      snap.hasDynamics = true;
-      snap.afterDynamics = sim::applySystemSecurityDelta(snap.base, itD->second, timeDays, systemSecurityDynParams);
-      snap.dynamicsNow = sim::decayedSystemSecurityDelta(itD->second, timeDays, systemSecurityDynParams);
+  auto snapshotSystemConditions = [&](const sim::StarSystem& sys) -> sim::SystemConditionsSnapshot {
+    const sim::SystemSecurityDeltaState* d = nullptr;
+    if (const auto itD = systemSecurityDeltaBySystem.find(sys.stub.id); itD != systemSecurityDeltaBySystem.end()) {
+      d = &itD->second;
     }
-
-    snap.event = sim::generateSystemEvent(universe.seed(), sys.stub.id, timeDays, snap.afterDynamics, systemEventParams);
-    snap.effective = sim::applySystemEventToProfile(snap.afterDynamics, snap.event);
-    return snap;
+    return sim::snapshotSystemConditions(universe.seed(), sys, timeDays, d, systemSecurityDynParams, systemEventParams);
   };
 
   auto effectiveSystemSecurityProfile = [&](const sim::StarSystem& sys,
                                            sim::SystemEvent* outEvent = nullptr) -> sim::SystemSecurityProfile {
-    const SystemConditionsSnapshot snap = snapshotSystemConditions(sys);
-    if (outEvent) *outEvent = snap.event;
-    return snap.effective;
+    const sim::SystemSecurityDeltaState* d = nullptr;
+    if (const auto itD = systemSecurityDeltaBySystem.find(sys.stub.id); itD != systemSecurityDeltaBySystem.end()) {
+      d = &itD->second;
+    }
+    return sim::effectiveSystemSecurityProfile(universe.seed(), sys, timeDays, d, systemSecurityDynParams, systemEventParams, outEvent);
   };
 
 
@@ -2150,6 +2169,10 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     std::string leaderName;
   };
   PirateDemand pirateDemand;
+
+  // Player-driven piracy extortion (not saved).
+  // Cooldown prevents spamming the same contact every frame.
+  std::unordered_map<core::u64, double> playerExtortionCooldownUntilDaysByTarget;
 
   // Squad tactics (not saved): group-level morale + reinforcement cooldowns.
   std::unordered_map<core::u64, double> pirateSquadRetreatUntilByGroup;
@@ -2366,6 +2389,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::FlightRecorderWindowState flightRecorderWindow{};
   game::CinematicCameraWindowState cinematicCameraWindow{};
   game::OrbitAnalyzerWindowState orbitAnalyzerWindow{};
+  game::TrafficLanesWindowState trafficLanesWindow{};
+  game::SystemConditionsWindowState systemConditionsWindow{};
   game::PhotoModeWindowState photoModeWindow{};
 
   struct PendingScreenshot { bool pending{false}; std::string path; bool copyToClipboard{false}; };
@@ -2759,6 +2784,11 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   // Prevents surprise immediate jumps after a quickload (or other nav state restoration).
   double navAutoRunHoldUntilDays = 0.0;
 
+  // Auto-run can temporarily force supercruise assist ON to guarantee safe auto-drops.
+  // If we do so, we restore the player's previous setting when auto-run ends.
+  bool navAutoRunOverrodeSupercruiseAssist = false;
+  bool navAutoRunSavedSupercruiseAssist = true;
+
   // Route planner settings
   enum class NavRouteMode { Hops = 0, Distance = 1, Fuel = 2 };
   NavRouteMode navRouteMode = NavRouteMode::Hops;
@@ -2998,6 +3028,12 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"OrbitAnalyzer", "Orbit Analyzer", "Tools", 55, false, true}, &orbitAnalyzerWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"TrafficLanes", "Traffic Lanes", "Tools", 55, false, true}, &trafficLanesWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"SystemConditions", "System Conditions", "Tools", 55, false, true}, &systemConditionsWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
@@ -3679,6 +3715,15 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   const double kSupercruiseEmergencyCooldownSec = 14.0;
   const double kSupercruiseSafeTtaSec = 7.0; // the classic "7-second rule"
 
+  // Auto-run (route runner) tuning.
+  // When the plotted route is complete and the player has a station targeted in the
+  // destination system, auto-run can optionally continue with supercruise + auto-dock.
+  //
+  // Engage supercruise when the station is sufficiently far away (otherwise, the docking
+  // computer is faster and avoids unnecessary mode switches).
+  const double kNavAutoRunSupercruiseEngageMinKm = 220000.0;
+  const double kNavAutoRunSupercruiseEngageDropMult = 8.0;
+
   auto fsdBaseRangeLy = [&]() -> double {
     const double cap = std::max(1.0, cargoCapacityKg);
     const double load = std::clamp(cargoMassKg(cargo) / cap, 0.0, 1.0);
@@ -4139,6 +4184,69 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
   };
 
 
+  // Detect whether an authority is likely to witness a cargo dump (ports/scanners/nearby police).
+  auto authorityWitness = [&]() -> std::pair<bool, std::string> {
+    if (!currentSystem) return {false, ""};
+
+    if (cargoScanActive && cargoScanFactionId != 0) {
+      const std::string src = cargoScanSourceName.empty() ? std::string("Authorities") : cargoScanSourceName;
+      return {true, src};
+    }
+
+    for (const auto& st : currentSystem->stations) {
+      const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+      const double d = (stPos - ship.positionKm()).length();
+      if (d <= st.commsRangeKm * 1.05) return {true, st.name};
+    }
+
+    for (const auto& c : contacts) {
+      if (!c.alive || c.role != ContactRole::Police) continue;
+      const double d = (c.ship.positionKm() - ship.positionKm()).length();
+      if (d <= 120000.0) {
+        const std::string src = c.name.empty() ? std::string("Police") : c.name;
+        return {true, src};
+      }
+    }
+
+    return {false, ""};
+  };
+
+  // Apply a dumping crime when witnessed. Used for both normal dumping and contraband dumping.
+  auto applyDumpCrime = [&](double dumpedValueCr, const std::string& witnessName, bool contraband) {
+    if (!currentSystem) return;
+    const core::u32 j = currentSystem->stub.factionId;
+    if (j == 0) return;
+
+    const double bountyAdd = (contraband ? 250.0 : 110.0) + dumpedValueCr * (contraband ? 0.22 : 0.12);
+    const double repPenalty = -std::clamp(0.8 + dumpedValueCr / (contraband ? 4200.0 : 6500.0),
+                                         0.8,
+                                         contraband ? 8.0 : 5.0);
+
+    commitCrime(j,
+               bountyAdd,
+               repPenalty,
+               (contraband ? "contraband dumping" : "cargo dumping") + std::string(" reported by ") + witnessName,
+               false);
+    toast(toasts,
+          witnessName + ": illegal dumping detected. Bounty +" + std::to_string((int)std::round(bountyAdd)) + " cr",
+          3.0);
+  };
+
+  // Jettison cargo behind the player's ship (spawns floating cargo pods) and count it toward
+  // pirate extortion demands if one is active.
+  auto doPlayerJettison = [&](econ::CommodityId what, double units) {
+    if (units <= 1e-6) return;
+    const math::Vec3d fwd = ship.forward().normalized();
+    const math::Vec3d dropPos = ship.positionKm() - fwd * 2600.0 + randUnit() * 250.0;
+    spawnCargoBurst(what, units, dropPos, ship.velocityKmS(), 2 + rng.range(0, 2), true);
+
+    // Counts toward pirate extortion demands (value by base price).
+    if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0) {
+      pirateDemand.deliveredValueCr += units * econ::commodityDef(what).basePrice;
+    }
+  };
+
+
   // Record a destroyed / interdicted traffic convoy so it cannot be re-spawned by re-entering the system.
   // Also applies a small-but-real market impact by removing the shipment units from the destination
   // station's inventory (background traffic already applied the shipment; this counteracts it).
@@ -4148,38 +4256,49 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     const core::u64 convoyId = (dead.trafficConvoyId != 0) ? dead.trafficConvoyId : dead.id;
     if (convoyId == 0) return;
 
-    // Prevent double-application (can happen if multiple systems report the same kill in a frame).
-    if (trafficInterdictionsById.find(convoyId) != trafficInterdictionsById.end()) return;
+    const double deltaUnits = std::max(0.0, lostUnits);
 
-    sim::TrafficInterdictionState d{};
-    d.convoyId = convoyId;
-    d.systemId = currentSystem ? currentSystem->stub.id : 0;
-    d.fromStation = dead.trafficFromStationId;
-    d.toStation = dead.trafficToStationId;
-    d.commodity = dead.tradeCommodity;
-    d.units = std::max(0.0, lostUnits);
-    d.expireDay = dead.trafficArriveDay;
+    // Persist / accumulate interdiction units. We allow additive calls so partial theft can be
+    // recorded before the convoy is later destroyed (or hit multiple times).
+    sim::TrafficInterdictionState* st = nullptr;
+    if (auto it = trafficInterdictionsById.find(convoyId); it != trafficInterdictionsById.end()) {
+      st = &it->second;
+      st->units += deltaUnits;
+      // Refresh metadata (keep best-effort values in case the first record was partial).
+      if (st->systemId == 0 && currentSystem) st->systemId = currentSystem->stub.id;
+      if (st->fromStation == 0) st->fromStation = dead.trafficFromStationId;
+      if (st->toStation == 0) st->toStation = dead.trafficToStationId;
+      st->commodity = dead.tradeCommodity;
+      st->expireDay = std::max(st->expireDay, dead.trafficArriveDay);
+    } else {
+      sim::TrafficInterdictionState d{};
+      d.convoyId = convoyId;
+      d.systemId = currentSystem ? currentSystem->stub.id : 0;
+      d.fromStation = dead.trafficFromStationId;
+      d.toStation = dead.trafficToStationId;
+      d.commodity = dead.tradeCommodity;
+      d.units = deltaUnits;
+      d.expireDay = dead.trafficArriveDay;
+      st = &trafficInterdictionsById.emplace(convoyId, d).first->second;
+    }
 
-    // Persist.
-    trafficInterdictionsById[convoyId] = d;
-
-    // Apply market impact (destination loses the shipment units).
-    if (d.systemId != 0 && d.toStation != 0 && d.units > 0.0 && currentSystem) {
+    // Apply market impact (destination loses the *additional* units).
+    if (st && st->systemId != 0 && st->toStation != 0 && deltaUnits > 0.0 && currentSystem) {
       const sim::Station* dst = nullptr;
-      for (const auto& st : currentSystem->stations) {
-        if (st.id == d.toStation) { dst = &st; break; }
+      for (const auto& stn : currentSystem->stations) {
+        if (stn.id == st->toStation) { dst = &stn; break; }
       }
 
       if (dst) {
         auto& econState = universe.stationEconomy(*dst, timeDays);
-        const double removed = econ::takeInventory(econState, dst->economyModel, d.commodity, d.units);
+        const double removed = econ::takeInventory(econState, dst->economyModel, st->commodity, deltaUnits);
 
         // Small toast so the player understands that convoys are now "real".
         if (removed > 0.0) {
           char buf[256];
           std::snprintf(buf, sizeof(buf), "Traffic disrupted: -%.0f %s at %s",
                         std::round(removed),
-                        econ::commodityDef(d.commodity).name,
+                        econ::commodityDef(st->commodity).name,
                         dst->name.c_str());
           toast(toasts, buf, 3.5);
         }
@@ -4194,19 +4313,20 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
 
     // Force a near-term refresh so the scanner list updates promptly.
-  nextTrafficConvoyRefreshDays = std::min(nextTrafficConvoyRefreshDays, timeDays);
+    nextTrafficConvoyRefreshDays = std::min(nextTrafficConvoyRefreshDays, timeDays);
 
-  // System security dynamics: disrupting legitimate traffic reduces local trade flow and
-  // emboldens piracy. Scale slightly with shipment value so big hits matter more.
-  if (d.systemId != 0 && d.units > 0.0) {
-    const double valueCr = std::max(0.0, d.units) * econ::commodityDef(d.commodity).basePrice;
-    const double mag = std::clamp(valueCr / 8000.0, 0.35, 2.25);
-    applySystemSecurityImpulseTo(d.systemId,
-                                 -0.004 * mag,
-                                 +0.010 * mag,
-                                 -0.012 * mag);
-  }
-};
+    // System security dynamics: disrupting legitimate traffic reduces local trade flow and
+    // emboldens piracy. Scale slightly with *incremental* shipment value so repeated hits don't
+    // double-count earlier losses.
+    if (st && st->systemId != 0 && deltaUnits > 0.0) {
+      const double valueCr = deltaUnits * econ::commodityDef(st->commodity).basePrice;
+      const double mag = std::clamp(valueCr / 8000.0, 0.35, 2.25);
+      applySystemSecurityImpulseTo(st->systemId,
+                                   -0.004 * mag,
+                                   +0.010 * mag,
+                                   -0.012 * mag);
+    }
+  };
 
   // ---------------------------------------------------------------------------
   // Traffic Convoy Escort Contracts
@@ -4370,6 +4490,186 @@ if (currentSystem) {
     }
 
     return true;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Player Piracy: Cargo Extortion ("Drop cargo or else")
+  // ---------------------------------------------------------------------------
+  // This is the mirror-image of pirate demands against the player: the player can try to
+  // extort cargo from traders (including physicalized traffic convoys).
+  //
+  // Gameplay notes:
+  //  - Traders may comply by jettisoning cargo and then fleeing.
+  //  - In traffic convoys, escorts immediately react.
+  //  - When witnessed by authorities, this creates a bounty.
+  auto playerExtortTrader = [&](Contact& trg) {
+    if (!trg.alive) return;
+    if (trg.role != ContactRole::Trader) return;
+
+    // Quick anti-spam cooldown per target.
+    if (const auto itCd = playerExtortionCooldownUntilDaysByTarget.find(trg.id); itCd != playerExtortionCooldownUntilDaysByTarget.end()) {
+      if (timeDays < itCd->second) {
+        toast(toasts, "Target ignores your threats (cooldown)", 1.8);
+        return;
+      }
+    }
+
+    if (trg.tradeUnits <= 1e-6) {
+      toast(toasts, "No cargo to extort", 1.8);
+      return;
+    }
+    if ((int)trg.tradeCommodity < 0 || trg.tradeCommodity >= econ::kCommodityCount) {
+      toast(toasts, "Unknown cargo", 1.8);
+      return;
+    }
+
+    // Range gate: this is a comms/intimidation action.
+    const double distKm = (trg.ship.positionKm() - ship.positionKm()).length();
+    if (distKm > 120000.0) {
+      toast(toasts, "Out of comms range", 1.8);
+      return;
+    }
+
+    // Estimate strengths (ratio-only). Keep it cheap and robust.
+    const double playerDmg = weaponDef(weaponPrimary).dmg + 0.65 * weaponDef(weaponSecondary).dmg;
+    const double trgDmg = weaponDef(trg.weapon).dmg;
+    const double attackerStrength = std::max(1.0, playerHullMax + playerShieldMax + 18.0 * playerDmg);
+    const double defenderStrength = std::max(1.0, trg.hullMax + trg.shieldMax + 18.0 * trgDmg);
+
+    // Cargo value estimate (prefer explicit trade cargo value when present).
+    const double cargoValueCr = std::max({0.0, trg.tradeCargoValueCr, trg.cargoValueCr});
+
+    const auto sec = (currentSystem ? effectiveSystemSecurityProfile(*currentSystem) : sim::SystemSecurityProfile{});
+    const auto wit = authorityWitness();
+    const bool policeNearby = wit.first;
+
+    const auto plan = sim::planExtortionDemand(universe.seed(), trg.id,
+                                               cargoValueCr,
+                                               attackerStrength, defenderStrength,
+                                               sec.security01,
+                                               policeNearby);
+
+    if (!plan.offer || plan.demandedValueCr <= 0.0) {
+      toast(toasts, "No leverage: they refuse to even respond", 2.0);
+      return;
+    }
+
+    // Apply cooldown (even on refusal) so the UI doesn't become a slot machine.
+    playerExtortionCooldownUntilDaysByTarget[trg.id] = timeDays + (std::max(10.0, plan.suggestedCooldownSec) / 86400.0);
+    if (playerExtortionCooldownUntilDaysByTarget.size() > 512) {
+      // Lazy prune of expired cooldown entries.
+      for (auto it = playerExtortionCooldownUntilDaysByTarget.begin(); it != playerExtortionCooldownUntilDaysByTarget.end(); ) {
+        if (timeDays > it->second + 0.25) it = playerExtortionCooldownUntilDaysByTarget.erase(it);
+        else ++it;
+      }
+    }
+
+    const bool comply = rng.nextUnit() < plan.complyChance01;
+
+    // Convert demanded value into units based on a simple per-unit estimate.
+    double unitValueCr = std::max(1.0, econ::commodityDef(trg.tradeCommodity).basePrice);
+    if (trg.tradeUnits > 1e-6 && cargoValueCr > 1e-6) {
+      unitValueCr = std::max(1.0, cargoValueCr / trg.tradeUnits);
+    }
+
+    const double demandedUnits = std::clamp(std::ceil(plan.demandedValueCr / unitValueCr), 0.0, trg.tradeUnits);
+    const double unitsDrop = std::clamp(demandedUnits * rng.range(0.90, 1.20), 0.0, trg.tradeUnits);
+    const double stolenValueCr = unitsDrop * unitValueCr;
+
+    // Crime consequences (only if witnessed).
+    const core::u32 victimFaction = (trg.factionId != 0) ? trg.factionId : (currentSystem ? currentSystem->stub.factionId : 0);
+
+    if (comply && unitsDrop > 1e-6) {
+      const math::Vec3d fwd = trg.ship.forward().normalized();
+      const math::Vec3d dropPos = trg.ship.positionKm() - fwd * 2400.0 + randUnit() * 220.0;
+      spawnCargoBurst(trg.tradeCommodity,
+                     unitsDrop,
+                     dropPos,
+                     trg.ship.velocityKmS(),
+                     2 + rng.range(0, 2),
+                     /*fromPlayer=*/false);
+
+      trg.tradeUnits = std::max(0.0, trg.tradeUnits - unitsDrop);
+      trg.tradeCargoValueCr = std::max(0.0, trg.tradeUnits * unitValueCr);
+      trg.cargoValueCr = trg.tradeCargoValueCr;
+
+      trg.fleeUntilDays = std::max(trg.fleeUntilDays, timeDays + (std::max(30.0, plan.suggestedFleeSec) / 86400.0));
+
+      // Traffic convoys: record partial interdiction so markets reflect lost cargo and signals don't re-spawn.
+      if (trg.trafficConvoy) {
+        interdictTrafficConvoy(trg, unitsDrop);
+
+        // Pirating a convoy you're supposed to escort should immediately fail the contract.
+        if (trafficEscort.active && trafficEscort.convoyId != 0 && (trg.id == trafficEscort.convoyId || trg.trafficConvoyId == trafficEscort.convoyId)) {
+          failTrafficEscort("Escort failed: you pirated the convoy.", -std::max(2.0, trafficEscort.repReward));
+        }
+
+        // Escorts immediately react.
+        for (auto& c : contacts) {
+          if (!c.alive) continue;
+          if (c.role != ContactRole::Police) continue;
+          if (c.followId == trg.id) {
+            c.hostileToPlayer = true;
+            c.fireCooldown = std::min(c.fireCooldown, 0.10);
+          }
+        }
+      } else {
+        // Normal traders actually deliver less cargo now: also nudge local security dynamics.
+        if (currentSystem && stolenValueCr > 0.0) {
+          const double mag = std::clamp(stolenValueCr / 6000.0, 0.35, 2.0);
+          applyLocalSecurityImpulse(-0.003 * mag, +0.008 * mag, -0.006 * mag);
+        }
+      }
+
+      if (wit.first && victimFaction != 0) {
+        const double bountyAdd = 170.0 + stolenValueCr * 0.16;
+        const double repPenalty = -std::clamp(0.9 + stolenValueCr / 5200.0, 0.9, 8.0);
+        commitCrime(victimFaction,
+                   bountyAdd,
+                   repPenalty,
+                   "Cargo extortion reported by " + wit.second,
+                   false);
+      } else if (!wit.first && victimFaction != 0) {
+        addRep(victimFaction, -0.45);
+      }
+
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "%s complies: jettisoned %.0f %s (~%.0f cr)",
+                    trg.name.c_str(),
+                    std::round(unitsDrop),
+                    econ::commodityDef(trg.tradeCommodity).name,
+                    std::round(stolenValueCr));
+      toast(toasts, buf, 3.6);
+    } else {
+      // Refusal: they run and (if authorities are around) you still get heat for threatening them.
+      trg.fleeUntilDays = std::max(trg.fleeUntilDays, timeDays + (std::max(45.0, plan.suggestedFleeSec) / 86400.0));
+
+      if (trg.trafficConvoy) {
+        for (auto& c : contacts) {
+          if (!c.alive) continue;
+          if (c.role != ContactRole::Police) continue;
+          if (c.followId == trg.id) {
+            c.hostileToPlayer = true;
+            c.fireCooldown = std::min(c.fireCooldown, 0.15);
+          }
+        }
+      }
+
+      if (wit.first && victimFaction != 0) {
+        // Attempted extortion: smaller bounty/rep hit than a successful theft.
+        const double bountyAdd = 110.0 + plan.demandedValueCr * 0.06;
+        const double repPenalty = -std::clamp(0.6 + plan.demandedValueCr / 9000.0, 0.6, 5.0);
+        commitCrime(victimFaction,
+                   bountyAdd,
+                   repPenalty,
+                   "Attempted cargo extortion reported by " + wit.second,
+                   false);
+      } else if (!wit.first && victimFaction != 0) {
+        addRep(victimFaction, -0.25);
+      }
+
+      toast(toasts, (trg.name + ": refuses and runs").c_str(), 2.8);
+    }
   };
 
   // Helper: apply damage from the player to a contact (laser / cannon / projectiles).
@@ -4588,9 +4888,9 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
     // Missile lock (player): build/decay lock progress for guided weapons.
     {
-      auto updateLock = [&](MissileLockState& st, WeaponType wt) {
+      auto updateLock = [&](MissileLockState& st, WeaponType wt, int ammo) {
         const WeaponDef& wd = weaponDef(wt);
-        if (!wd.guided || docked || paused || supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+        if (!wd.guided || ammo <= 0 || docked || paused || supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
           st.active = false;
           st.progress = 0.0;
           st.targetId = 0;
@@ -4650,8 +4950,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         }
       };
 
-      updateLock(missileLockPrimary, weaponPrimary);
-      updateLock(missileLockSecondary, weaponSecondary);
+      updateLock(missileLockPrimary, weaponPrimary, (int)weaponAmmoPrimary);
+      updateLock(missileLockSecondary, weaponSecondary, (int)weaponAmmoSecondary);
     }
 
     // Keep relative mouse mode in sync with our control mode.
@@ -4768,6 +5068,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	          const int maxWeaponIdx = (int)std::size(kWeaponDefs) - 1;
 	          s.weaponPrimary = (core::u8)std::clamp((int)weaponPrimary, 0, maxWeaponIdx);
 	          s.weaponSecondary = (core::u8)std::clamp((int)weaponSecondary, 0, maxWeaponIdx);
+	          s.weaponAmmoPrimary = weaponAmmoPrimary;
+	          s.weaponAmmoSecondary = weaponAmmoSecondary;
           s.smuggleHoldMk = (core::u8)std::clamp(smuggleHoldMk, 0, 3);
           s.fuelScoopMk = (core::u8)std::clamp(fuelScoopMk, 0, 3);
 
@@ -5051,6 +5353,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	            const int maxWeaponIdx = (int)std::size(kWeaponDefs) - 1;
 	            weaponPrimary = (WeaponType)std::clamp((int)s.weaponPrimary, 0, maxWeaponIdx);
 	            weaponSecondary = (WeaponType)std::clamp((int)s.weaponSecondary, 0, maxWeaponIdx);
+            weaponAmmoPrimary = s.weaponAmmoPrimary;
+            weaponAmmoSecondary = s.weaponAmmoSecondary;
             smuggleHoldMk = std::clamp((int)s.smuggleHoldMk, 0, 3);
             fuelScoopMk = std::clamp((int)s.fuelScoopMk, 0, 3);
             recalcPlayerStats();
@@ -5575,7 +5879,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           if (autopilot) {
             autopilot = false;
             dockingComputer.reset();
-            toast(toasts, "Docking computer disengaged.", 1.6);
+            if (navAutoRun && (navRoute.empty() || navRouteHop + 1 >= navRoute.size())) {
+              navAutoRun = false;
+              toast(toasts, "Auto-run canceled.", 1.8);
+            } else {
+              toast(toasts, "Docking computer disengaged.", 1.6);
+            }
           } else {
             if (docked) {
               toast(toasts, "Already docked.", 1.6);
@@ -6498,7 +6807,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                 ship.setVelocityKmS(stV);
                 ship.setAngularVelocityRadS({0,0,0});
 
-                toast(toasts, "Docked at " + st.name, 2.5);
+                const bool autoRunComplete = navAutoRun && (navRoute.empty() || navRouteHop + 1 >= navRoute.size());
+                if (autoRunComplete) navAutoRun = false;
+
+                std::string msg = "Docked at " + st.name;
+                if (autoRunComplete) msg += " (auto-run)";
+                toast(toasts, msg, 2.5);
                 audio.play(game::AudioEngine::Sfx::Docked, 1.0f, 0.0f);
               }
             } else {
@@ -6526,11 +6840,26 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
           double& cd = primary ? weaponPrimaryCooldown : weaponSecondaryCooldown;
 
+          core::u8& ammo = primary ? weaponAmmoPrimary : weaponAmmoSecondary;
+          double& ammoToastUntilDay = primary ? weaponAmmoToastPrimaryUntilDays : weaponAmmoToastSecondaryUntilDays;
+
           if (cd <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
             const double capCost = sim::weaponCapacitorCost(w);
             if (distributorState.wep + 1e-9 < capCost) {
               // Not enough weapon capacitor to fire.
               continue;
+            }
+
+            if (w.guided) {
+              // Guided weapons have finite ammo.
+              syncWeaponAmmo();
+              if (ammo == 0) {
+                if (timeDays >= ammoToastUntilDay) {
+                  toast(toasts, "Out of missiles — dock to rearm.", 2.4);
+                  ammoToastUntilDay = timeDays + 2.0 / 86400.0;
+                }
+                continue;
+              }
             }
 
             // Contact aim cone (soft aim assist).
@@ -6638,6 +6967,14 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
               if (fr.hasMissile) {
                 missiles.push_back(fr.missile);
+              }
+
+              if (fr.hasMissile && w.guided) {
+                if (ammo > 0) ammo = (core::u8)(ammo - 1);
+                if (ammo == 0 && timeDays >= ammoToastUntilDay) {
+                  toast(toasts, "Out of missiles — dock to rearm.", 2.4);
+                  ammoToastUntilDay = timeDays + 2.0 / 86400.0;
+                }
               }
 
               // Resolve beam hit effects (mining/damage). Projectile impacts are handled in the tick.
@@ -6780,7 +7117,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         if (thrustMag > dockingComputerManualDeadzone || torqueMag > dockingComputerManualDeadzone || input.boost || input.brake) {
           autopilot = false;
           dockingComputer.reset();
-          toast(toasts, "Docking computer disengaged (manual override).", 1.6);
+          if (navAutoRun) {
+            navAutoRun = false;
+            toast(toasts, "Auto-run canceled (manual override).", 2.0);
+          } else {
+            toast(toasts, "Docking computer disengaged (manual override).", 1.6);
+          }
         }
       }
 
@@ -6833,7 +7175,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           autopilot = false;
           dockingComputer.reset();
 
-          toast(toasts, "Docked at " + st.name + " (docking computer)", 2.5);
+          const bool autoRunComplete = navAutoRun && (navRoute.empty() || navRouteHop + 1 >= navRoute.size());
+          if (autoRunComplete) navAutoRun = false;
+
+          std::string msg = "Docked at " + st.name + " (docking computer)";
+          if (autoRunComplete) msg += " (auto-run)";
+          toast(toasts, msg, 2.5);
         }
       }
     }
@@ -7550,8 +7897,18 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           if (!navRoute.empty() && navRouteHop + 1 < navRoute.size() && navRoute[navRouteHop + 1] == currentSystem->stub.id) {
             navRouteHop++;
             if (navRouteHop + 1 >= navRoute.size()) {
-              navAutoRun = false;
-              toast(toasts, "Route complete.", 2.0);
+              // Route complete.
+              // If auto-run is armed *and* we have a station target in this system, keep it
+              // engaged so we can continue hands-free via supercruise + auto-dock.
+              if (navAutoRun && currentSystem &&
+                  target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+                toast(toasts,
+                      "Route complete: continuing to " + currentSystem->stations[target.index].name + ".",
+                      2.6);
+              } else {
+                navAutoRun = false;
+                toast(toasts, "Route complete.", 2.0);
+              }
             }
           }
 // QoL: auto-select the next hop in the Galaxy UI after each jump.
@@ -7574,75 +7931,145 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
         }
       }
 
-      // Auto-run route (hands-free multi-jump). We only auto-trigger when safe.
-      // If the next hop becomes invalid (e.g., jump range changes), attempt a one-shot replot
-      // to the final destination. If fuel is insufficient, stop and target the nearest station.
-      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= fsdReadyDay && timeDays >= navAutoRunHoldUntilDays &&
+      // Auto-run route (hands-free multi-jump).
+      //
+      // New behavior: once the route is complete, if the player has a *station* targeted in the
+      // destination system, auto-run will continue hands-free by engaging supercruise (if far)
+      // and then the docking computer.
+      //
+      // Safety: we only auto-trigger while in normal space and not docked.
+      if (navAutoRun && fsdState == FsdState::Idle && timeDays >= navAutoRunHoldUntilDays &&
           !docked && supercruiseState == SupercruiseState::Idle) {
-        if (navRoute.empty() || navRouteHop + 1 >= navRoute.size()) {
-          navAutoRun = false;
-        } else if (!isMassLocked()) {
-          bool replotted = false;
-          for (int attempt = 0; attempt < 2; ++attempt) {
-            if (navRoute.empty() || navRouteHop + 1 >= navRoute.size()) break;
-            const sim::SystemId nextId = navRoute[navRouteHop + 1];
-            const auto& nextSys = universe.getSystem(nextId);
-            const double hopDistLy = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
 
-            const double rangeLy = fsdBaseRangeLy();
-            if (hopDistLy > rangeLy + 1e-9) {
-              // Try a one-shot replot to the final destination using the current planner settings.
-              if (replotted || navRoute.size() < 2) {
-                navAutoRun = false;
-                toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
-                break;
-              }
-              const sim::SystemId finalDest = navRoute.back();
-              const bool ok = plotRouteToSystem(finalDest, /*showToast=*/false);
-              if (!ok) {
-                navAutoRun = false;
-                toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
-                break;
-              }
-              // plotRouteToSystem() disarms auto-run; re-arm and retry once.
-              navAutoRun = true;
-              replotted = true;
-              toast(toasts, "Auto-run: replotted route (jump range changed).", 2.6);
-              continue;
-            }
+        const bool routeComplete = (navRoute.empty() || navRouteHop + 1 >= navRoute.size());
+        const bool haveStationTarget = (currentSystem && target.kind == TargetKind::Station &&
+                                        target.index < currentSystem->stations.size());
 
-            const double hopFuel = fsdFuelCostFor(hopDistLy);
-            if (fuel + 1e-6 < hopFuel) {
-              navAutoRun = false;
-              // Best-effort: target the nearest station so the player can refuel.
-              if (currentSystem && !currentSystem->stations.empty()) {
-                const math::Vec3d p = ship.positionKm();
-                std::size_t bestIdx = 0;
-                double bestD2 = 1e300;
-                for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
-                  const auto& st = currentSystem->stations[i];
-                  const math::Vec3d sp = sim::stationPosKm(st, timeDays);
-                  const double d2 = (sp - p).lengthSq();
-                  if (d2 < bestD2) {
-                    bestD2 = d2;
-                    bestIdx = i;
-                  }
+        if (routeComplete) {
+          if (!haveStationTarget) {
+            // Nothing more to do automatically.
+            navAutoRun = false;
+          } else {
+            const auto& st = currentSystem->stations[target.index];
+
+            const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+            const double distKm = (stPos - ship.positionKm()).length();
+            const double dropKm = std::max(15000.0, st.radiusKm * 3.0);
+            const double engageKm = std::max(kNavAutoRunSupercruiseEngageMinKm, dropKm * kNavAutoRunSupercruiseEngageDropMult);
+
+            // If we're far, use supercruise for the long leg; otherwise go straight to auto-dock.
+            if (distKm > engageKm) {
+              // Ensure supercruise assist is ON so we auto-drop safely.
+              if (!supercruiseAssist) {
+                if (!navAutoRunOverrodeSupercruiseAssist) {
+                  navAutoRunSavedSupercruiseAssist = supercruiseAssist;
+                  navAutoRunOverrodeSupercruiseAssist = true;
                 }
-                target.kind = TargetKind::Station;
-                target.index = bestIdx;
-                selectedStationIndex = (int)bestIdx;
-                toast(toasts, "Auto-run stopped: not enough fuel (target set to " + currentSystem->stations[bestIdx].name + ").", 3.0);
-              } else {
-                toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+                supercruiseAssist = true;
               }
+
+              double nearestPirateKm = 1e99;
+              for (const auto& c : contacts) {
+                if (!c.alive || c.role != ContactRole::Pirate) continue;
+                nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
+              }
+              const bool pirateNearby = (nearestPirateKm < 160000.0);
+
+              supercruiseState = SupercruiseState::Charging;
+              supercruiseChargeRemainingSec = kSupercruiseChargeSec;
+              supercruiseDropRequested = false;
+              interdiction = sim::InterdictionState{};
+              interdictionPirateName.clear();
+              interdictionSubmitRequested = false;
+              autopilot = false;
+              dockingComputer.reset();
+              scanning = false;
+              scanProgressSec = 0.0;
+
+              toast(toasts,
+                    pirateNearby ? "Auto-run: supercruise charging... (pirate signals nearby)" : "Auto-run: supercruise charging...",
+                    2.2);
+            } else {
+              // Engage docking computer for the final approach.
+              if (!autopilot) {
+                autopilot = true;
+                dockingComputer.reset();
+                toast(toasts, "Auto-run: docking computer engaged.", 2.0);
+              }
+            }
+          }
+        } else {
+          // Still mid-route: only trigger the next jump after the FSD cooldown.
+          if (timeDays >= fsdReadyDay && !isMassLocked()) {
+            bool replotted = false;
+            for (int attempt = 0; attempt < 2; ++attempt) {
+              if (navRoute.empty() || navRouteHop + 1 >= navRoute.size()) break;
+              const sim::SystemId nextId = navRoute[navRouteHop + 1];
+              const auto& nextSys = universe.getSystem(nextId);
+              const double hopDistLy = (nextSys.stub.posLy - currentSystem->stub.posLy).length();
+
+              const double rangeLy = fsdBaseRangeLy();
+              if (hopDistLy > rangeLy + 1e-9) {
+                // Try a one-shot replot to the final destination using the current planner settings.
+                if (replotted || navRoute.size() < 2) {
+                  navAutoRun = false;
+                  toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                  break;
+                }
+                const sim::SystemId finalDest = navRoute.back();
+                const bool ok = plotRouteToSystem(finalDest, /*showToast=*/false);
+                if (!ok) {
+                  navAutoRun = false;
+                  toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                  break;
+                }
+                // plotRouteToSystem() disarms auto-run; re-arm and retry once.
+                navAutoRun = true;
+                replotted = true;
+                toast(toasts, "Auto-run: replotted route (jump range changed).", 2.6);
+                continue;
+              }
+
+              const double hopFuel = fsdFuelCostFor(hopDistLy);
+              if (fuel + 1e-6 < hopFuel) {
+                navAutoRun = false;
+                // Best-effort: target the nearest station so the player can refuel.
+                if (currentSystem && !currentSystem->stations.empty()) {
+                  const math::Vec3d p = ship.positionKm();
+                  std::size_t bestIdx = 0;
+                  double bestD2 = 1e300;
+                  for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+                    const auto& st2 = currentSystem->stations[i];
+                    const math::Vec3d sp = sim::stationPosKm(st2, timeDays);
+                    const double d2 = (sp - p).lengthSq();
+                    if (d2 < bestD2) {
+                      bestD2 = d2;
+                      bestIdx = i;
+                    }
+                  }
+                  target.kind = TargetKind::Station;
+                  target.index = bestIdx;
+                  selectedStationIndex = (int)bestIdx;
+                  toast(toasts, "Auto-run stopped: not enough fuel (target set to " + currentSystem->stations[bestIdx].name + ").", 3.0);
+                } else {
+                  toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+                }
+                break;
+              }
+
+              startFsdJumpTo(nextId);
+              navAutoRunHoldUntilDays = 0.0;
               break;
             }
-
-            startFsdJumpTo(nextId);
-            navAutoRunHoldUntilDays = 0.0;
-            break;
           }
         }
+      }
+
+      // If auto-run forced supercruise assist ON, restore the player's setting
+      // once auto-run is no longer active (and we're back in normal space).
+      if (!navAutoRun && navAutoRunOverrodeSupercruiseAssist && supercruiseState == SupercruiseState::Idle) {
+        supercruiseAssist = navAutoRunSavedSupercruiseAssist;
+        navAutoRunOverrodeSupercruiseAssist = false;
       }
 
 
@@ -8504,13 +8931,14 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                          const math::Vec3d& targetVelKmS,
                          double desiredDistKm,
                          double maxSpeedKmS,
-                         double faceGain) {
+                         double faceGain,
+                         bool allowBoost = false) {
 	    sim::FlightControlParams fp{};
 	    fp.maxSpeedKmS = maxSpeedKmS;
 	    fp.speedGain = 0.000004;
 	    fp.velGain = 1.8;
 	    fp.desiredDistKm = desiredDistKm;
-	    fp.allowBoost = false;
+	    fp.allowBoost = allowBoost;
 	    fp.dampers = true;
 
 	    sim::AttitudeControlParams ap{};
@@ -8783,12 +9211,117 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     }
   };
 
+  // Small deterministic lateral strafe to make NPCs harder to pin down.
+  // The caller supplies a primary direction (toward target when attacking, away when fleeing).
+  auto applyOrbitStrafe = [&](const Contact& c,
+                             sim::ShipInput& ai,
+                             const math::Vec3d& primaryDirWorld,
+                             double strength01) {
+    if (strength01 <= 1e-6) return;
+
+    math::Vec3d fwd = primaryDirWorld;
+    if (fwd.lengthSq() < 1e-12) return;
+    fwd = fwd.normalized();
+
+    // Choose a deterministic orbit direction per contact.
+    const core::u64 h = core::hashCombine(universe.seed(), c.id);
+    const double sign = ((h & 1ull) != 0ull) ? -1.0 : 1.0;
+
+    math::Vec3d orbit = math::cross(fwd, math::Vec3d{0,1,0});
+    if (orbit.lengthSq() < 1e-12) orbit = math::cross(fwd, math::Vec3d{1,0,0});
+    if (orbit.lengthSq() < 1e-12) orbit = math::cross(fwd, math::Vec3d{0,0,1});
+    if (orbit.lengthSq() > 1e-12) orbit = orbit.normalized() * sign;
+
+    // Add a small out-of-plane component so fights aren't flat.
+    math::Vec3d up = math::cross(orbit, fwd);
+    if (up.lengthSq() > 1e-12) up = up.normalized();
+
+    math::Vec3d eW = orbit * 0.88 + up * 0.35;
+    if (eW.lengthSq() < 1e-12) eW = orbit;
+    if (eW.lengthSq() > 1e-12) eW = eW.normalized();
+
+    const math::Vec3d rW = c.ship.right().normalized();
+    const math::Vec3d uW = c.ship.up().normalized();
+    const math::Vec3d fW = c.ship.forward().normalized();
+
+    math::Vec3d eL{math::dot(rW, eW), math::dot(uW, eW), math::dot(fW, eW)};
+    eL.z = 0.0;
+
+    const double mag = std::sqrt(eL.x * eL.x + eL.y * eL.y);
+    if (mag > 1e-6) {
+      eL.x /= mag;
+      eL.y /= mag;
+    }
+
+    const double strength = std::clamp(strength01, 0.0, 1.0);
+    ai.thrustLocal.x = std::clamp(ai.thrustLocal.x + eL.x * strength, -1.0, 1.0);
+    ai.thrustLocal.y = std::clamp(ai.thrustLocal.y + eL.y * strength, -1.0, 1.0);
+  };
+
   // Contacts AI + combat
   for (auto& c : contacts) {
     if (!c.alive) continue;
 
     // Keep contact dampers in the same local reference frame as the player.
     c.ship.setDampingFrameVelocityKmS(localFrameVelKmS);
+
+    // Missile threat summary (used for power + evasive decisions).
+    const sim::MissileThreatSummary missileThreat = sim::nearestInboundMissile(
+      missiles.data(),
+      missiles.size(),
+      sim::CombatTargetKind::Ship,
+      c.id,
+      c.ship.positionKm(),
+      c.ship.velocityKmS(),
+      npcMissileThreatParams
+    );
+
+    // Dynamic NPC power management: pips + (light) combat jinking.
+    sim::NpcPipContext npcPipCtx{};
+    npcPipCtx.role = (c.role == ContactRole::Police)   ? sim::NpcCombatRole::Police
+                    : (c.role == ContactRole::Pirate)  ? sim::NpcCombatRole::Pirate
+                    :                                   sim::NpcCombatRole::Trader;
+    npcPipCtx.aiSkill = std::clamp(c.aiSkill, 0.0, 1.0);
+    npcPipCtx.shieldFrac = (c.shieldMax > 1e-9) ? std::clamp(c.shield / c.shieldMax, 0.0, 1.0) : 0.0;
+    npcPipCtx.hullFrac = (c.hullMax > 1e-9) ? std::clamp(c.hull / c.hullMax, 0.0, 1.0) : 0.0;
+    npcPipCtx.engCapFrac = (c.distributorCfg.capEng > 1e-9) ? std::clamp(c.distributorState.eng / c.distributorCfg.capEng, 0.0, 1.0) : 0.0;
+    npcPipCtx.wepCapFrac = (c.distributorCfg.capWep > 1e-9) ? std::clamp(c.distributorState.wep / c.distributorCfg.capWep, 0.0, 1.0) : 0.0;
+    npcPipCtx.sysCapFrac = (c.distributorCfg.capSys > 1e-9) ? std::clamp(c.distributorState.sys / c.distributorCfg.capSys, 0.0, 1.0) : 0.0;
+
+    const bool npcFleeingNow = (timeDays < c.fleeUntilDays);
+    const bool npcUnderFireNow = (timeDays < c.underFireUntilDays) || missileThreat.inbound;
+
+    bool policeNearPirate = false;
+    if (c.role == ContactRole::Police && !c.hostileToPlayer) {
+      policeNearPirate = nearestPirateIndex(c.ship.positionKm(), 140000.0).has_value();
+    }
+
+    const bool npcInCombatNow = npcUnderFireNow || npcFleeingNow || c.hostileToPlayer || c.missionTarget
+                               || (c.attackTargetId != 0) || policeNearPirate;
+
+    const sim::WeaponDef pipW = sim::weaponDef(c.weapon);
+    const double distToPlayerKm = (ship.positionKm() - c.ship.positionKm()).length();
+    const double boostDistKm = std::max(60000.0, pipW.rangeKm * 1.35);
+
+    npcPipCtx.inCombat = npcInCombatNow;
+    npcPipCtx.fleeing = npcFleeingNow;
+    npcPipCtx.underFire = npcUnderFireNow;
+    npcPipCtx.missileThreat = missileThreat.inbound;
+    npcPipCtx.wantsToFire = npcInCombatNow && (distToPlayerKm < pipW.rangeKm * 0.95);
+    npcPipCtx.wantsToBoost = npcFleeingNow || (npcInCombatNow && distToPlayerKm > boostDistKm);
+
+    const core::u64 npcSeed = core::hashCombine(universe.seed(), core::hashCombine(c.id, 0x4e504350495053ull));
+    const sim::NpcPipDecision npcPipDec = sim::decideNpcPips(npcPipCtx, npcSeed);
+    const bool npcAllowBoost = npcPipDec.allowBoost;
+    const double npcOrbitStrafe = npcPipDec.orbitStrafe01;
+
+    const double pipsUpdateSec = std::clamp(1.15 - 0.65 * c.aiSkill, 0.45, 1.35);
+    if (timeDays >= c.pipsNextUpdateDays || npcPipCtx.fleeing || npcPipCtx.missileThreat) {
+      c.pips = npcPipDec.pips;
+      sim::normalizePips(c.pips);
+      const double urgency = (npcPipCtx.fleeing || npcPipCtx.missileThreat) ? 0.55 : 1.0;
+      c.pipsNextUpdateDays = timeDays + (pipsUpdateSec * urgency) / 86400.0;
+    }
 
     // Power distributor regen (NPCs share the same capacitor + pip model as the player).
     sim::stepDistributor(c.distributorState, c.distributorCfg, c.pips, dtSim);
@@ -8812,16 +9345,6 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     }
 
     // Missile threat / defense (NPC): deploy countermeasures + apply short evasive strafes.
-    const sim::MissileThreatSummary missileThreat = sim::nearestInboundMissile(
-      missiles.data(),
-      missiles.size(),
-      sim::CombatTargetKind::Ship,
-      c.id,
-      c.ship.positionKm(),
-      c.ship.velocityKmS(),
-      npcMissileThreatParams
-    );
-
     if (missileThreat.inbound) {
       // Consider "under fire" for a short time to bias decisions (morale / flee).
       c.underFireUntilDays = std::max(c.underFireUntilDays, timeDays + (8.0 / 86400.0));
@@ -8946,7 +9469,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         // Break off: run away from the player.
         const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
         const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
-        chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 240000.0, ship.velocityKmS(), 0.0, 0.28, 1.3);
+        chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 240000.0, ship.velocityKmS(), 0.0, 0.28, 1.3, /*allowBoost*/npcAllowBoost);
+        applyOrbitStrafe(c, ai, dir, npcOrbitStrafe);
         applyMissileEvasion(c, ai, missileThreat);
         stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
         continue;
@@ -8979,7 +9503,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         }
       }
 
-      chaseTargetFace(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8, (aimPointKm - c.ship.positionKm()), /*allowBoost*/false);
+      chaseTargetFace(c.ship, ai, aimPos, tgtVel, standOffKm, 0.22, 1.8, (aimPointKm - c.ship.positionKm()), /*allowBoost*/npcAllowBoost);
+      applyOrbitStrafe(c, ai, toPN, npcOrbitStrafe);
       applyMissileEvasion(c, ai, missileThreat);
       stepContactShip(c, dtSim, ai, /*allowGravity=*/true);
 
@@ -9081,6 +9606,9 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                 }
               }
 
+              if (w.guided && c.weaponAmmo == 0) {
+                // Out of missiles.
+              } else {
               const sim::FireResult fr = sim::tryFireWeapon(
                 c.ship,
                 c.weapon,
@@ -9104,6 +9632,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                 }
                 if (fr.hasMissile) {
                   missiles.push_back(fr.missile);
+                  if (fr.hasMissile && w.guided && c.weaponAmmo > 0) c.weaponAmmo = (core::u8)(c.weaponAmmo - 1);
                 }
 
                 if (w.beam && fr.hit) {
@@ -9118,6 +9647,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                     }
                   }
                 }
+              }
               }
             }
           }
@@ -9169,7 +9699,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         // Run away from player.
         const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
         const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
-        chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 200000.0, ship.velocityKmS(), 0.0, 0.25, 1.4);
+        chaseTarget(c.ship, ai, c.ship.positionKm() + dir * 200000.0, ship.velocityKmS(), 0.0, 0.25, 1.4, /*allowBoost*/npcAllowBoost);
       } else if (currentSystem && !currentSystem->stations.empty()) {
         // Hauling between stations in the current system (if possible).
         if (currentSystem->stations.size() >= 2) {
@@ -9299,6 +9829,12 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         }
       }
 
+      if (npcOrbitStrafe > 1e-6) {
+        const math::Vec3d away = (c.ship.positionKm() - ship.positionKm());
+        const math::Vec3d dir = (away.lengthSq() > 1e-6) ? away.normalized() : math::Vec3d{0,0,1};
+        applyOrbitStrafe(c, ai, dir, npcOrbitStrafe);
+      }
+
       applyMissileEvasion(c, ai, missileThreat);
       stepContactShip(c, dtStep, ai, /*allowGravity=*/true);
       continue;
@@ -9364,7 +9900,9 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	            aimPointKm = lead->leadPointKm;
 	          }
 	        }
-	        chaseTargetFace(c.ship, ai, tgtPos, tgtVel, standoff, 0.26, 2.0, aimPointKm - c.ship.positionKm(), false);
+	        chaseTargetFace(c.ship, ai, tgtPos, tgtVel, standoff, 0.26, 2.0, aimPointKm - c.ship.positionKm(), npcAllowBoost);
+        const math::Vec3d to = tgtPos - c.ship.positionKm();
+        if (to.lengthSq() > 1e-6) applyOrbitStrafe(c, ai, to.normalized(), npcOrbitStrafe);
 	      } else if (followTarget) {
 	        const double standoff = 36000.0 + ((c.leaderId != 0) ? 5500.0 : 0.0) + (double)((c.id % 3) * 1200);
 	        chaseTarget(c.ship, ai, followTarget->ship.positionKm(), followTarget->ship.velocityKmS(), standoff, 0.22, 1.8);
@@ -9472,6 +10010,9 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	                }
 	              }
 
+	              if (w.guided && c.weaponAmmo == 0) {
+	                // Out of missiles.
+	              } else {
 	              const sim::FireResult fr = sim::tryFireWeapon(c.ship,
 	                                                          c.weapon,
 	                                                          c.fireCooldown,
@@ -9488,6 +10029,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	                }
 	                if (fr.hasProjectile) projectiles.push_back(fr.projectile);
 	                if (fr.hasMissile) missiles.push_back(fr.missile);
+	                if (fr.hasMissile && w.guided && c.weaponAmmo > 0) c.weaponAmmo = (core::u8)(c.weaponAmmo - 1);
 
 	                if (fr.hit && w.beam) {
 	                  if (fr.hitKind == sim::CombatTargetKind::Player) {
@@ -9511,6 +10053,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	                    }
 	                  }
 	                }
+	              }
 	              }
 	            }
 	          }
@@ -14128,6 +14671,64 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                                                &maneuverDvRadialMS});
     }
 
+
+    // Traffic lanes / convoy layer visualizer
+    {
+      game::TrafficLanesContext tlCtx;
+      tlCtx.universe = universe;
+      tlCtx.currentSystem = currentSystem;
+      tlCtx.timeDays = timeDays;
+      tlCtx.playerPosKm = ship.positionKm();
+      tlCtx.playerVelKmS = ship.velocityKmS();
+      tlCtx.laneParams = trafficLaneParamsGame;
+
+      // Use the live traffic ledger if available; otherwise fall back to deterministic scheduling.
+      tlCtx.trafficLedger = nullptr;
+      if (currentSystem) {
+        auto it = trafficLedgerBySystem.find(currentSystem->stub.id);
+        if (it != trafficLedgerBySystem.end()) tlCtx.trafficLedger = &it->second;
+      }
+
+      // Filter convoys that have already been interdicted/destroyed.
+      tlCtx.isConvoySuppressed = [&](core::u64 convoyId) {
+        return trafficInterdictionsById.find(convoyId) != trafficInterdictionsById.end();
+      };
+
+      // Bridge to the game's Target system (traffic convoys are represented as SignalType::TrafficConvoy).
+      tlCtx.targetTrafficConvoy = [&](core::u64 convoyId) {
+        if (!currentSystem) return;
+        syncTrafficConvoySignals(*currentSystem);
+        for (std::size_t i = 0; i < signals.size(); ++i) {
+          if (signals[i].type == SignalType::TrafficConvoy && signals[i].id == convoyId) {
+            target.kind = TargetKind::Signal;
+            target.index = i;
+            return;
+          }
+        }
+        toast(toasts, "Convoy signal not found (outside current signal window).", 2.2);
+      };
+
+      tlCtx.requestSupercruise = [&]() { uiToggleSupercruise(); };
+      tlCtx.toast = [&](std::string_view msg, double ttlSec) { toast(toasts, std::string(msg), ttlSec); };
+
+      game::drawTrafficLanesWindow(trafficLanesWindow, tlCtx);
+    }
+
+    // System conditions / system-events overview
+    {
+      game::SystemConditionsWindowContext scCtx;
+      scCtx.universe = universe;
+      scCtx.currentSystem = currentSystem;
+      scCtx.timeDays = timeDays;
+      scCtx.systemSecurityDeltaBySystem = &systemSecurityDeltaBySystem;
+      scCtx.dynamicsParams = systemSecurityDynParams;
+      scCtx.eventParams = systemEventParams;
+      scCtx.plotRouteToSystem = [&](sim::SystemId id) { return plotRouteToSystem(id, false); };
+      scCtx.targetSystem = [&](sim::SystemId id) { galaxySelectedSystemId = id; };
+      scCtx.toast = [&](std::string_view msg, double ttlSec) { toast(toasts, std::string(msg), ttlSec); };
+      game::drawSystemConditionsWindow(systemConditionsWindow, scCtx);
+    }
+
     // Photo mode / screenshot capture
     {
       game::PhotoModeContext ctx;
@@ -14326,9 +14927,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         // Missile lock status (guided weapons).
         {
-          auto drawLock = [&](const char* prefix, const MissileLockState& st, WeaponType wt, float yOffPx) {
+          syncWeaponAmmo();
+
+          auto drawLock = [&](const char* prefix, const MissileLockState& st, WeaponType wt, int ammo, float yOffPx) {
             const WeaponDef& wd = weaponDef(wt);
             if (!wd.guided) return;
+
+            char suffix[32] = "";
+            {
+              const int maxAmmo = sim::weaponAmmoMax(wt, shipHullClass);
+              if (maxAmmo > 0) {
+                const int have = std::clamp(ammo, 0, maxAmmo);
+                std::snprintf(suffix, sizeof(suffix), "  %d/%d", have, maxAmmo);
+              }
+            }
 
             std::string tgt = "--";
             if (st.targetId != 0 && st.targetIndex < contacts.size()) {
@@ -14338,20 +14950,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
             char buf[256];
             if (st.targetId != 0 && st.progress >= 0.999) {
-              std::snprintf(buf, sizeof(buf), "%s: %s  LOCKED", prefix, tgt.c_str());
+              std::snprintf(buf, sizeof(buf), "%s: %s  LOCKED%s", prefix, tgt.c_str(), suffix);
             } else if (st.targetId != 0 && st.progress > 0.0) {
               const int pct = (int)std::round(std::clamp(st.progress, 0.0, 1.0) * 100.0);
-              std::snprintf(buf, sizeof(buf), "%s: %s  LOCK %d%%", prefix, tgt.c_str(), pct);
+              std::snprintf(buf, sizeof(buf), "%s: %s  LOCK %d%%%s", prefix, tgt.c_str(), pct, suffix);
             } else {
-              std::snprintf(buf, sizeof(buf), "%s: --", prefix);
+              std::snprintf(buf, sizeof(buf), "%s: --%s", prefix, suffix);
             }
 
             const ImU32 col = hudU32(hudColorText, (190.0f/255.0f) * retA);
             draw->AddText(ImVec2(center.x + baseR + 22.0f, center.y + yOffPx), col, buf);
           };
 
-          drawLock("P", missileLockPrimary, weaponPrimary, -8.0f);
-          drawLock("S", missileLockSecondary, weaponSecondary, +8.0f);
+          drawLock("P", missileLockPrimary, weaponPrimary, (int)weaponAmmoPrimary, -8.0f);
+          drawLock("S", missileLockSecondary, weaponSecondary, (int)weaponAmmoSecondary, +8.0f);
         }
 
 
@@ -15347,6 +15959,97 @@ if (objectiveHudEnabled) {
       ImGui::TextDisabled("Reward %.0f cr", tracked->reward);
     }
 
+    // Cargo-bearing missions: show progress and suggest a nearby cargo source when you're missing units.
+    if ((tracked->type == sim::MissionType::Delivery ||
+         tracked->type == sim::MissionType::MultiDelivery ||
+         tracked->type == sim::MissionType::Smuggle) &&
+        tracked->units > 0.0) {
+
+      const std::size_t ci = (std::size_t)tracked->commodity;
+      if (ci < econ::kCommodityCount) {
+        const double have = std::max(0.0, cargo[ci]);
+        const double need = std::max(0.0, tracked->units);
+        const double missing = std::max(0.0, need - have);
+        const auto def = econ::commodityDef(tracked->commodity);
+
+        if (missing > 1e-6) {
+          ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f),
+                             "Cargo: %.0f / %.0f %s (missing %.0f)",
+                             have, need, def.code, missing);
+
+          // Cache the scan so we don't recompute every frame.
+          static sim::MissionCargoSourcePlan cargoPlan{};
+          static core::u64 cargoPlanMissionId = 0;
+          static sim::SystemId cargoPlanOriginSys = 0;
+          static int cargoPlanStamp = -999999;
+          static econ::CommodityId cargoPlanCommodity = econ::CommodityId::Food;
+          static double cargoPlanMissing = 0.0;
+
+          const int stamp = (int)std::floor(timeDays * 4.0);
+          const bool needRefresh =
+            (cargoPlanMissionId != tracked->id) ||
+            (cargoPlanOriginSys != currentSystem->stub.id) ||
+            (cargoPlanStamp != stamp) ||
+            (cargoPlanCommodity != tracked->commodity) ||
+            (std::abs(cargoPlanMissing - missing) > 0.5);
+
+          if (needRefresh) {
+            cargoPlanMissionId = tracked->id;
+            cargoPlanOriginSys = currentSystem->stub.id;
+            cargoPlanStamp = stamp;
+            cargoPlanCommodity = tracked->commodity;
+            cargoPlanMissing = missing;
+            cargoPlan = sim::planMissionCargoSourcing(universe,
+                                                     *currentSystem,
+                                                     timeDays,
+                                                     tracked->commodity,
+                                                     missing);
+          }
+
+          if (cargoPlan.ok && !cargoPlan.candidates.empty()) {
+            const auto& best = cargoPlan.candidates.front();
+            const double estCost = missing * best.askEffCr;
+
+            const std::string sysName = uiSystemNameById(best.systemId);
+            const std::string stName = uiStationNameById(best.systemId, best.stationId);
+            ImGui::TextDisabled("Source: %s / %s (%.0f ly) ~%.0f cr",
+                                sysName.c_str(),
+                                stName.c_str(),
+                                best.distanceLy,
+                                estCost);
+
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+              ImGui::BeginTooltip();
+              ImGui::Text("Cargo sources for %s:", def.name);
+              ImGui::Separator();
+              for (const auto& c : cargoPlan.candidates) {
+                const std::string sN = uiSystemNameById(c.systemId);
+                const std::string stN = uiStationNameById(c.systemId, c.stationId);
+                ImGui::BulletText("%s / %s  %.0f ly  inv %.0f  ask~%.0f",
+                                  sN.c_str(), stN.c_str(), c.distanceLy,
+                                  c.inventoryUnits, c.askEffCr);
+              }
+              ImGui::EndTooltip();
+            }
+
+            if (ImGui::SmallButton("Plot source")) {
+              if (plotRouteToSystem(best.systemId)) {
+                pendingArrivalTargetStationId = best.stationId;
+                if (currentSystem && best.systemId == currentSystem->stub.id && best.stationId != 0) {
+                  tryTargetStationById(best.stationId);
+                }
+                toast(toasts, "Plotted route to cargo source.", 2.0);
+              }
+            }
+          } else {
+            ImGui::TextDisabled("Source: (none found nearby)");
+          }
+        } else {
+          ImGui::TextDisabled("Cargo: %.0f / %.0f %s", have, need, def.code);
+        }
+      }
+    }
+
     // Escort missions: surface convoy proximity + status to reduce "where did it go?" friction.
     if (tracked->type == sim::MissionType::Escort && !tracked->completed && !tracked->failed) {
       const Contact* convoy = nullptr;
@@ -15424,7 +16127,20 @@ if (objectiveHudEnabled) {
       std::string suffix;
       if (destSys != 0 && navRoute.back() == destSys) suffix = " (mission)";
       ImGui::TextDisabled("Route: %d jumps left | est fuel %.1f%s", remaining, remFuel, suffix.c_str());
-      if (navAutoRun) ImGui::TextDisabled("Auto-run: ON");
+      if (navAutoRun) {
+        const bool routeComplete = (navRoute.empty() || navRouteHop + 1 >= navRoute.size());
+        const char* phase = "ON";
+        if (!routeComplete) {
+          phase = "Jumps";
+        } else if (target.kind == TargetKind::Station) {
+          if (supercruiseState != SupercruiseState::Idle) phase = "Supercruise";
+          else if (autopilot) phase = "Docking";
+          else phase = "To station";
+        } else {
+          phase = "Complete";
+        }
+        ImGui::TextDisabled("Auto-run: %s", phase);
+      }
     } else if (destSys != 0 && currentSystem && destSys != currentSystem->stub.id) {
       ImGui::TextDisabled("No route plotted (Plot Route in Ship/Status).");
     }
@@ -15547,7 +16263,117 @@ if (hudThreatOverlayEnabled && pirateDemand.active && pirateDemand.requiredValue
   const float frac = (need > 1e-6) ? (float)std::clamp(have / need, 0.0, 1.0) : 0.0f;
   ImGui::ProgressBar(frac, ImVec2(240.0f * uiScale, 0.0f));
   ImGui::TextDisabled("Drop cargo value: %.0f / %.0f cr | %.0f s left", have, need, leftSec);
-  ImGui::TextDisabled("Jettison: Ship/Status -> Cargo management");
+
+  const double remainingCr = std::max(0.0, need - have);
+
+  // Reserve mission cargo (prevents accidental dumping like the Market sell guard).
+  std::array<double, econ::kCommodityCount> reservedUnits{};
+  reservedUnits.fill(0.0);
+  for (const auto& m : missions) {
+    if (m.completed || m.failed) continue;
+    if (m.type != sim::MissionType::Delivery
+     && m.type != sim::MissionType::MultiDelivery
+     && m.type != sim::MissionType::Smuggle) continue;
+    const std::size_t idx = (std::size_t)m.commodity;
+    if (idx >= reservedUnits.size()) continue;
+    reservedUnits[idx] += std::max(0.0, m.units);
+  }
+
+  // Show an auto-jettison option so the player doesn't have to hunt through a menu under fire.
+  static bool pirateAutoAllowMissionCargo = false;
+  ImGui::Separator();
+  ImGui::Checkbox("Auto: allow mission cargo", &pirateAutoAllowMissionCargo);
+  ImGui::SameLine();
+  ImGui::TextDisabled("(uses reserved cargo if needed)");
+
+  // Quick witness warning (same heuristic as Cargo management).
+  const auto wit = authorityWitness();
+  if (wit.first) {
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "WARNING: Dump may be witnessed (%s)", wit.second.c_str());
+  }
+
+  // Planner: minimize overpay, then minimize jettisoned mass.
+  const sim::CargoJettisonPlan plan = sim::planCargoJettisonForValue(cargo, reservedUnits, remainingCr, pirateAutoAllowMissionCargo);
+
+  // Summary / details
+  if (remainingCr <= 1e-6) {
+    ImGui::TextDisabled("Tribute delivered.");
+  } else if (!plan.success) {
+    double freeValueCr = 0.0;
+    double reservedValueCr = 0.0;
+    for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+      const double reserved = std::max(0.0, reservedUnits[i]);
+      const double haveU = std::max(0.0, cargo[i]);
+      const double freeU = std::max(0.0, haveU - reserved);
+      freeValueCr += freeU * econ::commodityDef((econ::CommodityId)i).basePrice;
+      reservedValueCr += std::min(haveU, reserved) * econ::commodityDef((econ::CommodityId)i).basePrice;
+    }
+    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Auto: insufficient cargo value");
+    ImGui::TextDisabled("Need %.0f cr | Free %.0f cr | Reserved %.0f cr", remainingCr, freeValueCr, reservedValueCr);
+    ImGui::TextDisabled("Tip: open Ship/Status -> Cargo management to dump manually.");
+  } else {
+    if (plan.usedReserved) {
+      ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.65f, 1.0f), "Auto plan uses mission cargo!");
+    }
+
+    ImGui::TextDisabled("Auto plan: %.0f cr (%.0f kg)", plan.plannedValueCr, plan.plannedMassKg);
+
+    // Compact plan preview (first few lines).
+    int shown = 0;
+    for (const auto& ln : plan.lines) {
+      if (shown >= 3) break;
+      const auto name = econ::commodityName(ln.commodity);
+      ImGui::TextDisabled("- %.*s x%d (%.0f cr)", (int)name.size(), name.data(), (int)std::round(ln.units), ln.valueCr);
+      ++shown;
+    }
+    if ((int)plan.lines.size() > shown) {
+      ImGui::TextDisabled("(+%d more)", (int)plan.lines.size() - shown);
+    }
+
+    if (ImGui::Button("Auto-jettison tribute")) {
+      double dumpedValueCr = 0.0;
+      bool anyContraband = false;
+
+      for (const auto& ln : plan.lines) {
+        const std::size_t idx = (std::size_t)ln.commodity;
+        if (idx >= econ::kCommodityCount) continue;
+        const double reserved = reservedUnits[idx];
+        const double freeU = std::max(0.0, cargo[idx] - reserved);
+        const double maxU = pirateAutoAllowMissionCargo ? cargo[idx] : freeU;
+        const double take = std::min(maxU, std::max(0.0, ln.units));
+        if (take <= 1e-6) continue;
+
+        cargo[idx] = std::max(0.0, cargo[idx] - take);
+        doPlayerJettison(ln.commodity, take);
+        dumpedValueCr += take * econ::commodityDef(ln.commodity).basePrice;
+
+        if (currentSystem && currentSystem->stub.factionId != 0) {
+          if (isIllegalCommodity(currentSystem->stub.factionId, ln.commodity)) anyContraband = true;
+        }
+      }
+
+      if (dumpedValueCr > 1e-6) {
+        toast(toasts, "Auto-jettisoned tribute: " + std::to_string((int)std::round(dumpedValueCr)) + " cr", 2.8);
+
+        // Apply a single crime event if witnessed (mirrors the contraband panic button).
+        if (wit.first) {
+          applyDumpCrime(dumpedValueCr, wit.second, anyContraband);
+        }
+
+        // If this completes the demand, resolve immediately so the pirate pack disengages.
+        if (pirateDemand.deliveredValueCr + 1e-6 >= pirateDemand.requiredValueCr) {
+          resolvePirateDemand(true, src + ": tribute received. We'll take it and leave.");
+        }
+      } else {
+        toast(toasts, "Auto-jettison: nothing to dump.", 2.0);
+      }
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Refuse")) {
+      resolvePirateDemand(false, src + ": last chance. Open fire!");
+    }
+  }
   ImGui::End();
   if (hudLayoutEditMode) ImGui::PopStyleVar();
 }
@@ -17075,59 +17901,6 @@ if (showShip) {
         ImGui::SameLine();
         ImGui::TextDisabled("(dangerous: can strand deliveries/smuggles)");
 
-        // Detect whether an authority is likely to witness the dump (ports/scanners/nearby police).
-        auto authorityWitness = [&]() -> std::pair<bool, std::string> {
-          if (!currentSystem) return {false, ""};
-
-          if (cargoScanActive && cargoScanFactionId != 0) {
-            const std::string src = cargoScanSourceName.empty() ? std::string("Authorities") : cargoScanSourceName;
-            return {true, src};
-          }
-
-          for (const auto& st : currentSystem->stations) {
-            const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
-            const double d = (stPos - ship.positionKm()).length();
-            if (d <= st.commsRangeKm * 1.05) return {true, st.name};
-          }
-
-          for (const auto& c : contacts) {
-            if (!c.alive || c.role != ContactRole::Police) continue;
-            const double d = (c.ship.positionKm() - ship.positionKm()).length();
-            if (d <= 120000.0) {
-              const std::string src = c.name.empty() ? std::string("Police") : c.name;
-              return {true, src};
-            }
-          }
-
-          return {false, ""};
-        };
-
-        auto doJettison = [&](econ::CommodityId what, double units) {
-          if (units <= 1e-6) return;
-          const math::Vec3d fwd = ship.forward().normalized();
-          const math::Vec3d dropPos = ship.positionKm() - fwd * 2600.0 + randUnit() * 250.0;
-          spawnCargoBurst(what, units, dropPos, ship.velocityKmS(), 2 + rng.range(0, 2), true);
-
-          // Counts toward pirate extortion demands (value by base price).
-          if (pirateDemand.active && pirateDemand.requiredValueCr > 0.0) {
-            pirateDemand.deliveredValueCr += units * econ::commodityDef(what).basePrice;
-          }
-        };
-
-        auto applyDumpCrime = [&](double dumpedValueCr, const std::string& witnessName, bool contraband) {
-          if (!currentSystem) return;
-          const core::u32 j = currentSystem->stub.factionId;
-          if (j == 0) return;
-
-          const double bountyAdd = (contraband ? 250.0 : 110.0) + dumpedValueCr * (contraband ? 0.22 : 0.12);
-          const double repPenalty = -std::clamp(0.8 + dumpedValueCr / (contraband ? 4200.0 : 6500.0), 0.8, contraband ? 8.0 : 5.0);
-
-          commitCrime(j, bountyAdd, repPenalty, (contraband ? "contraband dumping" : "cargo dumping") + std::string(" reported by ") + witnessName, false);
-          toast(toasts,
-                witnessName + ": illegal dumping detected. Bounty +" + std::to_string((int)std::round(bountyAdd)) + " cr",
-                3.0);
-        };
-
         // Jettison selected commodity
         {
           const double maxUnits = allowDumpMissionCargo ? cargo[ci] : freeUnits;
@@ -17138,7 +17911,7 @@ if (showShip) {
           ImGui::BeginDisabled(!can);
           if (ImGui::Button("Jettison")) {
             cargo[ci] = std::max(0.0, cargo[ci] - take);
-            doJettison(cid, take);
+            doPlayerJettison(cid, take);
 
             const bool contraband = (currentSystem && currentSystem->stub.factionId != 0)
                                       ? isIllegalCommodity(currentSystem->stub.factionId, cid)
@@ -17189,7 +17962,7 @@ if (showShip) {
               if (free <= 1e-6) continue;
 
               cargo[i] = std::max(0.0, cargo[i] - free);
-              doJettison(c, free);
+              doPlayerJettison(c, free);
               dumpedValue += free * econ::commodityDef(c).basePrice;
               dumpedTypes++;
             }
@@ -17220,6 +17993,15 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
       ImGui::TextDisabled("Smuggling compartments: none");
     }
     ImGui::Text("Weapons: LMB %s | RMB %s", weaponDef(weaponPrimary).name, weaponDef(weaponSecondary).name);
+    {
+      const int maxP = sim::weaponAmmoMax(weaponPrimary, shipHullClass);
+      const int maxS = sim::weaponAmmoMax(weaponSecondary, shipHullClass);
+      if (maxP > 0 || maxS > 0) {
+        syncWeaponAmmo();
+        if (maxP > 0) ImGui::TextDisabled("LMB missiles: %d/%d", (int)weaponAmmoPrimary, maxP);
+        if (maxS > 0) ImGui::TextDisabled("RMB missiles: %d/%d", (int)weaponAmmoSecondary, maxS);
+      }
+    }
     ImGui::TextDisabled("Accel %.3f km/s^2 | Turn %.2f rad/s^2", playerBaseLinAccelKmS2, playerBaseAngAccelRadS2);
   }
 
@@ -17422,7 +18204,22 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
     }
 
     ImGui::Text("Route: %d jumps (%d remaining) | est fuel %.1f", totalJumps, remaining, remFuel);
-    ImGui::TextDisabled("Auto-run: %s", navAutoRun ? "ON" : "OFF");
+    if (navAutoRun) {
+      const bool routeComplete = (navRoute.empty() || navRouteHop + 1 >= navRoute.size());
+      const char* phase = "ON";
+      if (!routeComplete) {
+        phase = "Jumps";
+      } else if (target.kind == TargetKind::Station) {
+        if (supercruiseState != SupercruiseState::Idle) phase = "Supercruise";
+        else if (autopilot) phase = "Docking";
+        else phase = "To station";
+      } else {
+        phase = "Complete";
+      }
+      ImGui::TextDisabled("Auto-run: %s", phase);
+    } else {
+      ImGui::TextDisabled("Auto-run: OFF");
+    }
 
     if (remFuel > fuel + 1e-6) {
       ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "Fuel shortfall: +%.1f", remFuel - fuel);
@@ -20010,6 +20807,69 @@ if (showScanner) {
             ImGui::TextDisabled("(%d, %.0f cr)", needH, costH);
           }
 
+          {
+            ImGui::Separator();
+            ImGui::Text("Ordnance");
+            syncWeaponAmmo();
+
+            auto drawOrdnanceSlot = [&](const char* slotName, const char* btnLabel, WeaponType wt, core::u8& ammo) {
+              const int maxAmmo = sim::weaponAmmoMax(wt, shipHullClass);
+              if (maxAmmo <= 0) return;
+
+              const int have = std::clamp((int)ammo, 0, maxAmmo);
+              ammo = (core::u8)have;
+              const int need = maxAmmo - have;
+              const double unitEff = sim::weaponAmmoUnitPriceCr(wt) * (1.0 + feeEff);
+              const double cost = (double)need * unitEff;
+
+              ImGui::TextDisabled("%s: %s  %d/%d", slotName, weaponDef(wt).name, have, maxAmmo);
+              ImGui::SameLine();
+              ImGui::BeginDisabled(need <= 0);
+              if (ImGui::SmallButton(btnLabel)) {
+                if (credits + 1e-9 >= cost) {
+                  credits -= cost;
+                  ammo = (core::u8)maxAmmo;
+                  toast(toasts, std::string(slotName) + " missiles rearmed.", 1.8);
+                } else {
+                  toast(toasts, "Not enough credits.", 1.6);
+                }
+              }
+              ImGui::EndDisabled();
+              ImGui::SameLine();
+              ImGui::TextDisabled("(%d, %.0f cr)", need, cost);
+            };
+
+            const int maxP = sim::weaponAmmoMax(weaponPrimary, shipHullClass);
+            const int maxS = sim::weaponAmmoMax(weaponSecondary, shipHullClass);
+            const int needP = (maxP > 0) ? (maxP - (int)std::clamp((int)weaponAmmoPrimary, 0, maxP)) : 0;
+            const int needS = (maxS > 0) ? (maxS - (int)std::clamp((int)weaponAmmoSecondary, 0, maxS)) : 0;
+            const int needAll = needP + needS;
+
+            if (maxP <= 0 && maxS <= 0) {
+              ImGui::TextDisabled("No ammo-based weapons installed.");
+            } else {
+              if (maxP > 0) drawOrdnanceSlot("LMB", "Rearm LMB", weaponPrimary, weaponAmmoPrimary);
+              if (maxS > 0) drawOrdnanceSlot("RMB", "Rearm RMB", weaponSecondary, weaponAmmoSecondary);
+
+              const double costAll = (double)needP * sim::weaponAmmoUnitPriceCr(weaponPrimary) * (1.0 + feeEff)
+                + (double)needS * sim::weaponAmmoUnitPriceCr(weaponSecondary) * (1.0 + feeEff);
+              ImGui::BeginDisabled(needAll <= 0);
+              if (ImGui::Button("Rearm all missiles")) {
+                if (credits + 1e-9 >= costAll) {
+                  credits -= costAll;
+                  if (maxP > 0) weaponAmmoPrimary = (core::u8)maxP;
+                  if (maxS > 0) weaponAmmoSecondary = (core::u8)maxS;
+                  toast(toasts, "All missiles rearmed.", 1.9);
+                } else {
+                  toast(toasts, "Not enough credits.", 1.6);
+                }
+              }
+              ImGui::EndDisabled();
+              ImGui::SameLine();
+              ImGui::TextDisabled("(%.0f cr)", costAll);
+            }
+          }
+
           // Insurance debt service: pay down emergency loan at any station.
           if (insuranceDebtCr > 0.01) {
             ImGui::Separator();
@@ -20539,6 +21399,12 @@ if (showScanner) {
                   if (credits + 1e-6 >= cost) {
                     credits -= cost;
                     wVar = newW;
+                    if (isPrimary) {
+                      weaponAmmoPrimary = 255;
+                    } else {
+                      weaponAmmoSecondary = 255;
+                    }
+                    syncWeaponAmmo();
                     toast(toasts, "Weapon installed: " + std::string(weaponDef(newW).name), 1.8);
                   } else {
                     toast(toasts, "Not enough credits.", 2.0);
@@ -21793,7 +22659,37 @@ if (canTrade) {
               const double have = (ci < econ::kCommodityCount) ? cargo[ci] : 0.0;
               const double need = m.units;
               if (have + 1e-6 < need) {
-                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Cargo: %.0f / %.0f (missing %.0f)", have, need, need - have);
+                const double missing = std::max(0.0, need - have);
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Cargo: %.0f / %.0f (missing %.0f)", have, need, missing);
+
+                // Quick logistics helper: find a nearby station that sells the missing commodity.
+                if (currentSystem) {
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Find source")) {
+                    const auto plan = sim::planMissionCargoSourcing(universe,
+                                                                   *currentSystem,
+                                                                   timeDays,
+                                                                   m.commodity,
+                                                                   missing);
+                    if (!plan.ok || plan.candidates.empty()) {
+                      toast(toasts, "No nearby station found with the required cargo.", 2.4);
+                    } else {
+                      const auto& best = plan.candidates.front();
+                      if (plotRouteToSystem(best.systemId)) {
+                        pendingArrivalTargetStationId = best.stationId;
+                        galaxySelectedSystemId = best.systemId;
+                        showGalaxy = true;
+                        toast(toasts, "Plotted route to cargo source.", 2.2);
+                      }
+                    }
+                  }
+                  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    ImGui::BeginTooltip();
+                    ImGui::TextUnformatted("Plot a route to a nearby station selling the missing cargo.");
+                    ImGui::TextDisabled("(Inventory/prices are estimates and can change over time.)");
+                    ImGui::EndTooltip();
+                  }
+                }
               } else {
                 ImGui::TextDisabled("Cargo: %.0f / %.0f", have, need);
               }
@@ -21921,19 +22817,27 @@ board.cargoCapacityKg = cargoCapacityKg;
 board.cargo = cargo;
 board.passengerSeats = passengerSeats;
 
-// Provide this system's dynamic security delta (if any) so mission weights
-// reflect recent events (pirate waves, crackdowns, disrupted traffic, etc.).
-if (currentSystem) {
-  if (const auto itD = systemSecurityDeltaBySystem.find(currentSystem->stub.id);
-      itD != systemSecurityDeltaBySystem.end()) {
-    board.systemSecurityDeltas.clear();
-    board.systemSecurityDeltas.push_back(itD->second);
-  }
+// Provide dynamic security deltas so mission offers can react not only to the
+// current system's state, but also to conditions in potential destinations.
+//
+// Note: we store these as a vector in SaveGame, so keep ordering stable.
+board.systemSecurityDeltas.clear();
+board.systemSecurityDeltas.reserve(systemSecurityDeltaBySystem.size());
+for (const auto& kv : systemSecurityDeltaBySystem) {
+  board.systemSecurityDeltas.push_back(kv.second);
 }
+std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
+          [](const sim::SystemSecurityDeltaState& a, const sim::SystemSecurityDeltaState& b) {
+            return a.systemId < b.systemId;
+          });
                 board.missionOffersStationId = missionOffersStationId;
                 board.missionOffersDayStamp = missionOffersDayStamp;
                 board.missionOffers = missionOffers;
-                sim::refreshMissionOffers(universe, *currentSystem, st, timeDays, rep, board);
+                sim::MissionBoardParams mbParams{};
+                mbParams.dynamicsParams = systemSecurityDynParams;
+                mbParams.eventParams = systemEventParams;
+                mbParams.applyDestinationSecurityDeltas = true;
+                sim::refreshMissionOffers(universe, *currentSystem, st, timeDays, rep, board, mbParams);
                 missionOffersStationId = board.missionOffersStationId;
                 missionOffersDayStamp = board.missionOffersDayStamp;
                 missionOffers = std::move(board.missionOffers);
@@ -22241,6 +23145,13 @@ if (currentSystem) {
 if (showContacts) {
   ImGui::Begin("Contacts / Combat");
 
+  // Shared context for the whole window (avoid O(N^2) work inside the contacts loop).
+  const auto contactsWit = authorityWitness();
+  const bool contactsPoliceNearby = contactsWit.first;
+  const auto contactsSec = (currentSystem ? effectiveSystemSecurityProfile(*currentSystem) : sim::SystemSecurityProfile{});
+  const double contactsPlayerDmg = weaponDef(weaponPrimary).dmg + 0.65 * weaponDef(weaponSecondary).dmg;
+  const double contactsAttackerStrength = std::max(1.0, playerHullMax + playerShieldMax + 18.0 * contactsPlayerDmg);
+
   int alivePirates = 0;
   int aliveTraders = 0;
   int alivePolice = 0;
@@ -22283,7 +23194,7 @@ if (showContacts) {
   ImGui::Separator();
 
   for (std::size_t i = 0; i < contacts.size(); ++i) {
-    const auto& c = contacts[i];
+    auto& c = contacts[i];
     if (!c.alive) continue;
 
     const double distKm = (c.ship.positionKm() - ship.positionKm()).length();
@@ -22354,6 +23265,55 @@ if (showContacts) {
                             c.cargoValueCr);
       } else {
         ImGui::TextDisabled("En route -> %s | Empty hold (piracy is illegal).", destName.c_str());
+      }
+
+      // Player piracy option: attempt cargo extortion.
+      const bool hasCargo = (c.tradeUnits > 1e-6) && ((int)c.tradeCommodity >= 0) && (c.tradeCommodity < econ::kCommodityCount);
+      const bool inRange = (distKm <= 120000.0);
+
+      bool coolingDown = false;
+      double cdSec = 0.0;
+      if (auto it = playerExtortionCooldownUntilDaysByTarget.find(c.id); it != playerExtortionCooldownUntilDaysByTarget.end()) {
+        if (timeDays < it->second) {
+          coolingDown = true;
+          cdSec = std::max(0.0, (it->second - timeDays) * 86400.0);
+        }
+      }
+
+      const double cargoValueCr = std::max({0.0, c.tradeCargoValueCr, c.cargoValueCr});
+      const double trgDmg = weaponDef(c.weapon).dmg;
+      const double defenderStrength = std::max(1.0, c.hullMax + c.shieldMax + 18.0 * trgDmg);
+      const auto plan = sim::planExtortionDemand(universe.seed(), c.id,
+                                                 cargoValueCr,
+                                                 contactsAttackerStrength, defenderStrength,
+                                                 contactsSec.security01,
+                                                 contactsPoliceNearby);
+
+      const bool canDemand = hasCargo && inRange && !coolingDown && plan.offer;
+
+      ImGui::BeginDisabled(!canDemand);
+      if (ImGui::SmallButton("Demand cargo")) {
+        playerExtortTrader(c);
+      }
+      ImGui::EndDisabled();
+
+      if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        if (!inRange) {
+          ImGui::Text("Out of comms range (<= 120000 km)");
+        }
+        if (!hasCargo) {
+          ImGui::Text("No cargo");
+        }
+        if (coolingDown) {
+          ImGui::Text("Cooldown: %.0fs", cdSec);
+        }
+        ImGui::Separator();
+        ImGui::Text("Demand: ~%.0f cr", plan.demandedValueCr);
+        ImGui::Text("Compliance: %.0f%%", plan.complyChance01 * 100.0);
+        ImGui::TextDisabled("Authorities nearby: %s", contactsPoliceNearby ? "yes" : "no");
+        ImGui::TextDisabled("If witnessed, this can generate a bounty.");
+        ImGui::EndTooltip();
       }
     }
 
@@ -23366,6 +24326,10 @@ if (showContacts) {
             }
 
             ImGui::Checkbox("Auto-run route", &navAutoRun);
+            if (ImGui::IsItemHovered()) {
+              ImGui::SetTooltip("Hands-free travel. When the route completes, auto-run can continue\n"
+                                "to a targeted station (supercruise + auto-dock).");
+            }
 
             if (!navRoute.empty()) {
               const int totalJumps = (int)navRoute.size() - 1;
@@ -25535,7 +26499,7 @@ draw_command_palette:
                   [&]() { pushChord(controls.actions.fsdJump); });
           addItem("Supercruise", "Enter/Exit", game::chordLabel(controls.actions.supercruise), canAct,
                   [&]() { pushChord(controls.actions.supercruise); });
-          addItem("Autopilot", (autopilotEnabled ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleAutopilot), canAct,
+          addItem("Autopilot", (autopilot ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleAutopilot), canAct,
                   [&]() { pushChord(controls.actions.toggleAutopilot); });
           addItem("Dock", "Dock/Undock", game::chordLabel(controls.actions.dockOrUndock), canAct,
                   [&]() { pushChord(controls.actions.dockOrUndock); });

@@ -147,6 +147,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SecurityModel.cpp
   src/sim/SystemSecurityDynamics.cpp
   src/sim/SystemEvents.cpp
+  src/sim/SystemConditions.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
   src/sim/DockingClearanceService.cpp
@@ -155,6 +156,9 @@ set(STELLAR_CORE_SOURCES
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
+  src/sim/Extortion.cpp
+  src/sim/NpcCombatAI.cpp
+  src/sim/CargoJettisonPlanner.cpp
   src/sim/Distress.cpp
   src/sim/Derelict.cpp
   src/sim/ResourceField.cpp
@@ -176,8 +180,10 @@ set(STELLAR_CORE_SOURCES
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
   src/sim/TradeRunPlanner.cpp
+  src/sim/MarketAnalysis.cpp
   src/sim/Universe.cpp
   src/sim/NavRoute.cpp
+  src/sim/MissionAssist.cpp
   src/sim/MissionLogic.cpp
 
   src/econ/Commodity.cpp
@@ -254,6 +260,8 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/FlightRecorderWindow.cpp
     apps/stellar_game/CinematicCameraWindow.cpp
     apps/stellar_game/OrbitAnalyzerWindow.cpp
+    apps/stellar_game/TrafficLanesWindow.cpp
+    apps/stellar_game/SystemConditionsWindow.cpp
     apps/stellar_game/PorkchopPlot.cpp
     apps/stellar_game/Screenshot.cpp
     apps/stellar_game/PhotoModeWindow.cpp
