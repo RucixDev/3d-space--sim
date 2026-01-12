@@ -4,6 +4,7 @@
 #include "stellar/math/Math.h"
 #include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/Universe.h"
+#include "stellar/sim/Units.h"
 
 #include "imgui.h"
 

@@ -1,6 +1,6 @@
 #include "stellar/sim/NpcCombatAI.h"
 
-#include "tests/test_harness.h"
+#include "test_harness.h"
 
 #include <iostream>
 
@@ -13,7 +13,7 @@ static void checkPipsInvariant(const sim::Pips& p, int& failures) {
   CHECK(p.eng <= sim::kPipMax);
   CHECK(p.wep <= sim::kPipMax);
   CHECK(p.sys <= sim::kPipMax);
-  CHECK(p.total() == sim::kPipTotal);
+  CHECK((p.eng + p.wep + p.sys) == sim::kPipTotal);
 }
 
 int test_npc_combat_ai() {

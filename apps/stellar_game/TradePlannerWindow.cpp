@@ -929,16 +929,31 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
             ImGui::Text("Inputs:");
             const auto inACode = stellar::econ::commodityCode(t.inputA);
 
-            ImGui::BulletText(\"%.*s x%.0f  (ask %.0f)  cost %.0f cr\", (int)inACode.size(), inACode.data(), t.inputAUnits, t.inputAAsk, t.inputACostCr);
+            ImGui::BulletText("%.*s x%.0f  (ask %.0f)  cost %.0f cr",
+                              (int)inACode.size(),
+                              inACode.data(),
+                              t.inputAUnits,
+                              t.inputAAsk,
+                              t.inputACostCr);
             if (t.inputBUnits > 0.0) {
               const auto inBCode = stellar::econ::commodityCode(t.inputB);
 
-              ImGui::BulletText(\"%.*s x%.0f  (ask %.0f)  cost %.0f cr\", (int)inBCode.size(), inBCode.data(), t.inputBUnits, t.inputBAsk, t.inputBCostCr);
+              ImGui::BulletText("%.*s x%.0f  (ask %.0f)  cost %.0f cr",
+                                (int)inBCode.size(),
+                                inBCode.data(),
+                                t.inputBUnits,
+                                t.inputBAsk,
+                                t.inputBCostCr);
             }
             ImGui::BulletText("Service fee %.0f cr", t.serviceFeeCr);
 
             ImGui::Text("Output:");
-            ImGui::BulletText(\"%.*s x%.0f  (bid %.0f)  revenue %.0f cr\", (int)outCode.size(), outCode.data(), t.outputUnits, t.outputBid, t.outputRevenueCr);
+            ImGui::BulletText("%.*s x%.0f  (bid %.0f)  revenue %.0f cr",
+                              (int)outCode.size(),
+                              outCode.data(),
+                              t.outputUnits,
+                              t.outputBid,
+                              t.outputRevenueCr);
 
             ImGui::TextDisabled("Net: %.0f cr  |  %.0f cr/kg  |  %.0f cr/day",
                                 t.netProfitCr, t.netProfitPerKg, t.netProfitPerDay);
