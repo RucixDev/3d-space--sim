@@ -91,7 +91,10 @@ float fade(float t) {
   return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
 }
 
-float noise3(vec3 x) {
+// NOTE: GLSL defines deprecated built-in functions named noise1/noise2/noise3/noise4.
+// Some drivers still expose these in core profiles. Avoid colliding with them by
+// using a project-specific name.
+float stellarNoise3(vec3 x) {
   vec3 i = floor(x);
   vec3 f = fract(x);
   vec3 u = vec3(fade(f.x), fade(f.y), fade(f.z));
@@ -122,7 +125,7 @@ float fbm(vec3 p) {
   float amp = 0.55;
   float freq = 1.0;
   for (int i = 0; i < 5; ++i) {
-    sum += amp * noise3(p * freq);
+    sum += amp * stellarNoise3(p * freq);
     freq *= 2.0;
     amp *= 0.5;
   }

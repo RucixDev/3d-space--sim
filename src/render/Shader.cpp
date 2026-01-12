@@ -2,9 +2,74 @@
 
 #include "stellar/render/Gl.h"
 
+#include <algorithm>
+#include <cctype>
+#include <sstream>
 #include <vector>
 
 namespace stellar::render {
+
+static const char* shaderStageName(unsigned int type) {
+  switch (type) {
+    case GL_VERTEX_SHADER:
+      return "vertex";
+    case GL_FRAGMENT_SHADER:
+      return "fragment";
+    default:
+      return "shader";
+  }
+}
+
+static int tryParseGlslErrorLine(std::string_view log) {
+  // Common formats:
+  //  - "ERROR: 0:63: ..."
+  //  - "0:63(12): error: ..."
+  //  - "0(63) : error ..."
+  auto parseDigits = [](std::string_view s, std::size_t i) -> int {
+    int v = 0;
+    bool any = false;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+      any = true;
+      v = v * 10 + (s[i] - '0');
+      ++i;
+    }
+    return any ? v : -1;
+  };
+
+  if (auto pos = log.find("0:"); pos != std::string_view::npos) {
+    int line = parseDigits(log, pos + 2);
+    if (line > 0) return line;
+  }
+  if (auto pos = log.find("0("); pos != std::string_view::npos) {
+    int line = parseDigits(log, pos + 2);
+    if (line > 0) return line;
+  }
+  return -1;
+}
+
+static void appendSourceExcerpt(std::string& out, std::string_view src, int lineNo, int radius = 4) {
+  if (lineNo <= 0) return;
+
+  const int start = std::max(1, lineNo - radius);
+  const int end = lineNo + radius;
+
+  out += "\n--- GLSL source excerpt ---\n";
+
+  std::istringstream iss(std::string(src));
+  std::string line;
+  int cur = 1;
+  while (std::getline(iss, line)) {
+    if (cur >= start && cur <= end) {
+      out += (cur == lineNo) ? "> " : "  ";
+      out += std::to_string(cur);
+      out += ": ";
+      out += line;
+      out += "\n";
+    }
+    if (cur > end) break;
+    ++cur;
+  }
+}
 
 static unsigned int compile(unsigned int type, std::string_view src, std::string* outError) {
   unsigned int sh = gl::CreateShader(type);
@@ -22,7 +87,10 @@ static unsigned int compile(unsigned int type, std::string_view src, std::string
     gl::GetShaderInfoLog(sh, logLen, nullptr, log.data());
 
     if (outError) {
-      *outError = std::string("Shader compile failed: ") + log.data();
+      std::string msg = std::string("Shader compile failed (") + shaderStageName(type) + "): " + log.data();
+      const int lineNo = tryParseGlslErrorLine(log.data());
+      appendSourceExcerpt(msg, src, lineNo);
+      *outError = std::move(msg);
     }
     gl::DeleteShader(sh);
     return 0;
