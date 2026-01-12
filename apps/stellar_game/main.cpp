@@ -5009,7 +5009,7 @@ if (currentSystem) {
       toast(toasts, "No cargo to extort", 1.8);
       return;
     }
-    if ((int)trg.tradeCommodity < 0 || trg.tradeCommodity >= econ::kCommodityCount) {
+    if (static_cast<std::size_t>(trg.tradeCommodity) >= econ::kCommodityCount) {
       toast(toasts, "Unknown cargo", 1.8);
       return;
     }
@@ -9576,7 +9576,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       sim::PirateSquadContext ctx{};
       ctx.security01 = sysSecurity01;
       ctx.piracy01 = sysPiracy01;
-      ctx.playerCargoValueCr = playerCargoValueCr * (0.85 + 0.30 * sysTraffic01);
+      ctx.playerCargoValueCr = cargoValueEstimateCr() * (0.85 + 0.30 * sysTraffic01);
       ctx.committedRaid = g.committedRaid;
 
       const auto d = sim::evaluatePirateSquad(snap, ctx, universe.seed(), gid);
@@ -14613,7 +14613,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const auto& sched = fg.schedule();
 
         auto findPassByName = [&](const std::string& name) -> const render::FrameGraph::PassInfo* {
-          for (const auto& p : sched.passes) {
+          const auto& passes = fg.passes();
+          for (int passId : sched) {
+            if (passId < 0 || passId >= (int)passes.size()) continue;
+            const auto& p = passes[(std::size_t)passId];
             if (p.name == name) return &p;
           }
           return nullptr;
@@ -15587,10 +15590,64 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
 
+
+    // Mirror the keyboard 'H' supercruise toggle as a shared UI action.
+    auto uiToggleSupercruise = [&]() {
+      if (docked) { toast(toasts, "Undock to use supercruise.", 1.8); return; }
+      if (fsdState != FsdState::Idle) { toast(toasts, "Supercruise unavailable in hyperspace.", 2.0); return; }
+
+      if (supercruiseState == SupercruiseState::Idle) {
+        if (target.kind == TargetKind::None) {
+          toast(toasts, "No nav target set.", 1.8);
+          return;
+        }
+
+        double nearestPirateKm = 1e99;
+        for (const auto& c : contacts) {
+          if (!c.alive || c.role != ContactRole::Pirate) continue;
+          nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
+        }
+        const bool pirateNearby = (nearestPirateKm < 160000.0);
+
+        supercruiseState = SupercruiseState::Charging;
+        supercruiseChargeRemainingSec = kSupercruiseChargeSec;
+        supercruiseDropRequested = false;
+        interdiction = sim::InterdictionState{};
+        interdictionPirateName.clear();
+        interdictionSubmitRequested = false;
+        autopilot = false;
+        dockingComputer.reset();
+        scanning = false;
+        scanProgressSec = 0.0;
+        navAutoRun = false;
+
+        toast(toasts,
+              pirateNearby ? "Supercruise charging... (pirate signals nearby)" : "Supercruise charging...",
+              1.8);
+      } else if (supercruiseState == SupercruiseState::Charging) {
+        supercruiseState = SupercruiseState::Idle;
+        supercruiseChargeRemainingSec = 0.0;
+        interdiction = sim::InterdictionState{};
+        interdictionPirateName.clear();
+        interdictionSubmitRequested = false;
+        toast(toasts, "Supercruise canceled.", 1.4);
+      } else if (supercruiseState == SupercruiseState::Active) {
+        if (sim::interdictionInProgress(interdiction)) {
+          interdictionSubmitRequested = true;
+          toast(toasts, "Submitted to interdiction.", 1.4);
+        } else {
+          supercruiseDropRequested = true;
+          toast(toasts, "Drop requested.", 1.2);
+        }
+      } else {
+        toast(toasts, "Supercruise cooling down...", 1.6);
+      }
+    };
+
+
     // Traffic lanes / convoy layer visualizer
     {
-      game::TrafficLanesContext tlCtx;
-      tlCtx.universe = universe;
+      game::TrafficLanesContext tlCtx{universe};
       tlCtx.currentSystem = currentSystem;
       tlCtx.timeDays = timeDays;
       tlCtx.playerPosKm = ship.positionKm();
@@ -15631,8 +15688,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // System conditions / system-events overview
     {
-      game::SystemConditionsWindowContext scCtx;
-      scCtx.universe = universe;
+      game::SystemConditionsWindowContext scCtx{universe};
       scCtx.currentSystem = currentSystem;
       scCtx.timeDays = timeDays;
       scCtx.systemSecurityDeltaBySystem = &systemSecurityDeltaBySystem;
@@ -21065,58 +21121,7 @@ if (showScanner) {
       const auto& atlasTex = hudAtlas.texture();
       const ImTextureID atlasId = (ImTextureID)(intptr_t)atlasTex.handle();
 
-      // Mirror the keyboard 'H' supercruise toggle as a UI action.
-      auto uiToggleSupercruise = [&]() {
-        if (docked) { toast(toasts, "Undock to use supercruise.", 1.8); return; }
-        if (fsdState != FsdState::Idle) { toast(toasts, "Supercruise unavailable in hyperspace.", 2.0); return; }
-
-        if (supercruiseState == SupercruiseState::Idle) {
-          if (target.kind == TargetKind::None) {
-            toast(toasts, "No nav target set.", 1.8);
-            return;
-          }
-
-          double nearestPirateKm = 1e99;
-          for (const auto& c : contacts) {
-            if (!c.alive || c.role != ContactRole::Pirate) continue;
-            nearestPirateKm = std::min(nearestPirateKm, (c.ship.positionKm() - ship.positionKm()).length());
-          }
-          const bool pirateNearby = (nearestPirateKm < 160000.0);
-
-          supercruiseState = SupercruiseState::Charging;
-          supercruiseChargeRemainingSec = kSupercruiseChargeSec;
-          supercruiseDropRequested = false;
-          interdiction = sim::InterdictionState{};
-          interdictionPirateName.clear();
-          interdictionSubmitRequested = false;
-          autopilot = false;
-          dockingComputer.reset();
-          scanning = false;
-          scanProgressSec = 0.0;
-          navAutoRun = false;
-
-          toast(toasts,
-                pirateNearby ? "Supercruise charging... (pirate signals nearby)" : "Supercruise charging...",
-                1.8);
-        } else if (supercruiseState == SupercruiseState::Charging) {
-          supercruiseState = SupercruiseState::Idle;
-          supercruiseChargeRemainingSec = 0.0;
-          interdiction = sim::InterdictionState{};
-          interdictionPirateName.clear();
-          interdictionSubmitRequested = false;
-          toast(toasts, "Supercruise canceled.", 1.4);
-        } else if (supercruiseState == SupercruiseState::Active) {
-          if (sim::interdictionInProgress(interdiction)) {
-            interdictionSubmitRequested = true;
-            toast(toasts, "Submitted to interdiction.", 1.4);
-          } else {
-            supercruiseDropRequested = true;
-            toast(toasts, "Drop requested.", 1.2);
-          }
-        } else {
-          toast(toasts, "Supercruise cooling down...", 1.6);
-        }
-      };
+      // Supercruise toggle action is defined once above and reused across UI panels.
 
       auto centerOnStar = [&]() {
         map.followShip = false;
@@ -23611,7 +23616,7 @@ if (canTrade) {
         showGalaxy = true;
         return plotRouteToSystem(sysId, /*showToast=*/true);
       };
-      lctx.targetStationById = [&](sim::StationId stId) {
+      lctx.targetStation = [&](sim::StationId stId) {
         if (stId != 0) tryTargetStationById(stId);
       };
       lctx.toast = [&](std::string_view msg, double ttlSec) {
@@ -24885,7 +24890,7 @@ if (showContacts) {
       }
 
       // Player piracy option: attempt cargo extortion.
-      const bool hasCargo = (c.tradeUnits > 1e-6) && ((int)c.tradeCommodity >= 0) && (c.tradeCommodity < econ::kCommodityCount);
+      const bool hasCargo = (c.tradeUnits > 1e-6) && (static_cast<std::size_t>(c.tradeCommodity) < econ::kCommodityCount);
       const bool inRange = (distKm <= 120000.0);
 
       bool coolingDown = false;
@@ -24945,6 +24950,7 @@ if (showContacts) {
 
       const auto center = currentSystem->stub.posLy;
       static float radius = 200.0f;
+      static bool mapShowHeatmap = true;
       ImGui::SliderFloat("Query radius (ly)", &radius, 20.0f, 2000.0f);
 
       auto nearby = universe.queryNearby(center, radius, 256);
@@ -25064,7 +25070,6 @@ if (showContacts) {
       static bool mapShowRoute = true;
 
       // System conditions heatmap (Security / Piracy / Traffic / Danger).
-      static bool mapShowHeatmap = true;
       static int mapHeatMode = 0; // 0=Security, 1=Piracy, 2=Traffic, 3=Danger
       static bool mapHeatUseDynamic = true;
       static bool mapHeatLegend = true;
@@ -28144,7 +28149,7 @@ draw_command_palette:
                 [&]() { toggleWindow("Galaxy"); });
         addItem("Ship", windowOpenState(showShip), game::chordLabel(controls.actions.toggleShip), true,
                 [&]() { toggleWindow("Ship"); });
-        addItem("Market", windowOpenState(showMarket), game::chordLabel(controls.actions.toggleMarket), true,
+        addItem("Market", windowOpenState(showEconomy), game::chordLabel(controls.actions.toggleMarket), true,
                 [&]() { toggleWindow("Market"); });
         addItem("Missions", windowOpenState(showMissions), game::chordLabel(controls.actions.toggleMissions), true,
                 [&]() { toggleWindow("Missions"); });
@@ -28162,7 +28167,7 @@ draw_command_palette:
                   [&]() { pushChord(controls.actions.dockOrUndock); });
           addItem("Hangar", windowOpenState(showHangar), game::chordLabel(controls.actions.toggleHangar), true,
                   [&]() { toggleWindow("Hangar"); });
-          addItem("Market", windowOpenState(showMarket), game::chordLabel(controls.actions.toggleMarket), true,
+          addItem("Market", windowOpenState(showEconomy), game::chordLabel(controls.actions.toggleMarket), true,
                   [&]() { toggleWindow("Market"); });
           addItem("Missions", windowOpenState(showMissions), game::chordLabel(controls.actions.toggleMissions), true,
                   [&]() { toggleWindow("Missions"); });

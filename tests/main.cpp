@@ -20,6 +20,7 @@ int test_noise3d();
 int test_auto_exposure();
 int test_procedural_asteroid();
 int test_procedural_postfx();
+int test_procedural_compositor();
 int test_sdf_mesher();
 int test_economy();
 int test_market_analysis();
@@ -117,6 +118,7 @@ int main() {
   fails += test_auto_exposure();
   fails += test_procedural_asteroid();
   fails += test_procedural_postfx();
+  fails += test_procedural_compositor();
   fails += test_sdf_mesher();
   fails += test_economy();
   fails += test_market_analysis();

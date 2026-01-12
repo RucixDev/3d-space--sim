@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 
 namespace stellar::game {
 
@@ -23,7 +24,7 @@ void closeActionWheel(ActionWheelState& st) {
 }
 
 static float wrapAnglePos(float a) {
-  const float twoPi = IM_PI * 2.0f;
+  const float twoPi = std::numbers::pi_v<float> * 2.0f;
   while (a < 0.0f) a += twoPi;
   while (a >= twoPi) a -= twoPi;
   return a;
@@ -39,11 +40,11 @@ static int computeHovered(const ActionWheelState& st, int count, ImVec2 mouse) {
   if (r < st.deadzoneRadius || r > st.outerRadius + 6.0f) return -1;
 
   // We want segment 0 to be at the top (12 o'clock).
-  const float start = -IM_PI * 0.5f;
+  const float start = -std::numbers::pi_v<float> * 0.5f;
   float ang = std::atan2(dy, dx);
   ang = wrapAnglePos(ang - start);
 
-  const float slice = (IM_PI * 2.0f) / (float)count;
+  const float slice = (std::numbers::pi_v<float> * 2.0f) / (float)count;
   int idx = (int)(ang / slice);
   idx = std::clamp(idx, 0, count - 1);
   return idx;
@@ -113,8 +114,8 @@ int drawActionWheelOverlay(ActionWheelState& st,
     const int n = (int)items.size();
     st.hovered = computeHovered(st, n, io.MousePos);
 
-    const float start = -IM_PI * 0.5f;
-    const float slice = (n > 0) ? (IM_PI * 2.0f) / (float)n : IM_PI * 2.0f;
+    const float start = -std::numbers::pi_v<float> * 0.5f;
+    const float slice = (n > 0) ? (std::numbers::pi_v<float> * 2.0f) / (float)n : std::numbers::pi_v<float> * 2.0f;
 
     // Colors from style.
     ImVec4 colBase = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);

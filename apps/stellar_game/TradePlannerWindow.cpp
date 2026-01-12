@@ -612,9 +612,10 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
           p.minRunProfitCr = st.minTotalProfitCr;
           p.manifest = mp;
 
-          p.enforceJumpRange = st.enforceJumpRange;
-          p.jumpRangeLy = st.jumpRangeLy;
-          p.routeCostPerHop = st.routeCostPerJump;
+          p.jumpRangeLy = st.enforceJumpRange ? st.jumpRangeLy : 0.0;
+
+          p.routeCostPerJump = st.routeCostPerJump;
+
           p.routeCostPerLy = st.routeCostPerLy;
 
           using M = stellar::sim::TradeRunScoreMode;
@@ -902,7 +903,8 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
           ImGui::TextUnformatted(rcode);
 
           ImGui::TableNextColumn();
-          ImGui::Text("%s x%.0f", stellar::econ::commodityCode(t.output).c_str(), t.outputUnits);
+          const auto outCode = stellar::econ::commodityCode(t.output);
+          ImGui::Text("%.*s x%.0f", (int)outCode.size(), outCode.data(), t.outputUnits);
 
           ImGui::TableNextColumn();
           ImGui::Text("%s:%s", t.toSystemName.c_str(), t.toStationName.c_str());
@@ -925,17 +927,18 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
             }
 
             ImGui::Text("Inputs:");
-            ImGui::BulletText("%s x%.0f  (ask %.0f)  cost %.0f cr",
-                              stellar::econ::commodityCode(t.inputA).c_str(), t.inputAUnits, t.inputAAsk, t.inputACostCr);
+            const auto inACode = stellar::econ::commodityCode(t.inputA);
+
+            ImGui::BulletText(\"%.*s x%.0f  (ask %.0f)  cost %.0f cr\", (int)inACode.size(), inACode.data(), t.inputAUnits, t.inputAAsk, t.inputACostCr);
             if (t.inputBUnits > 0.0) {
-              ImGui::BulletText("%s x%.0f  (ask %.0f)  cost %.0f cr",
-                                stellar::econ::commodityCode(t.inputB).c_str(), t.inputBUnits, t.inputBAsk, t.inputBCostCr);
+              const auto inBCode = stellar::econ::commodityCode(t.inputB);
+
+              ImGui::BulletText(\"%.*s x%.0f  (ask %.0f)  cost %.0f cr\", (int)inBCode.size(), inBCode.data(), t.inputBUnits, t.inputBAsk, t.inputBCostCr);
             }
             ImGui::BulletText("Service fee %.0f cr", t.serviceFeeCr);
 
             ImGui::Text("Output:");
-            ImGui::BulletText("%s x%.0f  (bid %.0f)  revenue %.0f cr",
-                              stellar::econ::commodityCode(t.output).c_str(), t.outputUnits, t.outputBid, t.outputRevenueCr);
+            ImGui::BulletText(\"%.*s x%.0f  (bid %.0f)  revenue %.0f cr\", (int)outCode.size(), outCode.data(), t.outputUnits, t.outputBid, t.outputRevenueCr);
 
             ImGui::TextDisabled("Net: %.0f cr  |  %.0f cr/kg  |  %.0f cr/day",
                                 t.netProfitCr, t.netProfitPerKg, t.netProfitPerDay);
