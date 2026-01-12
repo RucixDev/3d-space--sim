@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <sstream>
+#include <string>
 #include <vector>
 
 namespace stellar::render {
@@ -55,18 +55,36 @@ static void appendSourceExcerpt(std::string& out, std::string_view src, int line
 
   out += "\n--- GLSL source excerpt ---\n";
 
-  std::istringstream iss(std::string(src));
-  std::string line;
+  // Manual line scanning avoids locale/istream quirks and prevents MSVC's
+  // occasional std::getline overload resolution issues (C2672) in some build
+  // configurations.
   int cur = 1;
-  while (std::getline(iss, line)) {
+  std::size_t i = 0;
+
+  while (i <= src.size()) {
+    // Find end-of-line: \n, \r, or end.
+    std::size_t e = i;
+    while (e < src.size() && src[e] != '\n' && src[e] != '\r') ++e;
+    const std::string_view line = src.substr(i, e - i);
+
     if (cur >= start && cur <= end) {
       out += (cur == lineNo) ? "> " : "  ";
       out += std::to_string(cur);
       out += ": ";
-      out += line;
+      out.append(line.data(), line.size());
       out += "\n";
     }
+
     if (cur > end) break;
+
+    if (e >= src.size()) break;
+
+    // Skip newline sequences: \n, \r, or \r\n.
+    if (src[e] == '\r' && (e + 1) < src.size() && src[e + 1] == '\n') {
+      i = e + 2;
+    } else {
+      i = e + 1;
+    }
     ++cur;
   }
 }
@@ -103,18 +121,23 @@ ShaderProgram::~ShaderProgram() {
     gl::DeleteProgram(program_);
     program_ = 0;
   }
+  clearUniformCache();
 }
 
 ShaderProgram::ShaderProgram(ShaderProgram&& o) noexcept {
   program_ = o.program_;
+  uniformCache_ = std::move(o.uniformCache_);
   o.program_ = 0;
+  o.uniformCache_.clear();
 }
 
 ShaderProgram& ShaderProgram::operator=(ShaderProgram&& o) noexcept {
   if (this == &o) return *this;
   if (program_) gl::DeleteProgram(program_);
   program_ = o.program_;
+  uniformCache_ = std::move(o.uniformCache_);
   o.program_ = 0;
+  o.uniformCache_.clear();
   return *this;
 }
 
@@ -122,6 +145,12 @@ bool ShaderProgram::build(std::string_view vertexSrc, std::string_view fragmentS
   if (program_) {
     gl::DeleteProgram(program_);
     program_ = 0;
+  }
+  clearUniformCache();
+
+  if (vertexSrc.empty() || fragmentSrc.empty()) {
+    if (outError) *outError = "ShaderProgram::build called with an empty shader source.";
+    return false;
   }
 
   std::string err;
@@ -156,6 +185,7 @@ bool ShaderProgram::build(std::string_view vertexSrc, std::string_view fragmentS
     if (outError) *outError = std::string("Program link failed: ") + log.data();
     gl::DeleteProgram(program_);
     program_ = 0;
+    clearUniformCache();
     return false;
   }
 
@@ -167,7 +197,17 @@ void ShaderProgram::bind() const {
 }
 
 int ShaderProgram::uniformLocation(const char* name) const {
-  return gl::GetUniformLocation(program_, name);
+  if (!program_ || !name || !*name) return -1;
+
+  // Tiny linear cache: avoids repeated glGetUniformLocation calls (which can be
+  // surprisingly expensive) while keeping compile-time dependencies minimal.
+  for (const auto& kv : uniformCache_) {
+    if (kv.first == name) return kv.second;
+  }
+
+  const int loc = gl::GetUniformLocation(program_, name);
+  uniformCache_.emplace_back(name, loc);
+  return loc;
 }
 
 void ShaderProgram::setUniformMat4(const char* name, const float* mat4) const {

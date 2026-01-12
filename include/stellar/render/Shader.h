@@ -2,6 +2,8 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace stellar::render {
 
@@ -31,7 +33,13 @@ public:
   unsigned int handle() const { return program_; }
 
 private:
+  void clearUniformCache() const { uniformCache_.clear(); }
+
   unsigned int program_{0};
+  // Small per-program cache of uniform locations.
+  // Note: Shader uniforms are typically few; a flat vector is fast and keeps
+  // compile times low vs. unordered_map.
+  mutable std::vector<std::pair<std::string, int>> uniformCache_;
 };
 
 } // namespace stellar::render
