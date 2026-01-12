@@ -36,6 +36,11 @@ public:
 
   void setMesh(const Mesh* mesh) { mesh_ = mesh; }
   void setTexture(const Texture2D* tex) { tex_ = tex; }
+  // Optional tangent-space normal map (RGBA8 normal, encoded in RGB).
+  // When null, normal mapping is disabled.
+  void setNormalTexture(const Texture2D* tex) { normalTex_ = tex; }
+  void setNormalStrength(float strength) { normalStrength_ = strength; }
+
   // When enabled, skips directional lighting and renders the mesh as emissive/unlit.
   // Useful for stars, UI 3D previews, and debug visualizations.
   void setUnlit(bool unlit) { unlit_ = unlit; }
@@ -50,6 +55,21 @@ public:
     lightPos_[2] = z;
   }
 
+  // Camera position in world/render units. Used for specular highlights.
+  void setCameraPos(float x, float y, float z) {
+    cameraPos_[0] = x;
+    cameraPos_[1] = y;
+    cameraPos_[2] = z;
+  }
+
+  // Simple Blinn-Phong specular controls.
+  // strength: 0..1
+  // shininess: typical range 8..128
+  void setSpecular(float strength, float shininess) {
+    specularStrength_ = strength;
+    shininess_ = shininess;
+  }
+
   // When enabled, the fragment shader outputs alpha from the bound texture's A channel.
   // This is primarily used for translucent shells like planet cloud layers.
   void setAlphaFromTexture(bool enabled) { alphaFromTexture_ = enabled; }
@@ -62,9 +82,15 @@ public:
 private:
   const Mesh* mesh_{nullptr};
   const Texture2D* tex_{nullptr};
+  const Texture2D* normalTex_{nullptr};
   bool unlit_{false};
 
 	float lightPos_[3]{0.0f, 0.0f, 0.0f};
+	float cameraPos_[3]{0.0f, 0.0f, 0.0f};
+
+  float normalStrength_{1.0f};
+  float specularStrength_{0.08f};
+  float shininess_{48.0f};
 
   bool alphaFromTexture_{false};
   float alphaMul_{1.0f};

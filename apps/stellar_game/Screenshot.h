@@ -19,6 +19,10 @@ struct ScreenshotRequest {
 
   // If true, append a timestamp to the file name.
   bool timestamp{true};
+
+  // File extension without the dot (e.g. "png", "hdr").
+  // Used by buildScreenshotPath().
+  std::string extension{"png"};
 };
 
 // Keep only filename-safe ASCII characters: [A-Za-z0-9_-].
@@ -38,5 +42,31 @@ std::string buildScreenshotPath(const ScreenshotRequest& req, std::string* outEr
 // `width/height` are framebuffer pixel dimensions.
 // Returns true on success.
 bool captureBackbufferToPng(const std::string& path, int width, int height, std::string* outErr = nullptr);
+
+// Writes a pixel buffer as a PNG.
+//
+// `pixels` is expected to be tightly packed (strideBytes = width * comp) unless
+// you provide a custom stride.
+// If flipY is true, rows are flipped top/bottom before writing.
+bool writePixelsToPng(const std::string& path,
+                      int width,
+                      int height,
+                      int comp,
+                      const unsigned char* pixels,
+                      int strideBytes,
+                      bool flipY,
+                      std::string* outErr = nullptr);
+
+// Writes a float pixel buffer as Radiance HDR (.hdr).
+//
+// `pixels` must be tightly packed as width * height * comp floats.
+// If flipY is true, rows are flipped top/bottom before writing.
+bool writePixelsToHdr(const std::string& path,
+                      int width,
+                      int height,
+                      int comp,
+                      const float* pixels,
+                      bool flipY,
+                      std::string* outErr = nullptr);
 
 } // namespace stellar::game

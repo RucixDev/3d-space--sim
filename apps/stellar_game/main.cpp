@@ -24,18 +24,28 @@
 #include "stellar/render/Mesh.h"
 #include "stellar/render/MeshRenderer.h"
 #include "stellar/render/Texture.h"
+#include "stellar/render/GpuSurfaceCache.h"
+#include "stellar/render/GpuParticleField.h"
 #include "stellar/render/ProceduralSprite.h"
 #include "stellar/render/ProceduralPlanet.h"
 #include "stellar/render/ProceduralRings.h"
 #include "stellar/render/ProceduralLivery.h"
+#include "stellar/render/ProceduralAsteroid.h"
+#include "stellar/render/ProceduralArtifact.h"
+#include "stellar/render/ProceduralSky.h"
 #include "stellar/render/RenderTarget.h"
 #include "stellar/render/AtmosphereRenderer.h"
 #include "stellar/render/Starfield.h"
 #include "stellar/render/Nebula.h"
 #include "stellar/render/ParticleSystem.h"
 #include "stellar/render/PostFX.h"
+#include "stellar/render/TextureReadback.h"
+#include "stellar/render/ProceduralPostFX.h"
+#include "stellar/render/ProceduralCompositor.h"
 #include "stellar/ui/HudLayout.h"
 #include "stellar/ui/HudSettings.h"
+#include "stellar/ui/VfxSettings.h"
+#include "stellar/ui/ProceduralUi.h"
 #include "stellar/ui/AudioSettings.h"
 #include "stellar/ui/Livery.h"
 #include "stellar/ui/UiSettings.h"
@@ -1375,6 +1385,41 @@ int main(int argc, char** argv) {
   // Asteroids: low-ish poly sphere so rocks read better than cubes.
   render::Mesh rockSphere = render::Mesh::makeUvSphere(18, 10);
 
+  // Procedural asteroid mesh library (a "mini graphics engine" feature).
+  //
+  // The sim already spawns asteroid mining nodes; this replaces the placeholder
+  // rock spheres with deterministic, noise-displaced meshes.
+  bool vfxAsteroidProcMeshEnabled = true;
+  bool vfxAsteroidUseRockyTexture = true;
+  int vfxAsteroidVariantCount = 8;
+  render::AsteroidParams vfxAsteroidParams{};
+  core::u64 vfxAsteroidStyleNonce = 1;
+
+  // Cache of GPU meshes (one per variant) and their deterministic seeds.
+  std::vector<render::Mesh> asteroidVariantMeshes;
+  std::vector<core::u64> asteroidVariantSeeds;
+  std::vector<render::AsteroidMeshStats> asteroidVariantStats;
+  std::vector<std::vector<render::InstanceData>> asteroidVariantInstances;
+  bool asteroidMeshesDirty = true;
+
+  // Procedural SDF artifacts (Marching Tetrahedra isosurface meshing showcase).
+  bool vfxArtifactProcEnabled = false;
+  bool vfxArtifactUseProceduralTexture = true;
+  render::SurfaceKind vfxArtifactSurfaceKind = render::SurfaceKind::Ice;
+  int vfxArtifactVariantCount = 3;
+  int vfxArtifactInstanceCount = 18;
+  double vfxArtifactRingRadiusU = 1.25;
+  double vfxArtifactRingHeightU = 0.0;
+  double vfxArtifactScaleU = 0.55;
+  render::ArtifactParams vfxArtifactParams{};
+  core::u64 vfxArtifactStyleNonce = 1;
+
+  std::vector<render::Mesh> artifactVariantMeshes;
+  std::vector<core::u64> artifactVariantSeeds;
+  std::vector<render::SdfMeshStats> artifactVariantStats;
+  std::vector<std::vector<render::InstanceData>> artifactVariantInstances;
+  bool artifactMeshesDirty = true;
+
   // Planet rings (annulus meshes). These are purely visual and drawn in the same
   // star-relative frame as planets.
   render::Mesh ringThin  = render::Mesh::makeRing(/*segments=*/192, /*inner=*/0.70f, /*outer=*/1.15f, /*doubleSided=*/true);
@@ -1463,6 +1508,21 @@ int main(int argc, char** argv) {
   render::SurfaceTextureCache surfaceTexCache;
   surfaceTexCache.setMaxEntries(128);
 
+  // Procedural tangent-space normal maps matching the above surface albedo.
+  render::SurfaceNormalMapCache surfaceNrmCache;
+  surfaceNrmCache.setMaxEntries(128);
+
+  // Optional GPU path: render the procedural surfaces directly into textures (FBO + fragment shader).
+  // This is generally much faster for high resolutions than CPU pixel generation + upload.
+  render::GpuSurfaceCache gpuSurfaceCache;
+  gpuSurfaceCache.setMaxEntries(128);
+  {
+    std::string gpuErr;
+    if (!gpuSurfaceCache.init(&gpuErr)) {
+      core::log(core::LogLevel::Warn, "GPU surface cache disabled: " + gpuErr);
+    }
+  }
+
   // Procedural planet ring textures (annulus albedo/alpha).
   render::RingTextureCache ringTexCache;
   ringTexCache.setMaxEntries(96);
@@ -1473,6 +1533,84 @@ int main(int argc, char** argv) {
     return 1;
   }
   meshRenderer.setTexture(&checker);
+
+  auto rebuildAsteroidProcMeshes = [&]() {
+    asteroidVariantMeshes.clear();
+    asteroidVariantSeeds.clear();
+    asteroidVariantStats.clear();
+    asteroidVariantInstances.clear();
+
+    asteroidMeshesDirty = false;
+
+    if (!vfxAsteroidProcMeshEnabled) {
+      // Keep placeholder sphere path.
+      return;
+    }
+
+    const int variants = std::clamp(vfxAsteroidVariantCount, 1, 32);
+    asteroidVariantMeshes.reserve((std::size_t)variants);
+    asteroidVariantSeeds.reserve((std::size_t)variants);
+    asteroidVariantStats.reserve((std::size_t)variants);
+
+    for (int i = 0; i < variants; ++i) {
+      const core::u64 mSeed = core::hashCombine(seed,
+                                                core::hashCombine(core::fnv1a64("asteroid_mesh"), (core::u64)i));
+      const auto cpu = render::generateAsteroidMesh(mSeed, vfxAsteroidParams);
+
+      asteroidVariantSeeds.push_back(mSeed);
+      asteroidVariantStats.push_back(render::measureAsteroidMesh(cpu));
+
+      render::Mesh m;
+      m.upload(cpu.vertices, cpu.indices);
+      asteroidVariantMeshes.push_back(std::move(m));
+    }
+
+    asteroidVariantInstances.assign(asteroidVariantMeshes.size(), {});
+  };
+
+  // Note: we rebuild after loading VFX settings so first frame matches persisted config.
+
+  auto rebuildArtifactProcMeshes = [&]() {
+    artifactVariantMeshes.clear();
+    artifactVariantSeeds.clear();
+    artifactVariantStats.clear();
+    artifactVariantInstances.clear();
+
+    artifactMeshesDirty = false;
+
+    if (!vfxArtifactProcEnabled) {
+      return;
+    }
+
+    const int variants = std::clamp(vfxArtifactVariantCount, 1, 16);
+    artifactVariantMeshes.reserve((std::size_t)variants);
+    artifactVariantSeeds.reserve((std::size_t)variants);
+    artifactVariantStats.reserve((std::size_t)variants);
+
+    for (int i = 0; i < variants; ++i) {
+      const core::u64 styleSeed = core::hashCombine(seed,
+                                                   core::hashCombine(core::fnv1a64("artifact_style"), vfxArtifactStyleNonce));
+      const core::u64 mSeed = core::hashCombine(styleSeed,
+                                               core::hashCombine(core::fnv1a64("artifact_mesh"), (core::u64)i));
+
+      // Copy params so UI edits don't race with generation.
+      render::ArtifactParams ap = vfxArtifactParams;
+      // Clamp resolution to keep UI experimentation snappy.
+      ap.resolution = std::clamp(ap.resolution, 12, 128);
+
+      const auto cpu = render::generateArtifactMesh(mSeed, ap);
+      artifactVariantSeeds.push_back(mSeed);
+      artifactVariantStats.push_back(render::measureSdfMesh(cpu));
+
+      render::Mesh m;
+      m.upload(cpu.vertices, cpu.indices);
+      artifactVariantMeshes.push_back(std::move(m));
+    }
+
+    artifactVariantInstances.assign(artifactVariantMeshes.size(), {});
+  };
+
+  // Note: we rebuild after loading VFX settings so first frame matches persisted config.
 
   render::AtmosphereRenderer atmosphereRenderer;
   if (!atmosphereRenderer.init(&err)) {
@@ -1489,6 +1627,20 @@ int main(int argc, char** argv) {
 
   render::PointRenderer pointRenderer;
   if (!pointRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+
+  // GPU-resident particle field (ping-pong float textures + shader simulation).
+  // Optional: failure should not stop the game.
+  render::GpuParticleField gpuDust;
+  if (!gpuDust.init(&err)) {
+    core::log(core::LogLevel::Warn, "GpuParticleField disabled: " + err);
+  }
+
+  // GPU procedural sky background renderer (shader-based replacement for point-sprite stars/nebula).
+  render::ProceduralSky proceduralSky;
+  if (!proceduralSky.init(&err)) {
     core::log(core::LogLevel::Error, err);
     return 1;
   }
@@ -1525,15 +1677,39 @@ int main(int argc, char** argv) {
     return 1;
   }
   render::PostFXSettings postFxSettings{};
+
+  // Procedural PostFX preset generator (seeded looks).
+  core::u64 postFxPresetSeed = core::hashCombine(seed, core::fnv1a64("postfxPreset"));
+  int postFxPresetKind = (int)render::PostFXPresetKind::Random;
+  bool postFxPresetPreserveWarpHyper = true;
+
+  // Procedural compositor shader (runtime shader permutation via injected #defines).
+  core::u64 compositorSeed = core::hashCombine(seed, core::fnv1a64("procCompositorSeed"));
+  int compositorKind = (int)render::CompositorKind::Random;
+  std::string compositorDefines;
+  std::string compositorBuildError;
+
   bool postFxAutoWarpFromSpeed = true;
   bool postFxAutoHyperspaceFromFsd = true;
   float postFxFsdWarpBoost = 0.065f;
   float postFxFsdHyperspaceBoost = 1.00f;
   bool hudJumpOverlay = true;
 
+  // FrameGraph controls (new PostFX backend). Aliasing dramatically reduces
+  // transient HDR allocations, but makes per-pass texture previews unreliable.
+  bool postFxFrameGraphAliasing = true;
+  bool postFxFrameGraphGpuTiming = false;
+
   // --- Universe / sim state ---
 
   // --- Visual effects (background stars + particles) ---
+  // Shader-based procedural sky background (optional). When enabled, this replaces the
+  // point-sprite starfield + nebula layers.
+  bool vfxProceduralSkyEnabled = false;
+  render::ProceduralSkySettings vfxProceduralSky{};
+  vfxProceduralSky.seed = (int)(core::hashCombine(seed, core::fnv1a64("procSky")) & 0x7fffffffULL);
+  core::u64 vfxProceduralSkySeedNonce = 0;
+
   bool vfxStarfieldEnabled = true;
   bool vfxStarfieldTextured = true;
   int vfxStarCount = 5200;
@@ -1563,12 +1739,315 @@ int main(int argc, char** argv) {
   bool vfxExplosionsEnabled = true;
   float vfxParticleIntensity = 1.0f; // global scaler
 
+  // GPU dust field (GPGPU). Simulates a large number of particles entirely on
+  // the GPU using ping-pong float textures.
+  bool vfxGpuDustEnabled = false;
+  bool vfxGpuDustTextured = true;
+  int vfxGpuDustDim = 256; // particle count = dim*dim
+  int vfxGpuDustSeed = (int)(core::hashCombine(seed, core::fnv1a64("gpuDust")) & 0x7fffffffULL);
+  float vfxGpuDustBoundsU = 45.0f;
+  float vfxGpuDustDrag = 0.18f;
+  float vfxGpuDustNoiseFreq = 0.07f;
+  float vfxGpuDustNoiseStrength = 1.10f;
+  float vfxGpuDustAttract = 0.0f;
+  float vfxGpuDustMaxSpeed = 18.0f;
+  float vfxGpuDustPointSizePx = 2.25f;
+  float vfxGpuDustIntensity = 1.0f;
+  float vfxGpuDustAlpha = 0.65f;
+
+  // --- VFX Lab settings persistence ---
+  //
+  // These settings make the VFX Lab "real" game config: you can tune the procedural
+  // graphics stack and have it survive restarts.
+  const std::string vfxSettingsPath = ui::defaultVfxSettingsPath();
+  ui::VfxSettings vfxSettings = ui::makeDefaultVfxSettings();
+  ui::VfxSettings vfxSettingsSaved = vfxSettings;
+  bool vfxSettingsDirty = false;
+  bool vfxSettingsAutoSaveOnExit = true;
+
+  auto syncVfxSettingsFromRuntime = [&]() {
+    vfxSettings.autoSaveOnExit = vfxSettingsAutoSaveOnExit;
+
+    vfxSettings.proceduralSkyEnabled = vfxProceduralSkyEnabled;
+    vfxSettings.proceduralSky = vfxProceduralSky;
+
+    vfxSettings.starfieldEnabled = vfxStarfieldEnabled;
+    vfxSettings.starfieldTextured = vfxStarfieldTextured;
+    vfxSettings.starCount = vfxStarCount;
+    vfxSettings.starRadiusU = vfxStarRadiusU;
+
+    vfxSettings.nebulaEnabled = vfxNebulaEnabled;
+    vfxSettings.nebulaPuffCount = vfxNebulaPuffCount;
+    vfxSettings.nebulaVariant = vfxNebulaVariant;
+    vfxSettings.nebulaInnerRadiusU = vfxNebulaInnerRadiusU;
+    vfxSettings.nebulaOuterRadiusU = vfxNebulaOuterRadiusU;
+    vfxSettings.nebulaParallax = vfxNebulaParallax;
+    vfxSettings.nebulaIntensity = vfxNebulaIntensity;
+    vfxSettings.nebulaOpacity = vfxNebulaOpacity;
+    vfxSettings.nebulaSizeMinPx = vfxNebulaSizeMinPx;
+    vfxSettings.nebulaSizeMaxPx = vfxNebulaSizeMaxPx;
+    vfxSettings.nebulaBandPower = vfxNebulaBandPower;
+    vfxSettings.nebulaTurbulence = vfxNebulaTurbulence;
+    vfxSettings.nebulaTurbulenceSpeed = vfxNebulaTurbulenceSpeed;
+
+    vfxSettings.particlesEnabled = vfxParticlesEnabled;
+    vfxSettings.particlesTextured = vfxParticlesTextured;
+    vfxSettings.thrustersEnabled = vfxThrustersEnabled;
+    vfxSettings.impactsEnabled = vfxImpactsEnabled;
+    vfxSettings.explosionsEnabled = vfxExplosionsEnabled;
+    vfxSettings.particleIntensity = vfxParticleIntensity;
+
+    vfxSettings.gpuDustEnabled = vfxGpuDustEnabled;
+    vfxSettings.gpuDustTextured = vfxGpuDustTextured;
+    vfxSettings.gpuDustDim = vfxGpuDustDim;
+    vfxSettings.gpuDustSeed = vfxGpuDustSeed;
+    vfxSettings.gpuDustBoundsU = vfxGpuDustBoundsU;
+    vfxSettings.gpuDustDrag = vfxGpuDustDrag;
+    vfxSettings.gpuDustNoiseFreq = vfxGpuDustNoiseFreq;
+    vfxSettings.gpuDustNoiseStrength = vfxGpuDustNoiseStrength;
+    vfxSettings.gpuDustAttract = vfxGpuDustAttract;
+    vfxSettings.gpuDustMaxSpeed = vfxGpuDustMaxSpeed;
+    vfxSettings.gpuDustPointSizePx = vfxGpuDustPointSizePx;
+    vfxSettings.gpuDustIntensity = vfxGpuDustIntensity;
+    vfxSettings.gpuDustAlpha = vfxGpuDustAlpha;
+
+    vfxSettings.asteroidProcMeshEnabled = vfxAsteroidProcMeshEnabled;
+    vfxSettings.asteroidUseRockyTexture = vfxAsteroidUseRockyTexture;
+    vfxSettings.asteroidVariantCount = vfxAsteroidVariantCount;
+    vfxSettings.asteroidParams = vfxAsteroidParams;
+    vfxSettings.asteroidStyleNonce = vfxAsteroidStyleNonce;
+
+    vfxSettings.artifactProcEnabled = vfxArtifactProcEnabled;
+    vfxSettings.artifactUseProceduralTexture = vfxArtifactUseProceduralTexture;
+    vfxSettings.artifactSurfaceKind = vfxArtifactSurfaceKind;
+    vfxSettings.artifactVariantCount = vfxArtifactVariantCount;
+    vfxSettings.artifactInstanceCount = vfxArtifactInstanceCount;
+    vfxSettings.artifactRingRadiusU = vfxArtifactRingRadiusU;
+    vfxSettings.artifactRingHeightU = vfxArtifactRingHeightU;
+    vfxSettings.artifactScaleU = vfxArtifactScaleU;
+    vfxSettings.artifactParams = vfxArtifactParams;
+    vfxSettings.artifactStyleNonce = vfxArtifactStyleNonce;
+  };
+
+  auto applyVfxSettingsToRuntime = [&](const ui::VfxSettings& s) {
+    vfxSettingsAutoSaveOnExit = s.autoSaveOnExit;
+
+    vfxProceduralSkyEnabled = s.proceduralSkyEnabled;
+    vfxProceduralSky = s.proceduralSky;
+
+    vfxStarfieldEnabled = s.starfieldEnabled;
+    vfxStarfieldTextured = s.starfieldTextured;
+    vfxStarCount = s.starCount;
+    vfxStarRadiusU = s.starRadiusU;
+
+    vfxNebulaEnabled = s.nebulaEnabled;
+    vfxNebulaPuffCount = s.nebulaPuffCount;
+    vfxNebulaVariant = s.nebulaVariant;
+    vfxNebulaInnerRadiusU = s.nebulaInnerRadiusU;
+    vfxNebulaOuterRadiusU = s.nebulaOuterRadiusU;
+    vfxNebulaParallax = s.nebulaParallax;
+    vfxNebulaIntensity = s.nebulaIntensity;
+    vfxNebulaOpacity = s.nebulaOpacity;
+    vfxNebulaSizeMinPx = s.nebulaSizeMinPx;
+    vfxNebulaSizeMaxPx = s.nebulaSizeMaxPx;
+    vfxNebulaBandPower = s.nebulaBandPower;
+    vfxNebulaTurbulence = s.nebulaTurbulence;
+    vfxNebulaTurbulenceSpeed = s.nebulaTurbulenceSpeed;
+
+    vfxParticlesEnabled = s.particlesEnabled;
+    vfxParticlesTextured = s.particlesTextured;
+    vfxThrustersEnabled = s.thrustersEnabled;
+    vfxImpactsEnabled = s.impactsEnabled;
+    vfxExplosionsEnabled = s.explosionsEnabled;
+    vfxParticleIntensity = s.particleIntensity;
+
+    vfxGpuDustEnabled = s.gpuDustEnabled;
+    vfxGpuDustTextured = s.gpuDustTextured;
+    vfxGpuDustDim = s.gpuDustDim;
+    vfxGpuDustSeed = s.gpuDustSeed;
+    vfxGpuDustBoundsU = s.gpuDustBoundsU;
+    vfxGpuDustDrag = s.gpuDustDrag;
+    vfxGpuDustNoiseFreq = s.gpuDustNoiseFreq;
+    vfxGpuDustNoiseStrength = s.gpuDustNoiseStrength;
+    vfxGpuDustAttract = s.gpuDustAttract;
+    vfxGpuDustMaxSpeed = s.gpuDustMaxSpeed;
+    vfxGpuDustPointSizePx = s.gpuDustPointSizePx;
+    vfxGpuDustIntensity = s.gpuDustIntensity;
+    vfxGpuDustAlpha = s.gpuDustAlpha;
+
+    // Procedural asteroid mesh library.
+    vfxAsteroidProcMeshEnabled = s.asteroidProcMeshEnabled;
+    vfxAsteroidUseRockyTexture = s.asteroidUseRockyTexture;
+    vfxAsteroidVariantCount = s.asteroidVariantCount;
+    vfxAsteroidParams = s.asteroidParams;
+    vfxAsteroidStyleNonce = s.asteroidStyleNonce;
+    asteroidMeshesDirty = true;
+
+    // Procedural SDF artifacts.
+    vfxArtifactProcEnabled = s.artifactProcEnabled;
+    vfxArtifactUseProceduralTexture = s.artifactUseProceduralTexture;
+    vfxArtifactSurfaceKind = s.artifactSurfaceKind;
+    vfxArtifactVariantCount = s.artifactVariantCount;
+    vfxArtifactInstanceCount = s.artifactInstanceCount;
+    vfxArtifactRingRadiusU = s.artifactRingRadiusU;
+    vfxArtifactRingHeightU = s.artifactRingHeightU;
+    vfxArtifactScaleU = s.artifactScaleU;
+    vfxArtifactParams = s.artifactParams;
+    vfxArtifactStyleNonce = s.artifactStyleNonce;
+    artifactMeshesDirty = true;
+  };
+
+  auto vfxSettingsEquivalent = [&](const ui::VfxSettings& a, const ui::VfxSettings& b) -> bool {
+    auto deq = [](double x, double y, double eps = 1e-6) { return std::fabs(x - y) <= eps; };
+    auto feq = [](float x, float y, float eps = 1e-4f) { return std::fabs(x - y) <= eps; };
+
+    auto skyEq = [&](const render::ProceduralSkySettings& x, const render::ProceduralSkySettings& y) {
+      return x.seed == y.seed
+          && feq(x.intensity, y.intensity)
+          && feq(x.starIntensity, y.starIntensity)
+          && feq(x.starDensity, y.starDensity)
+          && feq(x.starProbability, y.starProbability)
+          && feq(x.starSize, y.starSize)
+          && feq(x.starTwinkle, y.starTwinkle)
+          && x.nebulaEnabled == y.nebulaEnabled
+          && feq(x.nebulaIntensity, y.nebulaIntensity)
+          && feq(x.nebulaFrequency, y.nebulaFrequency)
+          && feq(x.nebulaThreshold, y.nebulaThreshold)
+          && feq(x.nebulaSoftness, y.nebulaSoftness)
+          && feq(x.nebulaBandPower, y.nebulaBandPower)
+          && feq(x.nebulaParallax, y.nebulaParallax)
+          && x.nebulaSteps == y.nebulaSteps
+          && feq(x.nebulaWorldScale, y.nebulaWorldScale)
+          && feq(x.nebulaDrift, y.nebulaDrift);
+    };
+
+    auto asteroidEq = [&](const render::AsteroidParams& x, const render::AsteroidParams& y) {
+      return x.slices == y.slices
+          && x.stacks == y.stacks
+          && feq(x.baseRadius, y.baseRadius)
+          && feq(x.noiseFrequency, y.noiseFrequency)
+          && feq(x.noiseAmplitude, y.noiseAmplitude)
+          && x.noiseOctaves == y.noiseOctaves
+          && feq(x.noiseLacunarity, y.noiseLacunarity)
+          && feq(x.noiseGain, y.noiseGain)
+          && x.craterCount == y.craterCount
+          && feq(x.craterRadiusMinDeg, y.craterRadiusMinDeg)
+          && feq(x.craterRadiusMaxDeg, y.craterRadiusMaxDeg)
+          && feq(x.craterDepth, y.craterDepth)
+          && feq(x.craterRim, y.craterRim)
+          && feq(x.minRadius, y.minRadius)
+          && feq(x.maxRadius, y.maxRadius);
+    };
+
+    auto artifactEq = [&](const render::ArtifactParams& x, const render::ArtifactParams& y) {
+      return x.resolution == y.resolution
+          && feq(x.bounds, y.bounds)
+          && feq(x.iso, y.iso)
+          && feq(x.baseRadius, y.baseRadius)
+          && feq(x.noiseFrequency, y.noiseFrequency)
+          && feq(x.noiseAmplitude, y.noiseAmplitude)
+          && x.noiseOctaves == y.noiseOctaves
+          && feq(x.noiseLacunarity, y.noiseLacunarity)
+          && feq(x.noiseGain, y.noiseGain)
+          && x.blobCount == y.blobCount
+          && feq(x.blobRadiusMin, y.blobRadiusMin)
+          && feq(x.blobRadiusMax, y.blobRadiusMax)
+          && feq(x.blobCenterRadius, y.blobCenterRadius)
+          && feq(x.blobSmoothK, y.blobSmoothK)
+          && x.cutCount == y.cutCount
+          && feq(x.cutOffsetMin, y.cutOffsetMin)
+          && feq(x.cutOffsetMax, y.cutOffsetMax)
+          && feq(x.grooveStrength, y.grooveStrength)
+          && feq(x.grooveFrequency, y.grooveFrequency)
+          && feq(x.normalEps, y.normalEps);
+    };
+
+    return a.autoSaveOnExit == b.autoSaveOnExit
+        && a.proceduralSkyEnabled == b.proceduralSkyEnabled
+        && skyEq(a.proceduralSky, b.proceduralSky)
+        && a.starfieldEnabled == b.starfieldEnabled
+        && a.starfieldTextured == b.starfieldTextured
+        && a.starCount == b.starCount
+        && deq(a.starRadiusU, b.starRadiusU)
+        && a.nebulaEnabled == b.nebulaEnabled
+        && a.nebulaPuffCount == b.nebulaPuffCount
+        && a.nebulaVariant == b.nebulaVariant
+        && deq(a.nebulaInnerRadiusU, b.nebulaInnerRadiusU)
+        && deq(a.nebulaOuterRadiusU, b.nebulaOuterRadiusU)
+        && deq(a.nebulaParallax, b.nebulaParallax)
+        && feq(a.nebulaIntensity, b.nebulaIntensity)
+        && feq(a.nebulaOpacity, b.nebulaOpacity)
+        && feq(a.nebulaSizeMinPx, b.nebulaSizeMinPx)
+        && feq(a.nebulaSizeMaxPx, b.nebulaSizeMaxPx)
+        && feq(a.nebulaBandPower, b.nebulaBandPower)
+        && feq(a.nebulaTurbulence, b.nebulaTurbulence)
+        && feq(a.nebulaTurbulenceSpeed, b.nebulaTurbulenceSpeed)
+        && a.particlesEnabled == b.particlesEnabled
+        && a.particlesTextured == b.particlesTextured
+        && a.thrustersEnabled == b.thrustersEnabled
+        && a.impactsEnabled == b.impactsEnabled
+        && a.explosionsEnabled == b.explosionsEnabled
+        && feq(a.particleIntensity, b.particleIntensity)
+        && a.gpuDustEnabled == b.gpuDustEnabled
+        && a.gpuDustTextured == b.gpuDustTextured
+        && a.gpuDustDim == b.gpuDustDim
+        && a.gpuDustSeed == b.gpuDustSeed
+        && feq(a.gpuDustBoundsU, b.gpuDustBoundsU)
+        && feq(a.gpuDustDrag, b.gpuDustDrag)
+        && feq(a.gpuDustNoiseFreq, b.gpuDustNoiseFreq)
+        && feq(a.gpuDustNoiseStrength, b.gpuDustNoiseStrength)
+        && feq(a.gpuDustAttract, b.gpuDustAttract)
+        && feq(a.gpuDustMaxSpeed, b.gpuDustMaxSpeed)
+        && feq(a.gpuDustPointSizePx, b.gpuDustPointSizePx)
+        && feq(a.gpuDustIntensity, b.gpuDustIntensity)
+        && feq(a.gpuDustAlpha, b.gpuDustAlpha)
+        && a.asteroidProcMeshEnabled == b.asteroidProcMeshEnabled
+        && a.asteroidUseRockyTexture == b.asteroidUseRockyTexture
+        && a.asteroidVariantCount == b.asteroidVariantCount
+        && asteroidEq(a.asteroidParams, b.asteroidParams)
+        && a.asteroidStyleNonce == b.asteroidStyleNonce
+        && a.artifactProcEnabled == b.artifactProcEnabled
+        && a.artifactUseProceduralTexture == b.artifactUseProceduralTexture
+        && a.artifactSurfaceKind == b.artifactSurfaceKind
+        && a.artifactVariantCount == b.artifactVariantCount
+        && a.artifactInstanceCount == b.artifactInstanceCount
+        && deq(a.artifactRingRadiusU, b.artifactRingRadiusU)
+        && deq(a.artifactRingHeightU, b.artifactRingHeightU)
+        && deq(a.artifactScaleU, b.artifactScaleU)
+        && artifactEq(a.artifactParams, b.artifactParams)
+        && a.artifactStyleNonce == b.artifactStyleNonce;
+  };
+
+  // Load VFX settings (if present). Missing file -> keep runtime defaults.
+  {
+    ui::VfxSettings loaded = ui::makeDefaultVfxSettings();
+    if (ui::loadVfxSettingsFromFile(vfxSettingsPath, loaded)) {
+      vfxSettings = loaded;
+      applyVfxSettingsToRuntime(vfxSettings);
+    } else {
+      syncVfxSettingsFromRuntime();
+    }
+    vfxSettingsSaved = vfxSettings;
+    vfxSettingsDirty = false;
+  }
+
+  // Ensure procedural meshes match the persisted VFX config before first frame.
+  rebuildAsteroidProcMeshes();
+  rebuildArtifactProcMeshes();
+
   // --- World visuals (stars/planets) ---
   bool worldUseProceduralSurfaces = true;
+  bool worldUseGpuSurfaceCache = gpuSurfaceCache.isInited();
   bool worldUseSurfaceInUi = true; // show surface previews in tooltips
   int worldSurfaceTexWidth = 512;  // equirectangular width (height is width/2)
   bool worldStarUnlit = true;
   float worldStarIntensity = 3.5f; // HDR multiplier; affects bloom
+
+  // Procedural normal maps (tangent-space) derived from the same seeded noise as the albedo.
+  bool worldNormalMapsEnabled = true;
+  float worldNormalStrength = 1.0f;   // multiplier applied in shader
+  float worldSpecularStrength = 0.08f; // simple Blinn-Phong highlight
+  float worldShininess = 48.0f;
 
   // Planet secondary layers (visual only).
   bool worldCloudsEnabled = true;
@@ -2399,6 +2878,17 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   bool shotRestorePausedPending{false};
   bool shotPrevPaused{false};
 
+  // FrameGraph debug capture: schedule per-pass outputs to be written to disk.
+  struct PendingFrameGraphCapture {
+    std::string passName;
+    std::string outputName;
+    std::string path; // full path including extension
+  };
+  std::deque<PendingFrameGraphCapture> fgCaptureQueue{};
+  render::AsyncTextureReadback fgReadback{};
+  bool fgReadbackOk = false;
+  std::string fgReadbackInitErr{};
+
   bool photoModeWasOpen{false};
   bool photoModePrevPaused{false};
   bool photoModeForcedPause{false};
@@ -2426,7 +2916,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::TradePlannerWindowState tradePlannerWindow{};
   bool showGuide = true;
   bool showSprites = false;
-  bool showVfx = false;
+  // Integrate the VFX Lab into the base game's default layout.
+  bool showVfx = true;
   bool showPostFx = false;
   bool showWorldVisuals = false;
   bool showHangar = false;
@@ -4864,6 +5355,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
       hit.deathHandled = true;
     }
   };
+
+  // Optional: async GPU->CPU readback used by FrameGraph pass captures.
+  fgReadbackOk = fgReadback.init(&fgReadbackInitErr);
+  if (!fgReadbackOk && !fgReadbackInitErr.empty()) {
+    core::log(core::LogLevel::Warn, "FrameGraph capture disabled: " + fgReadbackInitErr);
+  }
 
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
@@ -12670,8 +13167,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       const bool floatingOriginEnabled = core::cvars().getBool("r.floating_origin.enabled", true);
       const math::Vec3d desiredOriginKm = floatingOriginEnabled ? ship.positionKm() : math::Vec3d{0,0,0};
       const math::Vec3d deltaKm = desiredOriginKm - gRenderOriginKm;
+      const math::Vec3d deltaU = deltaKm * kINV_RENDER_UNIT_KM;
+
       if (deltaKm.lengthSq() > 1e-16) {
-        const math::Vec3d deltaU = deltaKm * kINV_RENDER_UNIT_KM;
 
         // Shift long-lived render-space state into the new origin frame.
         // newPosU = oldPosU - deltaU
@@ -12682,6 +13180,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
 
         gRenderOriginKm = desiredOriginKm;
+      }
+
+      // GPU dust simulation is done in render-space, so it needs the same floating-origin shift.
+      if (vfxGpuDustEnabled && gpuDust.isInited()) {
+        render::GpuParticleField::Settings ds{};
+        ds.enabled = true;
+        ds.textured = vfxGpuDustTextured;
+        ds.dim = vfxGpuDustDim;
+        ds.seed = vfxGpuDustSeed;
+        ds.boundsU = vfxGpuDustBoundsU;
+        ds.drag = vfxGpuDustDrag;
+        ds.noiseFrequency = vfxGpuDustNoiseFreq;
+        ds.noiseStrength = vfxGpuDustNoiseStrength;
+        ds.attractStrength = vfxGpuDustAttract;
+        ds.maxSpeed = vfxGpuDustMaxSpeed;
+        ds.pointSizePx = vfxGpuDustPointSizePx;
+        ds.intensity = vfxGpuDustIntensity;
+        ds.alpha = vfxGpuDustAlpha;
+
+        const float shiftF[3] = {(float)deltaU.x, (float)deltaU.y, (float)deltaU.z};
+        const double dtVfxLocal = paused ? 0.0 : dtReal;
+        gpuDust.update(dtVfxLocal, shiftF, (float)timeRealSec, ds);
       }
     }
 
@@ -12742,11 +13262,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // so we feed the renderer the star position in the current render frame.
     const math::Vec3d sunPosU = toRenderPosU({0,0,0});
     meshRenderer.setLightPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
+    meshRenderer.setSpecular(worldSpecularStrength, worldShininess);
+    meshRenderer.setNormalStrength(worldNormalStrength);
+
+    {
+      const math::Vec3d cp = cam.position();
+      meshRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+    }
 
     atmosphereRenderer.setViewProj(viewF, projF);
     atmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
+    gpuDust.setViewProj(viewF, projF);
 
     // Atmosphere needs the camera position in world/render units for the rim factor.
     {
@@ -12755,7 +13283,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // Update VFX render buffers.
-    if (vfxStarfieldEnabled) {
+    if (!vfxProceduralSkyEnabled && vfxStarfieldEnabled) {
       if ((int)starfield.starCount() != vfxStarCount) {
         starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
       }
@@ -12765,7 +13293,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       starfield.update(cam.position(), timeRealSec);
     }
 
-    if (vfxNebulaEnabled) {
+    if (!vfxProceduralSkyEnabled && vfxNebulaEnabled) {
       const bool regen = ((int)nebula.puffCount() != vfxNebulaPuffCount)
                       || (vfxNebulaVariant != vfxNebulaVariantLast)
                       || (std::abs(vfxNebulaBandPower - vfxNebulaBandPowerLast) > 1e-3f);
@@ -13485,6 +14013,40 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     shipFighters.reserve(contacts.size());
     rockInstances.reserve(asteroids.size());
 
+    if (asteroidMeshesDirty) {
+      rebuildAsteroidProcMeshes();
+    }
+
+    if (artifactMeshesDirty) {
+      rebuildArtifactProcMeshes();
+    }
+
+    // Prepare instance buckets for each procedural asteroid variant.
+    if (vfxAsteroidProcMeshEnabled && !asteroidVariantMeshes.empty()) {
+      if (asteroidVariantInstances.size() != asteroidVariantMeshes.size()) {
+        asteroidVariantInstances.assign(asteroidVariantMeshes.size(), {});
+      } else {
+        for (auto& b : asteroidVariantInstances) b.clear();
+      }
+
+      const std::size_t per = (asteroids.size() / std::max<std::size_t>(1, asteroidVariantInstances.size())) + 1;
+      for (auto& b : asteroidVariantInstances) b.reserve(per);
+    }
+
+    // Prepare instance buckets for procedural SDF artifact variants.
+    if (vfxArtifactProcEnabled && !artifactVariantMeshes.empty()) {
+      if (artifactVariantInstances.size() != artifactVariantMeshes.size()) {
+        artifactVariantInstances.assign(artifactVariantMeshes.size(), {});
+      } else {
+        for (auto& b : artifactVariantInstances) b.clear();
+      }
+
+      const std::size_t per =
+          (std::size_t)(std::clamp(vfxArtifactInstanceCount, 1, 256) /
+                        std::max<std::size_t>(1, artifactVariantInstances.size())) + 1;
+      for (auto& b : artifactVariantInstances) b.reserve(per);
+    }
+
     auto pushShipInst = [&](ShipHullClass hc, const render::InstanceData& inst) {
       switch (hc) {
         case ShipHullClass::Hauler: shipHaulers.push_back(inst); break;
@@ -13539,7 +14101,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                               r,g,b));
 	    }
 
-	    // Asteroid mining nodes (rock spheres, slow deterministic spin)
+	    // Asteroid mining nodes (procedural mesh variants, slow deterministic spin)
 	    for (const auto& a : asteroids) {
 	      const float r = 0.55f, g = 0.55f, b = 0.58f;
 	      const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
@@ -13555,13 +14117,56 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	      const double ang = std::fmod(phase + timeDays * speed, 2.0 * math::kPi);
 	      const math::Quatd q = math::Quatd::fromAxisAngle(axis, ang);
 
-	      rockInstances.push_back(makeInst(toRenderPosU(a.posKm),
-	                                      {0.55 * s, 0.55 * s, 0.55 * s},
-	                                      q,
-	                                      r,g,b));
+	      const auto inst = makeInst(toRenderPosU(a.posKm),
+	                                 {0.55 * s, 0.55 * s, 0.55 * s},
+	                                 q,
+	                                 r,g,b);
+	      if (vfxAsteroidProcMeshEnabled && !asteroidVariantInstances.empty()) {
+	        const core::u64 h = core::hashCombine(a.id, core::fnv1a64("astMeshVariant"));
+	        const std::size_t vi = (std::size_t)(h % asteroidVariantInstances.size());
+	        asteroidVariantInstances[vi].push_back(inst);
+	      } else {
+	        rockInstances.push_back(inst);
+	      }
 	    }
 
-	    // Signal sources (distress / derelicts / resource sites)
+	
+
+	    // Procedural SDF artifacts (debug ring around player). Purely visual.
+	    if (vfxArtifactProcEnabled && !artifactVariantInstances.empty()) {
+	      const int count = std::clamp(vfxArtifactInstanceCount, 1, 256);
+	      const math::Vec3d centerU = toRenderPosU(ship.positionKm());
+	      const double rU = std::max(0.15, vfxArtifactRingRadiusU);
+	      const double yU = vfxArtifactRingHeightU;
+	      for (int i = 0; i < count; ++i) {
+	        const double t = (double)i / (double)count;
+	        const double ang = t * (2.0 * math::kPi);
+
+	        // Deterministic jitter so it doesn't look like a perfect ring.
+	        const core::u64 iid = core::hashCombine((core::u64)i, core::hashCombine(vfxArtifactStyleNonce, core::fnv1a64("artifact_iid")));
+	        core::SplitMix64 rng(iid);
+	        const double jitter = (rng.nextDouble() * 2.0 - 1.0) * 0.18;
+	        const double radius = rU * (1.0 + jitter * 0.25);
+	        const double lift = yU + jitter * 0.10;
+	        const math::Vec3d posU = centerU + math::Vec3d{std::cos(ang) * radius, lift, std::sin(ang) * radius};
+
+	        // Stable spin.
+	        math::Vec3d axis{rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0};
+	        if (axis.lengthSq() < 1e-12) axis = {0,1,0};
+	        axis = axis.normalized();
+	        const double phase = rng.nextDouble() * (2.0 * math::kPi);
+	        const double speed = math::degToRad(10.0 + rng.nextDouble() * 22.0); // rad/day
+	        const double a = std::fmod(phase + timeDays * speed, 2.0 * math::kPi);
+	        const math::Quatd q = math::Quatd::fromAxisAngle(axis, a);
+
+	        const double s = std::max(0.05, vfxArtifactScaleU) * (0.85 + rng.nextDouble() * 0.35);
+	        const auto inst = makeInst(posU, {s,s,s}, q, 1.0f, 1.0f, 1.0f);
+
+	        const std::size_t vi = (std::size_t)(core::hashCombine(iid, core::fnv1a64("artifactVariant")) % artifactVariantInstances.size());
+	        artifactVariantInstances[vi].push_back(inst);
+	      }
+	    }
+    // Signal sources (distress / derelicts / resource sites)
 	    for (const auto& s : signals) {
 	      float r = 0.85f, g = 0.85f, b = 0.85f;
 	      if (s.type == SignalType::Distress) { r = 1.0f; g = 0.6f; b = 0.2f; }
@@ -13581,6 +14186,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     glDisable(GL_BLEND);
 
     if (postFxSettings.enabled) {
+      // Apply FrameGraph flags before building passes this frame.
+      // When a FrameGraph capture is queued, force-disable transient texture aliasing for a
+      // single frame so pass outputs remain stable for readback.
+      postFx.frameGraph().setAliasingEnabled(postFxFrameGraphAliasing && fgCaptureQueue.empty());
+      postFx.frameGraph().setProfilingEnabled(postFxFrameGraphGpuTiming);
       postFx.ensureSize(w, h);
       postFx.beginScene(w, h);
     } else {
@@ -13591,8 +14201,38 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    // Shader-based procedural sky background (replaces starfield + nebula sprites).
+    if (vfxProceduralSkyEnabled) {
+      glDisable(GL_DEPTH_TEST);
+      glDepthMask(GL_FALSE);
+
+      const math::Quatd q = cam.orientation(); // camera->world
+      const math::Vec3d r = q * math::Vec3d{1, 0, 0};
+      const math::Vec3d u = q * math::Vec3d{0, 1, 0};
+      const math::Vec3d f = q * math::Vec3d{0, 0, 1};
+
+      const math::Vec3d cp = cam.position();
+      const float camRight[3] = {(float)r.x, (float)r.y, (float)r.z};
+      const float camUp[3] = {(float)u.x, (float)u.y, (float)u.z};
+      const float camForward[3] = {(float)f.x, (float)f.y, (float)f.z};
+      const float camPosU[3] = {(float)cp.x, (float)cp.y, (float)cp.z};
+
+      const float tanHalfFovY = (float)std::tan(math::degToRad(camFovDeg) * 0.5);
+      proceduralSky.draw(w, h,
+                         vfxProceduralSky,
+                         camRight, camUp, camForward,
+                         camPosU,
+                         tanHalfFovY,
+                         (float)aspect,
+                         (float)timeRealSec);
+
+      glDepthMask(GL_TRUE);
+      glEnable(GL_DEPTH_TEST);
+      glDisable(GL_BLEND);
+    }
+
     // Background nebula (large point sprites, additive blend). Don't write depth.
-    if (vfxNebulaEnabled) {
+    if (!vfxProceduralSkyEnabled && vfxNebulaEnabled) {
       glDepthMask(GL_FALSE);
       pointRenderer.drawPointsSprite(nebula.points(), nebulaPointSpriteTex, render::PointBlendMode::Additive);
       glDepthMask(GL_TRUE);
@@ -13600,7 +14240,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
     // Background stars (point sprites, additive blend). Don't write depth.
-    if (vfxStarfieldEnabled) {
+    if (!vfxProceduralSkyEnabled && vfxStarfieldEnabled) {
       glDepthMask(GL_FALSE);
       if (vfxStarfieldTextured) {
         pointRenderer.drawPointsSprite(starfield.points(), starPointSpriteTex, render::PointBlendMode::Additive);
@@ -13623,8 +14263,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     if (worldUseProceduralSurfaces) {
       // Star (procedural surface + optional unlit)
       {
-        const auto& starSurf = surfaceTexCache.get(render::SurfaceKind::Star, starSurfaceSeed, worldSurfaceTexWidth);
+        const auto& starSurf = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                ? gpuSurfaceCache.albedo(render::SurfaceKind::Star, starSurfaceSeed, worldSurfaceTexWidth)
+                                : surfaceTexCache.get(render::SurfaceKind::Star, starSurfaceSeed, worldSurfaceTexWidth);
         meshRenderer.setTexture(&starSurf);
+        meshRenderer.setNormalTexture(nullptr); // stars are typically emissive/unlit
         meshRenderer.setUnlit(worldStarUnlit);
         tmp.clear();
         tmp.push_back(starSphereInst);
@@ -13634,12 +14277,23 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // Planets (per-type procedural surfaces)
       for (const auto& pd : planetSurfaceDraws) {
-        const auto& surf = surfaceTexCache.get(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth);
+        const auto& surf = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                             ? gpuSurfaceCache.albedo(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth)
+                             : surfaceTexCache.get(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth);
         meshRenderer.setTexture(&surf);
+        if (worldNormalMapsEnabled) {
+          const auto& nrm = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                             ? gpuSurfaceCache.normal(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth)
+                             : surfaceNrmCache.get(pd.surface, pd.surfaceSeed, worldSurfaceTexWidth);
+          meshRenderer.setNormalTexture(&nrm);
+        } else {
+          meshRenderer.setNormalTexture(nullptr);
+        }
         tmp.clear();
         tmp.push_back(pd.inst);
         meshRenderer.drawInstances(tmp);
       }
+      meshRenderer.setNormalTexture(nullptr);
 
       // Cloud shell (alpha-blended) on top of the planet surface.
       if (worldCloudsEnabled && !planetCloudDraws.empty()) {
@@ -13648,9 +14302,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         meshRenderer.setAlphaFromTexture(true);
         meshRenderer.setUnlit(false);
+        meshRenderer.setNormalTexture(nullptr);
 
         for (const auto& cd : planetCloudDraws) {
-          const auto& cloud = surfaceTexCache.get(render::SurfaceKind::Clouds, cd.cloudSeed, worldSurfaceTexWidth);
+          const auto& cloud = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                ? gpuSurfaceCache.albedo(render::SurfaceKind::Clouds, cd.cloudSeed, worldSurfaceTexWidth)
+                                : surfaceTexCache.get(render::SurfaceKind::Clouds, cd.cloudSeed, worldSurfaceTexWidth);
           meshRenderer.setTexture(&cloud);
           meshRenderer.setAlphaMul(cd.alphaMul);
           tmp.clear();
@@ -13672,6 +14329,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         meshRenderer.setAlphaFromTexture(true);
         meshRenderer.setUnlit(false);
+        meshRenderer.setNormalTexture(nullptr);
 
         auto drawRingVariant = [&](const render::Mesh& ringMesh, std::uint8_t variant) {
           meshRenderer.setMesh(&ringMesh);
@@ -13699,9 +14357,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       // Restore default texture for other meshes.
       meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
     } else {
       // Fallback (single instanced draw, checker texture)
       meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
       meshRenderer.setUnlit(false);
       meshRenderer.drawInstances(spheres);
     }
@@ -13721,12 +14381,48 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Stations / salvage / signals (cubes)
     meshRenderer.setMesh(&cube);
     meshRenderer.setTexture(&checker);
+    meshRenderer.setNormalTexture(nullptr);
     meshRenderer.setUnlit(false);
     meshRenderer.setAlphaFromTexture(false);
     meshRenderer.drawInstances(cubes);
 
-    // Asteroids (rock spheres)
-    if (!rockInstances.empty()) {
+    // Asteroids (procedural mesh variants / fallback sphere)
+    if (vfxAsteroidProcMeshEnabled && !asteroidVariantMeshes.empty()) {
+      meshRenderer.setUnlit(false);
+      meshRenderer.setAlphaFromTexture(false);
+
+      for (std::size_t i = 0; i < asteroidVariantMeshes.size(); ++i) {
+        if (i >= asteroidVariantInstances.size()) break;
+        const auto& inst = asteroidVariantInstances[i];
+        if (inst.empty()) continue;
+
+        meshRenderer.setMesh(&asteroidVariantMeshes[i]);
+
+        if (vfxAsteroidUseRockyTexture && worldUseProceduralSurfaces && i < asteroidVariantSeeds.size()) {
+          const auto& rock = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                               ? gpuSurfaceCache.albedo(render::SurfaceKind::Rocky, asteroidVariantSeeds[i], worldSurfaceTexWidth)
+                               : surfaceTexCache.get(render::SurfaceKind::Rocky, asteroidVariantSeeds[i], worldSurfaceTexWidth);
+          meshRenderer.setTexture(&rock);
+          if (worldNormalMapsEnabled) {
+            const auto& nrm = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                               ? gpuSurfaceCache.normal(render::SurfaceKind::Rocky, asteroidVariantSeeds[i], worldSurfaceTexWidth)
+                               : surfaceNrmCache.get(render::SurfaceKind::Rocky, asteroidVariantSeeds[i], worldSurfaceTexWidth);
+            meshRenderer.setNormalTexture(&nrm);
+          } else {
+            meshRenderer.setNormalTexture(nullptr);
+          }
+        } else {
+          meshRenderer.setTexture(&checker);
+          meshRenderer.setNormalTexture(nullptr);
+        }
+
+        meshRenderer.drawInstances(inst);
+      }
+
+      // Restore for the rest of the forward pass.
+      meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
+    } else if (!rockInstances.empty()) {
       meshRenderer.setMesh(&rockSphere);
       meshRenderer.setTexture(&checker);
       meshRenderer.setUnlit(false);
@@ -13734,11 +14430,52 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       meshRenderer.drawInstances(rockInstances);
     }
 
+
+
+    // Procedural SDF artifacts (Marching Tetrahedra isosurface meshes)
+    if (vfxArtifactProcEnabled && !artifactVariantMeshes.empty()) {
+      meshRenderer.setUnlit(false);
+      meshRenderer.setAlphaFromTexture(false);
+
+      for (std::size_t i = 0; i < artifactVariantMeshes.size(); ++i) {
+        if (i >= artifactVariantInstances.size()) break;
+        const auto& inst = artifactVariantInstances[i];
+        if (inst.empty()) continue;
+
+        meshRenderer.setMesh(&artifactVariantMeshes[i]);
+
+        if (vfxArtifactUseProceduralTexture && worldUseProceduralSurfaces && i < artifactVariantSeeds.size()) {
+          const auto& albedo = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                 ? gpuSurfaceCache.albedo(vfxArtifactSurfaceKind, artifactVariantSeeds[i], worldSurfaceTexWidth)
+                                 : surfaceTexCache.get(vfxArtifactSurfaceKind, artifactVariantSeeds[i], worldSurfaceTexWidth);
+          meshRenderer.setTexture(&albedo);
+
+          if (worldNormalMapsEnabled) {
+            const auto& nrm = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                 ? gpuSurfaceCache.normal(vfxArtifactSurfaceKind, artifactVariantSeeds[i], worldSurfaceTexWidth)
+                                 : surfaceNrmCache.get(vfxArtifactSurfaceKind, artifactVariantSeeds[i], worldSurfaceTexWidth);
+            meshRenderer.setNormalTexture(&nrm);
+          } else {
+            meshRenderer.setNormalTexture(nullptr);
+          }
+        } else {
+          meshRenderer.setTexture(&checker);
+          meshRenderer.setNormalTexture(nullptr);
+        }
+
+        meshRenderer.drawInstances(inst);
+      }
+
+      // Restore for the rest of the forward pass.
+      meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
+    }
     // Ships (procedural hull meshes, checker texture + per-instance tint)
     auto drawShipGroup = [&](const render::Mesh& m, const std::vector<render::InstanceData>& inst) {
       if (inst.empty()) return;
       meshRenderer.setMesh(&m);
       meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
       meshRenderer.setUnlit(false);
       meshRenderer.setAlphaFromTexture(false);
       meshRenderer.drawInstances(inst);
@@ -13754,10 +14491,36 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       else if (shipHullClass == ShipHullClass::Fighter) m = &shipFighterMesh;
       meshRenderer.setMesh(m);
       meshRenderer.setTexture(&shipLiveryTex);
+      meshRenderer.setNormalTexture(nullptr);
       meshRenderer.setUnlit(false);
       meshRenderer.setAlphaFromTexture(false);
       meshRenderer.drawInstances(shipLiveryInst);
       meshRenderer.setTexture(&checker);
+    }
+
+    // GPU dust field (very high count micro-particles). Depth-tested but no depth writes.
+    if (vfxGpuDustEnabled && gpuDust.isInited()) {
+      glDepthMask(GL_FALSE);
+      render::GpuParticleField::Settings ds{};
+      ds.enabled = true;
+      ds.textured = vfxGpuDustTextured;
+      ds.dim = vfxGpuDustDim;
+      ds.seed = vfxGpuDustSeed;
+      ds.boundsU = vfxGpuDustBoundsU;
+      ds.drag = vfxGpuDustDrag;
+      ds.noiseFrequency = vfxGpuDustNoiseFreq;
+      ds.noiseStrength = vfxGpuDustNoiseStrength;
+      ds.attractStrength = vfxGpuDustAttract;
+      ds.maxSpeed = vfxGpuDustMaxSpeed;
+      ds.pointSizePx = vfxGpuDustPointSizePx;
+      ds.intensity = vfxGpuDustIntensity * vfxParticleIntensity;
+      ds.alpha = std::clamp(vfxGpuDustAlpha * vfxParticleIntensity, 0.0f, 1.0f);
+
+      const unsigned int sprite = (vfxGpuDustTextured ? particlePointSpriteTex.handle() : 0u);
+      gpuDust.draw(sprite, ds);
+
+      glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
     }
 
     // Particles (thrusters, impacts, explosions). Depth-tested but no depth writes.
@@ -13833,6 +14596,124 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
 
+    // FrameGraph capture (debug): issue any queued pass output captures after PostFX executes.
+    // Note: requests are scheduled from the UI, so they land here on the *next* frame.
+    if (!fgCaptureQueue.empty()) {
+      if (!postFxSettings.enabled) {
+        toast(toasts, "FrameGraph capture failed: PostFX is disabled.", 2.2);
+        fgCaptureQueue.clear();
+      } else if (!fgReadbackOk) {
+        const std::string msg = fgReadbackInitErr.empty()
+                                  ? std::string("FrameGraph capture unavailable (missing OpenGL buffer mapping).")
+                                  : ("FrameGraph capture unavailable: " + fgReadbackInitErr);
+        toast(toasts, msg, 2.4);
+        fgCaptureQueue.clear();
+      } else {
+        auto& fg = postFx.frameGraph();
+        const auto& sched = fg.schedule();
+
+        auto findPassByName = [&](const std::string& name) -> const render::FrameGraph::PassInfo* {
+          for (const auto& p : sched.passes) {
+            if (p.name == name) return &p;
+          }
+          return nullptr;
+        };
+
+        for (const auto& req : fgCaptureQueue) {
+          const auto* pass = findPassByName(req.passName);
+          if (!pass) {
+            toast(toasts, "Capture failed: pass not found: " + req.passName, 2.4);
+            continue;
+          }
+          if (!pass->write.valid() || pass->write.isBackbuffer()) {
+            toast(toasts, "Capture failed: pass has no writable texture output.", 2.4);
+            continue;
+          }
+
+          const auto& t = fg.textures()[pass->write.id];
+          const unsigned int tex = fg.glTexture(pass->write);
+          if (!tex || t.resolvedW <= 0 || t.resolvedH <= 0) {
+            toast(toasts, "Capture failed: invalid output texture.", 2.4);
+            continue;
+          }
+
+          if (!req.outputName.empty() && t.name != req.outputName) {
+            toast(toasts, "Capture warning: output name changed (" + req.outputName + " -> " + t.name + ").", 2.0);
+          }
+
+          // Prefer PNG for byte textures; otherwise read back as float and write HDR.
+          const unsigned int rbType = (t.desc.type == GL_UNSIGNED_BYTE || t.desc.type == GL_BYTE)
+                                        ? t.desc.type
+                                        : (unsigned int)GL_FLOAT;
+
+          render::TextureReadbackDesc desc{};
+          desc.texture = tex;
+          desc.width = t.resolvedW;
+          desc.height = t.resolvedH;
+          desc.format = t.desc.format;
+          desc.type = rbType;
+          desc.level = 0;
+
+          const bool ok = fgReadback.enqueue(desc, req.path, /*delayFrames=*/3);
+          if (!ok) {
+            toast(toasts, "Capture failed to enqueue: " + req.path, 2.4);
+          } else {
+            toast(toasts, "FrameGraph capture queued: " + req.path, 1.8);
+          }
+        }
+        fgCaptureQueue.clear();
+      }
+    }
+
+    // FrameGraph capture: poll async readbacks and write results to disk.
+    if (fgReadbackOk && fgReadback.pendingJobs() > 0) {
+      auto channelsForFormat = [](unsigned int fmt) -> int {
+        switch (fmt) {
+          case GL_RGBA:
+          case GL_BGRA:
+            return 4;
+          case GL_RGB:
+          case GL_BGR:
+            return 3;
+          case GL_RG:
+            return 2;
+          case GL_RED:
+            return 1;
+          default:
+            return 4;
+        }
+      };
+
+      render::TextureReadbackResult rb{};
+      int wroteThisFrame = 0;
+      while (fgReadback.poll(rb)) {
+        const int comp = channelsForFormat(rb.desc.format);
+        std::string err;
+        bool ok = false;
+
+        if (!rb.bytes.empty()) {
+          const int stride = rb.desc.width * comp;
+          ok = game::writePixelsToPng(rb.tag, rb.desc.width, rb.desc.height, comp,
+                                      rb.bytes.data(), stride, /*flipY=*/true, &err);
+        } else if (!rb.floats.empty()) {
+          ok = game::writePixelsToHdr(rb.tag, rb.desc.width, rb.desc.height, comp,
+                                      rb.floats.data(), /*flipY=*/true, &err);
+        } else {
+          err = "Empty readback buffer.";
+        }
+
+        if (ok) {
+          toast(toasts, "Saved capture: " + rb.tag, 2.2);
+        } else {
+          toast(toasts, err.empty() ? "FrameGraph capture write failed." : err, 2.4);
+        }
+
+        ++wroteThisFrame;
+        if (wroteThisFrame >= 4) break; // don't spend too long writing files in one frame
+      }
+    }
+
+
     // Flight telemetry recorder (sample after simulation + render, before UI).
     game::tickFlightRecorder(flightRecorderWindow, dtReal, timeRealSec, timeDays, ship, paused);
 
@@ -13859,6 +14740,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Keep HUD settings synced so manual save / auto-save always matches runtime.
     syncHudSettingsFromRuntime();
     hudSettingsDirty = !hudSettingsEquivalent(hudSettings, hudSettingsSaved);
+
+    // Keep VFX settings synced so manual save / auto-save always matches runtime.
+    syncVfxSettingsFromRuntime();
+    vfxSettingsDirty = !vfxSettingsEquivalent(vfxSettings, vfxSettingsSaved);
 
     auto hudU32 = [&](const ui::Color4f& c, float alphaMul = 1.0f) -> ImU32 {
       auto toByte = [](float v) -> int {
@@ -14291,6 +15176,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         showShip = true;
         showContacts = true;
         showMissions = true;
+        showVfx = true;
 
         uiDockResetLayout = false;
       }
@@ -14546,6 +15432,35 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
 
       ImGui::Separator();
+
+      // Procedural layout generator (seeded, deterministic).
+      {
+        static core::u64 procLayoutSeed = core::seedFromText("hud_layout_proc");
+        static bool procLayoutUseSystemSeed = true;
+
+        ImGui::TextDisabled("Procedural layout (seeded)");
+        ImGui::Checkbox("Seed from current system", &procLayoutUseSystemSeed);
+
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::InputScalar("Layout seed", ImGuiDataType_U64, &procLayoutSeed, nullptr, nullptr, "%llu");
+        ImGui::SameLine();
+        if (ImGui::Button("Use system seed") && currentSystem) {
+          procLayoutSeed = (core::u64)currentSystem->stub.seed;
+        }
+
+        if (ImGui::Button("Generate layout")) {
+          const core::u64 seed = (procLayoutUseSystemSeed && currentSystem) ? (core::u64)currentSystem->stub.seed : procLayoutSeed;
+          ui::applyProceduralHudLayout(seed, hudLayout);
+
+          // Keep toggles coherent with the layout (generator preserves enabled flags).
+          showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+          hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+          hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+
+          toast(toasts, "Generated HUD layout from seed.", 2.0);
+        }
+      }
 
       // Anchor presets (pivot)
       struct AnchorPreset { const char* label; float px; float py; };
@@ -16432,7 +17347,96 @@ if (showVfx) {
       "%s toggles this panel. Background stars + particles are rendered as point sprites.",
       game::chordLabel(controls.actions.toggleVfxLab).c_str());
 
+  ImGui::Separator();
+  ImGui::TextDisabled("VFX settings: %s", vfxSettingsPath.c_str());
+  if (vfxSettingsDirty) {
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.20f, 1.0f), "*unsaved*");
+  }
+
+  if (ImGui::Button("Save##vfx_settings")) {
+    syncVfxSettingsFromRuntime();
+    if (ui::saveVfxSettingsToFile(vfxSettings, vfxSettingsPath)) {
+      vfxSettingsSaved = vfxSettings;
+      vfxSettingsDirty = false;
+      toast(toasts, "VFX settings saved.", 2.0);
+    } else {
+      toast(toasts, "VFX settings: save failed.", 2.8);
+    }
+  }
+
+  ImGui::SameLine();
+  if (ImGui::Button("Load##vfx_settings")) {
+    ui::VfxSettings loaded = ui::makeDefaultVfxSettings();
+    if (ui::loadVfxSettingsFromFile(vfxSettingsPath, loaded)) {
+      vfxSettings = loaded;
+      applyVfxSettingsToRuntime(vfxSettings);
+      vfxSettingsSaved = vfxSettings;
+      vfxSettingsDirty = false;
+      toast(toasts, "VFX settings loaded.", 2.0);
+    } else {
+      toast(toasts, "VFX settings: load failed (missing/corrupt file).", 2.8);
+    }
+  }
+
+  ImGui::SameLine();
+  if (ImGui::Button("Restore defaults##vfx_settings")) {
+    vfxSettings = ui::makeDefaultVfxSettings();
+    applyVfxSettingsToRuntime(vfxSettings);
+    toast(toasts, "VFX settings reset to defaults (not saved).", 2.6);
+  }
+
+  ImGui::SameLine();
+  ImGui::Checkbox("Auto-save on exit##vfx_settings", &vfxSettingsAutoSaveOnExit);
+
+  ImGui::Separator();
+
+  if (ImGui::CollapsingHeader("Procedural Sky (Shader)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enabled##procSky", &vfxProceduralSkyEnabled);
+
+    ImGui::TextDisabled(
+        "When enabled, the background is rendered by a full-screen procedural shader (seeded stars + cheap volumetric nebula).\n"
+        "This replaces the point-sprite Starfield + Nebula layers below.");
+
+    if (vfxProceduralSkyEnabled) {
+      ImGui::Separator();
+      ImGui::InputInt("Seed##procSky", &vfxProceduralSky.seed);
+      if (ImGui::Button("Randomize seed##procSky")) {
+        core::SplitMix64 rr(core::hashCombine(
+            seed,
+            core::hashCombine(core::fnv1a64("procSkyRnd"), vfxProceduralSkySeedNonce++)));
+        vfxProceduralSky.seed = (int)(rr.nextU64() & 0x7fffffffULL);
+      }
+
+      ImGui::SliderFloat("Intensity##procSky", &vfxProceduralSky.intensity, 0.0f, 6.0f, "%.2f");
+
+      if (ImGui::CollapsingHeader("Stars##procSky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Star intensity##procSky", &vfxProceduralSky.starIntensity, 0.0f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Star density##procSky", &vfxProceduralSky.starDensity, 80.0f, 2200.0f, "%.0f");
+        ImGui::SliderFloat("Star probability##procSky", &vfxProceduralSky.starProbability, 0.0f, 0.30f, "%.3f");
+        ImGui::SliderFloat("Star size##procSky", &vfxProceduralSky.starSize, 0.25f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Star twinkle##procSky", &vfxProceduralSky.starTwinkle, 0.0f, 1.0f, "%.2f");
+      }
+
+      if (ImGui::CollapsingHeader("Nebula##procSky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Nebula enabled##procSky", &vfxProceduralSky.nebulaEnabled);
+        ImGui::SliderFloat("Nebula intensity##procSky", &vfxProceduralSky.nebulaIntensity, 0.0f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Nebula frequency##procSky", &vfxProceduralSky.nebulaFrequency, 0.2f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Threshold##procSky", &vfxProceduralSky.nebulaThreshold, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Softness##procSky", &vfxProceduralSky.nebulaSoftness, 0.01f, 0.55f, "%.2f");
+        ImGui::SliderFloat("Band power##procSky", &vfxProceduralSky.nebulaBandPower, 1.0f, 4.0f, "%.2f");
+        ImGui::SliderFloat("Parallax##procSky", &vfxProceduralSky.nebulaParallax, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderInt("Steps##procSky", &vfxProceduralSky.nebulaSteps, 2, 24);
+        ImGui::SliderFloat("World scale##procSky", &vfxProceduralSky.nebulaWorldScale, 1.0e-5f, 1.0e-3f, "%.6f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Drift##procSky", &vfxProceduralSky.nebulaDrift, 0.0f, 0.25f, "%.3f");
+      }
+    } else {
+      ImGui::TextDisabled("(procedural sky disabled)");
+    }
+  }
+
   if (ImGui::CollapsingHeader("Starfield", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (vfxProceduralSkyEnabled) ImGui::BeginDisabled(true);
     ImGui::Checkbox("Enabled##stars", &vfxStarfieldEnabled);
 
     if (vfxStarfieldEnabled) {
@@ -16451,11 +17455,17 @@ if (showVfx) {
     } else {
       ImGui::TextDisabled("(starfield disabled)");
     }
+
+    if (vfxProceduralSkyEnabled) {
+      ImGui::EndDisabled();
+      ImGui::TextDisabled("(disabled because Procedural Sky is enabled)");
+    }
   }
 
 
 
   if (ImGui::CollapsingHeader("Nebula", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (vfxProceduralSkyEnabled) ImGui::BeginDisabled(true);
     ImGui::Checkbox("Enabled##nebula", &vfxNebulaEnabled);
 
     if (vfxNebulaEnabled) {
@@ -16490,8 +17500,264 @@ if (showVfx) {
       ImGui::TextDisabled("Puffs generated: %zu", nebula.puffCount());
       ImGui::TextDisabled("Tip: Nebula is additive; tune PostFX bloom/warp for extra glow.");
     }
+
+    if (vfxProceduralSkyEnabled) {
+      ImGui::EndDisabled();
+      ImGui::TextDisabled("(disabled because Procedural Sky is enabled)");
+    }
   }
-  if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
+
+
+  if (ImGui::CollapsingHeader("Asteroids (Procedural Mesh)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::Checkbox("Use procedural meshes", &vfxAsteroidProcMeshEnabled)) {
+      asteroidMeshesDirty = true;
+    }
+
+    if (vfxAsteroidProcMeshEnabled) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Rocky texture", &vfxAsteroidUseRockyTexture);
+
+      if (ImGui::SliderInt("Variant count", &vfxAsteroidVariantCount, 1, 32)) {
+        asteroidMeshesDirty = true;
+      }
+
+      bool dirty = false;
+
+      dirty |= ImGui::SliderInt("Slices", &vfxAsteroidParams.slices, 8, 96);
+      dirty |= ImGui::SliderInt("Stacks", &vfxAsteroidParams.stacks, 6, 64);
+
+      dirty |= ImGui::SliderFloat("Noise frequency", &vfxAsteroidParams.noiseFrequency, 0.0f, 8.0f, "%.2f");
+      dirty |= ImGui::SliderFloat("Noise amplitude", &vfxAsteroidParams.noiseAmplitude, 0.0f, 0.75f, "%.2f");
+      dirty |= ImGui::SliderInt("Noise octaves", &vfxAsteroidParams.noiseOctaves, 0, 10);
+      dirty |= ImGui::SliderFloat("Noise gain", &vfxAsteroidParams.noiseGain, 0.15f, 0.85f, "%.2f");
+      dirty |= ImGui::SliderFloat("Noise lacunarity", &vfxAsteroidParams.noiseLacunarity, 1.20f, 3.50f, "%.2f");
+
+      ImGui::Separator();
+
+      dirty |= ImGui::SliderInt("Craters", &vfxAsteroidParams.craterCount, 0, 64);
+      dirty |= ImGui::SliderFloat("Crater radius min (deg)", &vfxAsteroidParams.craterRadiusMinDeg, 1.0f, 40.0f, "%.1f");
+      dirty |= ImGui::SliderFloat("Crater radius max (deg)", &vfxAsteroidParams.craterRadiusMaxDeg, 1.0f, 70.0f, "%.1f");
+      if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
+        vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
+      }
+
+      dirty |= ImGui::SliderFloat("Crater depth", &vfxAsteroidParams.craterDepth, 0.0f, 0.35f, "%.3f");
+      dirty |= ImGui::SliderFloat("Crater rim", &vfxAsteroidParams.craterRim, 0.0f, 1.0f, "%.2f");
+
+      ImGui::Separator();
+      dirty |= ImGui::SliderFloat("Clamp min radius", &vfxAsteroidParams.minRadius, 0.10f, 1.00f, "%.2f");
+      dirty |= ImGui::SliderFloat("Clamp max radius", &vfxAsteroidParams.maxRadius, 1.00f, 2.00f, "%.2f");
+      if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
+        vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+      }
+
+      if (dirty) asteroidMeshesDirty = true;
+
+      if (ImGui::Button("Rebuild meshes")) {
+        asteroidMeshesDirty = true;
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Randomize style")) {
+        // Changes parameters (not the sim seed). Think of this as "procedural engine presets".
+        core::SplitMix64 rr(core::hashCombine(seed, core::hashCombine(core::fnv1a64("astStyle"), vfxAsteroidStyleNonce++)));
+
+        vfxAsteroidVariantCount = rr.range(4, 14);
+        vfxAsteroidParams.slices = rr.range(14, 42);
+        vfxAsteroidParams.stacks = rr.range(10, 28);
+        vfxAsteroidParams.noiseFrequency = (float)rr.range(1.60, 4.80);
+        vfxAsteroidParams.noiseAmplitude = (float)rr.range(0.10, 0.40);
+        vfxAsteroidParams.noiseOctaves = rr.range(3, 7);
+        vfxAsteroidParams.noiseGain = (float)rr.range(0.40, 0.65);
+        vfxAsteroidParams.noiseLacunarity = (float)rr.range(1.70, 2.80);
+        vfxAsteroidParams.craterCount = rr.range(6, 28);
+        vfxAsteroidParams.craterRadiusMinDeg = (float)rr.range(4.0, 10.0);
+        vfxAsteroidParams.craterRadiusMaxDeg = (float)rr.range(16.0, 46.0);
+        vfxAsteroidParams.craterDepth = (float)rr.range(0.05, 0.16);
+        vfxAsteroidParams.craterRim = (float)rr.range(0.05, 0.45);
+        vfxAsteroidParams.minRadius = (float)rr.range(0.55, 0.80);
+        vfxAsteroidParams.maxRadius = (float)rr.range(1.15, 1.55);
+
+        if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
+          vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
+        }
+        if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
+          vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+        }
+
+        asteroidMeshesDirty = true;
+      }
+
+      if (asteroidMeshesDirty) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(pending rebuild)");
+      }
+
+      if (!asteroidVariantStats.empty()) {
+        std::size_t tri = asteroidVariantStats[0].indexCount / 3u;
+        ImGui::TextDisabled("Variant[0]: %zu vtx | %zu tris | radius %.2f..%.2f",
+                            asteroidVariantStats[0].vertexCount,
+                            tri,
+                            asteroidVariantStats[0].minRadius,
+                            asteroidVariantStats[0].maxRadius);
+      } else {
+        ImGui::TextDisabled("(no asteroid variants generated)");
+      }
+    } else {
+      ImGui::TextDisabled("(procedural asteroids disabled; using placeholder spheres)");
+    }
+  }
+
+
+  if (ImGui::CollapsingHeader("SDF Artifacts (Isosurface Mesher)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::Checkbox("Enabled##sdf_artifacts", &vfxArtifactProcEnabled)) {
+      artifactMeshesDirty = true;
+    }
+
+    if (vfxArtifactProcEnabled) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Procedural texture##sdf_artifacts", &vfxArtifactUseProceduralTexture);
+
+      // SurfaceKind selector (reuses the planet surface procedural generator).
+      const char* surfNames[] = {"Rocky", "Desert", "Ocean", "Ice", "Gas Giant", "Star", "Clouds"};
+      int surf = (int)vfxArtifactSurfaceKind;
+      if (ImGui::Combo("Surface kind##sdf_artifacts", &surf, surfNames, 7)) {
+        vfxArtifactSurfaceKind = (render::SurfaceKind)surf;
+      }
+
+      if (ImGui::SliderInt("Variant count##sdf_artifacts", &vfxArtifactVariantCount, 1, 16)) {
+        artifactMeshesDirty = true;
+      }
+
+      ImGui::SliderInt("Instance count##sdf_artifacts", &vfxArtifactInstanceCount, 1, 256);
+
+      float ringR = (float)vfxArtifactRingRadiusU;
+      if (ImGui::SliderFloat("Ring radius (U)##sdf_artifacts", &ringR, 0.15f, 6.0f, "%.2f")) {
+        vfxArtifactRingRadiusU = (double)ringR;
+      }
+
+      float ringH = (float)vfxArtifactRingHeightU;
+      if (ImGui::SliderFloat("Ring height (U)##sdf_artifacts", &ringH, -2.0f, 2.0f, "%.2f")) {
+        vfxArtifactRingHeightU = (double)ringH;
+      }
+
+      float baseS = (float)vfxArtifactScaleU;
+      if (ImGui::SliderFloat("Base scale (U)##sdf_artifacts", &baseS, 0.05f, 1.25f, "%.2f")) {
+        vfxArtifactScaleU = (double)baseS;
+      }
+
+      ImGui::Separator();
+
+      bool dirty = false;
+      dirty |= ImGui::SliderInt("Resolution##sdf_artifacts", &vfxArtifactParams.resolution, 16, 128);
+      dirty |= ImGui::SliderFloat("Bounds##sdf_artifacts", &vfxArtifactParams.bounds, 0.60f, 2.00f, "%.2f");
+      dirty |= ImGui::SliderFloat("Iso##sdf_artifacts", &vfxArtifactParams.iso, -0.45f, 0.45f, "%.3f");
+
+      ImGui::Separator();
+
+      dirty |= ImGui::SliderFloat("Base radius##sdf_artifacts", &vfxArtifactParams.baseRadius, 0.25f, 1.35f, "%.2f");
+
+      dirty |= ImGui::SliderFloat("Noise freq##sdf_artifacts", &vfxArtifactParams.noiseFrequency, 0.0f, 6.5f, "%.2f");
+      dirty |= ImGui::SliderFloat("Noise amp##sdf_artifacts", &vfxArtifactParams.noiseAmplitude, 0.0f, 0.75f, "%.2f");
+      dirty |= ImGui::SliderInt("Noise octaves##sdf_artifacts", &vfxArtifactParams.noiseOctaves, 0, 10);
+      dirty |= ImGui::SliderFloat("Noise gain##sdf_artifacts", &vfxArtifactParams.noiseGain, 0.15f, 0.85f, "%.2f");
+      dirty |= ImGui::SliderFloat("Noise lacunarity##sdf_artifacts", &vfxArtifactParams.noiseLacunarity, 1.20f, 3.50f, "%.2f");
+
+      ImGui::Separator();
+
+      dirty |= ImGui::SliderInt("Blob count##sdf_artifacts", &vfxArtifactParams.blobCount, 0, 18);
+      dirty |= ImGui::SliderFloat("Blob radius min##sdf_artifacts", &vfxArtifactParams.blobRadiusMin, 0.05f, 0.85f, "%.2f");
+      dirty |= ImGui::SliderFloat("Blob radius max##sdf_artifacts", &vfxArtifactParams.blobRadiusMax, 0.05f, 1.20f, "%.2f");
+      if (vfxArtifactParams.blobRadiusMax < vfxArtifactParams.blobRadiusMin) {
+        vfxArtifactParams.blobRadiusMax = vfxArtifactParams.blobRadiusMin;
+      }
+      dirty |= ImGui::SliderFloat("Blob smooth##sdf_artifacts", &vfxArtifactParams.blobSmoothK, 0.0f, 0.65f, "%.2f");
+      dirty |= ImGui::SliderFloat("Blob center radius##sdf_artifacts", &vfxArtifactParams.blobCenterRadius, 0.0f, 1.25f, "%.2f");
+
+      ImGui::Separator();
+
+      dirty |= ImGui::SliderInt("Cut planes##sdf_artifacts", &vfxArtifactParams.cutCount, 0, 10);
+      dirty |= ImGui::SliderFloat("Cut offset min##sdf_artifacts", &vfxArtifactParams.cutOffsetMin, 0.0f, 1.00f, "%.2f");
+      dirty |= ImGui::SliderFloat("Cut offset max##sdf_artifacts", &vfxArtifactParams.cutOffsetMax, 0.0f, 1.35f, "%.2f");
+      if (vfxArtifactParams.cutOffsetMax < vfxArtifactParams.cutOffsetMin) {
+        vfxArtifactParams.cutOffsetMax = vfxArtifactParams.cutOffsetMin;
+      }
+
+      ImGui::Separator();
+
+      dirty |= ImGui::SliderFloat("Groove strength##sdf_artifacts", &vfxArtifactParams.grooveStrength, 0.0f, 0.35f, "%.2f");
+      dirty |= ImGui::SliderFloat("Groove frequency##sdf_artifacts", &vfxArtifactParams.grooveFrequency, 0.0f, 20.0f, "%.1f");
+
+      dirty |= ImGui::SliderFloat("Normal eps##sdf_artifacts", &vfxArtifactParams.normalEps, 0.0005f, 0.0150f, "%.4f");
+
+      if (dirty) artifactMeshesDirty = true;
+
+      if (ImGui::Button("Rebuild artifacts##sdf_artifacts")) {
+        artifactMeshesDirty = true;
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Randomize style##sdf_artifacts")) {
+        // Randomize parameters (not the sim seed). Think of this as procedural engine presets.
+        core::SplitMix64 rr(core::hashCombine(seed,
+                                             core::hashCombine(core::fnv1a64("artifactStyle"), vfxArtifactStyleNonce++)));
+
+        vfxArtifactVariantCount = rr.range(2, 7);
+        vfxArtifactParams.resolution = rr.range(22, 70);
+        vfxArtifactParams.bounds = (float)rr.range(1.00, 1.80);
+        vfxArtifactParams.baseRadius = (float)rr.range(0.55, 1.15);
+
+        vfxArtifactParams.noiseFrequency = (float)rr.range(1.20, 3.80);
+        vfxArtifactParams.noiseAmplitude = (float)rr.range(0.08, 0.38);
+        vfxArtifactParams.noiseOctaves = rr.range(3, 7);
+        vfxArtifactParams.noiseGain = (float)rr.range(0.38, 0.62);
+        vfxArtifactParams.noiseLacunarity = (float)rr.range(1.60, 2.70);
+
+        vfxArtifactParams.blobCount = rr.range(2, 10);
+        vfxArtifactParams.blobRadiusMin = (float)rr.range(0.10, 0.22);
+        vfxArtifactParams.blobRadiusMax = (float)rr.range(0.30, 0.75);
+        vfxArtifactParams.blobSmoothK = (float)rr.range(0.12, 0.40);
+        vfxArtifactParams.blobCenterRadius = (float)rr.range(0.45, 0.95);
+
+        vfxArtifactParams.cutCount = rr.range(1, 6);
+        vfxArtifactParams.cutOffsetMin = (float)rr.range(0.10, 0.25);
+        vfxArtifactParams.cutOffsetMax = (float)rr.range(0.32, 0.85);
+
+        vfxArtifactParams.grooveStrength = (float)rr.range(0.00, 0.18);
+        vfxArtifactParams.grooveFrequency = (float)rr.range(5.0, 14.0);
+
+        vfxArtifactParams.normalEps = (float)rr.range(0.0025, 0.0080);
+
+        if (vfxArtifactParams.blobRadiusMax < vfxArtifactParams.blobRadiusMin) {
+          vfxArtifactParams.blobRadiusMax = vfxArtifactParams.blobRadiusMin;
+        }
+        if (vfxArtifactParams.cutOffsetMax < vfxArtifactParams.cutOffsetMin) {
+          vfxArtifactParams.cutOffsetMax = vfxArtifactParams.cutOffsetMin;
+        }
+
+        artifactMeshesDirty = true;
+      }
+
+      if (artifactMeshesDirty) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(pending rebuild)");
+      }
+
+      if (!artifactVariantStats.empty()) {
+        const std::size_t tri = artifactVariantStats[0].indexCount / 3u;
+        ImGui::TextDisabled("Variant[0]: %zu vtx | %zu tris | X [%.2f..%.2f]",
+                            artifactVariantStats[0].vertexCount,
+                            tri,
+                            artifactVariantStats[0].minX,
+                            artifactVariantStats[0].maxX);
+      } else {
+        ImGui::TextDisabled("(no artifacts generated)");
+      }
+    } else {
+      ImGui::TextDisabled("(artifacts disabled)");
+    }
+  }
+    if (ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen)) {
     ImGui::Checkbox("Enabled##particles", &vfxParticlesEnabled);
 
     if (vfxParticlesEnabled) {
@@ -16529,6 +17795,48 @@ if (showVfx) {
     } else {
       ImGui::TextDisabled("(particles disabled)");
     }
+
+    ImGui::Separator();
+    ImGui::Text("GPU Dust Field (GPGPU)");
+    if (!gpuDust.isInited()) {
+      ImGui::TextDisabled("(not available: shader or FBO init failed)");
+    }
+
+    ImGui::Checkbox("Enabled##gpu_dust", &vfxGpuDustEnabled);
+    if (vfxGpuDustEnabled) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Textured##gpu_dust", &vfxGpuDustTextured);
+
+      const long long estCount = (long long)vfxGpuDustDim * (long long)vfxGpuDustDim;
+      ImGui::Text("Particles: %lld", estCount);
+
+      ImGui::SliderInt("Resolution (dim)##gpu_dust", &vfxGpuDustDim, 64, 768);
+      ImGui::SliderFloat("Bounds (U)##gpu_dust", &vfxGpuDustBoundsU, 8.0f, 220.0f, "%.1f");
+      ImGui::SliderFloat("Point size (px)##gpu_dust", &vfxGpuDustPointSizePx, 0.25f, 8.0f, "%.2f");
+      ImGui::SliderFloat("Alpha##gpu_dust", &vfxGpuDustAlpha, 0.0f, 1.0f, "%.2f");
+      ImGui::SliderFloat("Intensity##gpu_dust", &vfxGpuDustIntensity, 0.0f, 4.0f, "%.2f");
+
+      ImGui::Separator();
+      ImGui::SliderFloat("Drag##gpu_dust", &vfxGpuDustDrag, 0.0f, 2.5f, "%.2f");
+      ImGui::SliderFloat("Noise freq##gpu_dust", &vfxGpuDustNoiseFreq, 0.0f, 0.35f, "%.3f");
+      ImGui::SliderFloat("Noise strength##gpu_dust", &vfxGpuDustNoiseStrength, 0.0f, 5.0f, "%.2f");
+      ImGui::SliderFloat("Attract##gpu_dust", &vfxGpuDustAttract, 0.0f, 0.75f, "%.3f");
+      ImGui::SliderFloat("Max speed##gpu_dust", &vfxGpuDustMaxSpeed, 0.25f, 80.0f, "%.1f");
+
+      ImGui::Separator();
+      ImGui::InputInt("Seed##gpu_dust", &vfxGpuDustSeed);
+      if (ImGui::Button("Randomize seed##gpu_dust")) {
+        core::SplitMix64 rr(core::hashCombine(seed, (core::u64)SDL_GetTicks64()));
+        vfxGpuDustSeed = (int)(rr.nextU32() & 0x7fffffffU);
+        gpuDust.reset();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Reset field##gpu_dust")) {
+        gpuDust.reset();
+      }
+
+      ImGui::TextDisabled("Sim: ping-pong RGBA32F textures; draw: gl_VertexID + texelFetch");
+    }
   }
 
   ImGui::End();
@@ -16545,6 +17853,98 @@ if (showPostFx) {
   ImGui::Checkbox("Enabled", &postFxSettings.enabled);
 
   if (postFxSettings.enabled) {
+    if (ImGui::CollapsingHeader("Procedural Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::InputScalar("Seed##postfx", ImGuiDataType_U64, &postFxPresetSeed);
+
+      const char* kinds[] = {"Cinematic", "Retro", "Random"};
+      ImGui::Combo("Kind##postfx", &postFxPresetKind, kinds, 3);
+      ImGui::Checkbox("Preserve warp/hyperspace", &postFxPresetPreserveWarpHyper);
+
+      if (ImGui::Button("Generate look##postfx")) {
+        const render::PostFXPresetKind kind = (render::PostFXPresetKind)postFxPresetKind;
+        render::PostFXSettings gen = render::makeProceduralPostFXSettings(postFxPresetSeed, kind);
+
+        if (postFxPresetPreserveWarpHyper) {
+          gen.warp = postFxSettings.warp;
+          gen.hyperspace = postFxSettings.hyperspace;
+          gen.hyperspaceTwist = postFxSettings.hyperspaceTwist;
+          gen.hyperspaceDensity = postFxSettings.hyperspaceDensity;
+          gen.hyperspaceNoise = postFxSettings.hyperspaceNoise;
+          gen.hyperspaceIntensity = postFxSettings.hyperspaceIntensity;
+        }
+
+        postFxSettings = gen;
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Randomize seed##postfx")) {
+        core::SplitMix64 rr(postFxPresetSeed);
+        postFxPresetSeed = rr.nextU64();
+      }
+
+      ImGui::TextDisabled("Presets are deterministic per seed. By default, warp/hyperspace are preserved so gameplay can drive them.");
+    }
+
+    if (ImGui::CollapsingHeader("Procedural Compositor Shader", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::TextDisabled(
+          "Builds a shader permutation by injecting #defines into PostFX's built-in composite shader.");
+
+      ImGui::InputScalar("Seed##comp", ImGuiDataType_U64, &compositorSeed);
+      const char* ckinds[] = {"Cinematic", "Noir", "Vaporwave", "Analog", "Random"};
+      ImGui::Combo("Kind##comp", &compositorKind, ckinds, 5);
+
+      if (ImGui::Button("Build shader##comp")) {
+        const render::CompositorKind k = (render::CompositorKind)compositorKind;
+        const render::CompositorRecipe r = render::makeProceduralCompositorRecipe(compositorSeed, k);
+        compositorDefines = render::buildCompositorShaderDefines(r);
+        std::string bErr;
+        if (!postFx.buildCompositeVariant(compositorDefines, &bErr)) {
+          compositorBuildError = bErr;
+        } else {
+          compositorBuildError.clear();
+        }
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Randomize seed##comp")) {
+        core::SplitMix64 rr(compositorSeed);
+        compositorSeed = rr.nextU64();
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Reset to default##comp")) {
+        std::string bErr;
+        if (!postFx.resetCompositeShader(&bErr)) {
+          compositorBuildError = bErr;
+        } else {
+          compositorBuildError.clear();
+          compositorDefines.clear();
+        }
+      }
+
+      ImGui::TextDisabled("Active: %s", postFx.hasCustomComposite() ? "procedural variant" : "built-in");
+
+      if (!compositorBuildError.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("Shader build error: %s", compositorBuildError.c_str());
+      }
+
+      if (!compositorDefines.empty() && ImGui::TreeNode("Injected defines##comp")) {
+        ImGui::BeginChild("defs##comp", ImVec2(0.0f, 120.0f), true);
+        ImGui::TextUnformatted(compositorDefines.c_str());
+        ImGui::EndChild();
+        ImGui::TreePop();
+      }
+
+      if (ImGui::TreeNode("Composite fragment shader source##comp")) {
+        ImGui::TextDisabled("Size: %zu bytes", postFx.compositeFragmentSource().size());
+        if (ImGui::Button("Copy to clipboard##comp")) {
+          ImGui::SetClipboardText(postFx.compositeFragmentSource().c_str());
+        }
+        ImGui::TreePop();
+      }
+    }
+
     if (ImGui::CollapsingHeader("Bloom", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::Checkbox("Bloom enabled", &postFxSettings.bloomEnabled);
       ImGui::SliderFloat("Threshold", &postFxSettings.bloomThreshold, 0.10f, 3.50f, "%.2f");
@@ -16558,6 +17958,36 @@ if (showPostFx) {
     if (ImGui::CollapsingHeader("Tonemap / Output", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::SliderFloat("Exposure", &postFxSettings.exposure, 0.10f, 3.50f, "%.2f");
       ImGui::SliderFloat("Gamma", &postFxSettings.gamma, 1.20f, 2.80f, "%.2f");
+
+      ImGui::Separator();
+      ImGui::Checkbox("Auto exposure", &postFxSettings.autoExposureEnabled);
+      if (postFxSettings.autoExposureEnabled) {
+        ImGui::SliderFloat("Target grey", &postFxSettings.autoExposureKey, 0.05f, 0.35f, "%.3f");
+        ImGui::SliderFloat("Min multiplier", &postFxSettings.autoExposureMin, 0.05f, 2.50f, "%.2f");
+        ImGui::SliderFloat("Max multiplier", &postFxSettings.autoExposureMax, 0.50f, 12.0f, "%.2f");
+        ImGui::SliderFloat("Speed up", &postFxSettings.autoExposureSpeedUp, 0.10f, 10.0f, "%.2f");
+        ImGui::SliderFloat("Speed down", &postFxSettings.autoExposureSpeedDown, 0.10f, 10.0f, "%.2f");
+        ImGui::SliderFloat("Center weight", &postFxSettings.autoExposureCenterWeight, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderInt("Max buffer size", &postFxSettings.autoExposureMaxSize, 32, 512);
+        ImGui::TextDisabled("Metered avgLum=%.4f | autoMul=%.3f", postFx.lastAvgLuminance(), postFx.lastAutoExposure());
+      } else {
+        ImGui::TextDisabled("(uses manual exposure only)");
+      }
+    }
+
+    if (ImGui::CollapsingHeader("Retro / CRT", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Checkbox("Retro compositor enabled", &postFxSettings.retroEnabled);
+      if (postFxSettings.retroEnabled) {
+        ImGui::SliderInt("Pixel size (px)", &postFxSettings.retroPixelSize, 1, 16);
+        ImGui::SliderInt("Color steps", &postFxSettings.retroColorSteps, 4, 256);
+        ImGui::SliderFloat("Dither", &postFxSettings.retroDitherStrength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Scanlines", &postFxSettings.retroScanlines, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Curvature", &postFxSettings.retroCurvature, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Jitter", &postFxSettings.retroJitter, 0.0f, 1.0f, "%.2f");
+        ImGui::TextDisabled("Retro mode uses ordered dithering (Bayer 8x8) + quantization, sampling the scene with texelFetch for crisp pixelation.");
+      } else {
+        ImGui::TextDisabled("(retro disabled)");
+      }
     }
 
     if (ImGui::CollapsingHeader("Extras", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -16581,6 +18011,135 @@ if (showPostFx) {
       ImGui::SliderFloat("Noise", &postFxSettings.hyperspaceNoise, 0.0f, 1.0f, "%.2f");
       ImGui::SliderFloat("Intensity", &postFxSettings.hyperspaceIntensity, 0.0f, 3.0f, "%.2f");
       ImGui::TextDisabled("Tip: During FSD charge, press J again to cancel before fuel is consumed.");
+    }
+
+    if (ImGui::CollapsingHeader("FrameGraph Debug", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Checkbox("Transient texture aliasing", &postFxFrameGraphAliasing);
+      ImGui::TextDisabled("Aliasing reuses transient HDR textures based on lifetime. Disable it to preview per-pass outputs.");
+
+      const auto& fg = postFx.frameGraph();
+
+      const bool fgTimingSupported = fg.profilingSupported();
+      if (fgTimingSupported) {
+        ImGui::Checkbox("GPU pass timing (timer queries)", &postFxFrameGraphGpuTiming);
+        if (postFxFrameGraphGpuTiming) {
+          ImGui::Text("GPU time (sum of pass timings): %.2f ms", fg.lastFrameTimeMs());
+        } else {
+          ImGui::TextDisabled("GPU time: disabled");
+        }
+      } else {
+        ImGui::TextDisabled("GPU time: unavailable (timer queries not supported by this context/loader).");
+      }
+
+      ImGui::Text("Passes: %zu (scheduled %zu) | Textures: %zu | Physical allocs: %d",
+                  fg.passes().size(), fg.schedule().size(), fg.textures().size(), fg.physicalTextureCount());
+
+      if (!fgReadbackOk) {
+        ImGui::TextDisabled("Capture: unavailable (%s)", fgReadbackInitErr.empty() ? "missing GL buffer mapping" : fgReadbackInitErr.c_str());
+      } else if (!fgCaptureQueue.empty() || fgReadback.pendingJobs() > 0) {
+        ImGui::Text("Captures queued: %zu | In flight: %zu",
+                    fgCaptureQueue.size(), fgReadback.pendingJobs());
+        if (!fgCaptureQueue.empty()) {
+          ImGui::TextDisabled("Queued captures will force-disable aliasing for one frame.");
+        }
+      }
+
+      if (postFxFrameGraphAliasing) {
+        ImGui::TextDisabled("Note: With aliasing enabled, intermediate pass outputs may be overwritten by later passes.");
+      }
+
+      if (ImGui::BeginTable("fg_passes##postfx", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28.0f);
+        ImGui::TableSetupColumn("Pass");
+        ImGui::TableSetupColumn("Output");
+        ImGui::TableSetupColumn("Phys", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+        ImGui::TableSetupColumn("GPU ms", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("Capture", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableHeadersRow();
+
+        for (std::size_t si = 0; si < fg.schedule().size(); ++si) {
+          const int pIdx = fg.schedule()[si];
+          if (pIdx < 0 || (std::size_t)pIdx >= fg.passes().size()) continue;
+          const auto& p = fg.passes()[(std::size_t)pIdx];
+
+          ImGui::TableNextRow();
+
+          ImGui::TableSetColumnIndex(0);
+          ImGui::Text("%zu", si);
+
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(p.name.c_str());
+
+          ImGui::TableSetColumnIndex(2);
+          if (p.write.isBackbuffer() || !p.write.valid()) {
+            ImGui::TextDisabled("Backbuffer");
+          } else {
+            const auto& t = fg.textures()[(std::size_t)p.write.id];
+            ImGui::Text("%s (%dx%d)", t.name.c_str(), t.resolvedW, t.resolvedH);
+          }
+
+          ImGui::TableSetColumnIndex(3);
+          if (p.write.valid() && !p.write.isBackbuffer()) {
+            const auto& t = fg.textures()[(std::size_t)p.write.id];
+            ImGui::Text("%d", t.physicalId);
+          } else {
+            ImGui::TextDisabled("-");
+          }
+
+          ImGui::TableSetColumnIndex(4);
+          if (fgTimingSupported && postFxFrameGraphGpuTiming && (std::size_t)pIdx < fg.lastPassTimesMs().size()) {
+            ImGui::Text("%.2f", fg.lastPassTimesMs()[(std::size_t)pIdx]);
+          } else {
+            ImGui::TextDisabled("-");
+          }
+
+          // Capture per-pass output to disk (queued; captured next frame).
+          ImGui::TableSetColumnIndex(5);
+          {
+            const bool canCapture = fgReadbackOk && p.write.valid() && !p.write.isBackbuffer();
+            if (!canCapture) ImGui::BeginDisabled();
+
+            const std::string btn = "Capture##fgcap_" + std::to_string(si);
+            if (ImGui::SmallButton(btn.c_str())) {
+              const auto& t = fg.textures()[(std::size_t)p.write.id];
+              const char* ext = (t.desc.type == GL_UNSIGNED_BYTE || t.desc.type == GL_BYTE) ? "png" : "hdr";
+
+              game::ScreenshotRequest req{};
+              req.outDir = "captures";
+              req.baseName = "fg_" + p.name + "_" + t.name;
+              req.timestamp = true;
+              req.extension = ext;
+
+              std::string err;
+              const std::string path = game::buildScreenshotPath(req, &err);
+              if (path.empty()) {
+                toast(toasts, err.empty() ? "Failed to schedule capture." : err, 2.4);
+              } else {
+                fgCaptureQueue.push_back(PendingFrameGraphCapture{p.name, t.name, path});
+                toast(toasts, "Capture scheduled: " + path, 2.0);
+              }
+            }
+
+            if (!canCapture) ImGui::EndDisabled();
+          }
+
+          // Optional per-pass preview when aliasing is disabled.
+          if (!postFxFrameGraphAliasing && p.write.valid() && !p.write.isBackbuffer()) {
+            const unsigned int tex = fg.glTexture(p.write);
+            if (tex) {
+              const auto& t = fg.textures()[(std::size_t)p.write.id];
+              const float pw = 240.0f;
+              const float aspect = (t.resolvedH > 0) ? ((float)t.resolvedW / (float)t.resolvedH) : 1.0f;
+              const float ph = pw / std::max(0.001f, aspect);
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(1);
+              ImGui::Image((ImTextureID)(intptr_t)tex, ImVec2(pw, std::min(160.0f, ph)));
+            }
+          }
+        }
+
+        ImGui::EndTable();
+      }
     }
   } else {
     ImGui::TextDisabled("(PostFX disabled)");
@@ -18596,6 +20155,20 @@ if (showWorldVisuals) {
   ImGui::SameLine();
   if (ImGui::Button("Clear surface cache")) surfaceTexCache.clear();
 
+  ImGui::Text("Surface normal cache: %zu / %zu", surfaceNrmCache.size(), surfaceNrmCache.maxEntries());
+  ImGui::SameLine();
+  if (ImGui::Button("Clear normal cache")) surfaceNrmCache.clear();
+
+  if (gpuSurfaceCache.isInited()) {
+    ImGui::Text("GPU surface cache: albedo %zu / %zu", gpuSurfaceCache.albedoSize(), gpuSurfaceCache.maxEntries());
+    ImGui::SameLine();
+    ImGui::Text("| normal %zu / %zu", gpuSurfaceCache.normalSize(), gpuSurfaceCache.maxEntries());
+    ImGui::SameLine();
+    if (ImGui::Button("Clear GPU surface cache")) gpuSurfaceCache.clear();
+  } else {
+    ImGui::TextDisabled("GPU surface cache: unavailable (shader/FBO init failed)");
+  }
+
   ImGui::Text("Ring texture cache: %zu / %zu", ringTexCache.size(), ringTexCache.maxEntries());
   ImGui::SameLine();
   if (ImGui::Button("Clear ring cache")) ringTexCache.clear();
@@ -18605,6 +20178,12 @@ if (showWorldVisuals) {
   ImGui::Checkbox("Procedural star/planet surfaces", &worldUseProceduralSurfaces);
   ImGui::SameLine();
   ImGui::Checkbox("Surface previews in UI", &worldUseSurfaceInUi);
+
+  ImGui::BeginDisabled(!gpuSurfaceCache.isInited());
+  ImGui::Checkbox("GPU surface synthesis", &worldUseGpuSurfaceCache);
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::TextDisabled("(FBO render-to-texture)");
 
   if (worldUseProceduralSurfaces) {
     ImGui::SetNextItemWidth(260.0f);
@@ -18616,6 +20195,22 @@ if (showWorldVisuals) {
     ImGui::SliderFloat("Star intensity", &worldStarIntensity, 0.5f, 8.0f, "%.2f");
     ImGui::SameLine();
     ImGui::Checkbox("Unlit star", &worldStarUnlit);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Material shading");
+
+    ImGui::Checkbox("Normal maps (procedural)", &worldNormalMapsEnabled);
+    if (worldNormalMapsEnabled) {
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Normal strength", &worldNormalStrength, 0.0f, 3.0f, "%.2f");
+    } else {
+      ImGui::TextDisabled("(normal maps disabled)");
+    }
+
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Specular strength", &worldSpecularStrength, 0.0f, 0.35f, "%.3f");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderFloat("Shininess", &worldShininess, 4.0f, 128.0f, "%.0f");
   } else {
     ImGui::TextDisabled("Meshes fall back to the checker texture.");
   }
@@ -18764,7 +20359,9 @@ if (showWorldVisuals) {
     const float thumbH = thumbW * 0.5f;
 
     auto preview = [&](render::SurfaceKind kind, const char* name, core::u64 s) {
-      const auto& t = surfaceTexCache.get(kind, s, worldSurfaceTexWidth);
+      const auto& t = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                       ? gpuSurfaceCache.albedo(kind, s, worldSurfaceTexWidth)
+                       : surfaceTexCache.get(kind, s, worldSurfaceTexWidth);
       ImGui::TextUnformatted(name);
       ImGui::Image((ImTextureID)(intptr_t)t.handle(), ImVec2(thumbW, thumbH), ImVec2(0, 0), ImVec2(1, 1));
     };
@@ -19004,10 +20601,19 @@ if (showScanner) {
         const core::u64 surfSeed = core::hashCombine(
             core::hashCombine(core::fnv1a64("star_surface"), (core::u64)currentSystem->stub.seed),
             (core::u64)(int)currentSystem->star.cls);
-        const auto& surf = surfaceTexCache.get(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth);
+        const auto& surf = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                             ? gpuSurfaceCache.albedo(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth)
+                             : surfaceTexCache.get(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth);
         ImGui::Separator();
         ImGui::TextDisabled("Surface");
         ImGui::Image((ImTextureID)(intptr_t)surf.handle(), ImVec2(192, 96));
+        if (worldNormalMapsEnabled) {
+          const auto& nrm = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                             ? gpuSurfaceCache.normal(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth)
+                             : surfaceNrmCache.get(render::SurfaceKind::Star, surfSeed, worldSurfaceTexWidth);
+          ImGui::TextDisabled("Normal");
+          ImGui::Image((ImTextureID)(intptr_t)nrm.handle(), ImVec2(192, 96));
+        }
       }
       ImGui::EndTooltip();
     }
@@ -19157,16 +20763,27 @@ if (showScanner) {
           const core::u64 surfSeed = core::hashCombine(
               core::hashCombine(core::fnv1a64("planet_surface"), (core::u64)currentSystem->stub.seed),
               (core::u64)i);
-          const auto& surf = surfaceTexCache.get(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth);
+          const auto& surf = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                               ? gpuSurfaceCache.albedo(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth)
+                               : surfaceTexCache.get(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth);
           ImGui::Separator();
           ImGui::TextDisabled("Surface");
           ImGui::Image((ImTextureID)(intptr_t)surf.handle(), ImVec2(192, 96));
+          if (worldNormalMapsEnabled) {
+            const auto& nrm = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                               ? gpuSurfaceCache.normal(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth)
+                               : surfaceNrmCache.get(planetSurfaceKind(p.type), surfSeed, worldSurfaceTexWidth);
+            ImGui::TextDisabled("Normal");
+            ImGui::Image((ImTextureID)(intptr_t)nrm.handle(), ImVec2(192, 96));
+          }
 
           // Optional cloud layer preview (alpha mask)
           if (worldCloudsEnabled) {
             core::u64 cloudSeed = core::hashCombine(surfSeed, core::fnv1a64("clouds"));
             cloudSeed = core::hashCombine(cloudSeed, (core::u64)(int)p.type);
-            const auto& cloud = surfaceTexCache.get(render::SurfaceKind::Clouds, cloudSeed, worldSurfaceTexWidth);
+            const auto& cloud = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                 ? gpuSurfaceCache.albedo(render::SurfaceKind::Clouds, cloudSeed, worldSurfaceTexWidth)
+                                 : surfaceTexCache.get(render::SurfaceKind::Clouds, cloudSeed, worldSurfaceTexWidth);
             ImGui::TextDisabled("Clouds");
             ImGui::Image((ImTextureID)(intptr_t)cloud.handle(), ImVec2(192, 96));
           }
@@ -26021,6 +27638,71 @@ if (showContacts) {
           }
 
           ImGui::Separator();
+          ImGui::TextDisabled("Procedural skin generator (seeded):");
+          {
+            static core::u64 procSkinSeed = core::seedFromText("hud_skin_proc");
+            static bool procSeedFromSystem = true;
+            static bool procAlsoUiAccent = true;
+            static bool procAlsoLayout = false;
+            static float procUiAccentStrength = 0.35f;
+
+            ImGui::Checkbox("Seed from current system", &procSeedFromSystem);
+
+            ImGui::SetNextItemWidth(240.0f);
+            ImGui::InputScalar("Skin seed", ImGuiDataType_U64, &procSkinSeed, nullptr, nullptr, "%llu");
+            ImGui::SameLine();
+            if (ImGui::Button("Use system seed##hudSkin") && currentSystem) {
+              procSkinSeed = (core::u64)currentSystem->stub.seed;
+            }
+
+            ImGui::Checkbox("Also sync ImGui accent", &procAlsoUiAccent);
+            if (procAlsoUiAccent) {
+              ImGui::SameLine();
+              ImGui::SetNextItemWidth(140.0f);
+              ImGui::SliderFloat("Accent strength##procUi", &procUiAccentStrength, 0.0f, 1.0f, "%.2f");
+            }
+            ImGui::Checkbox("Also generate HUD layout", &procAlsoLayout);
+
+            if (ImGui::Button("Generate procedural skin")) {
+              const core::u64 seed = (procSeedFromSystem && currentSystem) ? (core::u64)currentSystem->stub.seed : procSkinSeed;
+              const ui::ProceduralHudSkin skin = ui::makeProceduralHudSkin(seed);
+
+              // Apply to runtime palette immediately.
+              hudOverlayBgAlpha = skin.overlayBgAlpha;
+              hudOverlayBgAlphaEdit = skin.overlayBgAlphaEdit;
+              hudTintRadarIcons = skin.tintRadarIcons;
+              hudTintTacticalIcons = skin.tintTacticalIcons;
+              hudColorPrimary = skin.colorPrimary;
+              hudColorAccent = skin.colorAccent;
+              hudColorDanger = skin.colorDanger;
+              hudColorGrid = skin.colorGrid;
+              hudColorText = skin.colorText;
+              hudColorBackground = skin.colorBackground;
+
+              if (procAlsoLayout) {
+                ui::applyProceduralHudLayout(seed, hudLayout);
+                showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+                objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
+                hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
+                hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
+              }
+
+              if (procAlsoUiAccent) {
+                uiStyleOverridesEnabled = true;
+                uiStyleAccentEnabled = true;
+                uiStyleAccentStrength = procUiAccentStrength;
+                uiStyleAccentColor[0] = skin.colorPrimary.r;
+                uiStyleAccentColor[1] = skin.colorPrimary.g;
+                uiStyleAccentColor[2] = skin.colorPrimary.b;
+                rebuildUiStyle(uiTheme, uiScale);
+                uiSettingsDirty = true;
+              }
+
+              toast(toasts, "Generated procedural HUD skin from seed.", 2.0);
+            }
+          }
+
+          ImGui::Separator();
           ImGui::TextDisabled("Palette (RGBA):");
           ImGui::ColorEdit4("Primary", &hudColorPrimary.r, ImGuiColorEditFlags_Float);
           ImGui::ColorEdit4("Accent", &hudColorAccent.r, ImGuiColorEditFlags_Float);
@@ -26572,6 +28254,13 @@ draw_command_palette:
       matToFloat(hangarCam.projectionMatrix(), projF);
       meshRenderer.setViewProj(viewF, projF);
 
+      {
+        const math::Vec3d cp = hangarCam.position();
+        meshRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+      }
+      meshRenderer.setSpecular(worldSpecularStrength, worldShininess);
+      meshRenderer.setNormalStrength(worldNormalStrength);
+
       // Preview light: offset point-light so the model reads nicely.
       meshRenderer.setLightPos(2.5f, 1.8f, 3.5f);
       const render::Mesh* hangarMesh = &shipScoutMesh;
@@ -26581,6 +28270,7 @@ draw_command_palette:
       meshRenderer.setUnlit(false);
       meshRenderer.setAlphaFromTexture(false);
       meshRenderer.setTexture((shipLiveryTex.handle() != 0) ? &shipLiveryTex : &checker);
+      meshRenderer.setNormalTexture(nullptr);
 
       const math::Quatd q = math::Quatd::fromAxisAngle({0, 1, 0}, math::degToRad((double)hangarYawDeg))
                           * math::Quatd::fromAxisAngle({1, 0, 0}, math::degToRad((double)hangarPitchDeg));
@@ -26659,6 +28349,15 @@ draw_command_palette:
     const bool autoSavePrefChanged = (hudSettingsSaved.autoSaveOnExit != hudSettingsAutoSaveOnExit);
     if ((hudSettingsAutoSaveOnExit || autoSavePrefChanged) && !hudSettingsEquivalent(hudSettings, hudSettingsSaved)) {
       (void)ui::saveHudSettingsToFile(hudSettings, hudSettingsPath);
+    }
+  }
+
+  // Persist VFX settings on exit.
+  {
+    syncVfxSettingsFromRuntime();
+    const bool autoSavePrefChanged = (vfxSettingsSaved.autoSaveOnExit != vfxSettingsAutoSaveOnExit);
+    if ((vfxSettingsAutoSaveOnExit || autoSavePrefChanged) && !vfxSettingsEquivalent(vfxSettings, vfxSettingsSaved)) {
+      (void)ui::saveVfxSettingsToFile(vfxSettings, vfxSettingsPath);
     }
   }
 

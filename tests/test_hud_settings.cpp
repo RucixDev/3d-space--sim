@@ -6,9 +6,18 @@
 #include <fstream>
 
 using stellar::ui::HudSettings;
+using stellar::ui::Color4f;
 
 static bool feq(double a, double b, double eps = 1e-6) {
   return std::fabs(a - b) <= eps;
+}
+
+static bool feqf(float a, float b, float eps = 1e-4f) {
+  return std::fabs(a - b) <= eps;
+}
+
+static bool ceq(const Color4f& a, const Color4f& b, float eps = 1e-4f) {
+  return feqf(a.r, b.r, eps) && feqf(a.g, b.g, eps) && feqf(a.b, b.b, eps) && feqf(a.a, b.a, eps);
 }
 
 int test_hud_settings() {
@@ -57,6 +66,18 @@ int test_hud_settings() {
     s.tacticalShowAsteroids = false;
     s.tacticalShowSignals = false;
 
+    // Style / colors (v2)
+    s.overlayBgAlpha = 0.12f;
+    s.overlayBgAlphaEdit = 0.97f;
+    s.tintRadarIcons = true;
+    s.tintTacticalIcons = true;
+    s.colorPrimary = Color4f{0.10f, 0.20f, 0.30f, 0.40f};
+    s.colorAccent = Color4f{0.20f, 0.30f, 0.40f, 0.50f};
+    s.colorDanger = Color4f{0.90f, 0.10f, 0.10f, 0.80f};
+    s.colorGrid = Color4f{0.01f, 0.02f, 0.03f, 1.00f};
+    s.colorText = Color4f{0.80f, 0.81f, 0.82f, 0.83f};
+    s.colorBackground = Color4f{0.00f, 0.00f, 0.00f, 0.25f};
+
     CHECK(stellar::ui::saveHudSettingsToFile(s, path));
 
     HudSettings out;
@@ -99,6 +120,17 @@ int test_hud_settings() {
     CHECK(out.tacticalShowCargo == s.tacticalShowCargo);
     CHECK(out.tacticalShowAsteroids == s.tacticalShowAsteroids);
     CHECK(out.tacticalShowSignals == s.tacticalShowSignals);
+
+    CHECK(feqf(out.overlayBgAlpha, s.overlayBgAlpha));
+    CHECK(feqf(out.overlayBgAlphaEdit, s.overlayBgAlphaEdit));
+    CHECK(out.tintRadarIcons == s.tintRadarIcons);
+    CHECK(out.tintTacticalIcons == s.tintTacticalIcons);
+    CHECK(ceq(out.colorPrimary, s.colorPrimary));
+    CHECK(ceq(out.colorAccent, s.colorAccent));
+    CHECK(ceq(out.colorDanger, s.colorDanger));
+    CHECK(ceq(out.colorGrid, s.colorGrid));
+    CHECK(ceq(out.colorText, s.colorText));
+    CHECK(ceq(out.colorBackground, s.colorBackground));
   }
 
   // Clamp & resilience: values outside ranges should be clamped.
@@ -112,6 +144,9 @@ int test_hud_settings() {
     f << "leadMaxTimeSec -50\n";        // clamp
     f << "tacticalRangeKm 99999999\n";  // clamp
     f << "tacticalMaxMarkers -2\n";     // clamp
+    f << "overlayBgAlpha -10\n";         // clamp
+    f << "overlayBgAlphaEdit 10\n";      // clamp
+    f << "colorPrimary 2 -3 0.5 9\n";    // clamp
     f << "unknownKey 42\n";             // ignored
     f.close();
 
@@ -125,6 +160,12 @@ int test_hud_settings() {
     CHECK(out.leadMaxTimeSec >= 1.0 - 1e-4);
     CHECK(out.tacticalRangeKm <= 2000000.0 + 1e-4);
     CHECK(out.tacticalMaxMarkers >= 8);
+
+    CHECK(out.overlayBgAlpha >= 0.0f - 1e-4f);
+    CHECK(out.overlayBgAlphaEdit <= 1.0f + 1e-4f);
+    CHECK(out.colorPrimary.r <= 1.0f + 1e-4f);
+    CHECK(out.colorPrimary.g >= 0.0f - 1e-4f);
+    CHECK(out.colorPrimary.a <= 1.0f + 1e-4f);
   }
 
   return failures;

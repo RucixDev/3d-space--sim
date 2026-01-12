@@ -109,6 +109,8 @@ set(STELLAR_CORE_SOURCES
   src/ui/LogBuffer.cpp
   src/ui/HudLayout.cpp
   src/ui/HudSettings.cpp
+  src/ui/VfxSettings.cpp
+  src/ui/ProceduralUi.cpp
   src/ui/AudioSettings.cpp
   src/ui/Livery.cpp
   src/ui/UiLayoutProfiles.cpp
@@ -117,6 +119,14 @@ set(STELLAR_CORE_SOURCES
   src/ui/WindowRegistry.cpp
 
   src/proc/Noise.cpp
+  # Procedural geometry generators (CPU-side; safe for headless builds).
+  src/render/ProceduralAsteroid.cpp
+  src/render/SdfMesher.cpp
+  src/render/ProceduralArtifact.cpp
+  # Procedural render presets (CPU-side; safe for headless builds).
+  src/render/ProceduralPostFX.cpp
+  src/render/ProceduralCompositor.cpp
+  src/render/AutoExposure.cpp
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
   src/proc/SystemGenerator.cpp
@@ -196,11 +206,16 @@ set(STELLAR_RENDER_SOURCES
   src/render/Gl.cpp
   src/render/Shader.cpp
   src/render/Texture.cpp
+  src/render/FrameGraph.cpp
+  src/render/TextureReadback.cpp
+  src/render/GpuSurfaceCache.cpp
+  src/render/GpuParticleField.cpp
   src/render/ProceduralSprite.cpp
   src/render/ProceduralPlanet.cpp
   src/render/ProceduralRings.cpp
   src/render/ProceduralLivery.cpp
   src/render/AtmosphereRenderer.cpp
+  src/render/ProceduralSky.cpp
   src/render/Starfield.cpp
   src/render/Nebula.cpp
   src/render/ParticleSystem.cpp

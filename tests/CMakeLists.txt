@@ -16,6 +16,12 @@ add_executable(stellar_tests
   test_query_nearby.cpp
   test_universe_cache.cpp
   test_proc.cpp
+  test_noise3d.cpp
+  test_auto_exposure.cpp
+  test_procedural_asteroid.cpp
+  test_procedural_postfx.cpp
+  test_procedural_compositor.cpp
+  test_sdf_mesher.cpp
   test_economy.cpp
   test_market_analysis.cpp
   test_traffic.cpp
@@ -86,9 +92,17 @@ add_executable(stellar_tests
   test_ui_settings.cpp
   test_ui_layout_profiles.cpp
   test_hud_settings.cpp
+  test_vfx_settings.cpp
   test_ui_workspaces.cpp
   test_window_registry.cpp
+
+  # Render-graph tests are only available when the rendering backend is built.
+  # (They do not require a GL context; they test the graph compilation/aliasing logic.)
 )
+
+if (STELLAR_ENABLE_RENDER)
+  target_sources(stellar_tests PRIVATE test_frame_graph.cpp)
+endif()
 
 target_compile_features(stellar_tests PRIVATE cxx_std_20)
 target_link_libraries(stellar_tests PRIVATE stellar::stellar)

@@ -57,23 +57,67 @@ in vec3 vNrm;
 in vec3 vWorldPos;
 
 uniform sampler2D uTex;
+uniform sampler2D uNormalTex;
+uniform float uUseNormalMap;
+uniform float uNormalStrength;
+
 uniform float uUnlit;
 uniform vec3 uLightPos;
+uniform vec3 uCameraPos;
+
+uniform float uSpecularStrength;
+uniform float uShininess;
+
 uniform float uAlphaFromTex;
 uniform float uAlphaMul;
 
 out vec4 FragColor;
 
+mat3 cotangentFrame(vec3 N, vec3 p, vec2 uv) {
+  // Cotangent frame / derivative-based tangent space.
+  // This avoids requiring per-vertex tangents for normal mapping.
+  vec3 dp1 = dFdx(p);
+  vec3 dp2 = dFdy(p);
+  vec2 duv1 = dFdx(uv);
+  vec2 duv2 = dFdy(uv);
+
+  vec3 dp2perp = cross(dp2, N);
+  vec3 dp1perp = cross(N, dp1);
+  vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+  vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+  float invMax = inversesqrt(max(dot(T, T), dot(B, B)));
+  return mat3(T * invMax, B * invMax, N);
+}
+
 void main() {
   vec3 n = normalize(vNrm);
+
+  if (uUseNormalMap > 0.5) {
+    vec3 tn = texture(uNormalTex, vUv).xyz * 2.0 - 1.0;
+    tn.xy *= max(uNormalStrength, 0.0);
+    n = normalize(cotangentFrame(n, vWorldPos, vUv) * tn);
+  }
+
   // Point-light position in world space (the star sits at the origin in the prototype).
   vec3 l = normalize(uLightPos - vWorldPos);
   float diff = max(dot(n, l), 0.0);
+
   vec4 t = texture(uTex, vUv);
   vec3 tex = t.rgb;
+
   float lit = (0.35 + 0.65 * diff);
   float shade = mix(lit, 1.0, clamp(uUnlit, 0.0, 1.0));
   vec3 col = tex * vColor * shade;
+
+  // Simple Blinn-Phong specular (disabled for unlit meshes).
+  if (uUnlit < 0.5 && uSpecularStrength > 0.0) {
+    vec3 v = normalize(uCameraPos - vWorldPos);
+    vec3 h = normalize(l + v);
+    float s = pow(max(dot(n, h), 0.0), max(uShininess, 1.0));
+    col += vec3(s * uSpecularStrength);
+  }
+
   float a = 1.0;
   if (uAlphaFromTex > 0.5) {
     a = clamp(t.a * uAlphaMul, 0.0, 1.0);
@@ -108,12 +152,19 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
   shader_.setUniformMat4("uView", view_);
   shader_.setUniformMat4("uProj", proj_);
   shader_.setUniform1i("uTex", 0);
+  shader_.setUniform1i("uNormalTex", 1);
+  shader_.setUniform1f("uUseNormalMap", normalTex_ ? 1.0f : 0.0f);
+  shader_.setUniform1f("uNormalStrength", normalStrength_);
   shader_.setUniform1f("uUnlit", unlit_ ? 1.0f : 0.0f);
   shader_.setUniform3f("uLightPos", lightPos_[0], lightPos_[1], lightPos_[2]);
+  shader_.setUniform3f("uCameraPos", cameraPos_[0], cameraPos_[1], cameraPos_[2]);
+  shader_.setUniform1f("uSpecularStrength", specularStrength_);
+  shader_.setUniform1f("uShininess", shininess_);
   shader_.setUniform1f("uAlphaFromTex", alphaFromTexture_ ? 1.0f : 0.0f);
   shader_.setUniform1f("uAlphaMul", alphaMul_);
 
   if (tex_) tex_->bind(0);
+  if (normalTex_) normalTex_->bind(1);
 
   // Bind mesh VAO and configure instance attributes
   mesh_->bind();

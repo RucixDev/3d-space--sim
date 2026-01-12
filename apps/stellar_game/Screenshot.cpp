@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 // stb_image_write is a tiny single-header image writer (PNG, BMP, TGA, ...).
@@ -80,6 +81,19 @@ static std::string fileTimestampNow() {
   return oss.str();
 }
 
+static std::string sanitizeExtension(std::string_view ext) {
+  std::string out;
+  out.reserve(ext.size());
+
+  for (unsigned char ch : ext) {
+    if (ch == '.') continue;
+    if (std::isalnum(ch)) out.push_back((char)std::tolower(ch));
+  }
+
+  if (out.empty()) out = "png";
+  return out;
+}
+
 std::string buildScreenshotPath(const ScreenshotRequest& req, std::string* outErr) {
   namespace fs = std::filesystem;
 
@@ -93,6 +107,7 @@ std::string buildScreenshotPath(const ScreenshotRequest& req, std::string* outEr
   }
 
   const std::string base = sanitizeFileToken(req.baseName);
+  const std::string ext = sanitizeExtension(req.extension);
   std::string file = base;
   if (req.timestamp) {
     file += '_';
@@ -100,10 +115,10 @@ std::string buildScreenshotPath(const ScreenshotRequest& req, std::string* outEr
   }
 
   // Ensure uniqueness by appending _N if needed.
-  fs::path p = fs::path(dir) / (file + ".png");
+  fs::path p = fs::path(dir) / (file + "." + ext);
   if (fs::exists(p, ec)) {
     for (int i = 2; i < 10000; ++i) {
-      fs::path cand = fs::path(dir) / (file + "_" + std::to_string(i) + ".png");
+      fs::path cand = fs::path(dir) / (file + "_" + std::to_string(i) + "." + ext);
       if (!fs::exists(cand, ec)) {
         p = cand;
         break;
@@ -112,6 +127,103 @@ std::string buildScreenshotPath(const ScreenshotRequest& req, std::string* outEr
   }
 
   return p.string();
+}
+
+bool writePixelsToPng(const std::string& path,
+                      int width,
+                      int height,
+                      int comp,
+                      const unsigned char* pixels,
+                      int strideBytes,
+                      bool flipY,
+                      std::string* outErr) {
+  if (width <= 0 || height <= 0) {
+    if (outErr) *outErr = "Invalid image size.";
+    return false;
+  }
+  if (comp <= 0 || comp > 4) {
+    if (outErr) *outErr = "Invalid channel count.";
+    return false;
+  }
+  if (!pixels) {
+    if (outErr) *outErr = "Null pixel pointer.";
+    return false;
+  }
+  if (path.empty()) {
+    if (outErr) *outErr = "Empty output path.";
+    return false;
+  }
+
+  const int minStride = width * comp;
+  const int stride = (strideBytes > 0) ? strideBytes : minStride;
+  if (stride < minStride) {
+    if (outErr) *outErr = "Invalid stride.";
+    return false;
+  }
+
+  const unsigned char* src = pixels;
+  std::vector<unsigned char> flipped;
+  if (flipY) {
+    flipped.resize((std::size_t)height * (std::size_t)stride);
+    for (int y = 0; y < height; ++y) {
+      const unsigned char* rowSrc = src + (std::size_t)(height - 1 - y) * (std::size_t)stride;
+      unsigned char* rowDst = flipped.data() + (std::size_t)y * (std::size_t)stride;
+      std::copy(rowSrc, rowSrc + stride, rowDst);
+    }
+    src = flipped.data();
+  }
+
+  const int ok = stbi_write_png(path.c_str(), width, height, comp, src, stride);
+  if (!ok) {
+    if (outErr) *outErr = "Failed to write PNG.";
+    return false;
+  }
+  return true;
+}
+
+bool writePixelsToHdr(const std::string& path,
+                      int width,
+                      int height,
+                      int comp,
+                      const float* pixels,
+                      bool flipY,
+                      std::string* outErr) {
+  if (width <= 0 || height <= 0) {
+    if (outErr) *outErr = "Invalid image size.";
+    return false;
+  }
+  if (comp <= 0 || comp > 4) {
+    if (outErr) *outErr = "Invalid channel count.";
+    return false;
+  }
+  if (!pixels) {
+    if (outErr) *outErr = "Null pixel pointer.";
+    return false;
+  }
+  if (path.empty()) {
+    if (outErr) *outErr = "Empty output path.";
+    return false;
+  }
+
+  const float* src = pixels;
+  std::vector<float> flipped;
+  if (flipY) {
+    const std::size_t rowFloats = (std::size_t)width * (std::size_t)comp;
+    flipped.resize((std::size_t)height * rowFloats);
+    for (int y = 0; y < height; ++y) {
+      const float* rowSrc = src + (std::size_t)(height - 1 - y) * rowFloats;
+      float* rowDst = flipped.data() + (std::size_t)y * rowFloats;
+      std::copy(rowSrc, rowSrc + rowFloats, rowDst);
+    }
+    src = flipped.data();
+  }
+
+  const int ok = stbi_write_hdr(path.c_str(), width, height, comp, src);
+  if (!ok) {
+    if (outErr) *outErr = "Failed to write HDR.";
+    return false;
+  }
+  return true;
 }
 
 bool captureBackbufferToPng(const std::string& path, int width, int height, std::string* outErr) {
@@ -132,23 +244,8 @@ bool captureBackbufferToPng(const std::string& path, int width, int height, std:
   glReadBuffer(GL_BACK);
   glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 
-  // Flip vertically: OpenGL origin is bottom-left, images are typically top-left.
   const int stride = width * 4;
-  std::vector<unsigned char> flipped;
-  flipped.resize(pixels.size());
-
-  for (int y = 0; y < height; ++y) {
-    const unsigned char* src = pixels.data() + (std::size_t)(height - 1 - y) * (std::size_t)stride;
-    unsigned char* dst = flipped.data() + (std::size_t)y * (std::size_t)stride;
-    std::copy(src, src + stride, dst);
-  }
-
-  const int ok = stbi_write_png(path.c_str(), width, height, 4, flipped.data(), stride);
-  if (!ok) {
-    if (outErr) *outErr = "Failed to write PNG.";
-    return false;
-  }
-  return true;
+  return writePixelsToPng(path, width, height, 4, pixels.data(), stride, /*flipY=*/true, outErr);
 }
 
 } // namespace stellar::game

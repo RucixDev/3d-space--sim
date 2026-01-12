@@ -37,6 +37,9 @@ PFNGLBUFFERDATAPROC BufferData = nullptr;
 PFNGLBUFFERSUBDATAPROC BufferSubData = nullptr;
 PFNGLDELETEBUFFERSPROC DeleteBuffers = nullptr;
 
+PFNGLMAPBUFFERRANGEPROC MapBufferRange = nullptr;
+PFNGLUNMAPBUFFERPROC UnmapBuffer = nullptr;
+
 PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray = nullptr;
 PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer = nullptr;
 PFNGLVERTEXATTRIBDIVISORPROC VertexAttribDivisor = nullptr;
@@ -64,6 +67,12 @@ PFNGLBINDRENDERBUFFERPROC BindRenderbuffer = nullptr;
 PFNGLRENDERBUFFERSTORAGEPROC RenderbufferStorage = nullptr;
 PFNGLFRAMEBUFFERRENDERBUFFERPROC FramebufferRenderbuffer = nullptr;
 PFNGLDELETERENDERBUFFERSPROC DeleteRenderbuffers = nullptr;
+
+PFNGLGENQUERIESPROC GenQueries = nullptr;
+PFNGLDELETEQUERIESPROC DeleteQueries = nullptr;
+PFNGLBEGINQUERYPROC BeginQuery = nullptr;
+PFNGLENDQUERYPROC EndQuery = nullptr;
+PFNGLGETQUERYOBJECTUI64VPROC GetQueryObjectui64v = nullptr;
 
 template <class T>
 static T loadProc(const char* name) {
@@ -104,6 +113,12 @@ bool load() {
   BufferSubData = loadProc<PFNGLBUFFERSUBDATAPROC>("glBufferSubData");
   DeleteBuffers = loadProc<PFNGLDELETEBUFFERSPROC>("glDeleteBuffers");
 
+  // Optional buffer mapping (debug tooling).
+  MapBufferRange = loadProc<PFNGLMAPBUFFERRANGEPROC>("glMapBufferRange");
+  if (!MapBufferRange) MapBufferRange = loadProc<PFNGLMAPBUFFERRANGEPROC>("glMapBufferRangeARB");
+  UnmapBuffer = loadProc<PFNGLUNMAPBUFFERPROC>("glUnmapBuffer");
+  if (!UnmapBuffer) UnmapBuffer = loadProc<PFNGLUNMAPBUFFERPROC>("glUnmapBufferARB");
+
   EnableVertexAttribArray = loadProc<PFNGLENABLEVERTEXATTRIBARRAYPROC>("glEnableVertexAttribArray");
   VertexAttribPointer = loadProc<PFNGLVERTEXATTRIBPOINTERPROC>("glVertexAttribPointer");
   VertexAttribDivisor = loadProc<PFNGLVERTEXATTRIBDIVISORPROC>("glVertexAttribDivisor");
@@ -139,6 +154,19 @@ bool load() {
   RenderbufferStorage = loadProc<PFNGLRENDERBUFFERSTORAGEPROC>("glRenderbufferStorage");
   FramebufferRenderbuffer = loadProc<PFNGLFRAMEBUFFERRENDERBUFFERPROC>("glFramebufferRenderbuffer");
   DeleteRenderbuffers = loadProc<PFNGLDELETERENDERBUFFERSPROC>("glDeleteRenderbuffers");
+
+  // Optional timer query functions (for GPU profiling).
+  GenQueries = loadProc<PFNGLGENQUERIESPROC>("glGenQueries");
+  DeleteQueries = loadProc<PFNGLDELETEQUERIESPROC>("glDeleteQueries");
+  BeginQuery = loadProc<PFNGLBEGINQUERYPROC>("glBeginQuery");
+  EndQuery = loadProc<PFNGLENDQUERYPROC>("glEndQuery");
+  GetQueryObjectui64v = loadProc<PFNGLGETQUERYOBJECTUI64VPROC>("glGetQueryObjectui64v");
+
+  if (!GenQueries) GenQueries = loadProc<PFNGLGENQUERIESPROC>("glGenQueriesARB");
+  if (!DeleteQueries) DeleteQueries = loadProc<PFNGLDELETEQUERIESPROC>("glDeleteQueriesARB");
+  if (!BeginQuery) BeginQuery = loadProc<PFNGLBEGINQUERYPROC>("glBeginQueryARB");
+  if (!EndQuery) EndQuery = loadProc<PFNGLENDQUERYPROC>("glEndQueryARB");
+  if (!GetQueryObjectui64v) GetQueryObjectui64v = loadProc<PFNGLGETQUERYOBJECTUI64VPROC>("glGetQueryObjectui64vARB");
 
 
   // Fallback for entry points that may be exported directly by the OpenGL library

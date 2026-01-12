@@ -44,6 +44,32 @@ typedef void (APIENTRYP PFNGLDELETETEXTURESPROC)(GLsizei n, const GLuint* textur
 typedef void (APIENTRYP PFNGLGENERATEMIPMAPPROC)(GLenum target);
 #endif
 
+// Timer queries (for GPU profiling). These are optional in our loader; the
+// engine will gracefully disable profiling if they are unavailable.
+#ifndef PFNGLGENQUERIESPROC
+typedef void (APIENTRYP PFNGLGENQUERIESPROC)(GLsizei n, GLuint* ids);
+#endif
+#ifndef PFNGLDELETEQUERIESPROC
+typedef void (APIENTRYP PFNGLDELETEQUERIESPROC)(GLsizei n, const GLuint* ids);
+#endif
+#ifndef PFNGLBEGINQUERYPROC
+typedef void (APIENTRYP PFNGLBEGINQUERYPROC)(GLenum target, GLuint id);
+#endif
+#ifndef PFNGLENDQUERYPROC
+typedef void (APIENTRYP PFNGLENDQUERYPROC)(GLenum target);
+#endif
+#ifndef PFNGLGETQUERYOBJECTUI64VPROC
+typedef void (APIENTRYP PFNGLGETQUERYOBJECTUI64VPROC)(GLuint id, GLenum pname, GLuint64* params);
+#endif
+
+// Buffer mapping (used by async texture readback / debug tooling).
+#ifndef PFNGLMAPBUFFERRANGEPROC
+typedef void* (APIENTRYP PFNGLMAPBUFFERRANGEPROC)(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+#endif
+#ifndef PFNGLUNMAPBUFFERPROC
+typedef GLboolean (APIENTRYP PFNGLUNMAPBUFFERPROC)(GLenum target);
+#endif
+
 namespace stellar::render::gl {
 
 bool load();
@@ -84,6 +110,10 @@ extern PFNGLBUFFERDATAPROC BufferData;
 extern PFNGLBUFFERSUBDATAPROC BufferSubData;
 extern PFNGLDELETEBUFFERSPROC DeleteBuffers;
 
+// Optional buffer mapping functions (nullptr when unsupported).
+extern PFNGLMAPBUFFERRANGEPROC MapBufferRange;
+extern PFNGLUNMAPBUFFERPROC UnmapBuffer;
+
 extern PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray;
 extern PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer;
 extern PFNGLVERTEXATTRIBDIVISORPROC VertexAttribDivisor;
@@ -111,5 +141,12 @@ extern PFNGLBINDRENDERBUFFERPROC BindRenderbuffer;
 extern PFNGLRENDERBUFFERSTORAGEPROC RenderbufferStorage;
 extern PFNGLFRAMEBUFFERRENDERBUFFERPROC FramebufferRenderbuffer;
 extern PFNGLDELETERENDERBUFFERSPROC DeleteRenderbuffers;
+
+// Optional timer query functions (nullptr when unsupported).
+extern PFNGLGENQUERIESPROC GenQueries;
+extern PFNGLDELETEQUERIESPROC DeleteQueries;
+extern PFNGLBEGINQUERYPROC BeginQuery;
+extern PFNGLENDQUERYPROC EndQuery;
+extern PFNGLGETQUERYOBJECTUI64VPROC GetQueryObjectui64v;
 
 } // namespace stellar::render::gl

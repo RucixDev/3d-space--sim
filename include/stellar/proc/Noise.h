@@ -12,8 +12,12 @@ double valueNoise3D(core::u64 seed, int x, int y, int z);
 
 // Smooth value noise sampled at fractional coordinates.
 double smoothNoise2D(core::u64 seed, double x, double y);
+double smoothNoise3D(core::u64 seed, double x, double y, double z);
 
 // Fractional Brownian motion (fBm) using smoothNoise2D.
 double fbm2D(core::u64 seed, double x, double y, int octaves = 5, double lacunarity = 2.0, double gain = 0.5);
+
+// Fractional Brownian motion (fBm) using smoothNoise3D.
+double fbm3D(core::u64 seed, double x, double y, double z, int octaves = 5, double lacunarity = 2.0, double gain = 0.5);
 
 } // namespace stellar::proc

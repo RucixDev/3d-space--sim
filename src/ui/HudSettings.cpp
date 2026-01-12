@@ -21,6 +21,29 @@ static bool parseBool(const std::string& s, bool def) {
   return def;
 }
 
+static void writeColor(std::ostream& f, const char* key, const Color4f& c) {
+  f << key << " " << c.r << " " << c.g << " " << c.b << " " << c.a << "\n";
+}
+
+static bool readColor(std::istringstream& ss, Color4f& out) {
+  // Accept either RGB or RGBA.
+  float r = out.r, g = out.g, b = out.b, a = out.a;
+  if (!(ss >> r >> g >> b)) return false;
+  if (!(ss >> a)) a = out.a;
+
+  // Heuristic: if values exceed 1.0, assume author used 0..255 components.
+  // (Supports hand-editing + copying colors from external tools.)
+  const float maxv = std::max(std::max(r, g), std::max(b, a));
+  if (maxv > 1.0001f) {
+    r /= 255.0f;
+    g /= 255.0f;
+    b /= 255.0f;
+    a /= 255.0f;
+  }
+  out = Color4f{r, g, b, a};
+  return true;
+}
+
 std::string defaultHudSettingsPath() {
   return "hud_settings.txt";
 }
@@ -86,6 +109,19 @@ bool saveHudSettingsToFile(const HudSettings& s, const std::string& path) {
   f << "tacticalShowAsteroids " << (s.tacticalShowAsteroids ? 1 : 0) << "\n";
   f << "tacticalShowSignals " << (s.tacticalShowSignals ? 1 : 0) << "\n";
 
+  // Style / colors (v2+)
+  f << "overlayBgAlpha " << s.overlayBgAlpha << "\n";
+  f << "overlayBgAlphaEdit " << s.overlayBgAlphaEdit << "\n";
+  f << "tintRadarIcons " << (s.tintRadarIcons ? 1 : 0) << "\n";
+  f << "tintTacticalIcons " << (s.tintTacticalIcons ? 1 : 0) << "\n";
+
+  writeColor(f, "colorPrimary", s.colorPrimary);
+  writeColor(f, "colorAccent", s.colorAccent);
+  writeColor(f, "colorDanger", s.colorDanger);
+  writeColor(f, "colorGrid", s.colorGrid);
+  writeColor(f, "colorText", s.colorText);
+  writeColor(f, "colorBackground", s.colorBackground);
+
   return true;
 }
 
@@ -108,7 +144,8 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
   }
 
   HudSettings s = makeDefaultHudSettings();
-  s.version = version;
+  // Preserve the file's version but clamp it upward so saving writes a modern schema.
+  s.version = std::max(version, s.version);
 
   std::string line;
   std::getline(f, line); // consume remainder of header line
@@ -201,6 +238,28 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
       s.tacticalShowAsteroids = readBool(s.tacticalShowAsteroids);
     } else if (key == "tacticalshowsignals") {
       s.tacticalShowSignals = readBool(s.tacticalShowSignals);
+
+    } else if (key == "overlaybgalpha" || key == "overlayalpha" || key == "overlaybg") {
+      ss >> s.overlayBgAlpha;
+    } else if (key == "overlaybgalphaedit" || key == "overlayalphaedit" || key == "overlaybgedit") {
+      ss >> s.overlayBgAlphaEdit;
+    } else if (key == "tintradaricons" || key == "tintradar") {
+      s.tintRadarIcons = readBool(s.tintRadarIcons);
+    } else if (key == "tinttacticalicons" || key == "tinttactical") {
+      s.tintTacticalIcons = readBool(s.tintTacticalIcons);
+
+    } else if (key == "colorprimary" || key == "primary") {
+      readColor(ss, s.colorPrimary);
+    } else if (key == "coloraccent" || key == "accent") {
+      readColor(ss, s.colorAccent);
+    } else if (key == "colordanger" || key == "danger") {
+      readColor(ss, s.colorDanger);
+    } else if (key == "colorgrid" || key == "grid") {
+      readColor(ss, s.colorGrid);
+    } else if (key == "colortext" || key == "text") {
+      readColor(ss, s.colorText);
+    } else if (key == "colorbackground" || key == "background") {
+      readColor(ss, s.colorBackground);
     }
   }
 
@@ -218,6 +277,22 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
 
   s.tacticalRangeKm = std::clamp(s.tacticalRangeKm, 20000.0, 2000000.0);
   s.tacticalMaxMarkers = std::clamp(s.tacticalMaxMarkers, 8, 512);
+
+  s.overlayBgAlpha = std::clamp(s.overlayBgAlpha, 0.0f, 1.0f);
+  s.overlayBgAlphaEdit = std::clamp(s.overlayBgAlphaEdit, 0.0f, 1.0f);
+
+  auto clampC = [](Color4f& c) {
+    c.r = std::clamp(c.r, 0.0f, 1.0f);
+    c.g = std::clamp(c.g, 0.0f, 1.0f);
+    c.b = std::clamp(c.b, 0.0f, 1.0f);
+    c.a = std::clamp(c.a, 0.0f, 1.0f);
+  };
+  clampC(s.colorPrimary);
+  clampC(s.colorAccent);
+  clampC(s.colorDanger);
+  clampC(s.colorGrid);
+  clampC(s.colorText);
+  clampC(s.colorBackground);
 
   out = s;
   return true;
