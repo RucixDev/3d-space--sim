@@ -27,18 +27,24 @@ file(MAKE_DIRECTORY "${STELLAR_TEST_GEN_DIR}")
 
 set(STELLAR_TEST_REGISTRY_CPP "${STELLAR_TEST_GEN_DIR}/generated_test_registry.cpp")
 
-set(_registry "#include \"test_registry.h\"\n\n#include <cstddef>\n\nnamespace stellar::test {\n\n")
+set(_registry "#include \"test_registry.h\"\n\n#include <cstddef>\n\n")
 
-# Forward declarations.
+# Forward declarations for test entry points.
+#
+# NOTE: Each test translation unit defines a *global* `int test_xxx()` function (see test_registry.h).
+# We keep these declarations in the global namespace and explicitly take their address with `&::...`
+# to avoid accidentally looking for `stellar::test::test_xxx` symbols.
 foreach(src ${STELLAR_TEST_SOURCES})
   get_filename_component(name "${src}" NAME_WE)
   string(APPEND _registry "int ${name}();\n")
 endforeach()
 
-string(APPEND _registry "\nstatic const Case kCases[] = {\n")
+string(APPEND _registry "\nnamespace stellar::test {\n\n")
+
+string(APPEND _registry "static const Case kCases[] = {\n")
 foreach(src ${STELLAR_TEST_SOURCES})
   get_filename_component(name "${src}" NAME_WE)
-  string(APPEND _registry "  {\"${name}\", &${name}},\n")
+  string(APPEND _registry "  {\"${name}\", &::${name}},\n")
 endforeach()
 string(APPEND _registry "};\n\nconst Case* cases(std::size_t* outCount) {\n  if (outCount) *outCount = sizeof(kCases) / sizeof(kCases[0]);\n  return kCases;\n}\n\n} // namespace stellar::test\n")
 

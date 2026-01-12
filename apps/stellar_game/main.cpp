@@ -15597,9 +15597,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     game::drawCVarWindow(cvarWindow,
                          [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
     // CPU profiler (frame breakdown) + optional GPU FrameGraph timings.
-    game::drawProfilerWindow(profilerWindow, profiler,
-                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                             postFxEnabled ? &postFx.frameGraph() : nullptr);
+	    game::drawProfilerWindow(profilerWindow, profiler,
+	                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+	                             postFxSettings.enabled ? &postFx.frameGraph() : nullptr);
 
     // Flight telemetry recorder
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
