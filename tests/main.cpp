@@ -1,203 +1,173 @@
+#include "test_registry.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstring>
 #include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
 
-int test_orbit();
-int test_orbital_elements();
-int test_gravity();
-int test_atmosphere();
-int test_trajectory_predictor();
-int test_trajectory_analysis();
-int test_maneuver_computer();
-int test_maneuver_program_computer();
-int test_lambert_solver();
-int test_lambert_solver_multirev();
-int test_lambert_planner();
-int test_lambert_planner_stepper();
-int test_streaming();
-int test_query_nearby();
-int test_universe_cache();
-int test_proc();
-int test_noise3d();
-int test_auto_exposure();
-int test_procedural_asteroid();
-int test_procedural_postfx();
-int test_procedural_compositor();
-int test_sdf_mesher();
-int test_economy();
-int test_market_analysis();
-int test_traffic();
-int test_traffic_ledger();
-int test_traffic_lanes();
-int test_traffic_convoy_layer();
-int test_route_planner();
-int test_manifest_planner();
-int test_cargo_jettison_planner();
-int test_savegame();
-int test_missions();
-int test_mission_assist();
-int test_law();
-int test_police_scan();
-int test_extortion();
-int test_npc_combat_ai();
-int test_faction_profile();
-int test_security_model();
-int test_system_security_dynamics();
-int test_distress();
-int test_derelict();
-int test_resource_field();
-int test_signals();
-int test_mining();
-int test_traffic_escort();
-int test_docking();
-int test_docking_clearance();
-int test_thermal();
-int test_fuel_scoop();
-int test_system_events();
-int test_system_conditions();
-int test_nav();
-int test_k_routes();
-int test_args();
-int test_signature();
-int test_industry();
-int test_industry_service();
-int test_industry_scanner();
-int test_warehouse();
-int test_trade_scanner();
-int test_trade_loops();
-int test_trade_loops_parallel();
-int test_trade_runs();
-int test_trade_runs_parallel();
-int test_ship();
-int test_ship_loadout();
-int test_shipyard_service();
-int test_insurance();
-int test_power_distributor();
-int test_flight_controller();
-int test_nav_assist();
-int test_intercept_course();
-int test_interdiction();
-int test_combat();
-int test_ballistics();
-int test_missile_defense();
-int test_supercruise();
-int test_encounter_director();
-int test_squad_tactics();
-int test_bookmarks();
-int test_fuzzy_search();
-int test_ui_settings();
-int test_ui_layout_profiles();
-int test_hud_settings();
-int test_vfx_settings();
-int test_ui_workspaces();
-int test_window_registry();
-int test_log_sinks();
-int test_log_buffer();
-int test_profiler();
+namespace {
 
-int test_cvars();
-int test_jobs();
-int main() {
-  int fails = 0;
+static bool icontains(std::string_view hay, std::string_view needle) {
+  if (needle.empty()) return true;
+  if (hay.empty()) return false;
 
-  fails += test_orbit();
-  fails += test_orbital_elements();
-  fails += test_gravity();
-  fails += test_atmosphere();
-  fails += test_trajectory_predictor();
-  fails += test_trajectory_analysis();
-  fails += test_maneuver_computer();
-  fails += test_maneuver_program_computer();
-  fails += test_lambert_solver();
-  fails += test_lambert_solver_multirev();
-  fails += test_lambert_planner();
-  fails += test_lambert_planner_stepper();
-  fails += test_streaming();
-  fails += test_query_nearby();
-  fails += test_universe_cache();
-  fails += test_proc();
-  fails += test_noise3d();
-  fails += test_auto_exposure();
-  fails += test_procedural_asteroid();
-  fails += test_procedural_postfx();
-  fails += test_procedural_compositor();
-  fails += test_sdf_mesher();
-  fails += test_economy();
-  fails += test_market_analysis();
-  fails += test_traffic();
-  fails += test_traffic_ledger();
-  fails += test_traffic_lanes();
-  fails += test_traffic_convoy_layer();
-  fails += test_route_planner();
-  fails += test_manifest_planner();
-  fails += test_cargo_jettison_planner();
-  fails += test_savegame();
-  fails += test_missions();
-  fails += test_mission_assist();
-  fails += test_law();
-  fails += test_police_scan();
-  fails += test_extortion();
-  fails += test_npc_combat_ai();
-  fails += test_faction_profile();
-  fails += test_security_model();
-  fails += test_system_security_dynamics();
-  fails += test_system_events();
-  fails += test_system_conditions();
-  fails += test_distress();
-  fails += test_derelict();
-  fails += test_resource_field();
-  fails += test_signals();
-  fails += test_mining();
-  fails += test_traffic_escort();
-  fails += test_docking();
-  fails += test_docking_clearance();
-  fails += test_thermal();
-  fails += test_fuel_scoop();
-  fails += test_nav();
-  fails += test_k_routes();
-  fails += test_args();
-  fails += test_signature();
-  fails += test_industry();
-  fails += test_industry_service();
-  fails += test_industry_scanner();
-  fails += test_warehouse();
-  fails += test_trade_scanner();
-  fails += test_trade_loops();
-  fails += test_trade_loops_parallel();
-  fails += test_trade_runs();
-  fails += test_trade_runs_parallel();
-  fails += test_ship();
-  fails += test_ship_loadout();
-  fails += test_shipyard_service();
-  fails += test_insurance();
-  fails += test_power_distributor();
-  fails += test_flight_controller();
-  fails += test_nav_assist();
-  fails += test_intercept_course();
-  fails += test_interdiction();
-  fails += test_combat();
-  fails += test_ballistics();
-  fails += test_missile_defense();
-  fails += test_supercruise();
-  fails += test_encounter_director();
-  fails += test_squad_tactics();
-  fails += test_bookmarks();
-  fails += test_fuzzy_search();
-  fails += test_ui_settings();
-  fails += test_ui_layout_profiles();
-  fails += test_hud_settings();
-  fails += test_vfx_settings();
-  fails += test_ui_workspaces();
-  fails += test_window_registry();
-  fails += test_cvars();
-  fails += test_jobs();
-  fails += test_log_sinks();
-  fails += test_log_buffer();
-  fails += test_profiler();
+  auto lower = [](char c) -> char {
+    return (char)std::tolower((unsigned char)c);
+  };
 
-  if (fails == 0) {
-    std::cout << "[stellar_tests] ALL PASS\n";
+  for (std::size_t i = 0; i < hay.size(); ++i) {
+    std::size_t j = 0;
+    while (i + j < hay.size() && j < needle.size() && lower(hay[i + j]) == lower(needle[j])) {
+      ++j;
+    }
+    if (j == needle.size()) return true;
+  }
+  return false;
+}
+
+static void printHelp(const char* exe) {
+  std::cout << "stellar_tests\n"
+            << "Usage:\n"
+            << "  " << (exe ? exe : "stellar_tests") << " [options] [pattern ...]\n\n"
+            << "Options:\n"
+            << "  --list                 List all available tests and exit\n"
+            << "  --filter <pattern>     Run only tests whose name contains <pattern> (case-insensitive)\n"
+            << "  --failfast             Stop after the first failing test\n"
+            << "  -h, --help             Show this help\n\n"
+            << "Patterns:\n"
+            << "  Any extra positional arguments are treated as filter patterns (OR'd together).\n"
+            << "Examples:\n"
+            << "  stellar_tests --list\n"
+            << "  stellar_tests --filter trade\n"
+            << "  stellar_tests orbit docking\n";
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+  bool list = false;
+  bool failfast = false;
+  std::vector<std::string> patterns;
+
+  for (int i = 1; i < argc; ++i) {
+    const char* a = argv[i];
+    if (!a) continue;
+
+    if (std::strcmp(a, "--list") == 0) {
+      list = true;
+      continue;
+    }
+    if (std::strcmp(a, "--failfast") == 0) {
+      failfast = true;
+      continue;
+    }
+    if (std::strcmp(a, "--filter") == 0) {
+      if (i + 1 >= argc) {
+        std::cerr << "[stellar_tests] --filter requires a pattern\n";
+        return 1;
+      }
+      patterns.emplace_back(argv[++i]);
+      continue;
+    }
+    if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
+      printHelp(argv[0]);
+      return 0;
+    }
+
+    // Positional patterns.
+    patterns.emplace_back(a);
+  }
+
+  std::size_t count = 0;
+  const stellar::test::Case* cases = stellar::test::cases(&count);
+  if (!cases || count == 0) {
+    std::cerr << "[stellar_tests] No tests registered.\n";
+    return 1;
+  }
+
+  if (list) {
+    for (std::size_t i = 0; i < count; ++i) {
+      std::cout << cases[i].name << "\n";
+    }
     return 0;
   }
 
-  std::cerr << "[stellar_tests] FAILS=" << fails << "\n";
+  auto matches = [&](const char* name) -> bool {
+    if (!name) return false;
+    if (patterns.empty()) return true;
+    for (const auto& p : patterns) {
+      if (icontains(name, p)) return true;
+    }
+    return false;
+  };
+
+  using clock = std::chrono::high_resolution_clock;
+
+  int totalFails = 0;
+  int ran = 0;
+  int skipped = 0;
+
+  for (std::size_t i = 0; i < count; ++i) {
+    const stellar::test::Case& tc = cases[i];
+    if (!matches(tc.name)) {
+      ++skipped;
+      continue;
+    }
+
+    ++ran;
+    const auto t0 = clock::now();
+
+    int fails = 0;
+    if (!tc.fn) {
+      fails = 1;
+      std::cerr << "[stellar_tests] [FAIL] " << (tc.name ? tc.name : "<null>")
+                << " (null function pointer)\n";
+    } else {
+      try {
+        fails = tc.fn();
+      } catch (const std::exception& e) {
+        fails = 1;
+        std::cerr << "[stellar_tests] [EXC ] " << (tc.name ? tc.name : "<null>")
+                  << ": " << e.what() << "\n";
+      } catch (...) {
+        fails = 1;
+        std::cerr << "[stellar_tests] [EXC ] " << (tc.name ? tc.name : "<null>")
+                  << ": unknown exception\n";
+      }
+    }
+
+    const auto t1 = clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    if (fails == 0) {
+      std::cout << "[stellar_tests] [PASS] " << tc.name << " (" << ms << " ms)\n";
+    } else {
+      std::cerr << "[stellar_tests] [FAIL] " << tc.name << " fails=" << fails
+                << " (" << ms << " ms)\n";
+      totalFails += fails;
+      if (failfast) break;
+    }
+  }
+
+  if (ran == 0) {
+    std::cerr << "[stellar_tests] No tests matched the given pattern(s).\n";
+    printHelp(argv[0]);
+    return 1;
+  }
+
+  if (totalFails == 0) {
+    std::cout << "[stellar_tests] ALL PASS (" << ran << " tests";
+    if (skipped > 0) std::cout << ", " << skipped << " skipped";
+    std::cout << ")\n";
+    return 0;
+  }
+
+  std::cerr << "[stellar_tests] FAILS=" << totalFails << " (" << ran << " tests";
+  if (skipped > 0) std::cerr << ", " << skipped << " skipped";
+  std::cerr << ")\n";
   return 1;
 }

@@ -365,6 +365,13 @@ unsigned int FrameGraph::ensureGlTexture(int physId, const ResolvedDesc& d) {
     gl::TexImage2D(GL_TEXTURE_2D, 0, d.internalFormat, d.w, d.h, 0, d.format, d.type, nullptr);
     gl::BindTexture(GL_TEXTURE_2D, 0);
     p.desc = d;
+
+    // Label the GL object for external GPU debuggers/profilers (KHR_debug).
+    if (gl::ObjectLabel && p.tex) {
+      const std::string label = "FG Tex " + std::to_string(physId) + " (" +
+                               std::to_string(d.w) + "x" + std::to_string(d.h) + ")";
+      gl::ObjectLabel(GL_TEXTURE, p.tex, (GLsizei)label.size(), label.c_str());
+    }
   }
 
   return p.tex;
@@ -373,11 +380,19 @@ unsigned int FrameGraph::ensureGlTexture(int physId, const ResolvedDesc& d) {
 unsigned int FrameGraph::ensureFbo(int physId) {
   if (physId < 0 || physId >= (int)phys_.size()) return 0;
   auto& p = phys_[(std::size_t)physId];
+  const bool created = (p.fbo == 0);
   if (!p.fbo) gl::GenFramebuffers(1, &p.fbo);
   gl::BindFramebuffer(GL_FRAMEBUFFER, p.fbo);
   gl::FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, p.tex, 0);
   glDrawBuffer(GL_COLOR_ATTACHMENT0);
   gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  // Label the FBO for GPU tools (KHR_debug).
+  if (created && gl::ObjectLabel && p.fbo) {
+    const std::string label = "FG FBO " + std::to_string(physId);
+    gl::ObjectLabel(GL_FRAMEBUFFER, p.fbo, (GLsizei)label.size(), label.c_str());
+  }
+
   return p.fbo;
 }
 
@@ -412,6 +427,9 @@ void FrameGraph::execute() {
 
   const int passCount = (int)passes_.size();
   const bool doProfile = profilingEnabled_ && profilingSupported_ && passCount > 0;
+
+  const bool doGroups = gl::debugGroupsSupported();
+
 
   int readFrame = 0;
   int writeFrame = 0;
@@ -467,10 +485,28 @@ void FrameGraph::execute() {
   }
 
   // Execute passes.
+
+  struct DebugGroupScope {
+    bool active{false};
+    DebugGroupScope(const char* label, bool enabled) {
+      if (enabled && gl::PushDebugGroup && gl::PopDebugGroup && label) {
+        gl::PushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0u, -1, label);
+        active = true;
+      }
+    }
+    ~DebugGroupScope() {
+      if (active && gl::PopDebugGroup) {
+        gl::PopDebugGroup();
+      }
+    }
+  };
+
   for (int si = 0; si < (int)schedule_.size(); ++si) {
     const int pIdx = schedule_[(std::size_t)si];
     if (pIdx < 0 || pIdx >= (int)passes_.size()) continue;
     const PassInfo& p = passes_[(std::size_t)pIdx];
+
+    DebugGroupScope dbg(p.name.c_str(), doGroups);
 
     int outW = viewW_;
     int outH = viewH_;

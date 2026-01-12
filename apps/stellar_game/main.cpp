@@ -931,7 +931,12 @@ int main(int argc, char** argv) {
   }
 
   // GL 3.3 core
+  // Request a debug context in debug builds (helps KHR_debug / driver messages).
+#ifndef NDEBUG
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+#else
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+#endif
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -960,6 +965,19 @@ int main(int argc, char** argv) {
   }
 
   core::log(core::LogLevel::Info, std::string("OpenGL: ") + render::gl::glVersionString());
+
+  // ---- OpenGL debugging (KHR_debug) ----
+  // These features are optional and may be unavailable depending on driver/context.
+  // When available, FrameGraph pass markers/labels greatly improve the debugging
+  // experience in tools like RenderDoc/Nsight.
+  bool glDebugOutputEnabled = false;
+  bool glDebugOutputSynchronous = false;
+  bool glDebugOutputNotifications = false;
+#ifndef NDEBUG
+  glDebugOutputEnabled = true;
+  glDebugOutputSynchronous = true;
+#endif
+  render::gl::setDebugOutputEnabled(glDebugOutputEnabled, glDebugOutputSynchronous, glDebugOutputNotifications);
 
   glEnable(GL_DEPTH_TEST);
 
@@ -3601,6 +3619,16 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   // Console: hook core logging + built-in commands.
   consoleWindow.simTimeDaysPtr = &timeDays;
   game::consoleAddBuiltins(consoleWindow);
+
+  // Load persistent command history (optional).
+  {
+    std::error_code ec;
+    if (std::filesystem::exists(consoleWindow.historyPath, ec)) {
+      std::string err;
+      (void)game::consoleLoadHistoryFromFile(consoleWindow, consoleWindow.historyPath, &err);
+    }
+  }
+
   game::consoleInstallCoreLogSink(consoleWindow);
 
   auto respawnNearStation = [&](const sim::StarSystem& sys, std::size_t stationIdx) {
@@ -15568,9 +15596,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // CVar browser/editor (developer tool)
     game::drawCVarWindow(cvarWindow,
                          [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
-    // CPU profiler (frame breakdown)
+    // CPU profiler (frame breakdown) + optional GPU FrameGraph timings.
     game::drawProfilerWindow(profilerWindow, profiler,
-                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                             postFxEnabled ? &postFx.frameGraph() : nullptr);
 
     // Flight telemetry recorder
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
@@ -18074,6 +18103,50 @@ if (showPostFx) {
       ImGui::TextDisabled("Aliasing reuses transient HDR textures based on lifetime. Disable it to preview per-pass outputs.");
 
       const auto& fg = postFx.frameGraph();
+
+      // --- OpenGL debug instrumentation (KHR_debug) ---
+      // Driver debug output: structured callback messages to the log window / console.
+      // Debug groups / labels: show up in GPU tools like RenderDoc/Nsight Graphics to
+      // annotate FrameGraph passes and transient textures.
+      if (ImGui::TreeNodeEx("OpenGL Debug (KHR_debug)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const bool dbgOutSupported = render::gl::debugOutputSupported();
+        const bool dbgGroupsSupported = render::gl::debugGroupsSupported();
+        const bool dbgLabelsSupported = render::gl::debugLabelsSupported();
+
+        if (dbgOutSupported) {
+          bool changed = false;
+          changed |= ImGui::Checkbox("Driver debug output", &glDebugOutputEnabled);
+          if (glDebugOutputEnabled) {
+            ImGui::Indent();
+            changed |= ImGui::Checkbox("Synchronous", &glDebugOutputSynchronous);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("Include notifications", &glDebugOutputNotifications);
+            ImGui::Unindent();
+          }
+
+          if (changed) {
+            render::gl::setDebugOutputEnabled(glDebugOutputEnabled, glDebugOutputSynchronous, glDebugOutputNotifications);
+          }
+
+          ImGui::TextDisabled("Tip: Best with a debug GL context (enabled automatically in debug builds).");
+        } else {
+          ImGui::TextDisabled("Driver debug output: unavailable (KHR_debug not supported).");
+        }
+
+        if (dbgGroupsSupported) {
+          ImGui::Text("Debug groups: supported (FrameGraph pass markers enabled)");
+        } else {
+          ImGui::TextDisabled("Debug groups: unavailable");
+        }
+
+        if (dbgLabelsSupported) {
+          ImGui::Text("Object labels: supported (FrameGraph textures/FBOs labeled)");
+        } else {
+          ImGui::TextDisabled("Object labels: unavailable");
+        }
+
+        ImGui::TreePop();
+      }
 
       const bool fgTimingSupported = fg.profilingSupported();
       if (fgTimingSupported) {
@@ -27873,6 +27946,102 @@ if (showContacts) {
         goto draw_command_palette;
       }
 
+      // --- CVar mode (prefix with ':') ---
+      // Fast path for tweaking developer CVars without leaving the palette.
+      // Examples:
+      //   :render.vsync=0
+      //   :ui.theme=HighContrast
+      //   :some.bool        (toggles)
+      const bool paletteCvarMode = (commandPalette.query[0] == ':');
+      if (paletteCvarMode) {
+        core::installDefaultCVars();
+        const std::string expr = trimAscii(std::string_view(commandPalette.query + 1));
+
+        // Always provide a way to open the full browser/editor.
+        addItem(": Open CVar Browser",
+                "CVar • Window (tip: ':name=value' to set, ':name' to toggle/edit)",
+                std::string(), 210,
+                [&]() {
+                  game::openCVarWindow(cvarWindow, /*focusFilter=*/true);
+                });
+
+        // Parse optional ":name=value" assignment.
+        std::string name = expr;
+        std::string value;
+        bool hasEq = false;
+        const std::size_t eq = expr.find('=');
+        if (eq != std::string::npos) {
+          name = trimAscii(std::string_view(expr).substr(0, eq));
+          value = trimAscii(std::string_view(expr).substr(eq + 1));
+          hasEq = true;
+        } else {
+          name = trimAscii(name);
+        }
+
+        if (hasEq && !name.empty()) {
+          const std::string label = std::string(": Set ") + name + " = " + value;
+          addItem(label, "CVar • Apply", std::string(), 240,
+                  [&, name, value]() {
+                    std::string err;
+                    if (!core::cvars().setFromString(name, value, &err)) {
+                      toast(toasts, err.empty() ? "Failed to set CVar." : err, 2.2);
+                      return;
+                    }
+                    const core::CVar* v = core::cvars().find(name);
+                    const std::string msg =
+                      v ? (v->name + " = " + core::CVarRegistry::valueToString(*v)) : (name + " updated.");
+                    toast(toasts, msg, 2.0);
+                  });
+        }
+
+        // Add CVars as palette items. We keep it simple and let the palette's fuzzy-match
+        // filter down the list based on the user query.
+        const auto vars = core::cvars().list();
+        int pri = 140;
+        for (const core::CVar* v : vars) {
+          std::string flags;
+          if ((v->flags & core::CVar_Archive) != 0u) flags += 'A';
+          if ((v->flags & core::CVar_ReadOnly) != 0u) flags += 'R';
+          if ((v->flags & core::CVar_Cheat) != 0u) flags += 'C';
+
+          std::string detail = std::string("CVar • ") + core::CVarRegistry::typeName(v->type)
+                               + " • " + core::CVarRegistry::valueToString(*v);
+          if (!flags.empty()) detail += " [" + flags + "]";
+          if (!v->help.empty()) detail += " • " + v->help;
+
+          const std::string label = std::string(": ") + v->name;
+
+          if (v->type == core::CVarType::Bool) {
+            addItem(label, detail + " • toggle", std::string(), pri,
+                    [&, n = v->name]() {
+                      const core::CVar* cur = core::cvars().find(n);
+                      if (!cur || cur->type != core::CVarType::Bool) return;
+                      const bool b = std::get<bool>(cur->value);
+                      std::string err;
+                      if (!core::cvars().setBool(n, !b, &err)) {
+                        toast(toasts, err.empty() ? "Failed to toggle CVar." : err, 2.2);
+                        return;
+                      }
+                      const core::CVar* v2 = core::cvars().find(n);
+                      if (v2) toast(toasts, v2->name + " = " + core::CVarRegistry::valueToString(*v2), 1.8);
+                    });
+          } else {
+            addItem(label, detail + " • edit", std::string(), pri,
+                    [&, n = v->name]() {
+                      game::openCVarWindow(cvarWindow, /*focusFilter=*/true);
+                      std::snprintf(cvarWindow.filter, sizeof(cvarWindow.filter), "%s", n.c_str());
+                      std::snprintf(cvarWindow.setLine, sizeof(cvarWindow.setLine), "%s = ", n.c_str());
+                      cvarWindow.focusFilter = true;
+                    });
+          }
+
+          pri = std::max(pri - 1, 1);
+        }
+
+        // Don't add the usual item corpus in CVar mode.
+        goto draw_command_palette;
+      }
+
       // UI / windows
       for (const auto& b : uiWindows.items()) {
         if (!b.open) continue;
@@ -28393,6 +28562,15 @@ draw_command_palette:
   if (uiSettingsAutoSaveOnExit && uiSettingsDirty) {
     syncUiSettingsFromRuntime();
     (void)ui::saveUiSettingsToFile(uiSettings, uiSettingsPath);
+  }
+
+  // Persist console history on exit (optional).
+  if (consoleWindow.historyAutoSaveOnExit && consoleWindow.historyDirty) {
+    std::string err;
+    if (!game::consoleSaveHistoryToFile(consoleWindow, consoleWindow.historyPath, &err)) {
+      // Don't spam; just emit a warning on failure.
+      core::log(core::LogLevel::Warn, err.empty() ? "Failed to save console history." : err);
+    }
   }
 
   // Unhook core log forwarding before shutdown.

@@ -2,6 +2,8 @@
 
 #include "stellar/core/Log.h"
 
+#include <string>
+
 namespace stellar::render::gl {
 
 PFNGLCREATESHADERPROC CreateShader = nullptr;
@@ -73,6 +75,13 @@ PFNGLDELETEQUERIESPROC DeleteQueries = nullptr;
 PFNGLBEGINQUERYPROC BeginQuery = nullptr;
 PFNGLENDQUERYPROC EndQuery = nullptr;
 PFNGLGETQUERYOBJECTUI64VPROC GetQueryObjectui64v = nullptr;
+
+// --- KHR_debug (optional) ---
+PFNGLDEBUGMESSAGECALLBACKPROC DebugMessageCallback = nullptr;
+PFNGLDEBUGMESSAGECONTROLPROC DebugMessageControl = nullptr;
+PFNGLPUSHDEBUGGROUPPROC PushDebugGroup = nullptr;
+PFNGLPOPDEBUGGROUPPROC PopDebugGroup = nullptr;
+PFNGLOBJECTLABELPROC ObjectLabel = nullptr;
 
 template <class T>
 static T loadProc(const char* name) {
@@ -168,6 +177,20 @@ bool load() {
   if (!EndQuery) EndQuery = loadProc<PFNGLENDQUERYPROC>("glEndQueryARB");
   if (!GetQueryObjectui64v) GetQueryObjectui64v = loadProc<PFNGLGETQUERYOBJECTUI64VPROC>("glGetQueryObjectui64vARB");
 
+  // Optional KHR_debug functions (debug output, debug groups, object labels).
+  // Per spec, OpenGL entry points are non-suffixed; we also try KHR-suffixed
+  // names for extra robustness across loader quirks.
+  DebugMessageCallback = loadProc<PFNGLDEBUGMESSAGECALLBACKPROC>("glDebugMessageCallback");
+  if (!DebugMessageCallback) DebugMessageCallback = loadProc<PFNGLDEBUGMESSAGECALLBACKPROC>("glDebugMessageCallbackKHR");
+  DebugMessageControl = loadProc<PFNGLDEBUGMESSAGECONTROLPROC>("glDebugMessageControl");
+  if (!DebugMessageControl) DebugMessageControl = loadProc<PFNGLDEBUGMESSAGECONTROLPROC>("glDebugMessageControlKHR");
+  PushDebugGroup = loadProc<PFNGLPUSHDEBUGGROUPPROC>("glPushDebugGroup");
+  if (!PushDebugGroup) PushDebugGroup = loadProc<PFNGLPUSHDEBUGGROUPPROC>("glPushDebugGroupKHR");
+  PopDebugGroup = loadProc<PFNGLPOPDEBUGGROUPPROC>("glPopDebugGroup");
+  if (!PopDebugGroup) PopDebugGroup = loadProc<PFNGLPOPDEBUGGROUPPROC>("glPopDebugGroupKHR");
+  ObjectLabel = loadProc<PFNGLOBJECTLABELPROC>("glObjectLabel");
+  if (!ObjectLabel) ObjectLabel = loadProc<PFNGLOBJECTLABELPROC>("glObjectLabelKHR");
+
 
   // Fallback for entry points that may be exported directly by the OpenGL library
   // rather than returned by SDL_GL_GetProcAddress (common on Windows for GL 1.1/1.3 funcs).
@@ -205,6 +228,111 @@ bool load() {
 const char* glVersionString() {
   const auto* s = glGetString(GL_VERSION);
   return s ? reinterpret_cast<const char*>(s) : "(null)";
+}
+
+// --- KHR_debug helpers ---
+
+namespace {
+
+const char* dbgSourceStr(GLenum src) {
+  switch (src) {
+    case GL_DEBUG_SOURCE_API: return "API";
+    case GL_DEBUG_SOURCE_WINDOW_SYSTEM: return "WindowSystem";
+    case GL_DEBUG_SOURCE_SHADER_COMPILER: return "ShaderCompiler";
+    case GL_DEBUG_SOURCE_THIRD_PARTY: return "ThirdParty";
+    case GL_DEBUG_SOURCE_APPLICATION: return "Application";
+    case GL_DEBUG_SOURCE_OTHER: return "Other";
+    default: return "Unknown";
+  }
+}
+
+const char* dbgTypeStr(GLenum ty) {
+  switch (ty) {
+    case GL_DEBUG_TYPE_ERROR: return "Error";
+    case GL_DEBUG_TYPE_DEPRECATED_BEHAVIOR: return "Deprecated";
+    case GL_DEBUG_TYPE_UNDEFINED_BEHAVIOR: return "Undefined";
+    case GL_DEBUG_TYPE_PORTABILITY: return "Portability";
+    case GL_DEBUG_TYPE_PERFORMANCE: return "Performance";
+    case GL_DEBUG_TYPE_MARKER: return "Marker";
+    case GL_DEBUG_TYPE_PUSH_GROUP: return "PushGroup";
+    case GL_DEBUG_TYPE_POP_GROUP: return "PopGroup";
+    case GL_DEBUG_TYPE_OTHER: return "Other";
+    default: return "Unknown";
+  }
+}
+
+core::LogLevel dbgSeverityToLogLevel(GLenum sev) {
+  switch (sev) {
+    case GL_DEBUG_SEVERITY_HIGH: return core::LogLevel::Error;
+    case GL_DEBUG_SEVERITY_MEDIUM: return core::LogLevel::Warn;
+    case GL_DEBUG_SEVERITY_LOW: return core::LogLevel::Info;
+    case GL_DEBUG_SEVERITY_NOTIFICATION: return core::LogLevel::Debug;
+    default: return core::LogLevel::Info;
+  }
+}
+
+void APIENTRY glDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity,
+                             GLsizei length, const GLchar* message, const void* userParam) {
+  (void)length;
+  (void)userParam;
+
+  // Many drivers already include a prefix; keep ours compact but structured.
+  const core::LogLevel lvl = dbgSeverityToLogLevel(severity);
+
+  std::string s;
+  s.reserve(128);
+  s += "GL[";
+  s += dbgSourceStr(source);
+  s += "/";
+  s += dbgTypeStr(type);
+  s += "] id=";
+  s += std::to_string((unsigned)id);
+  s += ": ";
+  if (message) s += message;
+
+  core::log(lvl, s);
+}
+
+} // namespace
+
+bool debugOutputSupported() {
+  return DebugMessageCallback != nullptr;
+}
+
+bool debugGroupsSupported() {
+  return PushDebugGroup != nullptr && PopDebugGroup != nullptr;
+}
+
+bool debugLabelsSupported() {
+  return ObjectLabel != nullptr;
+}
+
+void setDebugOutputEnabled(bool enabled, bool synchronous, bool includeNotifications) {
+  if (!DebugMessageCallback) return;
+
+  if (!enabled) {
+    // Disable callback + state.
+    DebugMessageCallback(nullptr, nullptr);
+    glDisable(GL_DEBUG_OUTPUT);
+    glDisable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    return;
+  }
+
+  glEnable(GL_DEBUG_OUTPUT);
+  if (synchronous) glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+  else glDisable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+
+  // Route messages through our logger.
+  DebugMessageCallback(&glDebugCallback, nullptr);
+
+  // Filter out notification spam by default (can be toggled by callers).
+  if (DebugMessageControl) {
+    // Enable everything first, then optionally disable notifications.
+    DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+    if (!includeNotifications) {
+      DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0, nullptr, GL_FALSE);
+    }
+  }
 }
 
 } // namespace stellar::render::gl

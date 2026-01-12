@@ -1,110 +1,61 @@
-add_executable(stellar_tests
-  main.cpp
-  test_orbit.cpp
-  test_orbital_elements.cpp
-  test_gravity.cpp
-  test_atmosphere.cpp
-  test_trajectory_predictor.cpp
-  test_trajectory_analysis.cpp
-  test_maneuver_computer.cpp
-  test_maneuver_program_computer.cpp
-  test_lambert_solver.cpp
-  test_lambert_solver_multirev.cpp
-  test_lambert_planner.cpp
-  test_lambert_planner_stepper.cpp
-  test_streaming.cpp
-  test_query_nearby.cpp
-  test_universe_cache.cpp
-  test_proc.cpp
-  test_noise3d.cpp
-  test_auto_exposure.cpp
-  test_procedural_asteroid.cpp
-  test_procedural_postfx.cpp
-  test_procedural_compositor.cpp
-  test_sdf_mesher.cpp
-  test_economy.cpp
-  test_market_analysis.cpp
-  test_traffic.cpp
+# Test runner
+#
+# This directory intentionally uses a tiny bespoke harness (see test_harness.h)
+# instead of pulling a large third-party test framework.
+#
+# To reduce maintenance burden, the list of test translation units is globbed and
+# a small registry translation unit is generated at CMake configure-time.
 
-  test_traffic_ledger.cpp
-  test_traffic_lanes.cpp
-  test_traffic_convoy_layer.cpp
-  test_route_planner.cpp
-  test_manifest_planner.cpp
-  test_cargo_jettison_planner.cpp
-  test_savegame.cpp
-  test_missions.cpp
-  test_mission_assist.cpp
-  test_law.cpp
-  test_police_scan.cpp
-  test_extortion.cpp
-  test_npc_combat_ai.cpp
-  test_faction_profile.cpp
-  test_security_model.cpp
-  test_system_security_dynamics.cpp
-  test_distress.cpp
-  test_derelict.cpp
-  test_resource_field.cpp
-  test_signals.cpp
-  test_mining.cpp
-  test_traffic_escort.cpp
-  test_docking.cpp
-  test_docking_clearance.cpp
-  test_thermal.cpp
-  test_fuel_scoop.cpp
-  test_system_events.cpp
-  test_system_conditions.cpp
-  test_nav.cpp
-  test_k_routes.cpp
-  test_args.cpp
-  test_signature.cpp
-  test_industry.cpp
-  test_industry_service.cpp
-  test_industry_scanner.cpp
-  test_warehouse.cpp
-  test_trade_scanner.cpp
-  test_trade_loops.cpp
-  test_trade_loops_parallel.cpp
-  test_trade_runs.cpp
-  test_trade_runs_parallel.cpp
-  test_ship.cpp
-  test_ship_loadout.cpp
-  test_shipyard_service.cpp
-  test_insurance.cpp
-  test_power_distributor.cpp
-  test_flight_controller.cpp
-  test_nav_assist.cpp
-  test_intercept_course.cpp
-  test_interdiction.cpp
-  test_combat.cpp
-  test_ballistics.cpp
-  test_supercruise.cpp
-  test_encounter_director.cpp
-  test_squad_tactics.cpp
-  test_missile_defense.cpp
-  test_bookmarks.cpp
-  test_fuzzy_search.cpp
-  test_log_sinks.cpp
-  test_log_buffer.cpp
-  test_profiler.cpp
-  test_cvars.cpp
-  test_jobs.cpp
-  test_ui_settings.cpp
-  test_ui_layout_profiles.cpp
-  test_hud_settings.cpp
-  test_vfx_settings.cpp
-  test_ui_workspaces.cpp
-  test_window_registry.cpp
-
-  # Render-graph tests are only available when the rendering backend is built.
-  # (They do not require a GL context; they test the graph compilation/aliasing logic.)
+file(GLOB STELLAR_TEST_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp"
 )
 
-if (STELLAR_ENABLE_RENDER)
-  target_sources(stellar_tests PRIVATE test_frame_graph.cpp)
+# Keep ordering stable across platforms/generators.
+list(SORT STELLAR_TEST_SOURCES)
+
+# Render-only tests.
+# (These depend on the optional OpenGL rendering backend being compiled into the library.)
+if (NOT STELLAR_ENABLE_RENDER)
+  list(FILTER STELLAR_TEST_SOURCES EXCLUDE REGEX "test_frame_graph\\.cpp$")
+  list(FILTER STELLAR_TEST_SOURCES EXCLUDE REGEX "test_surface_normalmap\\.cpp$")
 endif()
 
+# ---- Generate a registry TU that maps file base-names -> test function symbols ----
+# Convention: each test file test_xxx.cpp defines: int test_xxx();
+set(STELLAR_TEST_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${STELLAR_TEST_GEN_DIR}")
+
+set(STELLAR_TEST_REGISTRY_CPP "${STELLAR_TEST_GEN_DIR}/generated_test_registry.cpp")
+
+set(_registry "#include \"test_registry.h\"\n\n#include <cstddef>\n\nnamespace stellar::test {\n\n")
+
+# Forward declarations.
+foreach(src ${STELLAR_TEST_SOURCES})
+  get_filename_component(name "${src}" NAME_WE)
+  string(APPEND _registry "int ${name}();\n")
+endforeach()
+
+string(APPEND _registry "\nstatic const Case kCases[] = {\n")
+foreach(src ${STELLAR_TEST_SOURCES})
+  get_filename_component(name "${src}" NAME_WE)
+  string(APPEND _registry "  {\"${name}\", &${name}},\n")
+endforeach()
+string(APPEND _registry "};\n\nconst Case* cases(std::size_t* outCount) {\n  if (outCount) *outCount = sizeof(kCases) / sizeof(kCases[0]);\n  return kCases;\n}\n\n} // namespace stellar::test\n")
+
+file(WRITE "${STELLAR_TEST_REGISTRY_CPP}" "${_registry}")
+
+add_executable(stellar_tests
+  main.cpp
+  ${STELLAR_TEST_SOURCES}
+  ${STELLAR_TEST_REGISTRY_CPP}
+)
+
+target_include_directories(stellar_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 target_compile_features(stellar_tests PRIVATE cxx_std_20)
+
 target_link_libraries(stellar_tests PRIVATE stellar::stellar)
 
 add_test(NAME stellar_tests COMMAND stellar_tests)

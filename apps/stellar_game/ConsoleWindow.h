@@ -53,6 +53,14 @@ struct ConsoleWindowState {
   // Command history
   std::vector<std::string> history;
   int historyPos{-1}; // -1 = new line
+  std::size_t maxHistory{256};
+
+  // History persistence (optional).
+  // Path is treated as UTF-8 on all platforms.
+  char historyPath[256]{"console_history.txt"};
+  bool historyAutoSaveOnExit{true};
+  bool historyDirty{false};
+  bool historyLoaded{false};
 
   // Registered commands
   std::vector<ConsoleCommand> commands;
@@ -79,6 +87,16 @@ void consolePrint(ConsoleWindowState& st, stellar::core::LogLevel lvl, std::stri
 
 // Clear output/history.
 void consoleClear(ConsoleWindowState& st);
+
+// ---- History persistence ----
+// Save/load command history. The format is a simple line-based text file (one command per line).
+// Lines starting with '#' are treated as comments.
+// Returns false and sets outError on failure.
+bool consoleSaveHistoryToFile(const ConsoleWindowState& st, const std::string& path, std::string* outError = nullptr);
+bool consoleLoadHistoryFromFile(ConsoleWindowState& st, const std::string& path, std::string* outError = nullptr);
+
+// Clear only the command history (does not clear output lines).
+void consoleClearHistory(ConsoleWindowState& st);
 
 // Register a command.
 void consoleAddCommand(ConsoleWindowState& st,

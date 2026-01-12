@@ -76,4 +76,20 @@ bool writeCounterChromeTraceJson(const char* path,
                                 const ChromeTraceWriteOptions& opt = {},
                                 std::string* err = nullptr);
 
+// -----------------------------------------------------------------------------
+// Combined export helper
+// -----------------------------------------------------------------------------
+//
+// Writes a single Chrome JSON trace that contains:
+//  - CPU profiler span events ("X") from the provided frames
+//  - one or more counter tables ("C")
+//
+// This is useful for overlaying CPU breakdowns with time-series metrics such as
+// GPU pass timings.
+bool writeProfilerChromeTraceJsonWithCounters(const char* path,
+                                             const std::deque<ProfilerFrame>& frames,
+                                             const std::vector<ChromeTraceCounterTable>& counters,
+                                             const ChromeTraceWriteOptions& opt = {},
+                                             std::string* err = nullptr);
+
 } // namespace stellar::core

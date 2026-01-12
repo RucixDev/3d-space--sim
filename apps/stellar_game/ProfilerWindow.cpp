@@ -2,6 +2,7 @@
 
 #include "stellar/core/ChromeTrace.h"
 #include "stellar/core/Hash.h"
+#include "stellar/render/FrameGraph.h"
 
 #include <imgui.h>
 
@@ -89,6 +90,195 @@ static void drawFramePlot(const std::deque<core::ProfilerFrame>& frames) {
                    0.0f,
                    maxMs * 1.10f,
                    ImVec2(0, 80));
+}
+
+static void maybeCaptureGpuFrameGraphSample(ProfilerWindowState& st,
+                                            const core::Profiler& profiler,
+                                            const render::FrameGraph* fg) {
+  if (!fg) return;
+  const core::ProfilerFrame* newest = profiler.newest();
+  if (!newest) return;
+
+  // Capture exactly one GPU sample per completed CPU profiler frame.
+  if (newest->startNs == st.gpuLastCapturedCpuFrameStartNs) return;
+  st.gpuLastCapturedCpuFrameStartNs = newest->startNs;
+
+  const auto& passes = fg->passes();
+  const std::size_t passCount = passes.size();
+
+  // Build stable counter keys: [0]=total GPU, then per-pass with an index prefix.
+  std::vector<std::string> keys;
+  keys.reserve(passCount + 1);
+  keys.emplace_back("GPU Frame (ms)");
+  for (std::size_t i = 0; i < passCount; ++i) {
+    const std::string& name = passes[i].name;
+    // Prefix with pass id to guarantee uniqueness.
+    std::string k = "p";
+    if (i < 10) k += "0";
+    if (i < 100) {
+      k += std::to_string(i);
+    } else {
+      k += std::to_string(i);
+    }
+    k += ": ";
+    k += name.empty() ? std::string("<unnamed>") : name;
+    keys.push_back(std::move(k));
+  }
+
+  if (st.gpuCounterKeys != keys) {
+    st.gpuCounterKeys = std::move(keys);
+    st.gpuHistoryRows.clear();
+  }
+
+  std::vector<double> row;
+  row.assign(st.gpuCounterKeys.size(), 0.0);
+
+  const bool canRead = fg->profilingSupported() && fg->profilingEnabled();
+  if (canRead) {
+    row[0] = fg->lastFrameTimeMs();
+    const auto& times = fg->lastPassTimesMs();
+    for (std::size_t i = 0; i < passCount && i < times.size(); ++i) {
+      row[i + 1] = times[i];
+    }
+  }
+
+  st.gpuHistoryRows.push_back(std::move(row));
+
+  // Keep GPU history aligned to the CPU profiler ring buffer.
+  const std::size_t target = profiler.frames().size();
+  while (st.gpuHistoryRows.size() > target && !st.gpuHistoryRows.empty()) {
+    st.gpuHistoryRows.pop_front();
+  }
+}
+
+static void drawGpuFrameGraphPlot(const ProfilerWindowState& st) {
+  if (st.gpuHistoryRows.empty()) {
+    ImGui::TextUnformatted("No GPU timing samples captured yet.");
+    return;
+  }
+
+  static std::vector<float> values;
+  values.clear();
+  values.reserve(st.gpuHistoryRows.size());
+
+  float maxMs = 0.0f;
+  float sumMs = 0.0f;
+  for (const auto& r : st.gpuHistoryRows) {
+    const float ms = (!r.empty()) ? (float)r[0] : 0.0f;
+    values.push_back(ms);
+    sumMs += ms;
+    maxMs = std::max(maxMs, ms);
+  }
+
+  const float avgMs = sumMs / (float)std::max<std::size_t>(1, values.size());
+  ImGui::Text("GPU History: %zu frames | avg %.3f ms | max %.3f ms",
+              values.size(), avgMs, maxMs);
+
+  ImGui::PlotLines("##gpu_frame_times",
+                   values.data(),
+                   (int)values.size(),
+                   0,
+                   nullptr,
+                   0.0f,
+                   maxMs * 1.10f,
+                   ImVec2(0, 80));
+}
+
+struct GpuPassRow {
+  std::string_view name;
+  std::size_t passId{0};
+  double lastMs{0.0};
+  double avgMs{0.0};
+  double maxMs{0.0};
+};
+
+static void drawGpuFrameGraphTable(const ProfilerWindowState& st,
+                                   const render::FrameGraph& fg,
+                                   std::string_view filter) {
+  const auto& passes = fg.passes();
+  const std::size_t passCount = passes.size();
+
+  std::vector<GpuPassRow> rows;
+  rows.reserve(passCount);
+
+  const bool canRead = fg.profilingSupported() && fg.profilingEnabled();
+  const auto& last = fg.lastPassTimesMs();
+
+  const std::size_t histN = st.gpuHistoryRows.size();
+
+  for (std::size_t i = 0; i < passCount; ++i) {
+    const std::string_view name{passes[i].name};
+    if (!icontains(name, filter)) continue;
+
+    GpuPassRow r;
+    r.name = name.empty() ? std::string_view{"<unnamed>"} : name;
+    r.passId = i;
+    r.lastMs = (canRead && i < last.size()) ? last[i] : 0.0;
+
+    double sum = 0.0;
+    double mx = 0.0;
+    for (const auto& h : st.gpuHistoryRows) {
+      const std::size_t idx = i + 1; // [0] is total
+      const double v = (idx < h.size()) ? h[idx] : 0.0;
+      sum += v;
+      mx = std::max(mx, v);
+    }
+    r.avgMs = (histN > 0) ? (sum / (double)histN) : 0.0;
+    r.maxMs = mx;
+
+    rows.push_back(r);
+  }
+
+  if (st.gpuSortByLast) {
+    std::sort(rows.begin(), rows.end(), [](const GpuPassRow& a, const GpuPassRow& b) {
+      return a.lastMs > b.lastMs;
+    });
+  } else {
+    std::sort(rows.begin(), rows.end(), [](const GpuPassRow& a, const GpuPassRow& b) {
+      return a.avgMs > b.avgMs;
+    });
+  }
+
+  const double frameMs = canRead ? fg.lastFrameTimeMs() : 0.0;
+
+  if (ImGui::BeginTable("##gpu_fg_table", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
+    ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Last (ms)", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("Avg (ms)", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("Max (ms)", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("% GPU", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableHeadersRow();
+
+    for (const auto& r : rows) {
+      ImGui::TableNextRow();
+
+      ImGui::TableSetColumnIndex(0);
+      const std::string label = std::string(r.name) + "##gpu_pass_" + std::to_string(r.passId);
+      if (ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+        ImGui::SetClipboardText(std::string(r.name).c_str());
+      }
+
+      ImGui::TableSetColumnIndex(1);
+      ImGui::Text("%.3f", r.lastMs);
+
+      ImGui::TableSetColumnIndex(2);
+      ImGui::Text("%.3f", r.avgMs);
+
+      ImGui::TableSetColumnIndex(3);
+      ImGui::Text("%.3f", r.maxMs);
+
+      ImGui::TableSetColumnIndex(4);
+      const double pct = (frameMs > 1e-6) ? (100.0 * r.lastMs / frameMs) : 0.0;
+      ImGui::Text("%.1f", pct);
+
+      ImGui::TableSetColumnIndex(5);
+      ImGui::Text("%d", (int)r.passId);
+
+    }
+
+    ImGui::EndTable();
+  }
 }
 
 static void drawFlameGraph(const core::ProfilerFrame& frame, const char* id) {
@@ -282,7 +472,11 @@ static void drawAggregates(const core::ProfilerFrame& frame,
 
 void drawProfilerWindow(ProfilerWindowState& st,
                         core::Profiler& profiler,
-                        const ToastFn& toast) {
+                        const ToastFn& toast,
+                        const render::FrameGraph* frameGraph) {
+  // Always keep GPU history in sync even if the window is closed.
+  maybeCaptureGpuFrameGraphSample(st, profiler, frameGraph);
+
   if (!st.open) return;
 
   if (!ImGui::Begin("Profiler", &st.open)) {
@@ -325,6 +519,41 @@ void drawProfilerWindow(ProfilerWindowState& st,
 
   ImGui::Separator();
 
+  if (st.showGpuFrameGraph) {
+    if (ImGui::CollapsingHeader("GPU: FrameGraph", ImGuiTreeNodeFlags_DefaultOpen)) {
+      if (!frameGraph) {
+        ImGui::TextDisabled("(No FrameGraph provided — PostFX may be disabled)");
+      } else {
+        const bool supported = frameGraph->profilingSupported();
+        const bool enabled = frameGraph->profilingEnabled();
+        if (!supported) {
+          ImGui::TextDisabled("Timer queries unavailable (GPU timings not supported). ");
+        } else if (!enabled) {
+          ImGui::TextDisabled("GPU timings are available but currently disabled (enable in FrameGraph debug). ");
+        } else {
+          ImGui::Text("GPU frame time: %.3f ms", frameGraph->lastFrameTimeMs());
+        }
+
+        ImGui::Checkbox("Plot", &st.gpuShowPlot);
+        ImGui::SameLine();
+        ImGui::Checkbox("Table", &st.gpuShowTable);
+        ImGui::SameLine();
+        ImGui::Checkbox("Sort by last", &st.gpuSortByLast);
+
+        if (st.gpuShowPlot) {
+          drawGpuFrameGraphPlot(st);
+        }
+
+        if (st.gpuShowTable) {
+          ImGui::InputTextWithHint("GPU Filter", "substring...", st.gpuFilter, sizeof(st.gpuFilter));
+          drawGpuFrameGraphTable(st, *frameGraph, std::string_view(st.gpuFilter));
+          ImGui::TextDisabled("Tip: Click a pass to copy its name.");
+        }
+      }
+    }
+    ImGui::Separator();
+  }
+
   const auto& frames = profiler.frames();
   if (st.showPlot) {
     drawFramePlot(frames);
@@ -362,6 +591,13 @@ void drawProfilerWindow(ProfilerWindowState& st,
     ImGui::SameLine();
     ImGui::Checkbox("Pretty JSON", &st.exportPretty);
 
+    if (frameGraph) {
+      ImGui::Checkbox("Include GPU FrameGraph counters", &st.exportIncludeGpuCounters);
+      ImGui::TextDisabled("GPU export uses timer query results (enable GPU pass timing in FrameGraph debug). ");
+    } else {
+      st.exportIncludeGpuCounters = false;
+    }
+
     core::ChromeTraceWriteOptions opt;
     opt.includeFrameEvents = st.exportIncludeFrameEvents;
     opt.pretty = st.exportPretty;
@@ -370,10 +606,78 @@ void drawProfilerWindow(ProfilerWindowState& st,
       std::string err;
       bool ok = false;
 
+      // Decide which CPU frames to export.
+      std::deque<core::ProfilerFrame> framesOut;
       if (st.exportAllFrames) {
-        ok = core::writeProfilerChromeTraceJson(st.exportPath, profiler.frames(), opt, &err);
+        framesOut = profiler.frames();
       } else {
-        ok = core::writeProfilerChromeTraceJson(st.exportPath, *sel, opt, &err);
+        framesOut.push_back(*sel);
+      }
+
+      // Optional GPU counters.
+      if (st.exportIncludeGpuCounters && frameGraph) {
+        // Build a counter table aligned to the exported CPU frames.
+        core::ChromeTraceCounterTable gpu;
+        gpu.name = "FrameGraph GPU";
+        gpu.category = "gpu";
+
+        // Use the keys we captured from the live FrameGraph. If they are missing
+        // (e.g., profiler enabled recently), fall back to a minimal table.
+        if (!st.gpuCounterKeys.empty()) {
+          gpu.keys = st.gpuCounterKeys;
+        } else {
+          gpu.keys = {"GPU Frame (ms)"};
+        }
+
+        const std::size_t k = gpu.keys.size();
+        const std::size_t n = framesOut.size();
+        gpu.tsUs.reserve(n);
+        gpu.values.resize(n * k, 0.0);
+
+        const std::uint64_t baseNs = framesOut.empty() ? 0ull : framesOut.front().startNs;
+
+        // Align GPU history rows to the *current* profiler ring buffer.
+        // If we have fewer GPU samples than frames, pad with zeros at the front.
+        const std::size_t have = st.gpuHistoryRows.size();
+        const std::size_t need = profiler.frames().size();
+        const std::size_t pad = (need > have) ? (need - have) : 0;
+
+        auto rowForProfilerIndex = [&](std::size_t idx) -> const std::vector<double>* {
+          // idx is in [0, profiler.frames().size())
+          if (idx < pad) return nullptr;
+          const std::size_t hi = idx - pad;
+          if (hi >= st.gpuHistoryRows.size()) return nullptr;
+          return &st.gpuHistoryRows[hi];
+        };
+
+        // For each exported CPU frame, find its index in the current ring buffer.
+        // We match by startNs (unique per frame).
+        for (std::size_t i = 0; i < n; ++i) {
+          const auto& f = framesOut[i];
+          const std::uint64_t tsUs = (baseNs && f.startNs >= baseNs) ? ((f.startNs - baseNs) / 1000ull) : 0ull;
+          gpu.tsUs.push_back(tsUs);
+
+          // Locate frame in current profiler history.
+          std::size_t profIdx = (std::size_t)-1;
+          const auto& liveFrames = profiler.frames();
+          for (std::size_t j = 0; j < liveFrames.size(); ++j) {
+            if (liveFrames[j].startNs == f.startNs) {
+              profIdx = j;
+              break;
+            }
+          }
+
+          const std::vector<double>* row = (profIdx != (std::size_t)-1) ? rowForProfilerIndex(profIdx) : nullptr;
+
+          for (std::size_t col = 0; col < k; ++col) {
+            const double v = (row && col < row->size()) ? (*row)[col] : 0.0;
+            gpu.values[i * k + col] = v;
+          }
+        }
+
+        ok = core::writeProfilerChromeTraceJsonWithCounters(st.exportPath, framesOut, {gpu}, opt, &err);
+      } else {
+        ok = core::writeProfilerChromeTraceJson(st.exportPath, framesOut, opt, &err);
       }
 
       if (toast) {

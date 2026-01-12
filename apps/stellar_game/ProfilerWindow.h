@@ -2,8 +2,15 @@
 
 #include "stellar/core/Profiler.h"
 
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
+#include <vector>
+
+namespace stellar::render {
+class FrameGraph;
+}
 
 namespace stellar::game {
 
@@ -33,12 +40,31 @@ struct ProfilerWindowState {
   bool exportAllFrames{true};
   bool exportIncludeFrameEvents{true};
   bool exportPretty{false};
+
+  // ---- GPU FrameGraph timing view (optional) ----
+  bool showGpuFrameGraph{true};
+  bool gpuShowPlot{true};
+  bool gpuShowTable{true};
+  bool gpuSortByLast{true};
+
+  // Export GPU pass timings as Chrome trace counters in the same JSON file.
+  bool exportIncludeGpuCounters{true};
+
+  // Simple substring filter applied to GPU pass rows.
+  char gpuFilter[96]{};
+
+  // Internal: GPU timing history aligned to CPU profiler frames.
+  // Each row = { totalGpuMs, pass0Ms, pass1Ms, ... }.
+  std::vector<std::string> gpuCounterKeys{};
+  std::deque<std::vector<double>> gpuHistoryRows{};
+  std::uint64_t gpuLastCapturedCpuFrameStartNs{0};
 };
 
 using ToastFn = std::function<void(const std::string& msg, double ttlSec)>;
 
 void drawProfilerWindow(ProfilerWindowState& st,
                         core::Profiler& profiler,
-                        const ToastFn& toast);
+                        const ToastFn& toast,
+                        const render::FrameGraph* frameGraph = nullptr);
 
 } // namespace stellar::game

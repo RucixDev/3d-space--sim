@@ -11,6 +11,8 @@
 #include <ctime>
 #include <cstddef>
 #include <cctype>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -87,6 +89,120 @@ void consoleClear(ConsoleWindowState& st) {
   std::lock_guard<std::mutex> lock(st.mutex);
   st.lines.clear();
   st.scrollToBottom = true;
+}
+
+void consoleClearHistory(ConsoleWindowState& st) {
+  st.history.clear();
+  st.historyPos = -1;
+  st.historyDirty = true;
+}
+
+// Trim ASCII whitespace on both ends (for file IO parsing).
+static std::string trimAscii(std::string_view sv) {
+  std::size_t b = 0;
+  while (b < sv.size() && std::isspace((unsigned char)sv[b])) ++b;
+  std::size_t e = sv.size();
+  while (e > b && std::isspace((unsigned char)sv[e - 1])) --e;
+  return std::string(sv.substr(b, e - b));
+}
+
+static bool ensureParentDirs(const std::filesystem::path& p, std::string* outError) {
+  std::error_code ec;
+  const auto parent = p.parent_path();
+  if (parent.empty()) return true;
+  std::filesystem::create_directories(parent, ec);
+  if (ec) {
+    if (outError) *outError = "Failed to create directory: " + parent.string();
+    return false;
+  }
+  return true;
+}
+
+// Write a text file using a simple temp-file + rename strategy.
+static bool writeTextFileAtomic(const std::filesystem::path& path, std::string_view contents, std::string* outError) {
+  if (!ensureParentDirs(path, outError)) return false;
+
+  const std::filesystem::path tmp = path.string() + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+      if (outError) *outError = "Failed to write: " + tmp.string();
+      return false;
+    }
+    f.write(contents.data(), (std::streamsize)contents.size());
+    if (!f) {
+      if (outError) *outError = "Failed to write: " + tmp.string();
+      return false;
+    }
+  }
+
+  std::error_code ec;
+  // On Windows, rename() fails if destination exists.
+  std::filesystem::remove(path, ec);
+  ec.clear();
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    if (outError) *outError = "Failed to rename temp file to: " + path.string();
+    // Best-effort cleanup.
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  return true;
+}
+
+bool consoleSaveHistoryToFile(const ConsoleWindowState& st, const std::string& path, std::string* outError) {
+  std::string dump;
+  dump.reserve(st.history.size() * 32 + 64);
+  dump += "# Stellar Forge console history\n";
+  dump += "# One command per line. Lines starting with '#' are ignored.\n";
+
+  // Save only up to maxHistory entries (keep most recent).
+  const std::size_t maxN = (st.maxHistory == 0) ? st.history.size() : std::min(st.history.size(), st.maxHistory);
+  const std::size_t start = (st.history.size() > maxN) ? (st.history.size() - maxN) : 0;
+
+  for (std::size_t i = start; i < st.history.size(); ++i) {
+    dump += st.history[i];
+    dump.push_back('\n');
+  }
+
+  return writeTextFileAtomic(std::filesystem::path(path), dump, outError);
+}
+
+bool consoleLoadHistoryFromFile(ConsoleWindowState& st, const std::string& path, std::string* outError) {
+  std::ifstream f(path);
+  if (!f) {
+    if (outError) *outError = "History file not found: " + path;
+    return false;
+  }
+
+  std::vector<std::string> tmp;
+  tmp.reserve(st.maxHistory > 0 ? st.maxHistory : 256);
+
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    if (line[0] == '#') continue;
+
+    std::string cmd = trimAscii(line);
+    if (cmd.empty()) continue;
+
+    // Dedupe last occurrence (keep newest).
+    for (auto it = tmp.begin(); it != tmp.end(); ++it) {
+      if (*it == cmd) { tmp.erase(it); break; }
+    }
+
+    tmp.push_back(std::move(cmd));
+
+    if (st.maxHistory > 0 && tmp.size() > st.maxHistory) {
+      tmp.erase(tmp.begin());
+    }
+  }
+
+  st.history = std::move(tmp);
+  st.historyPos = -1;
+  st.historyDirty = false;
+  st.historyLoaded = true;
+  return true;
 }
 
 void consoleAddCommand(ConsoleWindowState& st,
@@ -198,12 +314,19 @@ static void execCommand(ConsoleWindowState& st, std::string_view line) {
   }
 
   // Update history (dedupe last occurrence).
-  if (!trimmed.empty()) {
+  if (!trimmed.empty() && st.maxHistory > 0) {
     for (auto it = st.history.begin(); it != st.history.end(); ++it) {
       if (*it == trimmed) { st.history.erase(it); break; }
     }
     st.history.push_back(trimmed);
-    if (st.history.size() > 256) st.history.erase(st.history.begin());
+
+    // Clamp to maxHistory (keep most-recent).
+    if (st.history.size() > st.maxHistory) {
+      const std::size_t extra = st.history.size() - st.maxHistory;
+      st.history.erase(st.history.begin(), st.history.begin() + (std::ptrdiff_t)extra);
+    }
+
+    st.historyDirty = true;
   }
   st.historyPos = -1;
 
@@ -469,6 +592,71 @@ void consoleAddBuiltins(ConsoleWindowState& st) {
       }
       consolePrint(c, core::LogLevel::Info, std::string("Loaded CVars from ") + path);
     });
+
+  // ---- Command history ----
+  consoleAddCommand(st, "history.clear", "Clear command history (does not clear output).",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>&) {
+      consoleClearHistory(c);
+      consolePrint(c, core::LogLevel::Info, "History cleared.");
+    });
+
+  consoleAddCommand(st, "history.size", "Print history size.",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>&) {
+      consolePrint(c, core::LogLevel::Info, "History entries: " + std::to_string(c.history.size()));
+    });
+
+  consoleAddCommand(st, "history.limit", "Get/set history limit. Usage: history.limit [n]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      if (args.empty()) {
+        consolePrint(c, core::LogLevel::Info, "History limit: " + std::to_string(c.maxHistory));
+        return;
+      }
+      int v = 0;
+      try {
+        v = std::stoi(std::string(args[0]));
+      } catch (...) {
+        consolePrint(c, core::LogLevel::Warn, "Invalid number.");
+        return;
+      }
+      if (v < 0) v = 0;
+      c.maxHistory = (std::size_t)v;
+
+      // Clamp existing history if needed.
+      if (c.maxHistory > 0 && c.history.size() > c.maxHistory) {
+        const std::size_t extra = c.history.size() - c.maxHistory;
+        c.history.erase(c.history.begin(), c.history.begin() + (std::ptrdiff_t)extra);
+        c.historyDirty = true;
+      }
+
+      consolePrint(c, core::LogLevel::Info, "History limit set to " + std::to_string(c.maxHistory));
+    });
+
+  consoleAddCommand(st, "history.save", "Save command history. Usage: history.save [path]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      const std::string path = args.empty() ? std::string(c.historyPath) : std::string(args[0]);
+      std::string err;
+      if (!consoleSaveHistoryToFile(c, path, &err)) {
+        consolePrint(c, core::LogLevel::Warn, err.empty() ? "Failed to save history." : err);
+        return;
+      }
+      c.historyDirty = false;
+      consolePrint(c, core::LogLevel::Info, "Saved history to " + path);
+    });
+
+  consoleAddCommand(st, "history.load", "Load command history (replaces current). Usage: history.load [path]",
+    [](ConsoleWindowState& c, const std::vector<std::string_view>& args) {
+      const std::string path = args.empty() ? std::string(c.historyPath) : std::string(args[0]);
+      std::string err;
+      if (!consoleLoadHistoryFromFile(c, path, &err)) {
+        // Missing file is not fatal; report as info to avoid scary red.
+        consolePrint(c, core::LogLevel::Info, err.empty() ? "No history file." : err);
+        return;
+      }
+      std::snprintf(c.historyPath, sizeof(c.historyPath), "%s", path.c_str());
+      c.historyDirty = false;
+      consolePrint(c, core::LogLevel::Info, "Loaded history from " + path);
+    });
+
 }
 
 // ---- ImGui input callbacks ----
@@ -712,6 +900,58 @@ void drawConsoleWindow(ConsoleWindowState& st) {
     } else {
       consolePrint(st, core::LogLevel::Warn, "Failed to save console_log.txt");
     }
+  }
+
+  ImGui::SameLine();
+  if (ImGui::Button("History")) {
+    ImGui::OpenPopup("##console_history_popup");
+  }
+  if (ImGui::BeginPopup("##console_history_popup")) {
+    ImGui::TextUnformatted("Command History");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(340.0f);
+    ImGui::InputTextWithHint("##history_path", "console_history.txt", st.historyPath, sizeof(st.historyPath));
+    ImGui::Checkbox("Auto-save on exit", &st.historyAutoSaveOnExit);
+
+    int maxHist = (int)st.maxHistory;
+    ImGui::SetNextItemWidth(140.0f);
+    if (ImGui::InputInt("Max entries", &maxHist, 16, 64)) {
+      if (maxHist < 0) maxHist = 0;
+      st.maxHistory = (std::size_t)maxHist;
+      if (st.maxHistory > 0 && st.history.size() > st.maxHistory) {
+        const std::size_t extra = st.history.size() - st.maxHistory;
+        st.history.erase(st.history.begin(), st.history.begin() + (std::ptrdiff_t)extra);
+        st.historyDirty = true;
+      }
+    }
+
+    if (ImGui::Button("Load##history")) {
+      std::string err;
+      if (consoleLoadHistoryFromFile(st, st.historyPath, &err)) {
+        consolePrint(st, core::LogLevel::Info, std::string("Loaded history from ") + st.historyPath);
+      } else {
+        consolePrint(st, core::LogLevel::Info, err.empty() ? "No history file." : err);
+      }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save##history")) {
+      std::string err;
+      if (consoleSaveHistoryToFile(st, st.historyPath, &err)) {
+        st.historyDirty = false;
+        consolePrint(st, core::LogLevel::Info, std::string("Saved history to ") + st.historyPath);
+      } else {
+        consolePrint(st, core::LogLevel::Warn, err.empty() ? "Failed to save history." : err);
+      }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##history")) {
+      consoleClearHistory(st);
+      consolePrint(st, core::LogLevel::Info, "History cleared.");
+    }
+
+    ImGui::TextDisabled("Entries: %d%s", (int)st.history.size(), st.historyDirty ? " (dirty)" : "");
+    ImGui::EndPopup();
   }
 
   ImGui::SameLine();

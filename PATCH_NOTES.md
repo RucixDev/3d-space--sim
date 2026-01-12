@@ -1470,3 +1470,25 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
 
 ## Tests
 - Added `test_market_analysis` coverage for trend stats + forecast direction.
+
+# Patch Notes (Jan 12, 2026) — Round 7
+
+## Command Palette: CVar quick mode
+- Added a **CVar mode** to the command palette:
+  - Type `:` to enter.
+  - Use `:name=value` to set a CVar.
+  - Selecting a bool CVar toggles it.
+  - Selecting a non-bool CVar jumps you into the CVar browser with the set-line prefilled.
+
+## Console: persistent command history
+- Console command history can now be **saved/loaded** from a line-based file (`console_history.txt` by default).
+- Added a **History** popup in the Console window to:
+  - Set the file path
+  - Change max history size
+  - Load / Save / Clear history
+- New console commands:
+  - `history.save [path]`
+  - `history.load [path]`
+  - `history.clear`
+  - `history.size`
+  - `history.limit [n]`
