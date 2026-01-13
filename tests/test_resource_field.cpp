@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <unordered_map>
 
 static bool near(double a, double b, double eps = 1e-6) {
   return std::abs(a - b) <= eps;
@@ -37,6 +38,12 @@ int test_resource_field() {
       ++fails;
       break;
     }
+
+    if (a.layout != b.layout) {
+      std::cerr << "[test_resource_field] determinism: field layout mismatch at i=" << i << "\n";
+      ++fails;
+      break;
+    }
     if (!stellar::sim::isDeterministicWorldId(a.id)) {
       std::cerr << "[test_resource_field] expected deterministic id bit set for field id=" << a.id << "\n";
       ++fails;
@@ -45,7 +52,37 @@ int test_resource_field() {
       std::cerr << "[test_resource_field] determinism: field position mismatch at i=" << i << "\n";
       ++fails;
     }
+
+    // Basis + params should be deterministic too.
+    if (!near3(a.basisX, b.basisX, 1e-9) || !near3(a.basisY, b.basisY, 1e-9) || !near3(a.basisZ, b.basisZ, 1e-9)) {
+      std::cerr << "[test_resource_field] determinism: field basis mismatch at i=" << i << "\n";
+      ++fails;
+    }
+    if (!near(a.majorRadiusKm, b.majorRadiusKm, 1e-6) || !near(a.minorRadiusKm, b.minorRadiusKm, 1e-6) ||
+        !near(a.arcRad, b.arcRad, 1e-6) || !near(a.arcCenterRad, b.arcCenterRad, 1e-6)) {
+      std::cerr << "[test_resource_field] determinism: field layout params mismatch at i=" << i << "\n";
+      ++fails;
+    }
+
+    // Orthonormal-ish basis.
+    const double lx = stellar::math::dot(a.basisX, a.basisX);
+    const double ly = stellar::math::dot(a.basisY, a.basisY);
+    const double lz = stellar::math::dot(a.basisZ, a.basisZ);
+    const double xy = stellar::math::dot(a.basisX, a.basisY);
+    const double xz = stellar::math::dot(a.basisX, a.basisZ);
+    const double yz = stellar::math::dot(a.basisY, a.basisZ);
+
+    if (!near(lx, 1.0, 1e-6) || !near(ly, 1.0, 1e-6) || !near(lz, 1.0, 1e-6) ||
+        !near(xy, 0.0, 1e-5) || !near(xz, 0.0, 1e-5) || !near(yz, 0.0, 1e-5)) {
+      std::cerr << "[test_resource_field] basis not orthonormal-ish at i=" << i << "\n";
+      ++fails;
+    }
   }
+
+  // Build a lookup for field metadata.
+  std::unordered_map<stellar::core::u64, const stellar::sim::ResourceFieldSite*> fieldById;
+  fieldById.reserve(p0.fields.size() * 2 + 1);
+  for (const auto& f : p0.fields) fieldById[f.id] = &f;
 
   // Asteroid ids should be deterministic and belong to known fields.
   std::size_t checked = 0;
@@ -65,6 +102,47 @@ int test_resource_field() {
       ++fails;
       break;
     }
+
+    // Layout bounds sanity for a sample of rocks.
+    const auto* f = fieldById[a.fieldId];
+    if (f) {
+      const stellar::math::Vec3d d = a.posKm - f->posKm;
+      const double x = stellar::math::dot(d, f->basisX);
+      const double y = stellar::math::dot(d, f->basisY);
+      const double z = stellar::math::dot(d, f->basisZ);
+
+      const double major = std::max(1.0, f->majorRadiusKm);
+      const double minor = std::max(1.0, f->minorRadiusKm);
+
+      if (f->layout == stellar::sim::ResourceFieldLayout::Cluster) {
+        const double nx = x / major;
+        const double ny = y / minor;
+        const double nz = z / major;
+        const double ell = nx * nx + ny * ny + nz * nz;
+        if (ell > 1.55) {
+          std::cerr << "[test_resource_field] asteroid outside cluster bounds\n";
+          ++fails;
+          break;
+        }
+      } else if (f->layout == stellar::sim::ResourceFieldLayout::Sheet) {
+        const double r = std::sqrt(x * x + z * z);
+        if (r > major * 1.08 || std::abs(y) > minor * 1.25) {
+          std::cerr << "[test_resource_field] asteroid outside sheet bounds\n";
+          ++fails;
+          break;
+        }
+      } else if (f->layout == stellar::sim::ResourceFieldLayout::Torus) {
+        const double r = std::sqrt(x * x + z * z);
+        const double dr = std::abs(r - major);
+        const double tube = std::sqrt(dr * dr + y * y);
+        if (tube > minor * 1.30) {
+          std::cerr << "[test_resource_field] asteroid outside torus bounds\n";
+          ++fails;
+          break;
+        }
+      }
+    }
+
     if (a.baseUnits <= 0.0) {
       std::cerr << "[test_resource_field] asteroid baseUnits should be > 0\n";
       ++fails;
@@ -75,6 +153,30 @@ int test_resource_field() {
       ++fails;
       break;
     }
+  }
+
+  // Ensure asteroids don't overlap within each field (simple check for a small sample).
+  for (const auto& f : p0.fields) {
+    int checkedPairs = 0;
+    for (std::size_t i = 0; i < p0.asteroids.size(); ++i) {
+      const auto& a = p0.asteroids[i];
+      if (a.fieldId != f.id) continue;
+      for (std::size_t j = i + 1; j < p0.asteroids.size(); ++j) {
+        const auto& b = p0.asteroids[j];
+        if (b.fieldId != f.id) continue;
+        const double d = (a.posKm - b.posKm).length();
+        const double min = (a.radiusKm + b.radiusKm) * 0.75; // should not intersect
+        if (d < min) {
+          std::cerr << "[test_resource_field] asteroid overlap detected\n";
+          ++fails;
+          checkedPairs = 999999;
+          break;
+        }
+        if (++checkedPairs > 256) break;
+      }
+      if (checkedPairs > 256) break;
+    }
+    if (fails != 0) break;
   }
 
   if (fails == 0) std::cout << "[test_resource_field] pass\n";

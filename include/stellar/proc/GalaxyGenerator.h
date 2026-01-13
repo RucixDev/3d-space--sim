@@ -10,11 +10,31 @@
 namespace stellar::proc {
 
 struct GalaxyParams {
-  double sectorSizeLy{10.0};          // edge length of a sector cube
-  double radiusLy{50000.0};           // approximate disc radius
-  double thicknessLy{1000.0};         // disc thickness (full)
-  double radialScaleLengthLy{15000.0}; // exponential falloff scale
+  double sectorSizeLy{10.0};            // edge length of a sector cube
+  double radiusLy{50000.0};             // approximate disc radius
+  double thicknessLy{1000.0};           // disc thickness (full)
+  double radialScaleLengthLy{15000.0};  // exponential falloff scale
   double baseMeanSystemsPerSector{5.0}; // at r=0
+
+  // --- Optional inhomogeneous structure (disabled by default) ---
+  // These parameters let you art-direct the galaxy away from a perfectly smooth
+  // exponential disc, while keeping generation deterministic.
+  //
+  // By default, spiralArmCount=0 and densityNoiseStrength=0, which preserves the
+  // legacy distribution (and therefore deterministic regression signatures).
+
+  // Log-spiral arm model (0 disables arms).
+  int spiralArmCount{0};
+  double spiralArmStrength{0.0};        // 0 disables (typical useful range: 0.25 .. 2.5)
+  double spiralPitchDeg{12.0};          // pitch angle of the log spiral (degrees)
+  double spiralArmWidthDeg{18.0};       // angular width of each arm (degrees)
+  double spiralArmPhaseDeg{0.0};        // rotation offset for the whole pattern (degrees)
+  double spiralArmNoiseStrength{0.25};  // 0..1 modulation along arms
+  double spiralArmNoiseFreq{0.0015};    // noise frequency (1 / ly)
+
+  // Global "clumpiness" density noise (0 disables).
+  double densityNoiseStrength{0.0};     // 0..1 recommended
+  double densityNoiseFreq{0.0010};      // noise frequency (1 / ly)
 };
 
 struct SectorCoord {

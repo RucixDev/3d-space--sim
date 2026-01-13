@@ -1,0 +1,171 @@
+#pragma once
+
+#include "stellar/core/Types.h"
+#include "stellar/render/RenderTarget.h"
+#include "stellar/render/Shader.h"
+#include "stellar/render/Texture.h"
+
+#include <array>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace stellar::render {
+
+// A tiny "procedural generation graphics engine" built around a scalar node graph
+// that compiles into a GLSL fragment shader and bakes into an offscreen Texture2D.
+//
+// Design goals:
+//  - Deterministic: (graph structure + params + seed) -> same result.
+//  - Fast iteration: structure changes rebuild shader; param changes are uniforms.
+//  - Self-contained: only depends on existing RenderTarget/Shader utilities.
+
+constexpr int kProcGraphMaxNodes = 64;
+constexpr int kProcGraphMaxPaletteStops = 8;
+
+enum class ProcNodeOp : core::u8 {
+  Constant = 0,
+
+  // Coordinate sources
+  UvX,
+  UvY,
+
+  // Math
+  Add,
+  Sub,
+  Mul,
+  Div,
+  Min,
+  Max,
+  Abs,
+  Invert,
+  Fract,
+  Clamp01,
+  Smoothstep,
+  Pow,
+  Sine,
+
+  // Noise / patterns
+  Noise2D,
+  Fbm2D,
+  Perlin2D,
+  FbmPerlin2D,
+  RidgedFbmPerlin2D,
+  Voronoi2D,
+
+  // Domain ops (re-evaluates its input node at a modified UV)
+  Warp,
+  Pan,
+};
+
+const char* procNodeOpName(ProcNodeOp op);
+
+// Parses either the canonical enum name (case-insensitive) or common aliases.
+// Returns std::nullopt on failure.
+std::optional<ProcNodeOp> procNodeOpFromString(const std::string& s);
+
+struct ProcNode {
+  ProcNodeOp op{ProcNodeOp::Constant};
+
+  // Input node indices (use -1 for "none"). Indices need not be topologically sorted;
+  // invalid indices are treated as 0.0 during compilation.
+  int in0{-1};
+  int in1{-1};
+  int in2{-1};
+
+  // Freeform parameters; meaning depends on op.
+  float p0{0.0f};
+  float p1{0.0f};
+  float p2{0.0f};
+  float p3{0.0f};
+
+  // Optional node-local seed tweak.
+  core::u64 seed{0};
+};
+
+struct ProcPaletteStop {
+  float pos{0.0f}; // [0,1]
+  float r{0.0f};
+  float g{0.0f};
+  float b{0.0f};
+};
+
+struct ProcGraph {
+  core::u64 seed{0xC0FFEEULL};
+
+  std::vector<ProcNode> nodes;
+  int output{-1};
+
+  bool usePalette{true};
+  int paletteCount{4};
+  std::array<ProcPaletteStop, kProcGraphMaxPaletteStops> palette{};
+
+  static ProcGraph makeDefault();
+};
+
+enum class ProcGraphPreset : core::u8 {
+  Nebula = 0,
+  Marble,
+  Lava,
+  AlienCircuit,
+  Rocky,
+};
+
+const char* procGraphPresetName(ProcGraphPreset preset);
+ProcGraph makeProceduralGraphPreset(ProcGraphPreset preset, core::u64 seed);
+
+// ---- Graph file I/O (human-readable, versioned text) ----
+//
+// These helpers exist so the procedural engine can be used as an *asset pipeline*:
+// users can save/share graphs, and other tools/windows can load them.
+//
+// File format is stable-ish but versioned so it can evolve.
+
+bool saveProcGraphToFile(const ProcGraph& g, const std::string& path, std::string* outError = nullptr);
+bool loadProcGraphFromFile(const std::string& path, ProcGraph& out, std::string* outError = nullptr);
+
+struct ProcBakeStats {
+  bool shaderRebuilt{false};
+  double shaderBuildMs{0.0};
+  double drawMs{0.0};
+};
+
+class ProceduralGraphBaker {
+public:
+  ProceduralGraphBaker() = default;
+  ~ProceduralGraphBaker();
+
+  ProceduralGraphBaker(const ProceduralGraphBaker&) = delete;
+  ProceduralGraphBaker& operator=(const ProceduralGraphBaker&) = delete;
+
+  // Bake graph into an offscreen texture.
+  // Returns false on shader compilation failure or FBO init failure; outError describes the problem.
+  bool bake(const ProcGraph& g, int width, int height, float timeSec, std::string* outError = nullptr);
+
+  const Texture2D& texture() const { return target_.color(); }
+  bool isReady() const { return target_.isInited() && shader_.handle() != 0; }
+
+  const ProcBakeStats& stats() const { return stats_; }
+  const std::string& lastFragmentSource() const { return lastFragSrc_; }
+
+private:
+  static core::u64 structureKey(const ProcGraph& g);
+  static std::string buildFragmentShader(const ProcGraph& g);
+
+  bool ensureShader(const ProcGraph& g, std::string* outError);
+
+  RenderTarget2D target_{};
+  ShaderProgram shader_{};
+  core::u64 shaderKey_{0};
+  unsigned int vao_{0};
+
+  ProcBakeStats stats_{};
+  std::string lastFragSrc_{};
+
+  // Packed uniform data (fixed max sizes).
+  std::array<float, kProcGraphMaxNodes * 4> packedParams_{};
+  std::array<int, kProcGraphMaxNodes> packedSeeds_{};
+  std::array<float, kProcGraphMaxPaletteStops * 4> packedPalette_{};
+};
+
+} // namespace stellar::render

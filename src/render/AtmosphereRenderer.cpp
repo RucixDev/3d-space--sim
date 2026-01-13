@@ -59,6 +59,11 @@ uniform float uPower;
 uniform float uSunLitBoost;
 uniform float uForwardScatter;
 
+// Optional spectral Mie phase LUT. Expected: width=N samples over μ∈[-1,1], height=1.
+uniform int uUsePhaseLut;
+uniform sampler2D uPhaseLut;
+uniform float uMiePhaseStrength;
+
 out vec4 FragColor;
 
 void main() {
@@ -77,14 +82,26 @@ void main() {
   // Make the rim brighter on the day-side limb.
   float sun = mix(1.0, 0.35 + 0.65 * ndotl, clamp(uSunLitBoost, 0.0, 1.0));
 
-  // Forward-scatter highlight when looking roughly toward the sun.
-  float forward = pow(clamp(dot(v, -l), 0.0, 1.0), 6.0);
+  // Scattering angle cosine μ between incoming light (-l) and view direction (v).
+  float mu = clamp(dot(v, -l), -1.0, 1.0);
 
-  float a = rim * sun + forward * uForwardScatter * rim;
-  a = clamp(a, 0.0, 1.0);
+  // Legacy forward curve (for backwards compatibility / shaping).
+  float legacyFwd = pow(clamp(mu, 0.0, 1.0), 6.0);
 
-  // Additive blend: contribution = rgb * alpha.
-  FragColor = vec4(vColor * uIntensity, a);
+  // Phase term (scalar or spectral). With LUT disabled: behaves like the old forward curve.
+  vec3 phase = vec3(legacyFwd);
+  if (uUsePhaseLut != 0) {
+    float t = mu * 0.5 + 0.5;
+    vec3 lut = texture(uPhaseLut, vec2(t, 0.5)).rgb;
+    phase = mix(vec3(legacyFwd), lut, clamp(uMiePhaseStrength, 0.0, 1.0));
+  }
+
+  // Base rim + forward-scatter highlight, both scaled by rim thickness.
+  vec3 scatter = vec3(rim * sun) + phase * (uForwardScatter * rim);
+
+  // Additive blend expects the contribution in RGB; we output alpha=1 so the blend
+  // function can remain (SRC_ALPHA, ONE).
+  FragColor = vec4(vColor * (uIntensity * scatter), 1.0);
 }
 )GLSL";
 
@@ -114,6 +131,8 @@ void AtmosphereRenderer::drawInstances(const std::vector<InstanceData>& instance
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 
+  const bool hasLut = useMiePhaseLut_ && miePhaseLut_ && miePhaseLut_->handle() != 0;
+
   shader_.bind();
   shader_.setUniformMat4("uView", view_);
   shader_.setUniformMat4("uProj", proj_);
@@ -123,6 +142,14 @@ void AtmosphereRenderer::drawInstances(const std::vector<InstanceData>& instance
   shader_.setUniform1f("uPower", power_);
   shader_.setUniform1f("uSunLitBoost", sunLitBoost_);
   shader_.setUniform1f("uForwardScatter", forwardScatter_);
+
+  shader_.setUniform1i("uUsePhaseLut", hasLut ? 1 : 0);
+  shader_.setUniform1f("uMiePhaseStrength", miePhaseStrength_);
+  if (hasLut) {
+    constexpr int kPhaseUnit = 3;
+    shader_.setUniform1i("uPhaseLut", kPhaseUnit);
+    miePhaseLut_->bind(kPhaseUnit);
+  }
 
   mesh_->bind();
 

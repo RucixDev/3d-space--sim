@@ -2,6 +2,7 @@
 
 #include "stellar/render/MeshRenderer.h" // InstanceData
 #include "stellar/render/Shader.h"
+#include "stellar/render/Texture.h"
 
 #include <string>
 #include <vector>
@@ -13,10 +14,13 @@ namespace stellar::render {
 // It draws instanced UV-spheres (or any PN mesh) with a Fresnel-ish rim term and
 // an optional sun-lit boost (caller supplies the sun position; the game sets it to the main star).
 //
+// Additionally, it can optionally sample a *spectral* Mie phase LUT (1D texture
+// over μ = cos(θ)) to color/shape the forward-scatter highlight.
+//
 // Usage pattern (caller controls when to draw):
 //   - depth test enabled
 //   - depth writes disabled
-//   - additive blend (SRC_ALPHA, ONE)
+//   - additive blend (SRC_ALPHA, ONE) (the shader outputs alpha=1 for simplicity)
 //
 // The per-instance color (InstanceData::cr/cg/cb) is treated as the atmosphere tint.
 class AtmosphereRenderer {
@@ -55,6 +59,14 @@ public:
   // Forward-scatter highlight when looking roughly toward the sun (0..1).
   void setForwardScatter(float v) { forwardScatter_ = v; }
 
+  // Optional: sample a spectral Mie phase LUT to drive the forward-scatter.
+  // The LUT is expected to be a 2D texture with height=1, width=N samples over
+  // μ∈[-1,1], using clamp-to-edge.
+  void setUseMiePhaseLut(bool v) { useMiePhaseLut_ = v; }
+  void setMiePhaseLut(const Texture2D* lut) { miePhaseLut_ = lut; }
+  // Blends between legacy forward power curve (0) and the LUT (1).
+  void setMiePhaseStrength(float v) { miePhaseStrength_ = v; }
+
   void drawInstances(const std::vector<InstanceData>& instances);
 
 private:
@@ -72,6 +84,10 @@ private:
   float power_{5.0f};
   float sunLitBoost_{0.85f};
   float forwardScatter_{0.25f};
+
+  bool useMiePhaseLut_{false};
+  const Texture2D* miePhaseLut_{nullptr};
+  float miePhaseStrength_{1.0f};
 };
 
 } // namespace stellar::render

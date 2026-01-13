@@ -1,3 +1,420 @@
+# Patch Notes
+
+## Round 17 — Geometry-Aware Gaussian Surfels for Active Object Reconstruction
+
+This round fills in a previously *missing* pillar of the project: an **object-centric active
+reconstruction loop** built on top of the existing procedural SDF/meshing pipeline.
+
+You can now procedurally generate a ground-truth SDF mesh and then simulate an active scanning
+process that converts newly visible triangles into **geometry-aware Gaussian surfels** (principal-axis
+ellipses on the triangle tangent plane) while choosing next viewpoints using a **multi-step
+beam-search next-best-path planner**.
+
+### Highlights
+
+#### New render module: Gaussian surfels + active view planning
+- **`include/stellar/render/GaussianSurfels.h`**, **`src/render/GaussianSurfels.cpp`**
+  - Geometry-aware surfel synthesis per triangle (principal-axis ellipse from triangle covariance).
+  - Visibility evaluation from candidate views:
+    - Fast **front-face + frustum** mode, or
+    - **Occlusion-aware** mode via a tiny CPU Z-buffer rasterizer.
+  - **Next-best-path (NBP)** beam-search planner with multi-step lookahead and motion/revisit costs.
+  - Instanced OpenGL renderer for surfels (premultiplied-alpha Gaussian quads).
+
+#### New tool window: Gaussian Surfel Reconstruction Lab
+- **`apps/stellar_game/GaussianSurfelReconstructionLabWindow.h/.cpp`**
+  - Pick an SDF preset + seed, mesh it, precompute candidate view visibilities.
+  - Step the scan using **Plan → Capture** (or auto-capture per frame).
+  - Tracks:
+    - **Coverage** (seen at least once), and
+    - **Completion** (seen >= required observations).
+  - Renders an overlay of **ground-truth mesh + reconstructed Gaussian surfels** for fast iteration.
+
+#### Integration
+- `apps/stellar_game/main.cpp`: window registration + draw call.
+- `CMakeLists.txt`: adds the new render source + window source.
+
+
+## Round 16 — Procedural Analytic Multiple Scattering
+
+This round pushes the atmospheric system forward again, focusing on one of the
+biggest remaining missing pieces: **multiple scattering**.
+
+You now have:
+
+1. **A procedurally generated analytic multiple-scattering phase LUT** derived
+   from the current spectral single-scatter LUT via **Legendre moments** and a
+   **closed-form geometric series**.
+2. **A cheap analytic multiple-scattering term** inside the volumetric
+   raymarcher, producing the missing “milky haze” and more realistic horizon
+   rolloff without a full precomputed atmosphere pipeline.
+
+### Highlights
+
+#### New core module: analytic MS phase LUT
+- **`proc::generateMultipleScatteringPhase(...)`** (`include/stellar/proc/PhaseMultipleScattering.h`, `src/proc/PhaseMultipleScattering.cpp`)
+  - Expands a single-scatter phase function into **Legendre moments**.
+  - Uses the convolution property (moments multiply across scattering orders) to
+    derive a normalized effective phase function for:
+    - **Multiple-only (orders 2+)**, or
+    - **Total (orders 1+)**
+  - Controlled by a physically meaningful **single-scattering albedo ω** (must be
+    < 1 for convergence).
+
+#### Spectral Mie Lab upgrades
+- Added a **Multiple scattering (analytic)** panel:
+  - Enable/disable MS LUT generation
+  - Choose **Legendre order**, **albedo ω**, and **mode** (2+ vs 1+)
+  - Optional **peak normalization** of the MS LUT for real-time shading
+  - **Export MS LUT** button (`*_ms.png`)
+- Added runtime hook:
+  - **Apply MS LUT to volumetric** + a **MS phase strength** control.
+
+#### Volumetric renderer: analytic MS contribution
+- `render::VolumetricAtmosphereRenderer` now supports an **additional MS
+  in-scattering lobe**:
+  - Energy boost uses a **geometric-series** style approximation driven by
+    optical depth and **ω**.
+  - Phase uses either:
+    - A separate **MS LUT** from the Spectral Mie Lab, or
+    - A HG fallback with a broadened lobe using **g²**.
+- Added new world sliders (Settings → Secondary layers → Volumetric params):
+  - **Enable multiple scattering**
+  - **MS strength**
+  - **MS albedo ω**
+
+#### Fix: density scaling in volumetric scattering
+- The volumetric shader no longer applies the density multiplier twice (once in
+  the extinction coefficients and once in the density integral). Thickness now
+  scales in a more physically reasonable way.
+
+### Files changed/added
+- `include/stellar/proc/PhaseMultipleScattering.h`, `src/proc/PhaseMultipleScattering.cpp`
+- `include/stellar/render/VolumetricAtmosphereRenderer.h`, `src/render/VolumetricAtmosphereRenderer.cpp`
+- `apps/stellar_game/SpectralMieLabWindow.h`, `apps/stellar_game/SpectralMieLabWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+
+## Round 15 — Volumetric Atmosphere (Single-Scattering Raymarch)
+
+This round upgrades one of the most underdeveloped visual systems in the project: **planet atmospheres**.
+
+The existing atmosphere pass was a fast limb-glow approximation. It's still available (and still the default), but you can now enable a **volumetric single-scattering renderer** that raymarches through a thin atmospheric shell and supports the **spectral Mie phase LUT** you added in Round 13.
+
+### Highlights
+- **New renderer:** `render::VolumetricAtmosphereRenderer`
+  - Solves **ray–sphere intersections** to find the segment of the view ray that travels through the atmosphere.
+  - Integrates **single-scattering** with Beer–Lambert transmittance and an exponential density profile.
+  - Rayleigh scattering uses an RGB **λ^-4** wavelength dependence.
+  - Mie scattering supports:
+    - A fast **Henyey–Greenstein** fallback (g slider)
+    - Optional sampling of the **Spectral Mie Lab** LUT (per-channel phase) when enabled.
+  - Includes optional **dither/jitter** to reduce banding with low step counts.
+
+- **Game toggle + controls (Settings → Secondary layers):**
+  - Enable **Volumetric scattering (raymarch)**
+  - Tune thickness, view steps, sun steps, Rayleigh/Mie strengths, scale-height multiplier, density multiplier, dither strength, and HG g.
+
+- **Sim-driven thickness:**
+  - In volumetric mode, shell thickness and scale height are driven by `sim::AtmosphereModel` (top altitude + scale height), scaled by a single “thickness multiplier”.
+
+### Files changed/added
+- `include/stellar/render/VolumetricAtmosphereRenderer.h`, `src/render/VolumetricAtmosphereRenderer.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+
+## Round 13 — Spectral Mie Phase Function LUT + Atmosphere Hookup
+
+This round targets a big missing piece in the visual pipeline: **spectral single-scattering anisotropy**.
+
+Instead of a purely hand-tuned forward-scatter curve, you can now generate and use a **procedurally generated spectral Mie phase function** (RGB) as a 1D LUT.
+
+### Highlights
+- **New core module:** `proc::generateSpectralMiePhase(...)`
+  - Computes the unpolarized Mie angular scattering distribution via the standard S1/S2 series.
+  - Supports **mono-disperse radius** or an **approximate log-normal radius distribution** (multi-sample average).
+  - Generates a 1D LUT over **μ = cos(θ)** for configurable **RGB wavelengths**.
+  - Outputs either **peak-normalized** curves (max=1) for real-time shading, or **physically normalized** curves (∫4π p dΩ = 1).
+  - Provides useful diagnostics per channel: **asymmetry parameter g**, **Qsca**, and physical **pMax**.
+
+- **New tool window:** **Spectral Mie Lab** (Visual)
+  - Async generation so the UI stays responsive.
+  - Preview: stretched LUT strip + per-channel phase plots.
+  - One-click **PNG export** of the LUT.
+  - Toggle to **apply LUT to atmosphere renderer** + strength control.
+
+- **Atmosphere renderer upgrade**
+  - Optional sampling of the spectral phase LUT in-shader to color the forward-scatter highlight.
+
+### Files changed/added
+- `include/stellar/proc/MiePhase.h`, `src/proc/MiePhase.cpp`
+- `apps/stellar_game/SpectralMieLabWindow.h/.cpp`
+- `include/stellar/render/AtmosphereRenderer.h`, `src/render/AtmosphereRenderer.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+
+
+## Round 11 — Spiral-Arm Galaxy Structure + Procedural Galaxy Lab
+
+This round targets a very underdeveloped part of the procedural stack: **large-scale universe structure**.
+
+The galaxy previously used a smooth exponential disc everywhere; now you can *art-direct* inhomogeneous structure (spiral arms + clumpiness) while keeping sector streaming deterministic.
+
+### Highlights
+- **GalaxyGenerator upgrade (backwards-compatible defaults):**
+  - New optional `GalaxyParams` controls for:
+    - Log-spiral arms: count, strength, pitch, width, phase.
+    - Arm modulation noise (breaks perfect symmetry).
+    - Global density noise (“clumpiness”).
+  - Uses deterministic **Poisson thinning** so density fields translate into sector contents cleanly.
+  - Defaults keep `spiralArmCount=0` and `densityNoiseStrength=0` — the legacy distribution is unchanged unless enabled.
+
+- **New tool window:** **Procedural Galaxy Lab**
+  - Real-time 2D top-down preview of generated systems within a radius and Z-slice.
+  - Toggle coloring by **star class** or **faction**.
+  - Hover points for full `SystemStub` details.
+  - Designed as a sandbox for iterating on galaxy-level procedural controls without touching gameplay.
+
+### Files changed/added
+- `include/stellar/proc/GalaxyGenerator.h`, `src/proc/GalaxyGenerator.cpp`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h/.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+
+## Round 10 — glTF 2.0 Exporter (Procedural Meshes → Modern Asset Pipeline)
+
+This round targets a major missing piece of the procedural pipeline: a **modern interchange format**.
+
+OBJ is great for quick debugging, but glTF 2.0 is the current “runtime-ready” standard for shipping assets (PBR materials, efficient buffers, broad tool support).
+
+### Highlights
+- **New core module:** `GltfExport` (dependency-free)
+  - Exports procedural meshes as **glTF 2.0**: `...*.gltf` + external `...*.bin` buffer.
+  - Writes **POSITION / NORMAL / TEXCOORD_0** + triangle indices.
+  - Optional **baseColorTexture** reference (so your baked ProcGraph texture comes along).
+  - Handles the glTF/OpenGL UV convention mismatch by **flipping V on export** (so it looks correct in common viewers).
+
+- **Procedural Mesh Lab:** new **Export glTF** button
+  - Supports exporting a single LOD **or** batch-exporting the whole LOD chain:
+    - `foo.gltf` → `foo_lod0.gltf`, `foo_lod1.gltf`, ...
+  - Optional texture write-out: `foo_albedo.png`.
+  - Exposes PBR sliders for quick iteration: **metallic / roughness** factors.
+
+- **Export reliability fix:** PNG writes now pass the correct stride
+  - Fixed a long-standing bug where `writePixelsToPng(...)` was called with the wrong parameter order (causing PNG export failures).
+
+### Files
+- Added: `include/stellar/render/GltfExport.h`, `src/render/GltfExport.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- Updated: `apps/stellar_game/ProceduralLabWindow.cpp`
+- Updated: `CMakeLists.txt`
+
+## Round 9 — QEM Mesh Simplification + LOD Chain Builder
+
+This round focuses on one of the most underdeveloped (and most important) parts of turning procedural meshes into *game-ready assets*: **triangle reduction + LODs**.
+
+You can now generate a high-res mesh from an SDF graph (marching cubes or dual contouring) and then automatically build a **LOD chain** using **Quadric Error Metrics (QEM)** edge-collapse simplification.
+
+### Highlights
+- **New CPU library:** `MeshSimplify` (Garland/Heckbert QEM)
+  - Error-based **edge collapse** with per-vertex quadrics built from triangle planes.
+  - Stable even when collapsing aggressively (degenerate triangles are culled).
+  - Optionally recomputes normals + spherical UVs after simplification.
+
+- **Procedural Mesh Lab:** **LOD / Simplify** panel
+  - Choose number of LOD levels and per-level triangle ratio.
+  - Async build job (won’t stall the UI).
+  - Preview any LOD instantly (uploads the selected LOD mesh to the GPU).
+  - LOD table shows per-level verts/tris and simplification stats.
+
+- **Export upgrades**
+  - Export a specific LOD **or** batch export the full chain:
+    - `foo.obj` → `foo_lod0.obj`, `foo_lod1.obj`, ...
+  - Works with or without the optional baked material + PNG output.
+
+### Files
+- Added: `include/stellar/render/MeshSimplify.h`, `src/render/MeshSimplify.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- Updated: `CMakeLists.txt`
+
+## Round 8 — Domain Transform Nodes + Function-Based Shader Codegen
+
+This round pushes the **custom procedural generation graphics engine** toward real SDF *modeling* workflows by adding the missing piece: **domain operations** (space transforms / repetition).
+
+These are the standard building blocks used in SDF modeling/raymarching to:
+- Move/rotate/scale **entire subgraphs** (not just primitives)
+- Build tiling “greebles” via **repeat**
+- Create symmetry and stylized shapes via **mirror** and **twist**
+
+### Highlights
+- **New SdfGraph node ops (CPU + GPU)**
+  - `Translate` — evaluate input at `(p - t)`
+  - `RotateX / RotateY / RotateZ` — rotate space around a pivot (degrees)
+  - `Scale` — uniform scale around a pivot (correct distance scaling)
+  - `Repeat` — infinite grid tiling (period + offset)
+  - `Mirror` — axis mirroring around a pivot (per-axis toggles)
+  - `TwistY` — twist around Y (deg/unit, with pivot)
+
+- **CPU SDF evaluation refactor (enables transforms)**
+  - `evalSdfGraph()` now uses a **recursive evaluator** so nodes can remap the evaluation point before sampling their children.
+  - Includes a small cycle guard so malformed graphs fail safely instead of hanging.
+
+- **Raymarch shader generator overhaul**
+  - `SdfRaymarcher::buildFragmentShader()` now compiles the SDF graph into **one GLSL function per node** (`float n0(vec3 p)`, `float n1(vec3 p)`, …).
+  - This removes the old “single-pass v[] array” limitation and naturally supports domain transforms.
+  - Keeps the ability to change `uOutput` without rebuilding the shader (dynamic output selection).
+
+- **Procedural Mesh Lab UI upgrades**
+  - New transform ops in the **Op** dropdown and contextual parameter editors (pivot buttons, axis toggles, etc).
+  - Quick-add buttons for common domain nodes: **Translate, RotateY, Scale, Repeat, Mirror, TwistY**.
+
+### Files
+- Updated: `include/stellar/render/SdfGraph.h`, `src/render/SdfGraph.cpp`
+- Updated: `src/render/SdfRaymarcher.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+
+## Round 7 — Dual Contouring Mesher + Sharp CSG Preservation
+
+This round upgrades the **custom procedural generation graphics engine** on the *geometry* side.
+The Procedural Mesh Lab now supports **Dual Contouring** (Hermite/QEF) as an alternative to Marching Tetrahedra.
+
+Why it matters:
+- Marching methods are great for smooth surfaces, but they tend to **round off or staircase sharp CSG edges**.
+- Dual Contouring places **one vertex per cell** and solves it from edge intersection *points + normals* using a tiny least-squares system (QEF), which helps preserve crisp features.
+
+### Highlights
+- **New core mesher:** `render::meshIsosurfaceDualContouring(...)`
+  - Uniform-grid Dual Contouring (watertight quads emitted around sign-changing grid edges)
+  - Per-cell vertex solved via a small **3x3 QEF**
+  - Optional **iso-surface projection** (Newton steps) + optional **cell clamping** to prevent spikes
+  - Uses the same output format (`SdfMeshData`) so it plugs into the existing preview + OBJ export pipeline
+
+- **Procedural Mesh Lab UI upgrades**
+  - New **Mesher algorithm** selector:
+    - Marching Tetrahedra
+    - Dual Contouring (QEF)
+  - Dual Contouring controls: **QEF regularization**, clamp-to-cell, and projection iterations
+  - Fresh sessions default to Dual Contouring (can be switched back any time)
+
+### Files
+- New: `include/stellar/render/SdfDualContouring.h`, `src/render/SdfDualContouring.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- Updated: `CMakeLists.txt`
+
+
+## Round 6 — Procedural Asset Pipeline + Procedural Material Bridge
+
+This round pushes the **custom procedural generation graphics engine** from “cool editor toys” into a reusable **asset pipeline** and a first-pass **procedural material system**.
+
+### Highlights
+- **Graph serialization (ProcGraph + SdfGraph)**
+  - Added **versioned, human-editable text formats**:
+    - `*.procgraph` for 2D procedural texture graphs (`ProcGraph`)
+    - `*.sdfgraph` for 3D SDF graphs (`SdfGraph`)
+  - Both Procedural Lab and Procedural Mesh Lab now have **Save/Load** controls.
+
+- **Procedural Mesh Lab: procedural albedo materials**
+  - Added a **Surface Material** section that bakes a 2D `ProcGraph` to an **albedo texture** and applies it to:
+    - the **raster mesh preview** (triangle renderer)
+    - the **GPU raymarch preview** (sphere tracing)
+  - Includes quick controls for preset/seed, resolution, auto-bake, and optional raymarch UV transform.
+
+- **Raymarch preview shading upgrade**
+  - `SdfRaymarcher` can now optionally sample an **albedo texture** using spherical UVs with a simple UV transform.
+
+- **OBJ export: optional MTL + albedo PNG**
+  - Procedural Mesh Lab can now export:
+    - `mesh.obj`
+    - `mesh.mtl`
+    - `mesh_albedo.png`
+  - The OBJ references the MTL (`mtllib`) and binds the material (`usemtl`).
+
+### Files
+- Updated: `include/stellar/render/ProceduralGraph.h`, `src/render/ProceduralGraph.cpp`
+- Updated: `include/stellar/render/SdfGraph.h`, `src/render/SdfGraph.cpp`
+- Updated: `include/stellar/render/SdfRaymarcher.h`, `src/render/SdfRaymarcher.cpp`
+- Updated: `apps/stellar_game/ProceduralLabWindow.h`, `apps/stellar_game/ProceduralLabWindow.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+
+
+## Round 5 — GPU SDF Raymarch Preview + Procedural Mesh Lab Fixups
+
+This round doubles down on the **custom procedural-generation graphics engine** by adding a **GPU raymarch (sphere tracing) preview pipeline** for `SdfGraph`, and fixes the Procedural Mesh Lab preview renderer to match the project’s actual `MeshRenderer` / `InstanceData` API.
+
+### Highlights
+- **`stellar::render::SdfRaymarcher`** (new):
+  - Builds a **GLSL fragment shader from the SDF node graph** and renders it to an offscreen `RenderTarget2D` using sphere tracing.
+  - Preview supports the mesher’s **bounds + iso** so the raymarch view matches the extracted level-set.
+  - Tunable settings: max steps, epsilon, max distance, soft shadows, ambient occlusion, debug views (normals/steps/distance).
+  - Optional “Show shader” to inspect the generated fragment shader.
+- **Procedural Mesh Lab preview overhaul**:
+  - Fixed preview rendering to use the project’s `MeshRenderer::drawInstances()` and the correct `InstanceData` layout.
+  - Added a **preview mode switch**: Mesh (triangle raster) ↔ Raymarch (SDF). Raymarch works even before you generate a triangle mesh.
+
+### Files
+- New: `include/stellar/render/SdfRaymarcher.h`, `src/render/SdfRaymarcher.cpp`
+- Updated: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- Updated: `CMakeLists.txt`
+
+
+## Round 4 — Procedural SDF Mesh Graph + Procedural Mesh Lab
+
+This round expands the custom procedural-generation graphics engine into **3D geometry** by adding a CPU-side **SDF node graph** that can be meshed (Marching Tetrahedra), previewed, and exported.
+
+### Highlights
+- **`stellar::render::SdfGraph`**: a deterministic, CPU-evaluated signed-distance node graph (primitives + CSG + smooth union + noise displacement + shell).
+- **Procedural Mesh Lab** (Visual → “Procedural Mesh Lab”):
+  - Edit the SDF graph + mesher parameters (resolution, bounds, iso, normals)
+  - Optional **async remesh** (coalesces changes to avoid job backlogs)
+  - Offscreen lit preview (with wireframe toggle)
+  - **Export to Wavefront OBJ**
+- **Fix**: `stellar_game/main.cpp` now correctly declares the `ProceduralLabWindowState` (Round 3 wired it into the registry but missed the state variable).
+
+### Files
+- New: `include/stellar/render/SdfGraph.h`, `src/render/SdfGraph.cpp`
+- New: `apps/stellar_game/ProceduralMeshLabWindow.h`, `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- Updated: `apps/stellar_game/main.cpp`, `CMakeLists.txt`
+
+## Round 3 — Procedural Graph Texture Engine + Procedural Lab
+
+This round adds a **custom GPU procedural-generation “graphics engine”** that can compile a small node-graph into GLSL, bake it into an offscreen texture, preview it live, and export it to PNG.
+
+### Highlights
+- **`stellar::render::ProceduralGraph`**: scalar node-graph → generated GLSL fragment shader → baked `Texture2D`.
+  - Node params + seeds are uploaded as uniform arrays, so **tweaking sliders does not recompile** (only topology changes recompile).
+  - Includes built-in **value noise, FBm, Voronoi distance**, and **domain warp / UV pan** nodes.
+- **Procedural Lab window** (Visual → “Procedural Lab”):
+  - Start from presets (Nebula / Marble / Lava / Alien Circuit / Rocky), then tweak nodes & palette.
+  - Live preview (offscreen render target) + **Export to PNG** (reuses Screenshot PNG writer).
+  - Optional “Show generated GLSL” for debugging.
+- **Shader/GL upgrades**:
+  - Added `ShaderProgram::setUniform1iv` / `setUniform4fv` for efficient uniform array uploads.
+  - Extended GL loader to load `glUniform1iv` and `glUniform4fv`.
+
+### Files
+- New: `include/stellar/render/ProceduralGraph.h`, `src/render/ProceduralGraph.cpp`
+- New: `apps/stellar_game/ProceduralLabWindow.h`, `apps/stellar_game/ProceduralLabWindow.cpp`
+- Updated: `include/stellar/render/Gl.h`, `src/render/Gl.cpp`
+- Updated: `include/stellar/render/Shader.h`, `src/render/Shader.cpp`
+- Updated: `apps/stellar_game/main.cpp`, `CMakeLists.txt`
+
+---
+
+## 2026-01-12 (Patch) - Async Trajectory Preview Compute
+
+- The **Trajectory / Maneuver Planner** preview cache now computes on a **background worker thread** (toggle: **Async compute**) to avoid frame hitches from RK4 integration + altitude scanning.
+- Adds preview diagnostics: **last compute time** (ms), **cache age** (s), and a **live “Computing…”** indicator while work is in flight.
+- Keeps a **sync fallback path** (disable Async compute) and avoids job backlogs by coalescing rapid input changes.
+
+## 2026-01-12 (Patch) - Flight Recorder Ghost Replay
+
+- Flight Recorder now captures full ship **pose**: orientation (quaternion) + angular velocity (rad/s).
+- Added a **Replay / Ghost** panel:
+  - Scrubbable **playhead**, **loop**, **play/pause**, **playback rate**
+  - Optional **wireframe ghost** ship in-world + optional **trail** drawn from recorded samples
+- CSV export now appends pose columns: `orient_w/x/y/z`, `ang_x/y/z_rads`.
+- Trace export can optionally include orientation + angular velocity counter tracks.
+
 ## 2026-01-11 (Patch) - Missile Ammo + Ordnance Restock
 
 - **Guided weapons now consume ammo** (missiles are no longer infinite).
@@ -1411,6 +1828,31 @@ This patch adds a low-cost **ambient NPC trade traffic** layer that moves commod
 ## Tests
 - Extended `test_supercruise` with boundary + interdiction regressions.
 
+
+# Patch Notes (Jan 13, 2026) — Procedural Noise + Perlin Graph Nodes
+
+## Proc: gradient Perlin noise (2D/3D) + FBm + ridged FBm
+- Added **Perlin-style gradient noise** implementations to `stellar::proc::Noise`:
+  - `perlinNoise2D/3D` (0..1)
+  - `fbmPerlin2D/3D`
+  - `ridgedFbmPerlin2D/3D`
+- These live alongside the existing value-noise + smooth-noise helpers (no breaking behavior changes).
+
+## Render: ProceduralGraph upgraded noise toolset
+- Added three new node ops:
+  - **Perlin2D** (single octave)
+  - **FBmPerlin2D**
+  - **RidgedFBmPerlin2D**
+- Updated **Nebula** and **Rocky** presets to use Perlin-based noise for smoother, less grid-like results.
+
+## Render: SdfGraph Perlin displacement modifier
+- Added `SdfNodeOp::NoiseDisplacePerlin` (same params as `NoiseDisplace`, but uses Perlin FBm).
+- Updated the SDF raymarcher shader path so previews match CPU meshing behavior.
+- Updated **Crystal** and **Torus** SDF presets to use Perlin displacement for cleaner surfaces.
+
+## UI: Procedural Mesh Lab
+- Added `NoiseDisplace (Perlin)` to the op dropdown.
+- Added a **+ Perlin Noise** quick-add button.
 
 # Patch Notes (Jan 6, 2026) — Round 13
 

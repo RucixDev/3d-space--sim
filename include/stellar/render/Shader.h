@@ -29,6 +29,9 @@ public:
   void setUniform2f(const char* name, float x, float y) const;
   void setUniform3f(const char* name, float x, float y, float z) const;
   void setUniform4f(const char* name, float x, float y, float z, float w) const;
+  // Array uniforms (for procedural graphs, palette ramps, etc.).
+  void setUniform1iv(const char* name, int count, const int* v) const;
+  void setUniform4fv(const char* name, int count, const float* v) const;
 
   unsigned int handle() const { return program_; }
 

@@ -3,6 +3,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
 #include "stellar/proc/NameGenerator.h"
+#include "stellar/proc/Noise.h"
 #include "stellar/math/Math.h"
 
 #include <algorithm>
@@ -114,6 +115,91 @@ static core::u32 pickFaction(const math::Vec3d& posLy, const std::vector<sim::Fa
   return best;
 }
 
+static double wrapAnglePi(double a) {
+  const double twoPi = 2.0 * stellar::math::kPi;
+  a = std::fmod(a + stellar::math::kPi, twoPi);
+  if (a < 0.0) a += twoPi;
+  return a - stellar::math::kPi;
+}
+
+static double fbmAmpSum(int octaves, double gain) {
+  double amp = 1.0;
+  double sum = 0.0;
+  for (int i = 0; i < octaves; ++i) {
+    sum += amp;
+    amp *= gain;
+  }
+  return sum;
+}
+
+static double spiralArmMask(const GalaxyParams& gp, core::u64 noiseSeed, double xLy, double yLy) {
+  const int arms = gp.spiralArmCount;
+  if (arms <= 0) return 0.0;
+
+  const double rxy = std::sqrt(xLy * xLy + yLy * yLy);
+  if (rxy < 1.0e-6) return 0.0;
+
+  const double pitchDeg = std::clamp(gp.spiralPitchDeg, 1.0, 89.0);
+  const double pitchRad = pitchDeg * (stellar::math::kPi / 180.0);
+  const double k = 1.0 / std::tan(pitchRad);
+
+  const double phaseRad = gp.spiralArmPhaseDeg * (stellar::math::kPi / 180.0);
+  const double widthRad = std::max(1.0e-5, gp.spiralArmWidthDeg * (stellar::math::kPi / 180.0));
+
+  // Reference radius for the log-spiral term. Using ~2% of disc radius yields
+  // a reasonable number of turns across the galaxy at common pitch angles.
+  const double rRef = std::max(1.0, gp.radiusLy * 0.02);
+  const double lnTerm = std::log(std::max(1.0e-6, rxy / rRef));
+
+  const double theta = std::atan2(yLy, xLy);
+
+  // Find angular distance to nearest arm.
+  double dMin = 1e30;
+  const double twoPi = 2.0 * stellar::math::kPi;
+  for (int i = 0; i < arms; ++i) {
+    const double armTheta = k * lnTerm + phaseRad + twoPi * (static_cast<double>(i) / static_cast<double>(arms));
+    const double d = std::abs(wrapAnglePi(theta - armTheta));
+    if (d < dMin) dMin = d;
+  }
+
+  // Gaussian falloff from the arm centerline.
+  const double t = dMin / widthRad;
+  double mask = std::exp(-0.5 * t * t);
+
+  // Fade arms out near the very center to avoid excessive winding.
+  const double fadeStart = rRef * 0.25;
+  const double fadeEnd = rRef * 0.60;
+  const double fade = std::clamp((rxy - fadeStart) / std::max(1.0e-6, (fadeEnd - fadeStart)), 0.0, 1.0);
+  mask *= fade;
+
+  // Optional modulation along arms.
+  const double ns = std::clamp(gp.spiralArmNoiseStrength, 0.0, 1.0);
+  if (ns > 0.0 && gp.spiralArmNoiseFreq > 0.0) {
+    const double n = smoothNoise2D(noiseSeed, xLy * gp.spiralArmNoiseFreq, yLy * gp.spiralArmNoiseFreq); // 0..1
+    const double mul = (1.0 - ns) + (2.0 * ns) * n; // [1-ns, 1+ns]
+    mask *= mul;
+  }
+
+  return mask;
+}
+
+static double densityNoiseMul(const GalaxyParams& gp, core::u64 seed, double xLy, double yLy) {
+  const double s = std::clamp(gp.densityNoiseStrength, 0.0, 0.99);
+  if (s <= 0.0 || gp.densityNoiseFreq <= 0.0) return 1.0;
+
+  constexpr int kOctaves = 5;
+  constexpr double kLacunarity = 2.0;
+  constexpr double kGain = 0.5;
+  const double ampSum = fbmAmpSum(kOctaves, kGain);
+
+  double n = fbm2D(seed, xLy * gp.densityNoiseFreq, yLy * gp.densityNoiseFreq, kOctaves, kLacunarity, kGain);
+  n /= std::max(1.0e-9, ampSum);
+  n = std::clamp(n, 0.0, 1.0);
+
+  // Map [0..1] -> [1-s .. 1+s]
+  return (1.0 - s) + (2.0 * s) * n;
+}
+
 Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vector<sim::Faction>& factions) const {
   // Sector seed
   core::u64 h = seed_;
@@ -133,21 +219,97 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
     (coord.y + 0.5) * s,
     (coord.z + 0.5) * s
   };
-  const double rxy = std::sqrt(centerLy.x*centerLy.x + centerLy.y*centerLy.y);
+  const double rxy = std::sqrt(centerLy.x * centerLy.x + centerLy.y * centerLy.y);
   const double z = std::abs(centerLy.z);
 
   const double radial = std::exp(-rxy / std::max(1.0, params_.radialScaleLengthLy));
   const double vertical = std::exp(-z / std::max(1.0, params_.thicknessLy * 0.5));
   const double mean = params_.baseMeanSystemsPerSector * radial * vertical;
 
-  const int n = poisson(rng, mean);
+  const bool useSpiral = (params_.spiralArmCount > 0) && (params_.spiralArmStrength > 0.0);
+  const bool useDensityNoise = (params_.densityNoiseStrength > 0.0);
 
-  sector.systems.reserve(static_cast<std::size_t>(std::max(0, n)));
+  if (!useSpiral && !useDensityNoise) {
+    // ---- Legacy smooth-disc distribution path (keep deterministic signatures stable) ----
+    const int n = poisson(rng, mean);
+
+    sector.systems.reserve(static_cast<std::size_t>(std::max(0, n)));
+
+    NameGenerator ng{};
+    const double halfThickness = params_.thicknessLy * 0.5;
+
+    for (int i = 0; i < n; ++i) {
+      // Try a few candidates to keep within disc bounds.
+      bool placed = false;
+      math::Vec3d pos{};
+      for (int tries = 0; tries < 8 && !placed; ++tries) {
+        const double ux = rng.nextDouble();
+        const double uy = rng.nextDouble();
+        const double uz = rng.nextDouble();
+        pos = {
+          (coord.x + ux) * s,
+          (coord.y + uy) * s,
+          (coord.z + uz) * s
+        };
+
+        const double rr = std::sqrt(pos.x * pos.x + pos.y * pos.y);
+        if (rr > params_.radiusLy) continue;
+        if (std::abs(pos.z) > halfThickness) continue;
+        placed = true;
+      }
+      if (!placed) continue;
+
+      sim::SystemStub stub{};
+      stub.id = makeSystemId(coord, static_cast<core::u32>(i));
+      stub.seed = core::hashCombine(seed_, static_cast<core::u64>(stub.id));
+
+      ng.reseed(stub.seed);
+      stub.name = ng.systemName();
+      stub.posLy = pos;
+      stub.primaryClass = pickStarClass(rng);
+      stub.planetCount = rng.range(0, 12);
+      stub.stationCount = std::max(1, rng.range(0, 3)); // ensure at least 1 station for gameplay
+      stub.factionId = pickFaction(stub.posLy, factions);
+
+      sector.systems.push_back(std::move(stub));
+    }
+
+    // Stable order for deterministic query results.
+    std::sort(sector.systems.begin(), sector.systems.end(), [](const sim::SystemStub& a, const sim::SystemStub& b) {
+      return a.id < b.id;
+    });
+
+    return sector;
+  }
+
+  // ---- Inhomogeneous galaxy path (spiral arms + density noise) ----
+  const double armStrength = std::max(0.0, params_.spiralArmStrength);
+  const double armNoiseStrength = std::clamp(params_.spiralArmNoiseStrength, 0.0, 1.0);
+  const double densityStrength = std::clamp(params_.densityNoiseStrength, 0.0, 0.99);
+
+  double mulMax = 1.0;
+  if (useSpiral) {
+    // armMask max is ~ (1+armNoiseStrength)
+    mulMax *= (1.0 + armStrength * (1.0 + armNoiseStrength));
+  }
+  if (useDensityNoise) {
+    // densityNoiseMul max is (1+densityStrength)
+    mulMax *= (1.0 + densityStrength);
+  }
+
+  const double meanMax = mean * mulMax;
+  const int nCand = poisson(rng, meanMax);
+
+  sector.systems.reserve(static_cast<std::size_t>(std::max(0, nCand)));
+
+  // Independent noise seeds (so tweaks don't perturb sector seeding).
+  const core::u64 spiralNoiseSeed = core::hashCombine(seed_, core::fnv1a64("galaxy_spiral_noise"));
+  const core::u64 densityNoiseSeed = core::hashCombine(seed_, core::fnv1a64("galaxy_density_noise"));
 
   NameGenerator ng{};
   const double halfThickness = params_.thicknessLy * 0.5;
 
-  for (int i = 0; i < n; ++i) {
+  for (int ci = 0; ci < nCand; ++ci) {
     // Try a few candidates to keep within disc bounds.
     bool placed = false;
     math::Vec3d pos{};
@@ -161,15 +323,27 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
         (coord.z + uz) * s
       };
 
-      const double rr = std::sqrt(pos.x*pos.x + pos.y*pos.y);
+      const double rr = std::sqrt(pos.x * pos.x + pos.y * pos.y);
       if (rr > params_.radiusLy) continue;
       if (std::abs(pos.z) > halfThickness) continue;
       placed = true;
     }
     if (!placed) continue;
 
+    // Thinning: accept with probability lambda(pos) / lambda_max.
+    double mul = 1.0;
+    if (useSpiral) {
+      mul *= (1.0 + armStrength * spiralArmMask(params_, spiralNoiseSeed, pos.x, pos.y));
+    }
+    if (useDensityNoise) {
+      mul *= densityNoiseMul(params_, densityNoiseSeed, pos.x, pos.y);
+    }
+
+    const double p = std::clamp(mul / std::max(1.0e-9, mulMax), 0.0, 1.0);
+    if (rng.nextDouble() > p) continue;
+
     sim::SystemStub stub{};
-    stub.id = makeSystemId(coord, static_cast<core::u32>(i));
+    stub.id = makeSystemId(coord, static_cast<core::u32>(sector.systems.size()));
     stub.seed = core::hashCombine(seed_, static_cast<core::u64>(stub.id));
 
     ng.reseed(stub.seed);

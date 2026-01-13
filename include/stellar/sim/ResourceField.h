@@ -20,6 +20,22 @@ enum class ResourceFieldKind : core::u8 {
   IceField = 2,
 };
 
+// Geometric layout for a generated resource field.
+//
+// This is primarily a *render/gameplay hint*: it describes how asteroids are
+// distributed around ResourceFieldSite::posKm.
+//
+// Keep numeric values stable (they may be implicitly persisted via deterministic
+// world id schemes and save-game depletion tables).
+enum class ResourceFieldLayout : core::u8 {
+  // Roughly spherical / ellipsoidal cluster.
+  Cluster = 0,
+  // Torus/ring (optionally an arc segment).
+  Torus = 1,
+  // Thin sheet/disc (useful for icy debris planes).
+  Sheet = 2,
+};
+
 const char* resourceFieldKindName(ResourceFieldKind k);
 
 // Deterministically generated "resource field" signal/site.
@@ -29,9 +45,33 @@ struct ResourceFieldSite {
   core::u64 id{0};
   ResourceFieldKind kind{ResourceFieldKind::OreBelt};
 
+  // Spatial layout of asteroids in this field.
+  ResourceFieldLayout layout{ResourceFieldLayout::Cluster};
+
   // Position in system-space (km). Caller supplies the anchor position that the
   // site is placed relative to (usually a station).
   math::Vec3d posKm{0, 0, 0};
+
+  // Local orthonormal basis for the layout.
+  //
+  // For Torus/Sheet: basisY is the plane normal, basisX/basisZ span the plane.
+  // For Cluster: the basis is arbitrary but deterministic (can be used for
+  // ellipsoid-like shaping).
+  math::Vec3d basisX{1, 0, 0};
+  math::Vec3d basisY{0, 1, 0};
+  math::Vec3d basisZ{0, 0, 1};
+
+  // Layout parameters (km). Interpretation depends on `layout`:
+  //  - Cluster: majorRadiusKm = cluster radius. minorRadiusKm may be used as an
+  //            optional "tightness"/secondary axis scale.
+  //  - Torus:   majorRadiusKm = ring radius (centerline), minorRadiusKm = tube radius.
+  //            arcRad < 2π produces a belt arc.
+  //  - Sheet:   majorRadiusKm = in-plane half-width (disc radius), minorRadiusKm =
+  //            half-thickness along basisY.
+  double majorRadiusKm{60000.0};
+  double minorRadiusKm{14000.0};
+  double arcRad{6.283185307179586};      // 2π by default
+  double arcCenterRad{0.0};              // only used when arcRad < 2π
 
   // Richness multiplier applied to asteroid yield (roughly ~[0.75,1.40]).
   double richness{1.0};

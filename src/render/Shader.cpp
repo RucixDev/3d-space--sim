@@ -240,4 +240,16 @@ void ShaderProgram::setUniform4f(const char* name, float x, float y, float z, fl
   if (loc >= 0) gl::Uniform4f(loc, x, y, z, w);
 }
 
+void ShaderProgram::setUniform1iv(const char* name, int count, const int* v) const {
+  if (!v || count <= 0) return;
+  const int loc = uniformLocation(name);
+  if (loc >= 0) gl::Uniform1iv(loc, count, v);
+}
+
+void ShaderProgram::setUniform4fv(const char* name, int count, const float* v) const {
+  if (!v || count <= 0) return;
+  const int loc = uniformLocation(name);
+  if (loc >= 0) gl::Uniform4fv(loc, count, v);
+}
+
 } // namespace stellar::render

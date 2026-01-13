@@ -27,6 +27,8 @@ PFNGLUNIFORM1FPROC Uniform1f = nullptr;
 PFNGLUNIFORM2FPROC Uniform2f = nullptr;
 PFNGLUNIFORM3FPROC Uniform3f = nullptr;
 PFNGLUNIFORM4FPROC Uniform4f = nullptr;
+PFNGLUNIFORM1IVPROC Uniform1iv = nullptr;
+PFNGLUNIFORM4FVPROC Uniform4fv = nullptr;
 PFNGLUNIFORMMATRIX4FVPROC UniformMatrix4fv = nullptr;
 
 PFNGLGENVERTEXARRAYSPROC GenVertexArrays = nullptr;
@@ -110,6 +112,10 @@ bool load() {
   Uniform2f = loadProc<PFNGLUNIFORM2FPROC>("glUniform2f");
   Uniform3f = loadProc<PFNGLUNIFORM3FPROC>("glUniform3f");
   Uniform4f = loadProc<PFNGLUNIFORM4FPROC>("glUniform4f");
+  Uniform1iv = loadProc<PFNGLUNIFORM1IVPROC>("glUniform1iv");
+  if (!Uniform1iv) Uniform1iv = loadProc<PFNGLUNIFORM1IVPROC>("glUniform1ivARB");
+  Uniform4fv = loadProc<PFNGLUNIFORM4FVPROC>("glUniform4fv");
+  if (!Uniform4fv) Uniform4fv = loadProc<PFNGLUNIFORM4FVPROC>("glUniform4fvARB");
   UniformMatrix4fv = loadProc<PFNGLUNIFORMMATRIX4FVPROC>("glUniformMatrix4fv");
 
   GenVertexArrays = loadProc<PFNGLGENVERTEXARRAYSPROC>("glGenVertexArrays");
@@ -209,7 +215,7 @@ bool load() {
   const bool ok =
       CreateShader && ShaderSource && CompileShader && GetShaderiv && GetShaderInfoLog && DeleteShader &&
       CreateProgram && AttachShader && LinkProgram && GetProgramiv && GetProgramInfoLog && UseProgram && DeleteProgram &&
-      GetUniformLocation && Uniform1i && Uniform1f && Uniform2f && Uniform3f && Uniform4f && UniformMatrix4fv &&
+      GetUniformLocation && Uniform1i && Uniform1f && Uniform2f && Uniform3f && Uniform4f && Uniform1iv && Uniform4fv && UniformMatrix4fv &&
       GenVertexArrays && BindVertexArray && DeleteVertexArrays &&
       GenBuffers && BindBuffer && BufferData && BufferSubData && DeleteBuffers &&
       EnableVertexAttribArray && VertexAttribPointer && VertexAttribDivisor &&

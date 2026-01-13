@@ -122,6 +122,10 @@ set(STELLAR_CORE_SOURCES
   # Procedural geometry generators (CPU-side; safe for headless builds).
   src/render/ProceduralAsteroid.cpp
   src/render/SdfMesher.cpp
+  src/render/SdfDualContouring.cpp
+  src/render/MeshSimplify.cpp
+  src/render/GltfExport.cpp
+  src/render/SdfGraph.cpp
   src/render/ProceduralArtifact.cpp
   # Procedural render presets (CPU-side; safe for headless builds).
   src/render/ProceduralPostFX.cpp
@@ -130,6 +134,8 @@ set(STELLAR_CORE_SOURCES
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
   src/proc/SystemGenerator.cpp
+  src/proc/MiePhase.cpp
+  src/proc/PhaseMultipleScattering.cpp
 
   src/sim/Faction.cpp
   src/sim/FactionProfile.cpp
@@ -205,16 +211,20 @@ set(STELLAR_CORE_SOURCES
 set(STELLAR_RENDER_SOURCES
   src/render/Gl.cpp
   src/render/Shader.cpp
+  src/render/GaussianSurfels.cpp
   src/render/Texture.cpp
   src/render/FrameGraph.cpp
   src/render/TextureReadback.cpp
   src/render/GpuSurfaceCache.cpp
   src/render/GpuParticleField.cpp
   src/render/ProceduralSprite.cpp
+  src/render/ProceduralGraph.cpp
+  src/render/SdfRaymarcher.cpp
   src/render/ProceduralPlanet.cpp
   src/render/ProceduralRings.cpp
   src/render/ProceduralLivery.cpp
   src/render/AtmosphereRenderer.cpp
+  src/render/VolumetricAtmosphereRenderer.cpp
   src/render/ProceduralSky.cpp
   src/render/Starfield.cpp
   src/render/Nebula.cpp
@@ -278,6 +288,11 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/TrafficLanesWindow.cpp
     apps/stellar_game/SystemConditionsWindow.cpp
     apps/stellar_game/PorkchopPlot.cpp
+    apps/stellar_game/ProceduralLabWindow.cpp
+    apps/stellar_game/ProceduralMeshLabWindow.cpp
+    apps/stellar_game/ProceduralGalaxyLabWindow.cpp
+    apps/stellar_game/SpectralMieLabWindow.cpp
+    apps/stellar_game/GaussianSurfelReconstructionLabWindow.cpp
     apps/stellar_game/Screenshot.cpp
     apps/stellar_game/PhotoModeWindow.cpp
   )

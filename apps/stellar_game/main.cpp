@@ -10,6 +10,7 @@
 #include "stellar/core/Log.h"
 #include "stellar/core/CVar.h"
 #include "stellar/core/Profiler.h"
+#include "stellar/core/JobSystem.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
 #include "stellar/core/Clamp.h"
@@ -35,6 +36,7 @@
 #include "stellar/render/ProceduralSky.h"
 #include "stellar/render/RenderTarget.h"
 #include "stellar/render/AtmosphereRenderer.h"
+#include "stellar/render/VolumetricAtmosphereRenderer.h"
 #include "stellar/render/Starfield.h"
 #include "stellar/render/Nebula.h"
 #include "stellar/render/ParticleSystem.h"
@@ -128,6 +130,11 @@
 #include "Screenshot.h"
 #include "PhotoModeWindow.h"
 #include "PorkchopPlot.h"
+#include "ProceduralLabWindow.h"
+#include "ProceduralMeshLabWindow.h"
+#include "ProceduralGalaxyLabWindow.h"
+#include "SpectralMieLabWindow.h"
+#include "GaussianSurfelReconstructionLabWindow.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -1637,6 +1644,13 @@ int main(int argc, char** argv) {
   }
   atmosphereRenderer.setMesh(&sphere);
 
+  render::VolumetricAtmosphereRenderer volumetricAtmosphereRenderer;
+  if (!volumetricAtmosphereRenderer.init(&err)) {
+    core::log(core::LogLevel::Error, err);
+    return 1;
+  }
+  volumetricAtmosphereRenderer.setMesh(&sphere);
+
   render::LineRenderer lineRenderer;
   if (!lineRenderer.init(&err)) {
     core::log(core::LogLevel::Error, err);
@@ -2088,6 +2102,31 @@ int main(int argc, char** argv) {
   float worldAtmoForwardScatter = 0.35f; // when looking toward the star
   bool worldAtmoTintWithStar = true;
 
+  // Volumetric single-scattering atmosphere (optional, more expensive).
+  bool worldAtmospheresVolumetricEnabled = false;
+  // Thickness uses the sim AtmosphereModel top altitude, scaled by this multiplier.
+  float worldAtmoVolumetricThicknessMul = 1.0f;
+  // Raymarch steps along the view ray through the shell.
+  int worldAtmoVolumetricViewSteps = 10;
+  // Raymarch steps for sun transmittance from each view sample.
+  int worldAtmoVolumetricSunSteps = 6;
+  // Global scattering/exctinction coefficients (artistic units).
+  float worldAtmoVolumetricRayleighStrength = 1.0f;
+  float worldAtmoVolumetricMieStrength = 1.0f;
+  // Multiplies per-planet scale height (lets you exaggerate the look without changing sim).
+  float worldAtmoVolumetricScaleHeightMul = 1.0f;
+  // Global density multiplier (in addition to per-planet sea-level density).
+  float worldAtmoVolumetricDensityMul = 1.0f;
+  // Jitter sampling to reduce banding.
+  float worldAtmoVolumetricDitherStrength = 0.35f;
+  // Fallback HG g parameter when no spectral LUT is provided.
+  float worldAtmoVolumetricMieG = 0.80f;
+
+  // Analytic multiple scattering (cheap approximation, optional).
+  bool worldAtmoVolumetricMsEnabled = true;
+  float worldAtmoVolumetricMsStrength = 0.65f;
+  float worldAtmoVolumetricMsAlbedo = 0.92f;
+
   // --- Physics (experimental): Newtonian gravity ---
   // Disabled by default to preserve the existing "Elite-ish" local-space feel.
   bool physicsGravityEnabled = false;
@@ -2119,6 +2158,7 @@ int main(int argc, char** argv) {
   // Draws a predicted path line in-world (using LineRenderer) and exposes a simple
   // 1-node maneuver planner in the Ship / Status panel.
   bool trajPreviewEnabled = false;
+  bool trajPreviewAsyncCompute = true; // compute preview in background (prevents frame hitches)
   float trajPreviewHorizonMin = 25.0f; // prediction horizon
   float trajPreviewStepSec = 2.0f;     // RK4 step
   int trajPreviewMaxSamples = 1400;    // safety cap
@@ -2213,6 +2253,7 @@ int main(int argc, char** argv) {
   struct TrajectoryPreviewCache {
     bool valid{false};
     double computedAtRealSec{0.0};
+    double computeWallMs{0.0};
 
     // Inputs snapshot
     double startTimeDays{0.0};
@@ -2255,6 +2296,41 @@ int main(int argc, char** argv) {
     math::Vec3d burnAlong{0,0,0};
     math::Vec3d burnNormal{0,0,0};
   } trajCache;
+
+
+struct TrajectoryPreviewInputs {
+  double startTimeDays{0.0};
+  math::Vec3d startPosKm{0,0,0};
+  math::Vec3d startVelKmS{0,0,0};
+  double horizonSec{0.0};
+  double stepSec{0.0};
+  int maxSamples{0};
+  int gravityMode{0};
+  sim::GravityParams gParams{};
+  int refBodyChoice{-1};
+
+  bool nodeEnabled{false};
+  double nodeTimeSec{0.0};
+  double dvAlongMS{0.0};
+  double dvNormalMS{0.0};
+  double dvRadialMS{0.0};
+};
+
+struct TrajectoryPreviewAsyncState {
+  bool pending{false};
+  bool dirty{false};
+
+  TrajectoryPreviewInputs pendingInputs{};
+  TrajectoryPreviewInputs desiredInputs{};
+
+  double pendingStartedRealSec{0.0};
+  double lastResultComputeMs{0.0};
+
+  std::future<TrajectoryPreviewCache> fut{};
+};
+
+std::unique_ptr<core::JobSystem> trajPreviewJobs;
+TrajectoryPreviewAsyncState trajPreviewAsync;
 
   render::Starfield starfield;
   starfield.setRadius(vfxStarRadiusU);
@@ -2889,6 +2965,11 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::TrafficLanesWindowState trafficLanesWindow{};
   game::SystemConditionsWindowState systemConditionsWindow{};
   game::PhotoModeWindowState photoModeWindow{};
+  game::ProceduralLabWindowState proceduralLabWindow{};
+  game::ProceduralMeshLabWindowState proceduralMeshLabWindow{};
+  game::ProceduralGalaxyLabWindowState proceduralGalaxyLabWindow{};
+  game::SpectralMieLabWindowState spectralMieLabWindow{};
+  game::GaussianSurfelReconstructionLabWindowState gaussianSurfelReconLabWindow{};
 
   struct PendingScreenshot { bool pending{false}; std::string path; bool copyToClipboard{false}; };
   PendingScreenshot shotWorld{};
@@ -3508,6 +3589,16 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleVfxLab); }});
     uiWindows.add(WindowBinding{WindowDesc{"PostFx", "Post FX", "Visual", 70, false, true}, &showPostFx,
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.togglePostFx); }});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralLab", "Procedural Lab", "Visual", 70, false, true}, &proceduralLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralMeshLab", "Procedural Mesh Lab", "Visual", 70, false, true}, &proceduralMeshLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralGalaxyLab", "Procedural Galaxy Lab", "Visual", 70, false, true}, &proceduralGalaxyLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"SpectralMieLab", "Spectral Mie Lab", "Visual", 70, false, true}, &spectralMieLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"GaussianSurfelReconLab", "Gaussian Surfel Reconstruction Lab", "Visual", 70, false, true}, &gaussianSurfelReconLabWindow.open,
+                                {}, {}, {}});
 
     // UI / tools
     uiWindows.add(WindowBinding{WindowDesc{"Bookmarks", "Bookmarks", "UI", 80, false, true}, &showBookmarksWindow,
@@ -13300,6 +13391,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     atmosphereRenderer.setViewProj(viewF, projF);
     atmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
+    volumetricAtmosphereRenderer.setViewProj(viewF, projF);
+    volumetricAtmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
     gpuDust.setViewProj(viewF, projF);
@@ -13308,6 +13401,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     {
       const math::Vec3d cp = cam.position();
       atmosphereRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+      volumetricAtmosphereRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
     }
 
     // Update VFX render buffers.
@@ -13385,6 +13479,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     std::vector<render::InstanceData> planetAtmoDraws;
     planetAtmoDraws.reserve(currentSystem->planets.size());
+
+    std::vector<render::VolumetricAtmosphereInstance> planetAtmoVolumetricDraws;
+    planetAtmoVolumetricDraws.reserve(currentSystem->planets.size());
 
     // Star at origin
     float starR = 1.0f, starG = 0.95f, starB = 0.75f;
@@ -13574,10 +13671,57 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                                   atmoG * atmoStrength,
                                                   atmoB * atmoStrength));
       }
+
+      // Optional: volumetric single-scattering atmosphere shell.
+      // This uses the simulation's AtmosphereModel (scale height / top altitude / density)
+      // to drive the visual thickness rather than a fixed multiplier.
+      if (worldAtmospheresEnabled && worldAtmospheresVolumetricEnabled && atmoStrength > 1e-4f) {
+        const sim::AtmosphereModel am = sim::atmosphereModelForPlanet(p);
+        if (am.hasAtmosphere && am.topAltitudeKm > 0.1) {
+          // Convert km -> render-scale units (planet sphere uses radiusKm / kRENDER_UNIT_KM * 200).
+          const double kmToScale = 200.0 / kRENDER_UNIT_KM;
+          const float thickness = (float)(am.topAltitudeKm * kmToScale * (double)worldAtmoVolumetricThicknessMul);
+          const float outer = scale + std::max(1e-4f, thickness);
+          const float scaleH = (float)(am.scaleHeightKm * kmToScale);
+
+          // Type-biased aerosol presence: desert worlds have more Mie haze, oceans less.
+          float mieMul = 1.0f;
+          switch (p.type) {
+            case sim::PlanetType::Desert:   mieMul = 1.35f; break;
+            case sim::PlanetType::Ocean:    mieMul = 0.85f; break;
+            case sim::PlanetType::Ice:      mieMul = 0.95f; break;
+            case sim::PlanetType::GasGiant: mieMul = 1.10f; break;
+            default:                        mieMul = 1.0f; break;
+          }
+
+          render::VolumetricAtmosphereInstance vi{};
+          vi.px = (float)posU.x;
+          vi.py = (float)posU.y;
+          vi.pz = (float)posU.z;
+          vi.sx = outer;
+          vi.sy = outer;
+          vi.sz = outer;
+          vi.qx = 0.0f;
+          vi.qy = 0.0f;
+          vi.qz = 0.0f;
+          vi.qw = 1.0f;
+          vi.cr = atmoR;
+          vi.cg = atmoG;
+          vi.cb = atmoB;
+          vi.innerRadius = scale;
+          vi.scaleHeight = scaleH;
+          // Density multiplier folds in the old per-type artistic strength.
+          vi.densityMul = atmoStrength * (float)(am.seaLevelDensityKgM3 / 1.2);
+          vi.mieMul = mieMul;
+          planetAtmoVolumetricDraws.push_back(vi);
+        }
+      }
     }
 
     // --- Trajectory preview cache (player) ---
     // Compute at a low rate to avoid per-frame RK4 work.
+    // When enabled, we run the heavy integration + scans on a background worker thread to
+    // prevent frame hitches.
     {
       const bool inNormal = (fsdState == FsdState::Idle) && (supercruiseState == SupercruiseState::Idle);
       const bool want = trajPreviewEnabled && inNormal && currentSystem;
@@ -13585,6 +13729,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       if (!want) {
         trajCache.valid = false;
         trajCache.samples.clear();
+
+        // Drop any pending work (we can't cancel it, but we can ignore it when it completes).
+        trajPreviewAsync.pending = false;
+        trajPreviewAsync.dirty = false;
+        trajPreviewAsync.fut = std::future<TrajectoryPreviewCache>{};
       } else {
         // Clamp reference choice if the system changed.
         const int maxChoice = (int)currentSystem->planets.size();
@@ -13601,6 +13750,260 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           gParams.scale = 1.0;
           gParams.maxAccelKmS2 = 0.0;
         }
+
+        auto fillInputs = [&](TrajectoryPreviewInputs& out) {
+          out.startTimeDays = timeDays;
+          out.startPosKm = ship.positionKm();
+          out.startVelKmS = ship.velocityKmS();
+          out.horizonSec = horizonSec;
+          out.stepSec = stepSec;
+          out.maxSamples = maxSamples;
+          out.gravityMode = gMode;
+          out.gParams = gParams;
+          out.refBodyChoice = trajRefBodyChoice;
+
+          out.nodeEnabled = maneuverNodeEnabled;
+          out.nodeTimeSec = (double)maneuverNodeTimeSec;
+          out.dvAlongMS = (double)maneuverDvAlongMS;
+          out.dvNormalMS = (double)maneuverDvNormalMS;
+          out.dvRadialMS = (double)maneuverDvRadialMS;
+        };
+
+        // Compare current inputs against a snapshot using the same tolerances as the sync cache.
+        auto inputsChangedFrom = [&](const TrajectoryPreviewInputs& snap) -> bool {
+          if (snap.horizonSec != horizonSec) return true;
+          if (snap.stepSec != stepSec) return true;
+          if (snap.maxSamples != maxSamples) return true;
+          if (snap.gravityMode != gMode) return true;
+          if (snap.refBodyChoice != trajRefBodyChoice) return true;
+
+          if (snap.gParams.includeStar != gParams.includeStar) return true;
+          if (snap.gParams.includePlanets != gParams.includePlanets) return true;
+          if (snap.gParams.scale != gParams.scale) return true;
+          if (snap.gParams.softeningRadiusScale != gParams.softeningRadiusScale) return true;
+          if (snap.gParams.maxAccelKmS2 != gParams.maxAccelKmS2) return true;
+
+          const bool nodeOn = maneuverNodeEnabled;
+          if (snap.nodeEnabled != nodeOn) return true;
+          if (snap.nodeTimeSec != (double)maneuverNodeTimeSec) return true;
+          if (snap.dvAlongMS != (double)maneuverDvAlongMS) return true;
+          if (snap.dvNormalMS != (double)maneuverDvNormalMS) return true;
+          if (snap.dvRadialMS != (double)maneuverDvRadialMS) return true;
+
+          const double posErr = (snap.startPosKm - ship.positionKm()).length();
+          const double velErr = (snap.startVelKmS - ship.velocityKmS()).length();
+          if (posErr > 25.0) return true;       // 25 km
+          if (velErr > 0.0025) return true;     // 2.5 m/s
+          if (std::abs(snap.startTimeDays - timeDays) > (0.25 / 86400.0)) return true;
+
+          return false;
+        };
+
+        // This is the worker computation that produces the same outputs as the old synchronous path.
+        auto computePreview = [](const sim::StarSystem& sys,
+                                 const TrajectoryPreviewInputs& in,
+                                 double computedAtRealSec) -> TrajectoryPreviewCache {
+          const auto t0 = std::chrono::high_resolution_clock::now();
+
+          TrajectoryPreviewCache out;
+          out.valid = true;
+          out.computedAtRealSec = computedAtRealSec;
+
+          // Snapshot inputs.
+          out.startTimeDays = in.startTimeDays;
+          out.startPosKm = in.startPosKm;
+          out.startVelKmS = in.startVelKmS;
+          out.horizonSec = in.horizonSec;
+          out.stepSec = in.stepSec;
+          out.maxSamples = in.maxSamples;
+          out.gravityMode = in.gravityMode;
+          out.gParams = in.gParams;
+          out.refBodyChoice = in.refBodyChoice;
+          out.nodeEnabled = in.nodeEnabled;
+          out.nodeTimeSec = in.nodeTimeSec;
+          out.dvAlongMS = in.dvAlongMS;
+          out.dvNormalMS = in.dvNormalMS;
+          out.dvRadialMS = in.dvRadialMS;
+
+          const double horizonSec = in.horizonSec;
+          const double stepSec = in.stepSec;
+          const int maxSamples = in.maxSamples;
+          const int gMode = in.gravityMode;
+          const sim::GravityParams gParams = in.gParams;
+
+          // Determine reference body (for orbit frame + alt readouts).
+          out.refValid = false;
+          out.refBody = {};
+          {
+            // Dominant/auto uses the same gravity model as the preview (if any),
+            // otherwise it uses physical params to pick a sensible body.
+            sim::GravityParams pickParams = gParams;
+            if (gMode == 0) {
+              pickParams.scale = 1.0;
+              pickParams.maxAccelKmS2 = 0.0;
+            }
+
+            if (in.refBodyChoice == -1) {
+              const auto dom = sim::dominantGravityBody(sys, in.startTimeDays, in.startPosKm, pickParams);
+              if (dom.valid) {
+                out.refValid = true;
+                out.refBody = dom.body;
+              }
+            } else if (in.refBodyChoice == 0) {
+              out.refValid = true;
+              out.refBody.kind = sim::GravityBody::Kind::Star;
+              out.refBody.id = sys.stub.id;
+              out.refBody.name = "Star";
+              out.refBody.posKm = {0,0,0};
+              out.refBody.velKmS = {0,0,0};
+              out.refBody.muKm3S2 = sim::muStarKm3S2(sys.star);
+              out.refBody.radiusKm = sim::radiusStarKm(sys.star);
+            } else {
+              const int pi = in.refBodyChoice - 1;
+              if (pi >= 0 && pi < (int)sys.planets.size()) {
+                const auto& p = sys.planets[(std::size_t)pi];
+                out.refValid = true;
+                out.refBody.kind = sim::GravityBody::Kind::Planet;
+                out.refBody.id = (core::u64)pi;
+                out.refBody.name = p.name;
+                out.refBody.posKm = sim::planetPosKm(p, in.startTimeDays);
+                out.refBody.velKmS = sim::planetVelKmS(p, in.startTimeDays);
+                out.refBody.muKm3S2 = sim::muPlanetKm3S2(p);
+                out.refBody.radiusKm = sim::radiusPlanetKm(p);
+              }
+            }
+          }
+
+          auto refBodyAtDays = [&](double tDays) -> sim::GravityBody {
+            sim::GravityBody b = out.refBody;
+            if (!out.refValid) return b;
+            if (b.kind == sim::GravityBody::Kind::Star) {
+              b.posKm = {0,0,0};
+              b.velKmS = {0,0,0};
+              b.muKm3S2 = sim::muStarKm3S2(sys.star);
+              b.radiusKm = sim::radiusStarKm(sys.star);
+              return b;
+            }
+            if (b.kind == sim::GravityBody::Kind::Planet) {
+              const std::size_t pi = (std::size_t)b.id;
+              if (pi < sys.planets.size()) {
+                const auto& p = sys.planets[pi];
+                b.posKm = sim::planetPosKm(p, tDays);
+                b.velKmS = sim::planetVelKmS(p, tDays);
+                b.muKm3S2 = sim::muPlanetKm3S2(p);
+                b.radiusKm = sim::radiusPlanetKm(p);
+              }
+              return b;
+            }
+            return b;
+          };
+
+          sim::TrajectoryPredictParams tp;
+          tp.horizonSec = horizonSec;
+          tp.stepSec = stepSec;
+          tp.maxSamples = maxSamples;
+          tp.includeGravity = (gMode != 0);
+          tp.gravity = gParams;
+
+          out.burnValid = false;
+          out.nodeIndex = -1;
+          out.samples.clear();
+
+          // Optional maneuver node.
+          std::optional<sim::ManeuverNode> node;
+          if (in.nodeEnabled && out.refValid) {
+            const double tNode = std::clamp((double)in.nodeTimeSec, 0.0, horizonSec);
+
+            // Propagate pre-burn state to the node time.
+            sim::TrajectoryPredictParams pre = tp;
+            pre.horizonSec = tNode;
+            const auto preS = sim::predictTrajectoryRK4(sys, in.startTimeDays,
+                                                       in.startPosKm, in.startVelKmS, pre);
+            if (!preS.empty()) {
+              out.burnPre = preS.back();
+
+              const sim::GravityBody rb = refBodyAtDays(in.startTimeDays + tNode / 86400.0);
+              const math::Vec3d relPos = out.burnPre.posKm - rb.posKm;
+              const math::Vec3d relVel = out.burnPre.velKmS - rb.velKmS;
+
+              // RTN frame (Radial, Tangential/Along-track, Normal).
+              math::Vec3d radial = relPos.normalized();
+              if (radial.lengthSq() < 1e-12) radial = {1,0,0};
+              math::Vec3d normal = math::cross(relPos, relVel);
+              if (normal.lengthSq() < 1e-12) normal = {0,1,0};
+              normal = normal.normalized();
+              math::Vec3d along = math::cross(normal, radial);
+              if (along.lengthSq() < 1e-12) {
+                along = (relVel - radial * math::dot(relVel, radial)).normalized();
+              } else {
+                along = along.normalized();
+              }
+
+              out.burnRadialOut = radial;
+              out.burnAlong = along;
+              out.burnNormal = normal;
+
+              const math::Vec3d dvWorldKmS =
+                along  * (in.dvAlongMS  / 1000.0) +
+                normal * (in.dvNormalMS / 1000.0) +
+                radial * (in.dvRadialMS / 1000.0);
+
+              node = sim::ManeuverNode{tNode, dvWorldKmS};
+              out.burnPost = out.burnPre;
+              out.burnPost.velKmS += dvWorldKmS;
+              out.burnValid = true;
+
+              // Orbit scalars (relative to the reference body). Use an "effective" mu when
+              // the preview is using a scaled gravity model.
+              const double muEff = rb.muKm3S2 * (tp.includeGravity ? tp.gravity.scale : 1.0);
+              out.orbitPre = sim::solveTwoBodyOrbit(relPos, relVel, muEff);
+              out.orbitPost = sim::solveTwoBodyOrbit(relPos, relVel + dvWorldKmS, muEff);
+            }
+          }
+
+          out.samples = sim::predictTrajectoryRK4(sys, in.startTimeDays,
+                                                 in.startPosKm, in.startVelKmS, tp,
+                                                 node ? &(*node) : nullptr);
+
+          // Find node sample index.
+          if (node) {
+            for (std::size_t i = 0; i < out.samples.size(); ++i) {
+              if (std::abs(out.samples[i].tSec - node->timeSec) < 1e-6) {
+                out.nodeIndex = (int)i;
+                break;
+              }
+            }
+          }
+
+          // Altitude scan (relative to reference body).
+          out.altValid = false;
+          if (out.refValid && !out.samples.empty()) {
+            out.altValid = true;
+            out.impact = false;
+            out.minAltKm = std::numeric_limits<double>::infinity();
+            out.minAltTimeSec = 0.0;
+            out.minAltIndex = -1;
+            for (std::size_t si = 0; si < out.samples.size(); ++si) {
+              const auto& s = out.samples[si];
+              const sim::GravityBody rb = refBodyAtDays(in.startTimeDays + s.tSec / 86400.0);
+              const double dist = (s.posKm - rb.posKm).length();
+              const double alt = dist - rb.radiusKm;
+              if (alt < out.minAltKm) {
+                out.minAltKm = alt;
+                out.minAltTimeSec = s.tSec;
+                out.minAltIndex = (int)si;
+              }
+              if (alt < 0.0) {
+                out.impact = true;
+              }
+            }
+          }
+
+          const auto t1 = std::chrono::high_resolution_clock::now();
+          out.computeWallMs =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
+          return out;
+        };
 
         auto inputsChanged = [&]() {
           if (!trajCache.valid) return true;
@@ -13637,196 +14040,68 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const double kMinInterval = 0.25; // seconds (real)
         const bool timeStale = (timeRealSec - trajCache.computedAtRealSec) > kMinInterval;
 
-        if (inputsChanged() || timeStale) {
-          // Snapshot inputs.
-          trajCache.valid = true;
-          trajCache.computedAtRealSec = timeRealSec;
-          trajCache.startTimeDays = timeDays;
-          trajCache.startPosKm = ship.positionKm();
-          trajCache.startVelKmS = ship.velocityKmS();
-          trajCache.horizonSec = horizonSec;
-          trajCache.stepSec = stepSec;
-          trajCache.maxSamples = maxSamples;
-          trajCache.gravityMode = gMode;
-          trajCache.gParams = gParams;
-          trajCache.refBodyChoice = trajRefBodyChoice;
-          trajCache.nodeEnabled = maneuverNodeEnabled;
-          trajCache.nodeTimeSec = (double)maneuverNodeTimeSec;
-          trajCache.dvAlongMS = (double)maneuverDvAlongMS;
-          trajCache.dvNormalMS = (double)maneuverDvNormalMS;
-          trajCache.dvRadialMS = (double)maneuverDvRadialMS;
+        // First, harvest any finished job.
+        if (trajPreviewAsync.pending && trajPreviewAsync.fut.valid()) {
+          if (trajPreviewAsync.fut.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            TrajectoryPreviewCache result = trajPreviewAsync.fut.get();
+            trajCache = std::move(result);
+            trajPreviewAsync.pending = false;
 
-          // Determine reference body (for orbit frame + alt readouts).
-          trajCache.refValid = false;
-          trajCache.refBody = {};
-          {
-            // Dominant/auto uses the same gravity model as the preview (if any),
-            // otherwise it uses physical params to pick a sensible body.
-            sim::GravityParams pickParams = gParams;
-            if (gMode == 0) {
-              pickParams.scale = 1.0;
-              pickParams.maxAccelKmS2 = 0.0;
-            }
-
-            if (trajRefBodyChoice == -1) {
-              const auto dom = sim::dominantGravityBody(*currentSystem, timeDays, ship.positionKm(), pickParams);
-              if (dom.valid) {
-                trajCache.refValid = true;
-                trajCache.refBody = dom.body;
-              }
-            } else if (trajRefBodyChoice == 0) {
-              trajCache.refValid = true;
-              trajCache.refBody.kind = sim::GravityBody::Kind::Star;
-              trajCache.refBody.id = currentSystem->stub.id;
-              trajCache.refBody.name = "Star";
-              trajCache.refBody.posKm = {0,0,0};
-              trajCache.refBody.velKmS = {0,0,0};
-              trajCache.refBody.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
-              trajCache.refBody.radiusKm = sim::radiusStarKm(currentSystem->star);
-            } else {
-              const int pi = trajRefBodyChoice - 1;
-              if (pi >= 0 && pi < (int)currentSystem->planets.size()) {
-                const auto& p = currentSystem->planets[(std::size_t)pi];
-                trajCache.refValid = true;
-                trajCache.refBody.kind = sim::GravityBody::Kind::Planet;
-                trajCache.refBody.id = (core::u64)pi;
-                trajCache.refBody.name = p.name;
-                trajCache.refBody.posKm = sim::planetPosKm(p, timeDays);
-                trajCache.refBody.velKmS = sim::planetVelKmS(p, timeDays);
-                trajCache.refBody.muKm3S2 = sim::muPlanetKm3S2(p);
-                trajCache.refBody.radiusKm = sim::radiusPlanetKm(p);
-              }
+            // If we accumulated new desired inputs while this was running, schedule again immediately.
+            if (trajPreviewAsync.dirty) {
+              trajPreviewAsync.dirty = false;
+              if (!trajPreviewJobs) trajPreviewJobs = std::make_unique<core::JobSystem>(1);
+              const sim::StarSystem sysCopy = *currentSystem;
+              const TrajectoryPreviewInputs in = trajPreviewAsync.desiredInputs;
+              trajPreviewAsync.pendingInputs = in;
+              trajPreviewAsync.pendingStartedRealSec = timeRealSec;
+              trajPreviewAsync.pending = true;
+              trajPreviewAsync.fut = trajPreviewJobs->submit([sys = sysCopy, in, computedAtRealSec = timeRealSec, computePreview]() mutable {
+                return computePreview(sys, in, computedAtRealSec);
+              });
             }
           }
+        }
 
-          auto refBodyAtDays = [&](double tDays) -> sim::GravityBody {
-            sim::GravityBody b = trajCache.refBody;
-            if (!trajCache.refValid) return b;
-            if (b.kind == sim::GravityBody::Kind::Star) {
-              b.posKm = {0,0,0};
-              b.velKmS = {0,0,0};
-              b.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
-              b.radiusKm = sim::radiusStarKm(currentSystem->star);
-              return b;
+        // Then, decide whether to launch new work.
+        if (trajPreviewAsyncCompute) {
+          if (!trajPreviewJobs) trajPreviewJobs = std::make_unique<core::JobSystem>(1);
+
+          if (trajPreviewAsync.pending) {
+            // While a job is running, track the latest requested inputs (so UI/ship movement feels responsive)
+            // but don't enqueue a backlog of heavy jobs.
+            if (inputsChangedFrom(trajPreviewAsync.pendingInputs)) {
+              trajPreviewAsync.desiredInputs = TrajectoryPreviewInputs{};
+              fillInputs(trajPreviewAsync.desiredInputs);
+              trajPreviewAsync.dirty = true;
             }
-            if (b.kind == sim::GravityBody::Kind::Planet) {
-              const std::size_t pi = (std::size_t)b.id;
-              if (pi < currentSystem->planets.size()) {
-                const auto& p = currentSystem->planets[pi];
-                b.posKm = sim::planetPosKm(p, tDays);
-                b.velKmS = sim::planetVelKmS(p, tDays);
-                b.muKm3S2 = sim::muPlanetKm3S2(p);
-                b.radiusKm = sim::radiusPlanetKm(p);
-              }
-              return b;
-            }
-            return b;
-          };
+          } else {
+            if (inputsChanged() || timeStale) {
+              TrajectoryPreviewInputs in{};
+              fillInputs(in);
 
-          sim::TrajectoryPredictParams tp;
-          tp.horizonSec = horizonSec;
-          tp.stepSec = stepSec;
-          tp.maxSamples = maxSamples;
-          tp.includeGravity = (gMode != 0);
-          tp.gravity = gParams;
+              const sim::StarSystem sysCopy = *currentSystem;
 
-          trajCache.burnValid = false;
-          trajCache.nodeIndex = -1;
-          trajCache.samples.clear();
+              trajPreviewAsync.pending = true;
+              trajPreviewAsync.dirty = false;
+              trajPreviewAsync.pendingInputs = in;
+              trajPreviewAsync.pendingStartedRealSec = timeRealSec;
 
-          // Optional maneuver node.
-          std::optional<sim::ManeuverNode> node;
-          if (maneuverNodeEnabled && trajCache.refValid) {
-            const double tNode = std::clamp((double)maneuverNodeTimeSec, 0.0, horizonSec);
-
-            // Propagate pre-burn state to the node time.
-            sim::TrajectoryPredictParams pre = tp;
-            pre.horizonSec = tNode;
-            const auto preS = sim::predictTrajectoryRK4(*currentSystem, timeDays,
-                                                       ship.positionKm(), ship.velocityKmS(), pre);
-            if (!preS.empty()) {
-              trajCache.burnPre = preS.back();
-
-              const sim::GravityBody rb = refBodyAtDays(timeDays + tNode / 86400.0);
-              const math::Vec3d relPos = trajCache.burnPre.posKm - rb.posKm;
-              const math::Vec3d relVel = trajCache.burnPre.velKmS - rb.velKmS;
-
-              // RTN frame (Radial, Tangential/Along-track, Normal).
-              math::Vec3d radial = relPos.normalized();
-              if (radial.lengthSq() < 1e-12) radial = {1,0,0};
-              math::Vec3d normal = math::cross(relPos, relVel);
-              if (normal.lengthSq() < 1e-12) normal = {0,1,0};
-              normal = normal.normalized();
-              math::Vec3d along = math::cross(normal, radial);
-              if (along.lengthSq() < 1e-12) {
-                along = (relVel - radial * math::dot(relVel, radial)).normalized();
-              } else {
-                along = along.normalized();
-              }
-
-              trajCache.burnRadialOut = radial;
-              trajCache.burnAlong = along;
-              trajCache.burnNormal = normal;
-
-              const math::Vec3d dvWorldKmS =
-                along  * (trajCache.dvAlongMS  / 1000.0) +
-                normal * (trajCache.dvNormalMS / 1000.0) +
-                radial * (trajCache.dvRadialMS / 1000.0);
-
-              node = sim::ManeuverNode{tNode, dvWorldKmS};
-              trajCache.burnPost = trajCache.burnPre;
-              trajCache.burnPost.velKmS += dvWorldKmS;
-              trajCache.burnValid = true;
-
-              // Orbit scalars (relative to the reference body). Use an "effective" mu when
-              // the preview is using a scaled gravity model.
-              const double muEff = rb.muKm3S2 * (tp.includeGravity ? tp.gravity.scale : 1.0);
-              trajCache.orbitPre = sim::solveTwoBodyOrbit(relPos, relVel, muEff);
-              trajCache.orbitPost = sim::solveTwoBodyOrbit(relPos, relVel + dvWorldKmS, muEff);
+              trajPreviewAsync.fut = trajPreviewJobs->submit([sys = sysCopy, in, computedAtRealSec = timeRealSec, computePreview]() mutable {
+                return computePreview(sys, in, computedAtRealSec);
+              });
             }
           }
-
-          trajCache.samples = sim::predictTrajectoryRK4(*currentSystem, timeDays,
-                                                       ship.positionKm(), ship.velocityKmS(), tp,
-                                                       node ? &(*node) : nullptr);
-
-          // Find node sample index.
-          if (node) {
-            for (std::size_t i = 0; i < trajCache.samples.size(); ++i) {
-              if (std::abs(trajCache.samples[i].tSec - node->timeSec) < 1e-6) {
-                trajCache.nodeIndex = (int)i;
-                break;
-              }
-            }
-          }
-
-          // Altitude scan (relative to reference body).
-          trajCache.altValid = false;
-          if (trajCache.refValid && !trajCache.samples.empty()) {
-            trajCache.altValid = true;
-            trajCache.impact = false;
-            trajCache.minAltKm = std::numeric_limits<double>::infinity();
-            trajCache.minAltTimeSec = 0.0;
-            trajCache.minAltIndex = -1;
-            for (std::size_t si = 0; si < trajCache.samples.size(); ++si) {
-              const auto& s = trajCache.samples[si];
-              const sim::GravityBody rb = refBodyAtDays(timeDays + s.tSec / 86400.0);
-              const double dist = (s.posKm - rb.posKm).length();
-              const double alt = dist - rb.radiusKm;
-              if (alt < trajCache.minAltKm) {
-                trajCache.minAltKm = alt;
-                trajCache.minAltTimeSec = s.tSec;
-                trajCache.minAltIndex = (int)si;
-              }
-              if (alt < 0.0) {
-                trajCache.impact = true;
-              }
-            }
+        } else {
+          // Synchronous fallback (old behavior).
+          if (inputsChanged() || timeStale) {
+            TrajectoryPreviewInputs in{};
+            fillInputs(in);
+            trajCache = computePreview(*currentSystem, in, timeRealSec);
           }
         }
       }
     }
-
     // Orbit lines (planets)
     std::vector<render::LineVertex> lines;
     lines.reserve(currentSystem->planets.size() * 128 + currentSystem->stations.size() * 64 + beams.size() * 2);
@@ -14000,6 +14275,29 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       lines.push_back({(float)b.bU.x,(float)b.bU.y,(float)b.bU.z, b.r,b.g,b.b});
     }
 
+    // Flight recorder ghost trail (debug)
+    if (flightRecorderWindow.ghostEnabled && flightRecorderWindow.ghostDrawTrail && flightRecorderWindow.samples.size() >= 2) {
+      const auto& s = flightRecorderWindow.samples;
+      const std::size_t n = s.size();
+      const std::size_t maxPts = 2048;
+      const std::size_t stride = std::max<std::size_t>(1, n / maxPts);
+
+      math::Vec3d prevU{};
+      bool hasPrev = false;
+      std::size_t added = 0;
+
+      for (std::size_t i = 0; i < n; i += stride) {
+        const math::Vec3d posU = toRenderPosU(s[i].posKm);
+        if (hasPrev) {
+          lines.push_back({(float)prevU.x,(float)prevU.y,(float)prevU.z, 0.55f,0.25f,0.70f});
+          lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.55f,0.25f,0.70f});
+          if (++added >= maxPts) break;
+        }
+        prevU = posU;
+        hasPrev = true;
+      }
+    }
+
     // Projectile tracers (draw a fixed-length tail so they're visible at astronomical scales)
     for (const auto& p : projectiles) {
       math::Vec3d tailKm = p.prevKm;
@@ -14029,6 +14327,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Station geometry and dynamic objects (ships, rocks, salvage, signals)
     std::vector<render::InstanceData> cubes;
     std::vector<render::InstanceData> shipLiveryInst;
+    std::vector<render::InstanceData> shipGhostInst;
     std::vector<render::InstanceData> shipScouts;
     std::vector<render::InstanceData> shipHaulers;
     std::vector<render::InstanceData> shipFighters;
@@ -14036,6 +14335,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     cubes.reserve(1 + currentSystem->stations.size() * 18 + floatingCargo.size() + signals.size());
     shipLiveryInst.reserve(1);
+    shipGhostInst.reserve(1);
     shipScouts.reserve(contacts.size() + 1);
     shipHaulers.reserve(contacts.size());
     shipFighters.reserve(contacts.size());
@@ -14103,6 +14403,15 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       } else {
         pushShipInst(shipHullClass, inst);
       }
+    }
+
+    // Flight recorder ghost (debug)
+    if (flightRecorderWindow.ghostEnabled && flightRecorderWindow.ghostSampleValid) {
+      const auto& gs = flightRecorderWindow.ghostSample;
+      shipGhostInst.push_back(makeInst(toRenderPosU(gs.posKm),
+                                       {0.35, 0.20, 0.60},
+                                       gs.orient,
+                                       0.85f, 0.35f, 1.00f));
     }
 
     // Contacts (pirates)
@@ -14394,14 +14703,51 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       meshRenderer.drawInstances(spheres);
     }
 
-    // Atmosphere limb glow (additive). This pass is independent of the surface texture mode.
-    if (worldAtmospheresEnabled && !planetAtmoDraws.empty()) {
+    // Atmospheres (additive). Two implementations:
+    //  - limb-glow (legacy, very cheap)
+    //  - volumetric single-scattering (raymarched shell)
+    //
+    // Both are independent of the surface texture mode.
+    if (worldAtmospheresEnabled) {
       glDepthMask(GL_FALSE);
-      atmosphereRenderer.setIntensity(worldAtmoIntensity);
-      atmosphereRenderer.setPower(worldAtmoPower);
-      atmosphereRenderer.setSunLitBoost(worldAtmoSunLitBoost);
-      atmosphereRenderer.setForwardScatter(worldAtmoForwardScatter);
-      atmosphereRenderer.drawInstances(planetAtmoDraws);
+
+      const bool useVol = worldAtmospheresVolumetricEnabled && !planetAtmoVolumetricDraws.empty();
+      if (useVol) {
+        volumetricAtmosphereRenderer.setIntensity(worldAtmoIntensity);
+        volumetricAtmosphereRenderer.setRayleighStrength(worldAtmoVolumetricRayleighStrength);
+        volumetricAtmosphereRenderer.setMieStrength(worldAtmoVolumetricMieStrength);
+        volumetricAtmosphereRenderer.setScaleHeightMul(worldAtmoVolumetricScaleHeightMul);
+        volumetricAtmosphereRenderer.setDensityMul(worldAtmoVolumetricDensityMul);
+        volumetricAtmosphereRenderer.setSteps(worldAtmoVolumetricViewSteps);
+        volumetricAtmosphereRenderer.setSunSteps(worldAtmoVolumetricSunSteps);
+        volumetricAtmosphereRenderer.setDitherStrength(worldAtmoVolumetricDitherStrength);
+        volumetricAtmosphereRenderer.setMieG(worldAtmoVolumetricMieG);
+
+        volumetricAtmosphereRenderer.setMultipleScatteringStrength(
+            worldAtmoVolumetricMsEnabled ? worldAtmoVolumetricMsStrength : 0.0f);
+        volumetricAtmosphereRenderer.setMultipleScatteringAlbedo(worldAtmoVolumetricMsAlbedo);
+
+        const bool useMsLut = worldAtmoVolumetricMsEnabled && spectralMieLabWindow.applyMsToVolumetric;
+        volumetricAtmosphereRenderer.setUseMultipleScatteringPhaseLut(useMsLut);
+        volumetricAtmosphereRenderer.setMultipleScatteringPhaseLut(useMsLut ? &spectralMieLabWindow.msLutTex : nullptr);
+        volumetricAtmosphereRenderer.setMultipleScatteringPhaseStrength(spectralMieLabWindow.atmosphereMsPhaseStrength);
+
+        volumetricAtmosphereRenderer.setUseMiePhaseLut(spectralMieLabWindow.applyToAtmospheres);
+        volumetricAtmosphereRenderer.setMiePhaseLut(spectralMieLabWindow.applyToAtmospheres ? &spectralMieLabWindow.lutTex : nullptr);
+        volumetricAtmosphereRenderer.setMiePhaseStrength(spectralMieLabWindow.atmosphereMieStrength);
+
+        volumetricAtmosphereRenderer.drawInstances(planetAtmoVolumetricDraws);
+      } else if (!planetAtmoDraws.empty()) {
+        atmosphereRenderer.setIntensity(worldAtmoIntensity);
+        atmosphereRenderer.setPower(worldAtmoPower);
+        atmosphereRenderer.setSunLitBoost(worldAtmoSunLitBoost);
+        atmosphereRenderer.setForwardScatter(worldAtmoForwardScatter);
+        atmosphereRenderer.setUseMiePhaseLut(spectralMieLabWindow.applyToAtmospheres);
+        atmosphereRenderer.setMiePhaseLut(spectralMieLabWindow.applyToAtmospheres ? &spectralMieLabWindow.lutTex : nullptr);
+        atmosphereRenderer.setMiePhaseStrength(spectralMieLabWindow.atmosphereMieStrength);
+        atmosphereRenderer.drawInstances(planetAtmoDraws);
+      }
+
       glDepthMask(GL_TRUE);
       glDisable(GL_BLEND);
     }
@@ -14524,6 +14870,38 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       meshRenderer.setAlphaFromTexture(false);
       meshRenderer.drawInstances(shipLiveryInst);
       meshRenderer.setTexture(&checker);
+    }
+
+    // Ghost ship replay (debug)
+    if (!shipGhostInst.empty()) {
+      const render::Mesh* m = &shipScoutMesh;
+      if (shipHullClass == ShipHullClass::Hauler) m = &shipHaulerMesh;
+      else if (shipHullClass == ShipHullClass::Fighter) m = &shipFighterMesh;
+
+      meshRenderer.setMesh(m);
+      meshRenderer.setTexture(&checker);
+      meshRenderer.setNormalTexture(nullptr);
+      meshRenderer.setUnlit(true);
+      meshRenderer.setAlphaFromTexture(false);
+
+      GLint polyMode[2]{};
+      glGetIntegerv(GL_POLYGON_MODE, polyMode);
+      const GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
+
+      if (flightRecorderWindow.ghostWireframe) {
+        glDisable(GL_CULL_FACE);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+      }
+
+      meshRenderer.drawInstances(shipGhostInst);
+
+      if (flightRecorderWindow.ghostWireframe) {
+        glPolygonMode(GL_FRONT, polyMode[0]);
+        glPolygonMode(GL_BACK, polyMode[1]);
+        if (wasCull) glEnable(GL_CULL_FACE);
+      }
+
+      meshRenderer.setUnlit(false);
     }
 
     // GPU dust field (very high count micro-particles). Depth-tested but no depth writes.
@@ -15605,8 +15983,24 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
+    game::drawProceduralLabWindow(proceduralLabWindow, (float)timeRealSec,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralMeshLabWindow(proceduralMeshLabWindow, (float)timeRealSec,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawSpectralMieLabWindow(spectralMieLabWindow, (float)timeRealSec,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+    game::drawGaussianSurfelReconstructionLabWindow(gaussianSurfelReconLabWindow, (float)timeRealSec,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+
     game::drawCinematicCameraWindow(cinematicCameraWindow,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
     // Orbit analyzer + maneuver planning helpers
     if (currentSystem) {
       game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, *currentSystem, timeDays, ship, gravityParams,
@@ -18527,6 +18921,19 @@ if (showShip) {
       ImGui::InputInt("Max samples", &trajPreviewMaxSamples);
       trajPreviewMaxSamples = std::clamp(trajPreviewMaxSamples, 32, 20000);
 
+ImGui::Checkbox("Async compute", &trajPreviewAsyncCompute);
+ImGui::SameLine();
+ImGui::TextDisabled("(background thread)");
+if (trajPreviewAsyncCompute && trajPreviewAsync.pending) {
+  const double ms = (timeRealSec - trajPreviewAsync.pendingStartedRealSec) * 1000.0;
+  ImGui::SameLine();
+  ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "Computing... (%.0f ms)", ms);
+}
+if (trajCache.valid) {
+  ImGui::TextDisabled("Last compute: %.1f ms | Age: %.2f s", trajCache.computeWallMs,
+                      timeRealSec - trajCache.computedAtRealSec);
+}
+
       // Reference body chooser.
       trajRefBodyChoice = std::clamp(trajRefBodyChoice, -1, (int)currentSystem->planets.size());
       std::string refLabel;
@@ -20433,19 +20840,63 @@ if (showWorldVisuals) {
 
   ImGui::TextDisabled("Secondary layers (visual only)");
 
-  ImGui::Checkbox("Atmospheres (limb glow)", &worldAtmospheresEnabled);
+  ImGui::Checkbox("Atmospheres", &worldAtmospheresEnabled);
   if (worldAtmospheresEnabled) {
     ImGui::SetNextItemWidth(260.0f);
     ImGui::SliderFloat("Atmosphere intensity", &worldAtmoIntensity, 0.0f, 3.0f, "%.2f");
-    ImGui::SetNextItemWidth(260.0f);
-    ImGui::SliderFloat("Atmosphere rim power", &worldAtmoPower, 1.5f, 10.0f, "%.2f");
-    ImGui::SetNextItemWidth(260.0f);
-    ImGui::SliderFloat("Atmosphere shell scale", &worldAtmoShellScale, 1.005f, 1.10f, "%.3f");
-    ImGui::SetNextItemWidth(260.0f);
-    ImGui::SliderFloat("Day-side boost", &worldAtmoSunLitBoost, 0.0f, 1.0f, "%.2f");
-    ImGui::SetNextItemWidth(260.0f);
-    ImGui::SliderFloat("Forward scatter", &worldAtmoForwardScatter, 0.0f, 1.0f, "%.2f");
+
+    ImGui::Checkbox("Volumetric scattering (raymarch)", &worldAtmospheresVolumetricEnabled);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(experimental)");
+
     ImGui::Checkbox("Tint with star color", &worldAtmoTintWithStar);
+
+    if (worldAtmospheresVolumetricEnabled) {
+      ImGui::SeparatorText("Volumetric params");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Thickness multiplier", &worldAtmoVolumetricThicknessMul, 0.05f, 6.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderInt("View steps", &worldAtmoVolumetricViewSteps, 2, 32, "%d");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderInt("Sun steps", &worldAtmoVolumetricSunSteps, 2, 16, "%d");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Rayleigh strength", &worldAtmoVolumetricRayleighStrength, 0.0f, 6.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Mie strength", &worldAtmoVolumetricMieStrength, 0.0f, 6.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Scale height multiplier", &worldAtmoVolumetricScaleHeightMul, 0.10f, 6.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Density multiplier", &worldAtmoVolumetricDensityMul, 0.0f, 6.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Dither strength", &worldAtmoVolumetricDitherStrength, 0.0f, 1.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Mie g (fallback)", &worldAtmoVolumetricMieG, 0.0f, 0.95f, "%.2f");
+
+      ImGui::SeparatorText("Multiple scattering (analytic)");
+      ImGui::Checkbox("Enable multiple scattering", &worldAtmoVolumetricMsEnabled);
+      if (worldAtmoVolumetricMsEnabled) {
+        ImGui::SetNextItemWidth(260.0f);
+        ImGui::SliderFloat("MS strength", &worldAtmoVolumetricMsStrength, 0.0f, 2.5f, "%.2f");
+        ImGui::SetNextItemWidth(260.0f);
+        ImGui::SliderFloat("MS albedo ω", &worldAtmoVolumetricMsAlbedo, 0.0f, 0.99f, "%.3f");
+        ImGui::TextDisabled("Tip: Spectral Mie Lab can generate a separate MS phase LUT.");
+      }
+      ImGui::TextDisabled("Tip: the Spectral Mie Lab can supply a spectral phase LUT for this renderer.");
+    } else {
+      ImGui::SeparatorText("Limb glow params");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Atmosphere rim power", &worldAtmoPower, 1.5f, 10.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Atmosphere shell scale", &worldAtmoShellScale, 1.005f, 1.10f, "%.3f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Day-side boost", &worldAtmoSunLitBoost, 0.0f, 1.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Forward scatter", &worldAtmoForwardScatter, 0.0f, 1.0f, "%.2f");
+    }
   }
 
   ImGui::BeginDisabled(!worldUseProceduralSurfaces);

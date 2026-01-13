@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stellar/core/Types.h"
+#include "stellar/math/Quat.h"
 #include "stellar/math/Vec3.h"
 
 #include <deque>
@@ -24,8 +26,13 @@ struct FlightRecorderSample {
   // Absolute simulation time (days).
   double tSimDays{0.0};
 
+  // Physics state (km / km/s / rad/s).
   math::Vec3d posKm{};
   math::Vec3d velKmS{};
+
+  // Full attitude (for ghost replays / debugging / trace exports).
+  math::Quatd orient{1,0,0,0};
+  math::Vec3d angVelRadS{};
 };
 
 struct FlightRecorderWindowState {
@@ -51,12 +58,39 @@ struct FlightRecorderWindowState {
   bool traceIncludePosition{true};
   bool traceIncludeVelocity{false};
   bool traceIncludeSimTime{true};
+  bool traceIncludeOrientation{false};
+  bool traceIncludeAngularVelocity{false};
   bool tracePretty{false};
+
+  // --- Replay / Ghost ---
+  // This is intentionally simple and deterministic:
+  // - Replay playhead is in recording-relative seconds.
+  // - Sampling is linear (nlerp for orientation).
+  bool playing{false};
+  bool playWhilePaused{false};
+  bool playUsesSimTime{true};
+  bool loop{true};
+  double playbackRate{1.0};
+  double playheadSec{0.0};
+
+  // Render a debug "ghost" ship at the current playhead.
+  bool ghostEnabled{false};
+  bool ghostWireframe{true};
+  bool ghostDrawTrail{true};
+
+  // Internal: sampled pose at the current playhead.
+  bool ghostSampleValid{false};
+  FlightRecorderSample ghostSample{};
 
   // Internal session state.
   double startRealSec{0.0};
   double startSimDays{0.0};
   double sampleAccumulatorSec{0.0};
+
+  // Internal tick bookkeeping to derive simulation delta-time for replay.
+  bool hasPrevTimes{false};
+  double prevRealSec{0.0};
+  double prevSimDays{0.0};
 
   std::deque<FlightRecorderSample> samples;
 };
