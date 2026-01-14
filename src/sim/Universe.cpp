@@ -489,7 +489,7 @@ const StarSystem& Universe::getSystem(SystemId id, const SystemStub* hintStub) {
 
   (void)haveStub;
 
-  StarSystem sys = proc::generateSystem(stub, factions_);
+  StarSystem sys = proc::generateSystem(seed_, stub, factions_);
   return systemCache_.put(id, std::move(sys));
 }
 

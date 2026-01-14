@@ -4,8 +4,11 @@
 #include "stellar/econ/Economy.h"
 #include "stellar/math/Math.h"
 #include "stellar/proc/NameGenerator.h"
+#include "stellar/proc/TradeEconomy.h"
+#include "stellar/proc/TradeProfile.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 // NOTE:
@@ -113,18 +116,96 @@ static void setPlanetMassRadius(sim::Planet& p, core::SplitMix64& rng) {
   }
 }
 
-static econ::StationType pickStationType(core::SplitMix64& rng, double bias) {
-  // bias -1..+1 (agri <-> industrial)
-  const double r = rng.nextDouble();
-  if (r < 0.15) return econ::StationType::Outpost;
-  if (r < 0.35) return econ::StationType::Mining;
-  if (r < 0.55) return econ::StationType::Refinery;
-  if (r < 0.75) {
-    return (bias < 0.0) ? econ::StationType::Agricultural : econ::StationType::Industrial;
+static double clamp01(double x) {
+  return std::clamp(x, 0.0, 1.0);
+}
+
+// Convert a TradeProfile into a single -1..+1 axis for quick station-type biasing.
+//
+// Negative => agricultural leaning, Positive => industrial leaning.
+static double localIndustryBias(const TradeProfile& p) {
+  const double x = clamp01(p.industry) - clamp01(p.agriculture);
+  return std::clamp(x * 1.25, -1.0, 1.0);
+}
+
+static std::array<double, static_cast<std::size_t>(econ::StationType::Count)>
+stationTypeWeights(const TradeProfile& p, double bias) {
+  using econ::StationType;
+  std::array<double, static_cast<std::size_t>(StationType::Count)> w{};
+
+  const double pop = clamp01(p.population);
+  const double hub = clamp01(p.hub);
+  const double res = clamp01(p.resources);
+  const double ag  = clamp01(p.agriculture);
+  const double ind = clamp01(p.industry);
+  const double tech = clamp01(p.technology);
+  const double wealth = clamp01(p.wealth);
+  const double law = clamp01(p.lawlessness);
+
+  // A gameplay-first model:
+  // - population/hub => more hubs + larger secondary ecosystem
+  // - resources/agriculture => upstream producers
+  // - industry/tech => downstream producers
+  // - lawlessness => more outposty, less mega-structures
+  w[(std::size_t)StationType::Outpost]      = 0.08 + 0.22 * (1.0 - pop) + 0.12 * law;
+  w[(std::size_t)StationType::Mining]       = 0.08 + 1.15 * res * (0.65 + 0.35 * (1.0 - ag));
+  w[(std::size_t)StationType::Agricultural] = 0.08 + 1.15 * ag  * (0.65 + 0.35 * (1.0 - ind));
+  w[(std::size_t)StationType::Refinery]     = 0.06 + 0.95 * res * ind;
+  w[(std::size_t)StationType::Industrial]   = 0.08 + 1.30 * ind * (0.40 + 0.60 * pop);
+  w[(std::size_t)StationType::Research]     = 0.05 + 1.10 * tech * (0.30 + 0.70 * pop);
+  w[(std::size_t)StationType::TradeHub]     = 0.05 + 1.80 * hub * (0.30 + 0.70 * pop) + 0.25 * wealth;
+  w[(std::size_t)StationType::Shipyard]     = 0.03 + 0.85 * ind * hub * (0.40 + 0.60 * wealth);
+
+  // Apply the industry-vs-agri axis.
+  w[(std::size_t)StationType::Agricultural] *= (bias < 0.0) ? (1.0 + (-bias) * 0.70) : (1.0 - bias * 0.10);
+  w[(std::size_t)StationType::Industrial]   *= (bias > 0.0) ? (1.0 + ( bias) * 0.70) : (1.0 + (-bias) * 0.10);
+
+  // Suppress the largest installations in anarchic space.
+  const double bigMul = (1.0 - 0.45 * law);
+  w[(std::size_t)StationType::TradeHub]   *= bigMul;
+  w[(std::size_t)StationType::Shipyard]   *= bigMul;
+  w[(std::size_t)StationType::Research]   *= (1.0 - 0.25 * law);
+  w[(std::size_t)StationType::Industrial] *= (1.0 - 0.25 * law);
+
+  // Ensure non-zero weights.
+  for (double& x : w) {
+    if (!std::isfinite(x) || x < 0.0) x = 0.0;
+    x = std::max(x, 1e-4);
   }
-  if (r < 0.88) return econ::StationType::TradeHub;
-  if (r < 0.96) return econ::StationType::Research;
-  return econ::StationType::Shipyard;
+  return w;
+}
+
+static econ::StationType pickStationType(core::SplitMix64& rng, const TradeProfile& p, double bias) {
+  using econ::StationType;
+
+  auto w = stationTypeWeights(p, bias);
+
+  double sum = 0.0;
+  for (double x : w) sum += std::max(0.0, x);
+  if (sum <= 1e-12) return StationType::Outpost;
+
+  double r = rng.nextDouble() * sum;
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    r -= std::max(0.0, w[i]);
+    if (r <= 0.0) return static_cast<StationType>(i);
+  }
+  return StationType::Outpost;
+}
+
+static econ::StationType primaryStationType(const TradeProfile& p, double bias) {
+  using econ::StationType;
+  auto w = stationTypeWeights(p, bias);
+
+  std::size_t bestI = 0;
+  double bestW = -1e30;
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    const double ww = w[i];
+    if (ww > bestW + 1e-12) {
+      bestW = ww;
+      bestI = i;
+    }
+  }
+  return static_cast<StationType>(bestI);
 }
 
 static const sim::Faction* findFaction(core::u32 id, const std::vector<sim::Faction>& factions) {
@@ -149,18 +230,33 @@ static double stationControlWeight(econ::StationType t) {
   }
 }
 
-static void applyFactionToStation(sim::Station& st,
-                                  core::u32 factionId,
-                                  const std::vector<sim::Faction>& factions) {
-  st.factionId = factionId;
-  const sim::Faction* fac = findFaction(factionId, factions);
-  const double fee = fac ? fac->taxRate : 0.02;
-  const double bias = fac ? fac->industryBias : 0.0;
-  st.feeRate = fee;
-  st.economyModel = econ::makeEconomyModel(st.type, bias);
+static double combinedIndustryBias(double factionBias, const TradeProfile& profile) {
+  // Blend faction-wide ideology with local macro conditions.
+  // Keep in [-1, +1] where negative is agri-leaning and positive is industry-leaning.
+  const double local = localIndustryBias(profile);
+  return std::clamp(factionBias + 0.65 * local, -1.0, 1.0);
 }
 
-sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<sim::Faction>& factions) {
+static void applyFactionToStation(sim::Station& st,
+                                  core::u32 factionId,
+                                  const std::vector<sim::Faction>& factions,
+                                  const TradeProfile& profile,
+                                  core::u64 stationSeed) {
+  st.factionId = factionId;
+  const sim::Faction* fac = findFaction(factionId, factions);
+  const double baseFee = fac ? fac->taxRate : 0.02;
+  const double facBias = fac ? fac->industryBias : 0.0;
+  const double bias = combinedIndustryBias(facBias, profile);
+
+  st.feeRate = tuneStationFeeRateForTradeProfile(stationSeed, baseFee, st.type, profile);
+
+  const econ::StationEconomyModel baseM = econ::makeEconomyModel(st.type, bias);
+  st.economyModel = tuneEconomyModelForTradeProfile(stationSeed, baseM, profile);
+}
+
+sim::StarSystem generateSystem(core::u64 universeSeed,
+                               const sim::SystemStub& stub,
+                               const std::vector<sim::Faction>& factions) {
   core::SplitMix64 rng(stub.seed);
 
   sim::StarSystem sys{};
@@ -169,6 +265,16 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
   sys.star = makeStar(stub.primaryClass, rng);
 
   NameGenerator ng(stub.seed);
+
+  // Macro trade profile used to shape station types + local economy tuning.
+  const TradeProfile tp = generateTradeProfile(universeSeed, stub);
+
+  // Station-type selection bias (agri <-> industrial). Blend the faction's
+  // ideology with local conditions, leaning a bit harder on local conditions
+  // so the map feels regionally diverse.
+  const sim::Faction* ctrlFac = findFaction(stub.factionId, factions);
+  const double facBias = ctrlFac ? ctrlFac->industryBias : 0.0;
+  const double typeBias = std::clamp(facBias * 0.40 + localIndustryBias(tp) * 0.90, -1.0, 1.0);
 
   // Planets
   double a = rng.range(0.25, 0.6); // start AU
@@ -205,10 +311,6 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
   // ---------------------------------------------------------------------------
   const int nStations = std::max(0, stub.stationCount);
   sys.stations.reserve(static_cast<std::size_t>(nStations));
-
-  const sim::Faction* fac = findFaction(stub.factionId, factions);
-  const double fee = fac ? fac->taxRate : 0.02;
-  const double bias = fac ? fac->industryBias : 0.0;
 
   // Helper: physical/docking parameters.
   auto setStationPhysicals = [&](sim::Station& st) {
@@ -270,14 +372,45 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
     st.commsRangeKm = st.radiusKm * rr(10.0, 16.0);
   };
 
+  // --- Station type plan ---
+  // We intentionally "plan" the station mix before placing orbits so we can
+  // guarantee the system expresses its macro identity (hub, mining, agri...).
+  std::vector<econ::StationType> stationTypes;
+  stationTypes.reserve(static_cast<std::size_t>(nStations));
+
+  if (nStations > 0) {
+    const econ::StationType primary = primaryStationType(tp, typeBias);
+    stationTypes.push_back(primary);
+
+    auto pushUnique = [&](econ::StationType t) {
+      if ((int)stationTypes.size() >= nStations) return;
+      if (std::find(stationTypes.begin(), stationTypes.end(), t) == stationTypes.end()) {
+        stationTypes.push_back(t);
+      }
+    };
+
+    // If the profile is strongly peaked, guarantee at least one matching station.
+    if (tp.hub > 0.65) pushUnique(econ::StationType::TradeHub);
+    if (tp.resources > 0.70) pushUnique(econ::StationType::Mining);
+    if (tp.agriculture > 0.70) pushUnique(econ::StationType::Agricultural);
+    if (tp.industry > 0.70) pushUnique(econ::StationType::Industrial);
+    if (tp.technology > 0.75) pushUnique(econ::StationType::Research);
+    if (tp.industry > 0.62 && tp.hub > 0.55) pushUnique(econ::StationType::Shipyard);
+    if (tp.industry > 0.58 && tp.resources > 0.58) pushUnique(econ::StationType::Refinery);
+
+    while ((int)stationTypes.size() < nStations) {
+      stationTypes.push_back(pickStationType(rng, tp, typeBias));
+    }
+  }
+
   for (int i = 0; i < nStations; ++i) {
     sim::Station st{};
     st.id = core::hashCombine(static_cast<core::u64>(stub.id), static_cast<core::u64>(i + 1));
     st.name = ng.stationName(stub.name, i);
-    st.factionId = stub.factionId;
-    st.feeRate = fee;
-    st.type = pickStationType(rng, bias);
-    st.economyModel = econ::makeEconomyModel(st.type, bias);
+    st.type = stationTypes[static_cast<std::size_t>(i)];
+
+    const core::u64 stationSeed = core::hashCombine(stub.seed, static_cast<core::u64>(st.id));
+    applyFactionToStation(st, stub.factionId, factions, tp, stationSeed);
 
     // Place stations on simple orbits around the primary.
     // Prefer to place near an existing planet orbit (feels like inhabited space), else pick a random AU.
@@ -356,7 +489,8 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
             const double w0 = stationControlWeight(sys.stations[0].type);
             const double w1 = stationControlWeight(sys.stations[1].type);
             if (w0 > w1 + 1e-12) {
-              applyFactionToStation(sys.stations[1], bestOtherId, factions);
+              const core::u64 stSeed = core::hashCombine(stub.seed, static_cast<core::u64>(sys.stations[1].id));
+              applyFactionToStation(sys.stations[1], bestOtherId, factions, tp, stSeed);
             }
           } else {
             // Choose a "minor" station (lowest weight) among indices [1..].
@@ -370,7 +504,8 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
               }
             }
 
-            applyFactionToStation(sys.stations[pickIdx], bestOtherId, factions);
+            const core::u64 stSeed = core::hashCombine(stub.seed, static_cast<core::u64>(sys.stations[pickIdx].id));
+            applyFactionToStation(sys.stations[pickIdx], bestOtherId, factions, tp, stSeed);
           }
         }
       }
@@ -378,6 +513,13 @@ sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<si
   }
 
   return sys;
+}
+
+sim::StarSystem generateSystem(const sim::SystemStub& stub, const std::vector<sim::Faction>& factions) {
+  // Legacy overload for external callers.
+  // NOTE: stubs already encode the universe seed into stub.seed, so this is a
+  // reasonable fallback.
+  return generateSystem(stub.seed, stub, factions);
 }
 
 } // namespace stellar::proc

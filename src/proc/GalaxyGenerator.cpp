@@ -4,12 +4,41 @@
 #include "stellar/core/Random.h"
 #include "stellar/proc/NameGenerator.h"
 #include "stellar/proc/Noise.h"
+#include "stellar/proc/GalaxyClusters.h"
+#include "stellar/proc/GalaxyMorphology.h"
+#include "stellar/proc/TradeProfile.h"
 #include "stellar/math/Math.h"
 
 #include <algorithm>
 #include <cmath>
 
 namespace stellar::proc {
+
+static int tunedStationCount(int baseCount, const TradeProfile& p, core::u64 stubSeed) {
+  baseCount = std::max(1, baseCount);
+
+  // Proxy for "economic size" / "market pull".
+  // Hub-ness is strongly amplified by population (a hub with no people isn't a hub).
+  const double hubPop = std::clamp(p.hub, 0.0, 1.0) * (0.35 + 0.65 * std::clamp(p.population, 0.0, 1.0));
+  const double dev = 0.45 * std::clamp(p.industry, 0.0, 1.0)
+                   + 0.30 * std::clamp(p.wealth, 0.0, 1.0)
+                   + 0.25 * std::clamp(p.technology, 0.0, 1.0);
+  const double size01 = std::clamp(0.65 * hubPop + 0.35 * dev, 0.0, 1.0);
+
+  // High lawlessness tends to suppress the number of large installations.
+  const double law = std::clamp(p.lawlessness, 0.0, 1.0);
+
+  // Deterministic micro-jitter per stub so not every "0.73 hub" system has
+  // exactly the same station count.
+  core::SplitMix64 srng(core::hashCombine(stubSeed, core::seedFromText("station_count")));
+
+  int extra = static_cast<int>(std::floor(size01 * 7.0 + srng.nextDouble() * 0.9)); // 0..7
+  extra -= static_cast<int>(std::floor(law * 2.2));                                 // 0..2-ish
+  extra = std::max(0, extra);
+
+  // Clamp to keep scan costs sane.
+  return std::clamp(baseCount + extra, 1, 12);
+}
 
 std::size_t SectorCoordHash::operator()(const SectorCoord& c) const noexcept {
   core::u64 h = 0xcbf29ce484222325ull;
@@ -220,24 +249,345 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
     (coord.z + 0.5) * s
   };
   const double rxy = std::sqrt(centerLy.x * centerLy.x + centerLy.y * centerLy.y);
-  const double z = std::abs(centerLy.z);
 
   const double radial = std::exp(-rxy / std::max(1.0, params_.radialScaleLengthLy));
-  const double vertical = std::exp(-z / std::max(1.0, params_.thicknessLy * 0.5));
+
+  // Vertical falloff is evaluated relative to an optionally warped midplane and
+  // optionally flared thickness.
+  const double warpZCenter = galaxyWarpZLy(seed_, params_, centerLy.x, centerLy.y);
+  const double halfThicknessCenter = galaxyThicknessHalfLy(params_, rxy);
+  const double zRel = std::abs(centerLy.z - warpZCenter);
+  const double vertical = std::exp(-zRel / std::max(1.0, halfThicknessCenter));
+
   const double mean = params_.baseMeanSystemsPerSector * radial * vertical;
 
   const bool useSpiral = (params_.spiralArmCount > 0) && (params_.spiralArmStrength > 0.0);
   const bool useDensityNoise = (params_.densityNoiseStrength > 0.0);
 
-  if (!useSpiral && !useDensityNoise) {
+  const bool useClusters = (params_.clusterStrength > 0.0) &&
+                           (params_.clusterCellSizeLy > 0.0) &&
+                           (params_.clusterChancePerCell > 0.0) &&
+                           (params_.clusterRadiusLy > 0.0);
+
+  const bool useBar = (params_.barStrength > 0.0);
+  const bool useRing = (params_.ringStrength > 0.0);
+
+  // Disc bounds helper: radius + (optional) warp and flare.
+  const auto discContains = [&](const math::Vec3d& p) -> bool {
+    const double rr = std::sqrt(p.x * p.x + p.y * p.y);
+    if (rr > params_.radiusLy) return false;
+    const double wz = galaxyWarpZLy(seed_, params_, p.x, p.y);
+    const double halfT = galaxyThicknessHalfLy(params_, rr);
+    return std::abs(p.z - wz) <= halfT;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Optional minimum-separation placement ("blue-noise-ish")
+  // ---------------------------------------------------------------------------
+  //
+  // When enabled (minSystemSeparationLy > 0), we avoid tight clumps by enforcing
+  // a minimum distance between neighboring systems.
+  //
+  // Design goals:
+  //  - Deterministic from (seed, galaxy params, global cell coordinate)
+  //  - Streaming safe: coherent across sector boundaries without multi-sector state
+  //  - Compatible with existing density fields (radial/vertical falloff, spiral arms,
+  //    density noise)
+  //
+  // Approach:
+  //  - Define a global 3D grid of "placement cells" with size = r / sqrt(3).
+  //  - Each cell contains one jittered candidate point.
+  //  - The cell is "enabled" with probability derived from the local intensity.
+  //  - Resolve close conflicts by accepting only the highest-priority candidate
+  //    within radius r (priority is deterministic per cell).
+  //
+  // This approximates a Poisson disk / blue-noise distribution and guarantees
+  // cross-sector minimum spacing because candidates live in global cell space.
+
+  const double minSepReq = std::max(0.0, params_.minSystemSeparationLy);
+  if (minSepReq > 0.0) {
+    // Clamp to avoid pathological perf/memory when the separation is extremely small.
+    // (At typical galaxy scales, <~0.25 ly separation is visually irrelevant.)
+    const double minSep = std::max(0.25, minSepReq);
+
+    const double cellSize = minSep / std::sqrt(3.0);
+    const double cellVol = cellSize * cellSize * cellSize;
+    const double sectorVol = s * s * s;
+
+    const int nbr = std::max(1, static_cast<int>(std::ceil(minSep / std::max(1.0e-12, cellSize))));
+
+    struct CellCand {
+      math::Vec3d pos{};
+      double priority{0.0};
+      core::u64 tie{0};
+      bool enabled{false};
+    };
+
+    // Sector bounds (half-open) in world-space ly.
+    const double x0 = coord.x * s;
+    const double y0 = coord.y * s;
+    const double z0 = coord.z * s;
+    const double x1 = x0 + s;
+    const double y1 = y0 + s;
+    const double z1 = z0 + s;
+
+    // Independent noise seeds (so tweaks don't perturb sector seeding).
+    const core::u64 spiralNoiseSeed = core::hashCombine(seed_, core::fnv1a64("galaxy_spiral_noise"));
+    const core::u64 densityNoiseSeed = core::hashCombine(seed_, core::fnv1a64("galaxy_density_noise"));
+
+    const double armStrength = std::max(0.0, params_.spiralArmStrength);
+    const double clusterStrength = std::clamp(params_.clusterStrength, 0.0, 10.0);
+    const double barStrength = std::clamp(params_.barStrength, 0.0, 10.0);
+    const double ringStrength = std::clamp(params_.ringStrength, 0.0, 10.0);
+
+    GalaxyClustersParams clusterParams{};
+    if (useClusters) {
+      clusterParams.cellSizeLy = params_.clusterCellSizeLy;
+      clusterParams.chancePerCell = params_.clusterChancePerCell;
+      clusterParams.radiusLy = params_.clusterRadiusLy;
+      clusterParams.radiusJitter01 = params_.clusterRadiusJitter;
+      clusterParams.strengthJitter01 = params_.clusterStrengthJitter;
+      clusterParams.falloffPower = params_.clusterFalloffPower;
+    }
+
+
+    auto cellMin = [&](double w0) -> long long {
+      return static_cast<long long>(std::floor(w0 / std::max(1.0e-12, cellSize)));
+    };
+    auto cellMax = [&](double w1) -> long long {
+      // Half-open [w0,w1): subtract epsilon so a boundary-aligned cell doesn't get included twice.
+      return static_cast<long long>(std::floor((w1 - 1.0e-9) / std::max(1.0e-12, cellSize)));
+    };
+
+    const long long minCx0 = cellMin(x0);
+    const long long maxCx0 = cellMax(x1);
+    const long long minCy0 = cellMin(y0);
+    const long long maxCy0 = cellMax(y1);
+    const long long minCz0 = cellMin(z0);
+    const long long maxCz0 = cellMax(z1);
+
+    // Extend by neighbor range so boundary candidates see cross-sector competitors.
+    const long long minCx = minCx0 - nbr;
+    const long long maxCx = maxCx0 + nbr;
+    const long long minCy = minCy0 - nbr;
+    const long long maxCy = maxCy0 + nbr;
+    const long long minCz = minCz0 - nbr;
+    const long long maxCz = maxCz0 + nbr;
+
+    const std::size_t nx = static_cast<std::size_t>(std::max(0ll, maxCx - minCx + 1));
+    const std::size_t ny = static_cast<std::size_t>(std::max(0ll, maxCy - minCy + 1));
+    const std::size_t nz = static_cast<std::size_t>(std::max(0ll, maxCz - minCz + 1));
+
+    // Build candidate cache over the extended cell range.
+    // This is faster than hashing each neighbor repeatedly.
+    std::vector<CellCand> cells;
+    cells.resize(nx * ny * nz);
+
+    auto idx = [&](long long cx, long long cy, long long cz) -> std::size_t {
+      const std::size_t ix = static_cast<std::size_t>(cx - minCx);
+      const std::size_t iy = static_cast<std::size_t>(cy - minCy);
+      const std::size_t iz = static_cast<std::size_t>(cz - minCz);
+      return ix + nx * (iy + ny * iz);
+    };
+
+    auto makeCand = [&](long long cx, long long cy, long long cz) -> CellCand {
+      CellCand c{};
+
+      core::u64 cellSeed = seed_;
+      cellSeed = core::hashCombine(cellSeed, static_cast<core::u64>(static_cast<core::i64>(cx)));
+      cellSeed = core::hashCombine(cellSeed, static_cast<core::u64>(static_cast<core::i64>(cy)));
+      cellSeed = core::hashCombine(cellSeed, static_cast<core::u64>(static_cast<core::i64>(cz)));
+
+      c.tie = cellSeed;
+
+      // Jittered candidate position within the cell.
+      {
+        core::SplitMix64 jrng(core::hashCombine(cellSeed, core::fnv1a64("galaxy_cell_jitter")));
+        const double jx = jrng.nextDouble();
+        const double jy = jrng.nextDouble();
+        const double jz = jrng.nextDouble();
+        c.pos = {
+          (static_cast<double>(cx) + jx) * cellSize,
+          (static_cast<double>(cy) + jy) * cellSize,
+          (static_cast<double>(cz) + jz) * cellSize,
+        };
+      }
+
+      // Priority used for local conflict resolution.
+      {
+        core::SplitMix64 prng(core::hashCombine(cellSeed, core::fnv1a64("galaxy_cell_priority")));
+        c.priority = prng.nextDouble();
+      }
+
+      // Hard disc bounds check (includes optional warp + flare).
+      const double rr = std::sqrt(c.pos.x * c.pos.x + c.pos.y * c.pos.y);
+      if (rr > params_.radiusLy) {
+        c.enabled = false;
+        return c;
+      }
+
+      const double warpZ = galaxyWarpZLy(seed_, params_, c.pos.x, c.pos.y);
+      const double halfThickness = galaxyThicknessHalfLy(params_, rr);
+      if (std::abs(c.pos.z - warpZ) > halfThickness) {
+        c.enabled = false;
+        return c;
+      }
+
+      // Local intensity at candidate position.
+      const double radialLocal = std::exp(-rr / std::max(1.0, params_.radialScaleLengthLy));
+      const double verticalLocal = std::exp(-std::abs(c.pos.z - warpZ) / std::max(1.0, halfThickness));
+      double meanLocal = params_.baseMeanSystemsPerSector * radialLocal * verticalLocal;
+
+      double mul = 1.0;
+      if (useSpiral) {
+        mul *= (1.0 + armStrength * spiralArmMask(params_, spiralNoiseSeed, c.pos.x, c.pos.y));
+      }
+      if (useDensityNoise) {
+        mul *= densityNoiseMul(params_, densityNoiseSeed, c.pos.x, c.pos.y);
+      }
+      if (useClusters) {
+        const auto cs = sampleGalaxyClusters(seed_, c.pos, clusterParams);
+        mul *= (1.0 + clusterStrength * cs.cluster01);
+      }
+      if (useBar) {
+        mul *= (1.0 + barStrength * galaxyBarMask01(params_, c.pos.x, c.pos.y));
+      }
+      if (useRing) {
+        mul *= (1.0 + ringStrength * galaxyRingMask01(params_, rr));
+      }
+      meanLocal *= mul;
+
+      // Convert expected systems/sector into a per-cell Bernoulli probability.
+      double pCell = meanLocal * (cellVol / std::max(1.0e-12, sectorVol));
+      pCell = std::clamp(pCell, 0.0, 1.0);
+
+      // Enable with probability pCell.
+      core::SplitMix64 erng(core::hashCombine(cellSeed, core::fnv1a64("galaxy_cell_enable")));
+      c.enabled = (erng.nextDouble() < pCell);
+      return c;
+    };
+
+    for (long long cz = minCz; cz <= maxCz; ++cz) {
+      for (long long cy = minCy; cy <= maxCy; ++cy) {
+        for (long long cx = minCx; cx <= maxCx; ++cx) {
+          cells[idx(cx, cy, cz)] = makeCand(cx, cy, cz);
+        }
+      }
+    }
+
+    struct Acc {
+      core::u64 tie{0};
+      math::Vec3d pos{};
+    };
+
+    std::vector<Acc> accepted;
+    accepted.reserve(static_cast<std::size_t>(std::max(0.0, mean * 1.25)) + 8);
+
+    const double minSep2 = minSep * minSep;
+    const double epsP = 1.0e-12;
+
+    // Accept only local maxima in a neighborhood of radius minSep.
+    for (long long cz = minCz0; cz <= maxCz0; ++cz) {
+      for (long long cy = minCy0; cy <= maxCy0; ++cy) {
+        for (long long cx = minCx0; cx <= maxCx0; ++cx) {
+          const CellCand& c = cells[idx(cx, cy, cz)];
+          if (!c.enabled) continue;
+
+          // Candidate must actually lie within this sector (cells can straddle sector boundaries).
+          if (c.pos.x < x0 || c.pos.x >= x1 || c.pos.y < y0 || c.pos.y >= y1 || c.pos.z < z0 || c.pos.z >= z1) continue;
+
+          bool ok = true;
+          for (int dz = -nbr; dz <= nbr && ok; ++dz) {
+            for (int dy = -nbr; dy <= nbr && ok; ++dy) {
+              for (int dx = -nbr; dx <= nbr; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+
+                const long long nxC = cx + dx;
+                const long long nyC = cy + dy;
+                const long long nzC = cz + dz;
+
+                const CellCand& n = cells[idx(nxC, nyC, nzC)];
+                if (!n.enabled) continue;
+
+                const double ddx = n.pos.x - c.pos.x;
+                const double ddy = n.pos.y - c.pos.y;
+                const double ddz = n.pos.z - c.pos.z;
+                const double d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (d2 >= minSep2) continue;
+
+                // If a neighbor has a strictly higher (priority,tie), we lose.
+                if (n.priority > c.priority + epsP) {
+                  ok = false;
+                  break;
+                }
+                if (std::abs(n.priority - c.priority) <= epsP && n.tie > c.tie) {
+                  ok = false;
+                  break;
+                }
+              }
+            }
+          }
+          if (!ok) continue;
+
+          accepted.push_back(Acc{c.tie, c.pos});
+
+          // The id format encodes localIndex in 16 bits. This should never happen
+          // under sane params, but guard anyway.
+          if (accepted.size() >= 65535u) goto minsep_done;
+        }
+      }
+    }
+
+minsep_done:
+
+    std::sort(accepted.begin(), accepted.end(), [](const Acc& a, const Acc& b) {
+      return a.tie < b.tie;
+    });
+
+    sector.systems.reserve(accepted.size());
+
+    NameGenerator ng{};
+
+    for (std::size_t i = 0; i < accepted.size(); ++i) {
+      sim::SystemStub stub{};
+      stub.id = makeSystemId(coord, static_cast<core::u32>(i));
+      stub.seed = core::hashCombine(seed_, static_cast<core::u64>(stub.id));
+
+      ng.reseed(stub.seed);
+      stub.name = ng.systemName();
+      stub.posLy = accepted[i].pos;
+
+      // Derive per-stub properties from the stub seed to avoid ordering sensitivity.
+      core::SplitMix64 srng(core::hashCombine(stub.seed, core::seedFromText("stub_props")));
+      stub.primaryClass = pickStarClass(srng);
+      stub.planetCount = srng.range(0, 12);
+
+      stub.stationCount = std::max(1, srng.range(0, 3));
+      {
+        const TradeProfile tp = generateTradeProfile(seed_, stub);
+        stub.stationCount = tunedStationCount(stub.stationCount, tp, stub.seed);
+      }
+
+      stub.factionId = pickFaction(stub.posLy, factions);
+
+      sector.systems.push_back(std::move(stub));
+    }
+
+    // Stable order for deterministic query results.
+    std::sort(sector.systems.begin(), sector.systems.end(), [](const sim::SystemStub& a, const sim::SystemStub& b) {
+      return a.id < b.id;
+    });
+
+    return sector;
+  }
+
+  if (!useSpiral && !useDensityNoise && !useClusters && !useBar && !useRing) {
     // ---- Legacy smooth-disc distribution path (keep deterministic signatures stable) ----
     const int n = poisson(rng, mean);
 
     sector.systems.reserve(static_cast<std::size_t>(std::max(0, n)));
 
     NameGenerator ng{};
-    const double halfThickness = params_.thicknessLy * 0.5;
-
     for (int i = 0; i < n; ++i) {
       // Try a few candidates to keep within disc bounds.
       bool placed = false;
@@ -252,9 +602,7 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
           (coord.z + uz) * s
         };
 
-        const double rr = std::sqrt(pos.x * pos.x + pos.y * pos.y);
-        if (rr > params_.radiusLy) continue;
-        if (std::abs(pos.z) > halfThickness) continue;
+        if (!discContains(pos)) continue;
         placed = true;
       }
       if (!placed) continue;
@@ -268,7 +616,13 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
       stub.posLy = pos;
       stub.primaryClass = pickStarClass(rng);
       stub.planetCount = rng.range(0, 12);
-      stub.stationCount = std::max(1, rng.range(0, 3)); // ensure at least 1 station for gameplay
+      // Keep the legacy RNG draw for determinism, then tune based on the system's
+      // macro trade profile.
+      stub.stationCount = std::max(1, rng.range(0, 3));
+      {
+        const TradeProfile tp = generateTradeProfile(seed_, stub);
+        stub.stationCount = tunedStationCount(stub.stationCount, tp, stub.seed);
+      }
       stub.factionId = pickFaction(stub.posLy, factions);
 
       sector.systems.push_back(std::move(stub));
@@ -282,10 +636,23 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
     return sector;
   }
 
-  // ---- Inhomogeneous galaxy path (spiral arms + density noise) ----
+  // ---- Inhomogeneous galaxy path (spiral arms + density noise + clusters) ----
   const double armStrength = std::max(0.0, params_.spiralArmStrength);
   const double armNoiseStrength = std::clamp(params_.spiralArmNoiseStrength, 0.0, 1.0);
   const double densityStrength = std::clamp(params_.densityNoiseStrength, 0.0, 0.99);
+  const double clusterStrength = std::clamp(params_.clusterStrength, 0.0, 10.0);
+  const double barStrength = std::clamp(params_.barStrength, 0.0, 10.0);
+  const double ringStrength = std::clamp(params_.ringStrength, 0.0, 10.0);
+
+  GalaxyClustersParams clusterParams{};
+  if (useClusters) {
+    clusterParams.cellSizeLy = params_.clusterCellSizeLy;
+    clusterParams.chancePerCell = params_.clusterChancePerCell;
+    clusterParams.radiusLy = params_.clusterRadiusLy;
+    clusterParams.radiusJitter01 = params_.clusterRadiusJitter;
+    clusterParams.strengthJitter01 = params_.clusterStrengthJitter;
+    clusterParams.falloffPower = params_.clusterFalloffPower;
+  }
 
   double mulMax = 1.0;
   if (useSpiral) {
@@ -295,6 +662,18 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
   if (useDensityNoise) {
     // densityNoiseMul max is (1+densityStrength)
     mulMax *= (1.0 + densityStrength);
+  }
+  if (useClusters) {
+    // cluster01 is clamped to [0..1], so the max multiplier is (1+clusterStrength)
+    mulMax *= (1.0 + clusterStrength);
+  }
+  if (useBar) {
+    // bar01 is clamped to [0..1], so the max multiplier is (1+barStrength)
+    mulMax *= (1.0 + barStrength);
+  }
+  if (useRing) {
+    // ring01 is clamped to [0..1], so the max multiplier is (1+ringStrength)
+    mulMax *= (1.0 + ringStrength);
   }
 
   const double meanMax = mean * mulMax;
@@ -307,7 +686,6 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
   const core::u64 densityNoiseSeed = core::hashCombine(seed_, core::fnv1a64("galaxy_density_noise"));
 
   NameGenerator ng{};
-  const double halfThickness = params_.thicknessLy * 0.5;
 
   for (int ci = 0; ci < nCand; ++ci) {
     // Try a few candidates to keep within disc bounds.
@@ -323,9 +701,7 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
         (coord.z + uz) * s
       };
 
-      const double rr = std::sqrt(pos.x * pos.x + pos.y * pos.y);
-      if (rr > params_.radiusLy) continue;
-      if (std::abs(pos.z) > halfThickness) continue;
+      if (!discContains(pos)) continue;
       placed = true;
     }
     if (!placed) continue;
@@ -337,6 +713,17 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
     }
     if (useDensityNoise) {
       mul *= densityNoiseMul(params_, densityNoiseSeed, pos.x, pos.y);
+    }
+    if (useClusters) {
+      const auto cs = sampleGalaxyClusters(seed_, pos, clusterParams);
+      mul *= (1.0 + clusterStrength * cs.cluster01);
+    }
+    if (useBar) {
+      mul *= (1.0 + barStrength * galaxyBarMask01(params_, pos.x, pos.y));
+    }
+    if (useRing) {
+      const double rr = std::sqrt(pos.x * pos.x + pos.y * pos.y);
+      mul *= (1.0 + ringStrength * galaxyRingMask01(params_, rr));
     }
 
     const double p = std::clamp(mul / std::max(1.0e-9, mulMax), 0.0, 1.0);
@@ -351,7 +738,13 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
     stub.posLy = pos;
     stub.primaryClass = pickStarClass(rng);
     stub.planetCount = rng.range(0, 12);
-    stub.stationCount = std::max(1, rng.range(0, 3)); // ensure at least 1 station for gameplay
+    // Keep the legacy RNG draw for determinism, then tune based on the system's
+    // macro trade profile.
+    stub.stationCount = std::max(1, rng.range(0, 3));
+    {
+      const TradeProfile tp = generateTradeProfile(seed_, stub);
+      stub.stationCount = tunedStationCount(stub.stationCount, tp, stub.seed);
+    }
     stub.factionId = pickFaction(stub.posLy, factions);
 
     sector.systems.push_back(std::move(stub));

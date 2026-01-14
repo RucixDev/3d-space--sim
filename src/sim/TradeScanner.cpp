@@ -236,6 +236,9 @@ std::vector<TradeManifestOpportunity> scanTradeManifests(Universe& u,
   mp.maxBuyCreditsCr = params.maxBuyCreditsCr;
   mp.simulatePriceImpact = params.simulatePriceImpact;
 
+  mp.planner = params.planner;
+  mp.beamWidth = params.beamWidth;
+
   out.reserve(std::min<std::size_t>(params.maxResults * 3, candidates.size() * 2));
 
   for (const auto& stub : candidates) {

@@ -164,57 +164,150 @@ static void clampEconomyState(StationEconomyState& s, const StationEconomyModel&
   }
 }
 
-CargoManifestPlan bestManifestForCargo(const StationEconomyState& fromState,
-                                       const StationEconomyModel& fromModel,
-                                       const StationEconomyState& toState,
-                                       const StationEconomyModel& toModel,
-                                       const CargoManifestParams& params) {
+struct ManifestAccum {
+  double units{0.0};
+  double massKg{0.0};
+  double buyCr{0.0};
+  double sellCr{0.0};
+};
+
+static CargoManifestPlan finalizeManifestPlan(double cargoCapacityKg,
+                                             double filledKg,
+                                             double totalBuy,
+                                             double totalSell,
+                                             const std::array<ManifestAccum, kCommodityCount>& acc,
+                                             double originalCapacityKg) {
   CargoManifestPlan plan{};
-  plan.cargoCapacityKg = safePos(params.cargoCapacityKg);
-  if (plan.cargoCapacityKg <= 1e-9) return plan;
+  plan.cargoCapacityKg = cargoCapacityKg;
+  plan.cargoFilledKg = filledKg;
+  plan.netBuyCr = totalBuy;
+  plan.netSellCr = totalSell;
+  plan.netProfitCr = totalSell - totalBuy;
 
-  CargoManifestParams p = params;
-  p.fromFeeRate = clamp01(p.fromFeeRate);
-  p.toFeeRate = clamp01(p.toFeeRate);
+  for (std::size_t i = 0; i < kCommodityCount; ++i) {
+    if (acc[i].units <= 1e-9) continue;
 
-  if (!std::isfinite(p.bidAskSpread)) p.bidAskSpread = 0.10;
-  p.bidAskSpread = std::clamp(p.bidAskSpread, 0.0, 1.0);
+    const CommodityId cid = static_cast<CommodityId>(i);
+    CargoManifestLine line{};
+    line.commodity = cid;
+    line.units = acc[i].units;
 
-  double stepKg = p.stepKg;
-  if (!std::isfinite(stepKg)) stepKg = 1.0;
-  // Be conservative: overly small steps can be expensive in tools.
-  stepKg = std::clamp(stepKg, 0.05, std::max(0.05, plan.cargoCapacityKg));
+    line.unitMassKg = std::max(1e-6, commodityDef(cid).massKg);
+    line.massKg = acc[i].massKg;
 
-  double maxBuy = p.maxBuyCreditsCr;
-  if (!std::isfinite(maxBuy)) maxBuy = 0.0;
-  maxBuy = std::max(0.0, maxBuy);
-  const bool useCredits = maxBuy > 0.0;
+    line.netBuyCr = acc[i].buyCr;
+    line.netSellCr = acc[i].sellCr;
+    line.netProfitCr = line.netSellCr - line.netBuyCr;
 
+    line.avgNetBuyPrice = (line.units > 1e-9) ? (line.netBuyCr / line.units) : 0.0;
+    line.avgNetSellPrice = (line.units > 1e-9) ? (line.netSellCr / line.units) : 0.0;
+    line.netProfitPerUnit = (line.units > 1e-9) ? (line.netProfitCr / line.units) : 0.0;
+    line.netProfitPerKg = (line.massKg > 1e-9) ? (line.netProfitCr / line.massKg) : 0.0;
+
+    plan.lines.push_back(std::move(line));
+  }
+
+  std::sort(plan.lines.begin(), plan.lines.end(), [](const CargoManifestLine& a, const CargoManifestLine& b) {
+    if (a.netProfitCr != b.netProfitCr) return a.netProfitCr > b.netProfitCr;
+    return a.netProfitPerKg > b.netProfitPerKg;
+  });
+
+  // If we ended up with negative profit (possible if numerical noise / tiny steps),
+  // return an empty plan.
+  if (plan.netProfitCr <= 1e-9) {
+    plan = CargoManifestPlan{};
+    plan.cargoCapacityKg = originalCapacityKg;
+  }
+
+  return plan;
+}
+
+// Lightweight quote helper for the manifest planner.
+//
+// We intentionally avoid copying StationEconomyState history vectors into the planner state.
+// Only inventory levels affect prices, so we operate on inventory arrays directly.
+struct QuoteLite {
+  double mid{0.0};
+  double ask{0.0};
+  double bid{0.0};
+};
+
+static QuoteLite quoteLite(const std::array<double, kCommodityCount>& inv,
+                           const StationEconomyModel& model,
+                           CommodityId id,
+                           double bidAskSpread) {
+  QuoteLite q{};
+
+  if (!std::isfinite(bidAskSpread)) bidAskSpread = 0.0;
+  bidAskSpread = std::clamp(bidAskSpread, 0.0, 1.0);
+  const double half = bidAskSpread * 0.5;
+
+  const std::size_t i = idx(id);
+  const auto& def = commodityDef(id);
+
+  // Clamp inventory defensively.
+  double cap = model.capacity[i];
+  if (!std::isfinite(cap)) cap = 0.0;
+  cap = std::max(0.0, cap);
+
+  double cur = inv[i];
+  if (!std::isfinite(cur)) cur = 0.0;
+  cur = std::clamp(cur, 0.0, cap);
+
+  // Match econ::midPrice(...) exactly (but without requiring StationEconomyState).
+  const double desired = model.desiredStock[i];
+  double mid = def.basePrice;
+
+  if (desired > 1e-9) {
+    const double ratio = cur / desired; // 1.0 means "normal"
+    double factor = 1.0 + model.priceVolatility * (1.0 - ratio);
+
+    // Scarcity spike if nearly empty
+    if (cur < desired * 0.05) factor *= 1.4;
+
+    factor = std::clamp(factor, 0.2, 5.0);
+    mid = def.basePrice * factor;
+  }
+
+  q.mid = mid;
+  q.ask = mid * (1.0 + half);
+  q.bid = mid * (1.0 - half);
+  return q;
+}
+
+static CargoManifestPlan bestManifestForCargoGreedy(const StationEconomyState& fromState,
+                                                   const StationEconomyModel& fromModel,
+                                                   const StationEconomyState& toState,
+                                                   const StationEconomyModel& toModel,
+                                                   const CargoManifestParams& params,
+                                                   double stepKg,
+                                                   double maxBuy,
+                                                   bool useCredits) {
   // Mutable copies are used for:
   //  - enforcing per-commodity availability (inventory/capacity)
-  //  - optionally simulating price impact (when p.simulatePriceImpact is true)
-  StationEconomyState from = fromState;
-  StationEconomyState to = toState;
+  //  - optionally simulating price impact (when params.simulatePriceImpact is true)
+  StationEconomyState from{};
+  StationEconomyState to{};
+  from.inventory = fromState.inventory;
+  to.inventory = toState.inventory;
   clampEconomyState(from, fromModel);
   clampEconomyState(to, toModel);
 
-  struct Accum {
-    double units{0.0};
-    double massKg{0.0};
-    double buyCr{0.0};
-    double sellCr{0.0};
-  };
-  std::array<Accum, kCommodityCount> acc{};
+  // Base pricing snapshot (used when simulatePriceImpact==false).
+  const StationEconomyState baseFrom = from;
+  const StationEconomyState baseTo = to;
+
+  std::array<ManifestAccum, kCommodityCount> acc{};
 
   double filledKg = 0.0;
   double totalBuy = 0.0;
   double totalSell = 0.0;
 
   // Hard guard: prevents accidental infinite loops when stepKg is tiny.
-  const std::size_t maxIter = static_cast<std::size_t>(std::ceil(plan.cargoCapacityKg / stepKg + 1e-6)) + 64;
+  const std::size_t maxIter = static_cast<std::size_t>(std::ceil(params.cargoCapacityKg / stepKg + 1e-6)) + 64;
 
   for (std::size_t iter = 0; iter < maxIter; ++iter) {
-    const double remainingKg = std::max(0.0, plan.cargoCapacityKg - filledKg);
+    const double remainingKg = std::max(0.0, params.cargoCapacityKg - filledKg);
     if (remainingKg <= 1e-9) break;
     if (useCredits && totalBuy + 1e-9 >= maxBuy) break;
 
@@ -226,8 +319,8 @@ CargoManifestPlan bestManifestForCargo(const StationEconomyState& fromState,
     double bestNetBuy = 0.0;
     double bestNetSell = 0.0;
 
-    const StationEconomyState& priceFrom = p.simulatePriceImpact ? from : fromState;
-    const StationEconomyState& priceTo = p.simulatePriceImpact ? to : toState;
+    const StationEconomyState& priceFrom = params.simulatePriceImpact ? from : baseFrom;
+    const StationEconomyState& priceTo = params.simulatePriceImpact ? to : baseTo;
 
     for (std::size_t i = 0; i < kCommodityCount; ++i) {
       const CommodityId cid = static_cast<CommodityId>(i);
@@ -246,11 +339,11 @@ CargoManifestPlan bestManifestForCargo(const StationEconomyState& fromState,
       if (deltaUnits <= 1e-9) continue;
 
       // Price / profit at the current step.
-      const auto qFrom = quote(priceFrom, fromModel, cid, p.bidAskSpread);
-      const auto qTo   = quote(priceTo, toModel, cid, p.bidAskSpread);
+      const auto qFrom = quote(priceFrom, fromModel, cid, params.bidAskSpread);
+      const auto qTo   = quote(priceTo, toModel, cid, params.bidAskSpread);
 
-      const double netBuyPerUnit = qFrom.ask * (1.0 + p.fromFeeRate);
-      const double netSellPerUnit = qTo.bid * (1.0 - p.toFeeRate);
+      const double netBuyPerUnit = qFrom.ask * (1.0 + params.fromFeeRate);
+      const double netSellPerUnit = qTo.bid * (1.0 - params.toFeeRate);
       const double netProfitPerUnit = netSellPerUnit - netBuyPerUnit;
       if (netProfitPerUnit <= 1e-9) continue;
 
@@ -311,47 +404,277 @@ CargoManifestPlan bestManifestForCargo(const StationEconomyState& fromState,
     if (massUsed < 1e-9) break;
   }
 
-  plan.cargoFilledKg = filledKg;
-  plan.netBuyCr = totalBuy;
-  plan.netSellCr = totalSell;
-  plan.netProfitCr = totalSell - totalBuy;
+  return finalizeManifestPlan(params.cargoCapacityKg,
+                              filledKg,
+                              totalBuy,
+                              totalSell,
+                              acc,
+                              safePos(params.cargoCapacityKg));
+}
+
+static CargoManifestPlan bestManifestForCargoBeamSearch(const StationEconomyState& fromState,
+                                                       const StationEconomyModel& fromModel,
+                                                       const StationEconomyState& toState,
+                                                       const StationEconomyModel& toModel,
+                                                       const CargoManifestParams& params,
+                                                       double stepKg,
+                                                       double maxBuy,
+                                                       bool useCredits) {
+  // Clamp beam width aggressively: this planner may be used in UI scans.
+  std::size_t beamWidth = params.beamWidth;
+  if (beamWidth == 0) beamWidth = 1;
+  beamWidth = std::clamp<std::size_t>(beamWidth, 1, 128);
+
+  // For safety/perf: cap iterations by inflating stepKg if needed.
+  std::size_t maxIter = static_cast<std::size_t>(std::ceil(params.cargoCapacityKg / stepKg + 1e-6)) + 64;
+  constexpr std::size_t kHardMaxIter = 1024;
+  if (maxIter > kHardMaxIter) {
+    const double minStep = params.cargoCapacityKg / std::max<double>(1.0, (double)(kHardMaxIter - 64));
+    stepKg = std::max(stepKg, minStep);
+    maxIter = static_cast<std::size_t>(std::ceil(params.cargoCapacityKg / stepKg + 1e-6)) + 64;
+  }
+
+  // Clamp inventories (without copying history vectors).
+  StationEconomyState baseFrom{};
+  StationEconomyState baseTo{};
+  baseFrom.inventory = fromState.inventory;
+  baseTo.inventory = toState.inventory;
+  clampEconomyState(baseFrom, fromModel);
+  clampEconomyState(baseTo, toModel);
+
+  const std::array<double, kCommodityCount> baseFromInv = baseFrom.inventory;
+  const std::array<double, kCommodityCount> baseToInv = baseTo.inventory;
+
+  // Precompute optimistic bounds (used for beam ranking).
+  //
+  // We rank partial states by: score = currentProfit + optimisticRemainingProfit,
+  // where optimisticRemainingProfit is bounded by both:
+  //  - remaining mass (bestProfitPerKgBound), and
+  //  - remaining credits (bestProfitPerCrBound) when a credit cap is active.
+  double bestProfitPerKgBound = 0.0;
+  double bestProfitPerCrBound = 0.0;
 
   for (std::size_t i = 0; i < kCommodityCount; ++i) {
-    if (acc[i].units <= 1e-9) continue;
-
     const CommodityId cid = static_cast<CommodityId>(i);
-    CargoManifestLine line{};
-    line.commodity = cid;
-    line.units = acc[i].units;
-    line.unitMassKg = std::max(1e-6, commodityDef(cid).massKg);
-    line.massKg = acc[i].massKg;
+    const double unitMass = std::max(1e-6, commodityDef(cid).massKg);
 
-    line.netBuyCr = acc[i].buyCr;
-    line.netSellCr = acc[i].sellCr;
-    line.netProfitCr = line.netSellCr - line.netBuyCr;
+    const auto qFrom = quoteLite(baseFromInv, fromModel, cid, params.bidAskSpread);
+    const auto qTo = quoteLite(baseToInv, toModel, cid, params.bidAskSpread);
 
-    line.avgNetBuyPrice = (line.units > 1e-9) ? (line.netBuyCr / line.units) : 0.0;
-    line.avgNetSellPrice = (line.units > 1e-9) ? (line.netSellCr / line.units) : 0.0;
-    line.netProfitPerUnit = (line.units > 1e-9) ? (line.netProfitCr / line.units) : 0.0;
-    line.netProfitPerKg = (line.massKg > 1e-9) ? (line.netProfitCr / line.massKg) : 0.0;
+    const double netBuy = qFrom.ask * (1.0 + params.fromFeeRate);
+    const double netSell = qTo.bid * (1.0 - params.toFeeRate);
+    const double netProfit = netSell - netBuy;
+    if (netProfit <= 1e-12) continue;
 
-    plan.lines.push_back(std::move(line));
+    bestProfitPerKgBound = std::max(bestProfitPerKgBound, netProfit / unitMass);
+
+    if (netBuy > 1e-12) {
+      bestProfitPerCrBound = std::max(bestProfitPerCrBound, netProfit / netBuy);
+    }
   }
 
-  std::sort(plan.lines.begin(), plan.lines.end(), [](const CargoManifestLine& a, const CargoManifestLine& b) {
-    if (a.netProfitCr != b.netProfitCr) return a.netProfitCr > b.netProfitCr;
-    return a.netProfitPerKg > b.netProfitPerKg;
-  });
+  struct BeamState {
+    std::array<double, kCommodityCount> fromInv{};
+    std::array<double, kCommodityCount> toInv{};
+    std::array<ManifestAccum, kCommodityCount> acc{};
+    double filledKg{0.0};
+    double buyCr{0.0};
+    double sellCr{0.0};
+    std::uint64_t seq{0};
+  };
 
-  // If we ended up with negative profit (possible if numerical noise / tiny steps),
-  // return an empty plan.
-  if (plan.netProfitCr <= 1e-9) {
-    plan = CargoManifestPlan{};
-    plan.cargoCapacityKg = safePos(params.cargoCapacityKg);
+  auto profitCr = [](const BeamState& s) { return s.sellCr - s.buyCr; };
+
+  auto score = [&](const BeamState& s) {
+    const double curProfit = profitCr(s);
+    const double remainingKg = std::max(0.0, params.cargoCapacityKg - s.filledKg);
+
+    double boundMass = remainingKg * bestProfitPerKgBound;
+    double boundCr = boundMass;
+
+    if (useCredits) {
+      const double remainingCr = std::max(0.0, maxBuy - s.buyCr);
+      boundCr = remainingCr * bestProfitPerCrBound;
+    }
+
+    const double optimistic = std::min(boundMass, boundCr);
+    return curProfit + optimistic;
+  };
+
+  // Initial beam.
+  std::vector<BeamState> beam;
+  beam.reserve(beamWidth);
+
+  BeamState root{};
+  root.fromInv = baseFromInv;
+  root.toInv = baseToInv;
+  beam.push_back(std::move(root));
+
+  std::uint64_t seqCounter = 1;
+
+  for (std::size_t iter = 0; iter < maxIter; ++iter) {
+    std::vector<BeamState> next;
+    next.reserve(beam.size() * (kCommodityCount + 1));
+
+    bool anyExpanded = false;
+
+    for (const auto& st : beam) {
+      const double remainingKg = std::max(0.0, params.cargoCapacityKg - st.filledKg);
+      const bool creditsExhausted = useCredits && (st.buyCr + 1e-9 >= maxBuy);
+
+      if (remainingKg <= 1e-9 || creditsExhausted) {
+        // Terminal: keep it around in case it's the best overall.
+        next.push_back(st);
+        continue;
+      }
+
+      const double thisStepKg = std::min(stepKg, remainingKg);
+
+      for (std::size_t i = 0; i < kCommodityCount; ++i) {
+        const CommodityId cid = static_cast<CommodityId>(i);
+        const double unitMass = std::max(1e-6, commodityDef(cid).massKg);
+
+        const double unitsFrom = safePos(st.fromInv[i]);
+        const double capTo = safePos(toModel.capacity[i]);
+        const double unitsToSpace = std::max(0.0, capTo - safePos(st.toInv[i]));
+        const double unitsStation = std::min(unitsFrom, unitsToSpace);
+        if (unitsStation <= 1e-9) continue;
+
+        double deltaUnits = std::min(unitsStation, thisStepKg / unitMass);
+        if (deltaUnits <= 1e-9) continue;
+
+        // Price snapshot: either dynamic (price impact) or fixed (baseline).
+        const auto& priceFromInv = params.simulatePriceImpact ? st.fromInv : baseFromInv;
+        const auto& priceToInv = params.simulatePriceImpact ? st.toInv : baseToInv;
+
+        const auto qFrom = quoteLite(priceFromInv, fromModel, cid, params.bidAskSpread);
+        const auto qTo = quoteLite(priceToInv, toModel, cid, params.bidAskSpread);
+
+        const double netBuyPerUnit = qFrom.ask * (1.0 + params.fromFeeRate);
+        const double netSellPerUnit = qTo.bid * (1.0 - params.toFeeRate);
+        const double netProfitPerUnit = netSellPerUnit - netBuyPerUnit;
+        if (netProfitPerUnit <= 1e-9) continue;
+
+        if (useCredits) {
+          const double remainingCr = std::max(0.0, maxBuy - st.buyCr);
+          if (remainingCr <= 1e-9) continue;
+          const double affordable = remainingCr / std::max(1e-9, netBuyPerUnit);
+          deltaUnits = std::min(deltaUnits, affordable);
+          if (deltaUnits <= 1e-9) continue;
+        }
+
+        const double massUsed = deltaUnits * unitMass;
+        if (massUsed <= 1e-9) continue;
+
+        BeamState ns = st;
+        ns.seq = seqCounter++;
+
+        ns.fromInv[i] = std::max(0.0, ns.fromInv[i] - deltaUnits);
+        ns.toInv[i] = std::min(capTo, std::max(0.0, ns.toInv[i] + deltaUnits));
+
+        ns.acc[i].units += deltaUnits;
+        ns.acc[i].massKg += massUsed;
+        ns.acc[i].buyCr += netBuyPerUnit * deltaUnits;
+        ns.acc[i].sellCr += netSellPerUnit * deltaUnits;
+
+        ns.filledKg += massUsed;
+        ns.buyCr += netBuyPerUnit * deltaUnits;
+        ns.sellCr += netSellPerUnit * deltaUnits;
+
+        next.push_back(std::move(ns));
+        anyExpanded = true;
+      }
+    }
+
+    if (!anyExpanded) break;
+
+    std::sort(next.begin(), next.end(), [&](const BeamState& a, const BeamState& b) {
+      const double sa = score(a);
+      const double sb = score(b);
+      if (sa != sb) return sa > sb;
+
+      const double pa = profitCr(a);
+      const double pb = profitCr(b);
+      if (pa != pb) return pa > pb;
+
+      if (a.filledKg != b.filledKg) return a.filledKg > b.filledKg;
+
+      // Deterministic final tie-break.
+      return a.seq < b.seq;
+    });
+
+    if (next.size() > beamWidth) next.resize(beamWidth);
+    beam = std::move(next);
   }
 
-  return plan;
+  // Pick the best by realized profit (not heuristic score).
+  const BeamState* best = nullptr;
+  for (const auto& st : beam) {
+    if (!best) {
+      best = &st;
+      continue;
+    }
+    const double pA = profitCr(st);
+    const double pB = profitCr(*best);
+    if (pA > pB + 1e-12) {
+      best = &st;
+    } else if (std::abs(pA - pB) <= 1e-12) {
+      if (st.filledKg > best->filledKg + 1e-9) best = &st;
+      else if (std::abs(st.filledKg - best->filledKg) <= 1e-9 && st.seq < best->seq) best = &st;
+    }
+  }
+
+  if (!best) {
+    CargoManifestPlan empty{};
+    empty.cargoCapacityKg = safePos(params.cargoCapacityKg);
+    return empty;
+  }
+
+  return finalizeManifestPlan(params.cargoCapacityKg,
+                              best->filledKg,
+                              best->buyCr,
+                              best->sellCr,
+                              best->acc,
+                              safePos(params.cargoCapacityKg));
 }
+
+CargoManifestPlan bestManifestForCargo(const StationEconomyState& fromState,
+                                       const StationEconomyModel& fromModel,
+                                       const StationEconomyState& toState,
+                                       const StationEconomyModel& toModel,
+                                       const CargoManifestParams& params) {
+  const double cap = safePos(params.cargoCapacityKg);
+
+  CargoManifestPlan plan{};
+  plan.cargoCapacityKg = cap;
+  if (cap <= 1e-9) return plan;
+
+  CargoManifestParams p = params;
+  p.cargoCapacityKg = cap;
+  p.fromFeeRate = clamp01(p.fromFeeRate);
+  p.toFeeRate = clamp01(p.toFeeRate);
+
+  if (!std::isfinite(p.bidAskSpread)) p.bidAskSpread = 0.10;
+  p.bidAskSpread = std::clamp(p.bidAskSpread, 0.0, 1.0);
+
+  double stepKg = p.stepKg;
+  if (!std::isfinite(stepKg)) stepKg = 1.0;
+  // Be conservative: overly small steps can be expensive in tools.
+  stepKg = std::clamp(stepKg, 0.05, std::max(0.05, cap));
+
+  double maxBuy = p.maxBuyCreditsCr;
+  if (!std::isfinite(maxBuy)) maxBuy = 0.0;
+  maxBuy = std::max(0.0, maxBuy);
+  const bool useCredits = maxBuy > 0.0;
+
+  // Default: existing greedy behavior.
+  if (p.planner == CargoManifestPlanner::BeamSearch) {
+    return bestManifestForCargoBeamSearch(fromState, fromModel, toState, toModel, p, stepKg, maxBuy, useCredits);
+  }
+
+  return bestManifestForCargoGreedy(fromState, fromModel, toState, toModel, p, stepKg, maxBuy, useCredits);
+}
+
 
 
 } // namespace stellar::econ
