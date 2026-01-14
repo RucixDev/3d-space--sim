@@ -2,7 +2,6 @@
 
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
-#include "stellar/proc/GalaxyClusters.h"
 
 #include "stellar/math/Math.h"
 
@@ -11,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
 
 namespace stellar::game {
 
@@ -59,22 +59,16 @@ static ImU32 colorForRegionKind(proc::GalaxyRegionKind k) {
   }
 }
 
- static ImU32 colorForClusterInfluence(float t) {
-  t = std::clamp(t, 0.0f, 1.0f);
-  // Simple ramp from dark -> bright; intentionally stylized.
-  const float r = 0.10f + 0.90f * t;
-  const float g = 0.20f + 0.80f * t;
-  const float b = 0.35f + 0.65f * t;
-  return rgba(r, g, b);
-}
+static ImU32 colorForHyperlane(const proc::HyperlaneEdge& e) {
+  const float risk = static_cast<float>(std::clamp(e.risk01, 0.0, 1.0));
+  const float bw = static_cast<float>(std::clamp(e.bandwidth01, 0.0, 1.0));
 
-static ImU32 colorForMorphologyInfluence(float t) {
-  t = std::clamp(t, 0.0f, 1.0f);
-  // Warm ramp: low -> cool; high -> hot.
-  const float r = 0.20f + 0.80f * t;
-  const float g = 0.18f + 0.52f * (1.0f - std::abs(2.0f * t - 1.0f));
-  const float b = 0.12f + 0.70f * (1.0f - t);
-  return rgba(r, g, b);
+  // Low risk: bluish, high risk: reddish; bandwidth controls alpha.
+  const float r = (1.0f - risk) * 0.30f + risk * 0.95f;
+  const float g = (1.0f - risk) * 0.65f + risk * 0.35f;
+  const float b = (1.0f - risk) * 0.95f + risk * 0.30f;
+  const float a = 0.10f + 0.55f * bw;
+  return rgba(r, g, b, a);
 }
 
 static bool dragDouble(const char* label, double& v, double step, double minV, double maxV, const char* fmt = "%.3f") {
@@ -83,6 +77,8 @@ static bool dragDouble(const char* label, double& v, double step, double minV, d
   if (changed) v = tmp;
   return changed;
 }
+
+static void rebuildHyperlanes(ProceduralGalaxyLabWindowState& st);
 
 static void rebuildPreview(ProceduralGalaxyLabWindowState& st) {
   const auto t0 = Clock::now();
@@ -99,22 +95,6 @@ static void rebuildPreview(ProceduralGalaxyLabWindowState& st) {
   st.stubRegionId.clear();
   st.stubRegionKind.reserve(4096);
   st.stubRegionId.reserve(4096);
-
-  st.stubCluster01.clear();
-  if (st.colorByCluster) st.stubCluster01.reserve(4096);
-
-  st.stubMorph01.clear();
-  if (st.colorByMorphology) st.stubMorph01.reserve(4096);
-
-  proc::GalaxyClustersParams clusterParams{};
-  if (st.colorByCluster) {
-    clusterParams.cellSizeLy = st.params.clusterCellSizeLy;
-    clusterParams.chancePerCell = st.params.clusterChancePerCell;
-    clusterParams.radiusLy = st.params.clusterRadiusLy;
-    clusterParams.radiusJitter01 = st.params.clusterRadiusJitter;
-    clusterParams.strengthJitter01 = st.params.clusterStrengthJitter;
-    clusterParams.falloffPower = st.params.clusterFalloffPower;
-  }
 
   const double s = std::max(1.0, st.params.sectorSizeLy);
   const double r = std::max(1.0, st.viewRadiusLy);
@@ -150,22 +130,6 @@ static void rebuildPreview(ProceduralGalaxyLabWindowState& st) {
             st.stubRegionId.push_back(reg.regionId);
           }
 
-          if (st.colorByCluster) {
-            const auto cs = proc::sampleGalaxyClusters(st.seed, stub.posLy, clusterParams);
-            st.stubCluster01.push_back(static_cast<float>(cs.cluster01));
-          }
-
-          if (st.colorByMorphology) {
-            const auto ms = proc::sampleGalaxyMorphology(st.seed, st.params, stub.posLy);
-            const double denom = std::max(1.0e-9, std::abs(st.params.barStrength) + std::abs(st.params.ringStrength));
-            double t = 0.0;
-            if (denom > 0.0) {
-              t = (ms.densityMul - 1.0) / denom;
-            }
-            t = std::clamp(t, 0.0, 1.0);
-            st.stubMorph01.push_back(static_cast<float>(t));
-          }
-
           if (st.stubs.size() >= st.maxStubs) goto done;
         }
       }
@@ -174,7 +138,35 @@ static void rebuildPreview(ProceduralGalaxyLabWindowState& st) {
 
 done:
   st.lastGenMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  rebuildHyperlanes(st);
   st.dirty = false;
+}
+
+static void rebuildHyperlanes(ProceduralGalaxyLabWindowState& st) {
+  st.hyperlanes.clear();
+  st.lastLaneMs = 0.0;
+
+  if (!st.showHyperlanes) {
+    return;
+  }
+  if (st.stubs.size() < 2) {
+    return;
+  }
+
+  const auto t0 = Clock::now();
+
+  // NOTE: Hyperlane generation is deterministic and depends only on
+  // (seed, stub list, params). It can be recomputed without regenerating stubs.
+  proc::HyperlaneParams p = st.hyperlaneParams;
+
+  // Keep lane region sampling resolution reasonably aligned with the region
+  // visualization cell size unless the user explicitly disables it.
+  if (p.regionCellSizeLy > 0.0) {
+    p.regionCellSizeLy = std::max(1.0, p.regionCellSizeLy);
+  }
+
+  st.hyperlanes = proc::generateHyperlaneNetwork(st.seed, st.stubs, p).edges;
+  st.lastLaneMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
 void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float timeSec, const ToastFn& toast) {
@@ -187,6 +179,7 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
   }
 
   bool dirty = false;
+  bool laneDirty = false;
 
   if (ImGui::BeginTable("##galaxy_lab_layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
     ImGui::TableNextColumn();
@@ -221,12 +214,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
       dirty |= dragDouble("Mean Systems/Sector", st.params.baseMeanSystemsPerSector, 0.05, 0.0, 100.0, "%.2f");
 
       ImGui::Separator();
-      ImGui::TextUnformatted("Star Placement");
-
-      dirty |= dragDouble("Min System Separation (ly)", st.params.minSystemSeparationLy, 0.05, 0.0, 10.0, "%.2f");
-      ImGui::TextDisabled("0 = legacy Poisson. >0 enables streaming-safe blue-noise-like placement (clamped to >= 0.25).");
-
-      ImGui::Separator();
       ImGui::TextUnformatted("Spiral Arms (log spiral)");
 
       dirty |= ImGui::SliderInt("Arm Count", &st.params.spiralArmCount, 0, 8);
@@ -244,48 +231,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
       dirty |= dragDouble("Density Noise Freq", st.params.densityNoiseFreq, 0.0001, 0.0, 0.05, "%.4f");
 
       ImGui::Separator();
-      ImGui::TextUnformatted("Star Clusters (sparse blobs)");
-
-      dirty |= dragDouble("Cluster Strength", st.params.clusterStrength, 0.02, 0.0, 10.0, "%.2f");
-      dirty |= dragDouble("Cluster Cell Size (ly)", st.params.clusterCellSizeLy, 10.0, 50.0, 50'000.0, "%.0f");
-      dirty |= dragDouble("Cluster Chance/Cell", st.params.clusterChancePerCell, 0.01, 0.0, 1.0, "%.2f");
-      dirty |= dragDouble("Cluster Radius (ly)", st.params.clusterRadiusLy, 10.0, 10.0, 50'000.0, "%.0f");
-      dirty |= dragDouble("Radius Jitter", st.params.clusterRadiusJitter, 0.01, 0.0, 1.0, "%.2f");
-      dirty |= dragDouble("Strength Jitter", st.params.clusterStrengthJitter, 0.01, 0.0, 1.0, "%.2f");
-      dirty |= dragDouble("Falloff Power", st.params.clusterFalloffPower, 0.05, 0.25, 8.0, "%.2f");
-      ImGui::TextDisabled("Density multiplier: mean *= (1 + Strength * cluster01). Strength=0 disables.");
-
-      ImGui::Separator();
-      ImGui::TextUnformatted("Galaxy Morphology (bar / ring / warp / flare)");
-
-      ImGui::TextUnformatted("Bar");
-      dirty |= dragDouble("Bar Strength", st.params.barStrength, 0.02, 0.0, 10.0, "%.2f");
-      dirty |= dragDouble("Bar Angle (deg)", st.params.barAngleDeg, 0.5, -180.0, 180.0, "%.1f");
-      dirty |= dragDouble("Bar Length (ly)", st.params.barLengthLy, 50.0, 10.0, 200'000.0, "%.0f");
-      dirty |= dragDouble("Bar Width (ly)", st.params.barWidthLy, 25.0, 10.0, 200'000.0, "%.0f");
-      dirty |= dragDouble("Bar Power", st.params.barPower, 0.05, 1.0, 8.0, "%.2f");
-
-      ImGui::TextUnformatted("Ring");
-      dirty |= dragDouble("Ring Strength", st.params.ringStrength, 0.02, 0.0, 10.0, "%.2f");
-      dirty |= dragDouble("Ring Radius (ly)", st.params.ringRadiusLy, 50.0, 0.0, 200'000.0, "%.0f");
-      dirty |= dragDouble("Ring Width (ly)", st.params.ringWidthLy, 25.0, 1.0, 50'000.0, "%.0f");
-      dirty |= dragDouble("Ring Power", st.params.ringPower, 0.05, 1.0, 8.0, "%.2f");
-
-      ImGui::TextUnformatted("Warp / Flare");
-      dirty |= dragDouble("Warp Amplitude (ly)", st.params.warpAmplitudeLy, 10.0, 0.0, 50'000.0, "%.0f");
-      dirty |= dragDouble("Warp Start Radius (ly)", st.params.warpStartRadiusLy, 50.0, 0.0, 200'000.0, "%.0f");
-      dirty |= dragDouble("Warp Power", st.params.warpPower, 0.05, 0.25, 8.0, "%.2f");
-      dirty |= ImGui::DragInt("Warp Lobes", &st.params.warpLobes, 1.0f, 1, 8);
-      dirty |= dragDouble("Warp Phase (deg)", st.params.warpPhaseDeg, 1.0, -180.0, 180.0, "%.1f");
-      dirty |= dragDouble("Warp Noise Strength", st.params.warpNoiseStrength, 0.01, 0.0, 1.0, "%.2f");
-      dirty |= dragDouble("Warp Noise Freq", st.params.warpNoiseFreq, 0.0001, 0.0, 0.05, "%.4f");
-
-      dirty |= dragDouble("Flare Strength", st.params.flareStrength, 0.02, 0.0, 10.0, "%.2f");
-      dirty |= dragDouble("Flare Power", st.params.flarePower, 0.05, 0.25, 8.0, "%.2f");
-
-      ImGui::TextDisabled("Bar/Ring: density multipliers. Warp/Flare: midplane + thickness.");
-
-      ImGui::Separator();
       ImGui::TextUnformatted("View");
 
       dirty |= dragDouble("Center X (ly)", st.centerLy.x, 5.0, -500'000.0, 500'000.0, "%.0f");
@@ -296,48 +241,37 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
 
       dirty |= ImGui::Checkbox("Auto regenerate", &st.autoRegenerate);
 
-      bool colorChanged = false;
-      colorChanged |= ImGui::Checkbox("Color: faction", &st.colorByFaction);
+      dirty |= ImGui::Checkbox("Color by faction", &st.colorByFaction);
       ImGui::SameLine();
-      colorChanged |= ImGui::Checkbox("region", &st.colorByRegion);
-      ImGui::SameLine();
-      colorChanged |= ImGui::Checkbox("cluster", &st.colorByCluster);
-      ImGui::SameLine();
-      colorChanged |= ImGui::Checkbox("morph", &st.colorByMorphology);
+      dirty |= ImGui::Checkbox("Color by region", &st.colorByRegion);
       ImGui::SameLine();
       dirty |= ImGui::Checkbox("Legend", &st.showLegend);
-      dirty |= colorChanged;
 
-      if (colorChanged) {
-        // Make color modes mutually exclusive to avoid ambiguity.
-        if (st.colorByFaction) {
-          st.colorByRegion = false;
-          st.colorByCluster = false;
-          st.colorByMorphology = false;
-        } else if (st.colorByRegion) {
-          st.colorByFaction = false;
-          st.colorByCluster = false;
-          st.colorByMorphology = false;
-        } else if (st.colorByCluster) {
-          st.colorByFaction = false;
-          st.colorByRegion = false;
-          st.colorByMorphology = false;
-        } else if (st.colorByMorphology) {
-          st.colorByFaction = false;
-          st.colorByRegion = false;
-          st.colorByCluster = false;
-        }
-      }
+      laneDirty |= ImGui::Checkbox("Hyperlanes", &st.showHyperlanes);
 
       if (st.colorByRegion) {
         ImGui::Indent();
-        dirty |= dragDouble("Region Cell Size (ly)", st.regionCellSizeLy, 10.0, 100.0, 5000.0, "%.0f");
+        const bool regChanged = dragDouble("Region Cell Size (ly)", st.regionCellSizeLy, 10.0, 100.0, 5000.0, "%.0f");
+        dirty |= regChanged;
+        if (regChanged && st.hyperlaneParams.regionCellSizeLy > 0.0) {
+          st.hyperlaneParams.regionCellSizeLy = st.regionCellSizeLy;
+          laneDirty = true;
+        }
+        ImGui::Unindent();
+      }
+
+      if (st.showHyperlanes) {
+        ImGui::Indent();
+        laneDirty |= dragDouble("Lane Max Dist (ly)", st.hyperlaneParams.maxNeighborDistanceLy, 0.5, 2.0, 200.0, "%.1f");
+        laneDirty |= ImGui::SliderInt("Lane Neighbor K", &st.hyperlaneParams.neighborK, 1, 12);
+        laneDirty |= ImGui::Checkbox("Lane Force Connected", &st.hyperlaneParams.forceConnected);
+        laneDirty |= ImGui::SliderInt("Lane Min Degree", &st.hyperlaneParams.minDegree, 0, 6);
+        laneDirty |= dragDouble("Lane Extra Edge Chance", st.hyperlaneParams.extraEdgeChance, 0.01, 0.0, 1.0, "%.2f");
+        laneDirty |= dragDouble("Lane Region Cell (ly)", st.hyperlaneParams.regionCellSizeLy, 10.0, 0.0, 5000.0, "%.0f");
         ImGui::Unindent();
       }
 
       ImGui::Checkbox("Arm guides", &st.showArmGuides);
-      ImGui::SameLine();
-      ImGui::Checkbox("Morph guides", &st.showMorphGuides);
 
       if (ImGui::Button("Regenerate")) {
         st.dirty = true;
@@ -353,6 +287,10 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
       ImGui::Separator();
       ImGui::Text("Preview: %zu systems", st.stubs.size());
       ImGui::Text("Last gen: %.2f ms", st.lastGenMs);
+      if (st.showHyperlanes) {
+        ImGui::Text("Hyperlanes: %zu", st.hyperlanes.size());
+        ImGui::Text("Last lane gen: %.2f ms", st.lastLaneMs);
+      }
       if (st.stubs.size() >= st.maxStubs) {
         ImGui::TextDisabled("(hit maxStubs cap: %zu)", st.maxStubs);
       }
@@ -364,6 +302,8 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
     if (dirty) st.dirty = true;
     if (st.dirty && st.autoRegenerate) {
       rebuildPreview(st);
+    } else if (laneDirty) {
+      rebuildHyperlanes(st);
     }
 
     const ImVec2 canvasSize = ImGui::GetContentRegionAvail();
@@ -426,59 +366,34 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
       }
     }
 
-    // Morphology guides overlay (bar + ring).
-    if (st.showMorphGuides && (st.params.barStrength > 0.0 || st.params.ringStrength > 0.0)) {
-      const double kPi = 3.14159265358979323846;
-
-      // Bar: draw the ellipse in world space (galactic center at origin), rotated by Bar Angle.
-      if (st.params.barStrength > 0.0 && st.params.barLengthLy > 0.0 && st.params.barWidthLy > 0.0) {
-        const double a = st.params.barLengthLy;
-        const double b = st.params.barWidthLy;
-        const double ang = math::degToRad(st.params.barAngleDeg);
-        const double ca = std::cos(ang);
-        const double sa = std::sin(ang);
-
-        ImVec2 prev{};
-        bool havePrev = false;
-        const int N = 128;
-        for (int i = 0; i <= N; ++i) {
-          const double t = (2.0 * kPi) * (static_cast<double>(i) / static_cast<double>(N));
-          const double xLocal = a * std::cos(t);
-          const double yLocal = b * std::sin(t);
-
-          // Rotate by +ang into world coordinates.
-          const double x = ca * xLocal - sa * yLocal;
-          const double y = sa * xLocal + ca * yLocal;
-
-          const ImVec2 p = worldToScreen(math::Vec3d{x, y, st.centerLy.z});
-          if (havePrev) {
-            dl->AddLine(prev, p, rgba(0.95f, 0.65f, 0.25f, 0.55f));
-          }
-          prev = p;
-          havePrev = true;
-        }
+    // Hyperlane overlay (drawn behind points).
+    if (st.showHyperlanes && !st.hyperlanes.empty()) {
+      std::unordered_map<sim::SystemId, math::Vec3d> idToPos;
+      idToPos.reserve(st.stubs.size() * 2);
+      for (const auto& stub : st.stubs) {
+        idToPos.emplace(stub.id, stub.posLy);
       }
 
-      // Ring: draw a circle at Ring Radius.
-      if (st.params.ringStrength > 0.0 && st.params.ringRadiusLy > 0.0) {
-        const double r = st.params.ringRadiusLy;
-        ImVec2 prev{};
-        bool havePrev = false;
-        const int N = 128;
-        for (int i = 0; i <= N; ++i) {
-          const double t = (2.0 * kPi) * (static_cast<double>(i) / static_cast<double>(N));
-          const double x = r * std::cos(t);
-          const double y = r * std::sin(t);
+      for (const auto& e : st.hyperlanes) {
+        const auto itA = idToPos.find(e.a);
+        const auto itB = idToPos.find(e.b);
+        if (itA == idToPos.end() || itB == idToPos.end()) continue;
 
-          const ImVec2 p = worldToScreen(math::Vec3d{x, y, st.centerLy.z});
-          if (havePrev) {
-            dl->AddLine(prev, p, rgba(0.35f, 0.85f, 0.75f, 0.55f));
-          }
-          prev = p;
-          havePrev = true;
+        const ImVec2 a = worldToScreen(itA->second);
+        const ImVec2 b = worldToScreen(itB->second);
+
+        // Quick reject: if both endpoints are on the same outside side, skip.
+        if ((a.x < p0.x && b.x < p0.x) || (a.x > p1.x && b.x > p1.x) ||
+            (a.y < p0.y && b.y < p0.y) || (a.y > p1.y && b.y > p1.y)) {
+          continue;
         }
+
+        const float bw = static_cast<float>(std::clamp(e.bandwidth01, 0.0, 1.0));
+        const float thickness = 1.0f + 1.6f * bw;
+        dl->AddLine(a, b, colorForHyperlane(e), thickness);
       }
     }
+
 
     // Draw points.
     for (std::size_t i = 0; i < st.stubs.size(); ++i) {
@@ -492,10 +407,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
         col = colorForFaction(stub.factionId, st.factions);
       } else if (st.colorByRegion && i < st.stubRegionKind.size()) {
         col = colorForRegionKind(st.stubRegionKind[i]);
-      } else if (st.colorByCluster && i < st.stubCluster01.size()) {
-        col = colorForClusterInfluence(st.stubCluster01[i]);
-      } else if (st.colorByMorphology && i < st.stubMorph01.size()) {
-        col = colorForMorphologyInfluence(st.stubMorph01[i]);
       }
       dl->AddCircleFilled(p, 2.0f, col);
     }
@@ -529,6 +440,25 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
         ImGui::Text("Stations: %u", stub.stationCount);
         ImGui::Text("Faction: %u", stub.factionId);
 
+
+        if (st.showHyperlanes && !st.hyperlanes.empty()) {
+          int degree = 0;
+          double bestBw = 0.0;
+          double bestRisk = 0.0;
+          for (const auto& e : st.hyperlanes) {
+            if (e.a == stub.id || e.b == stub.id) {
+              degree += 1;
+              bestBw = std::max(bestBw, e.bandwidth01);
+              bestRisk = std::max(bestRisk, e.risk01);
+            }
+          }
+
+          ImGui::Separator();
+          ImGui::Text("Hyperlanes: %d", degree);
+          ImGui::Text("Max lane BW: %.2f", bestBw);
+          ImGui::Text("Max lane Risk: %.2f", bestRisk);
+        }
+
         if (st.colorByRegion) {
           const auto reg = proc::sampleGalaxyRegion(st.seed, stub.posLy, st.regionCellSizeLy);
           ImGui::Separator();
@@ -536,37 +466,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
           ImGui::Text("Kind: %s", proc::galaxyRegionKindName(reg.kind));
           ImGui::Text("Edge: %.2f", reg.edge01);
         }
-        if (st.colorByCluster || st.params.clusterStrength > 0.0) {
-          proc::GalaxyClustersParams cp{};
-          cp.cellSizeLy = st.params.clusterCellSizeLy;
-          cp.chancePerCell = st.params.clusterChancePerCell;
-          cp.radiusLy = st.params.clusterRadiusLy;
-          cp.radiusJitter01 = st.params.clusterRadiusJitter;
-          cp.strengthJitter01 = st.params.clusterStrengthJitter;
-          cp.falloffPower = st.params.clusterFalloffPower;
-
-          const auto cs = proc::sampleGalaxyClusters(st.seed, stub.posLy, cp);
-          ImGui::Separator();
-          ImGui::Text("Cluster influence: %.2f", cs.cluster01);
-          if (cs.hasCluster) {
-            ImGui::Text("ClusterId: 0x%llx", static_cast<unsigned long long>(cs.clusterId));
-            ImGui::Text("Radius: %.0f ly", cs.radiusLy);
-          }
-        }
-
-        if (st.colorByMorphology || st.params.barStrength > 0.0 || st.params.ringStrength > 0.0 ||
-            std::abs(st.params.warpAmplitudeLy) > 0.0 || st.params.flareStrength > 0.0) {
-          const auto ms = proc::sampleGalaxyMorphology(st.seed, st.params, stub.posLy);
-          ImGui::Separator();
-          ImGui::Text("Morph mul: %.2f", ms.densityMul);
-          ImGui::Text("Bar01: %.2f  Ring01: %.2f", ms.bar01, ms.ring01);
-          if (std::abs(st.params.warpAmplitudeLy) > 0.0 || st.params.flareStrength > 0.0) {
-            ImGui::Text("Warp Z: %.0f ly", ms.warpZLy);
-            ImGui::Text("Half-thickness: %.0f ly", ms.thicknessHalfLy);
-            ImGui::Text("Zrel: %.0f ly", std::abs(stub.posLy.z - ms.warpZLy));
-          }
-        }
-
         ImGui::TextDisabled("Click to copy name");
         ImGui::EndTooltip();
 
@@ -584,15 +483,7 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
 
       const bool legendFaction = st.colorByFaction;
       const bool legendRegion = (!legendFaction && st.colorByRegion);
-      const bool legendCluster = (!legendFaction && !legendRegion && st.colorByCluster);
-      const bool legendMorph = (!legendFaction && !legendRegion && !legendCluster && st.colorByMorphology);
-
-      const char* legendTitle = legendFaction        ? "Legend (Faction)"
-                                : legendRegion     ? "Legend (Region)"
-                                : legendCluster    ? "Legend (Cluster Influence)"
-                                : legendMorph      ? "Legend (Morph Influence)"
-                                                   : "Legend (Star Class)";
-      ImGui::TextUnformatted(legendTitle);
+      ImGui::TextUnformatted(legendFaction ? "Legend (Faction)" : (legendRegion ? "Legend (Region)" : "Legend (Star Class)"));
       ImGui::Separator();
 
       if (legendRegion) {
@@ -608,20 +499,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
           ImGui::ColorButton("##r", ImGui::ColorConvertU32ToFloat4(colorForRegionKind(k)), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
           ImGui::SameLine();
           ImGui::TextUnformatted(proc::galaxyRegionKindName(k));
-        }
-      } else if (legendCluster) {
-        const float levels[] = {0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
-        for (float t : levels) {
-          ImGui::ColorButton("##cl", ImGui::ColorConvertU32ToFloat4(colorForClusterInfluence(t)), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
-          ImGui::SameLine();
-          ImGui::Text("%.2f", t);
-        }
-      } else if (legendMorph) {
-        const float levels[] = {0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
-        for (float t : levels) {
-          ImGui::ColorButton("##m", ImGui::ColorConvertU32ToFloat4(colorForMorphologyInfluence(t)), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
-          ImGui::SameLine();
-          ImGui::Text("%.2f", t);
         }
       } else if (!legendFaction) {
         const sim::StarClass classes[] = {sim::StarClass::O, sim::StarClass::B, sim::StarClass::A, sim::StarClass::F, sim::StarClass::G, sim::StarClass::K, sim::StarClass::M};

@@ -255,7 +255,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{29};
+  int version{30};
 
   core::u64 seed{0};
   double timeDays{0.0};

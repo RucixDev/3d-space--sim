@@ -70,6 +70,7 @@
 #include "stellar/sim/CargoJettisonPlanner.h"
 #include "stellar/sim/Law.h"
 #include "stellar/sim/PoliceScan.h"
+#include "stellar/sim/LawLedger.h"
 #include "stellar/sim/NpcCombatAI.h"
 #include "stellar/sim/Extortion.h"
 #include "stellar/sim/Distress.h"
@@ -105,8 +106,10 @@
 #include "stellar/sim/ThermalSystem.h"
 #include "stellar/sim/FuelScoopSystem.h"
 #include "stellar/sim/Traffic.h"
+#include "stellar/sim/TrafficTransit.h"
 #include "stellar/sim/TrafficLedger.h"
 #include "stellar/sim/TrafficConvoyLayer.h"
+#include "stellar/sim/TrafficConvoyEncounter.h"
 #include "stellar/sim/NavRoute.h"
 #include "stellar/sim/Universe.h"
 
@@ -133,6 +136,7 @@
 #include "ProceduralLabWindow.h"
 #include "ProceduralMeshLabWindow.h"
 #include "ProceduralGalaxyLabWindow.h"
+#include "ProceduralTradeSystemsLabWindow.h"
 #include "SpectralMieLabWindow.h"
 #include "GaussianSurfelReconstructionLabWindow.h"
 
@@ -2650,18 +2654,10 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   // Deterministic from (universe seed, faction id).
   std::unordered_map<core::u32, sim::LawProfile> lawProfileByFaction;
 
-  // Law / crime (per-faction bounties)
-  std::unordered_map<core::u32, double> bountyByFaction;
-  // Bounty vouchers (earned by destroying criminals; redeem later at stations).
-  std::unordered_map<core::u32, double> bountyVoucherByFaction;
+  // Law / crime ledger: per-faction bounties, vouchers, and fines.
+  // Moved into core as sim::LawLedger so the bookkeeping can be unit-tested and reused.
+  sim::LawLedger lawLedger;
 
-  // Outstanding fines (minor offenses), tracked per faction until paid.
-  // Fines are not treated as "WANTED" bounties, but may convert into bounties when overdue.
-  struct FineEntry {
-    double amountCr{0.0};
-    double dueDay{0.0};
-  };
-  std::unordered_map<core::u32, FineEntry> fineByFaction;
 
   double policeAlertUntilDays = 0.0;
   double policeHeat = 0.0; // soft pursuit intensity (drives police escalation / spawn rate)
@@ -2834,7 +2830,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   std::unordered_map<sim::SystemId, int> trafficDayStampBySystem;
 
   // Traffic shipment ledger (per visited system).
-  // Recorded from simulateNpcTradeTraffic(...) and used to drive TrafficConvoy signals
+  // Recorded from simulateNpcTradeTrafficTransit(...) and used to drive TrafficConvoy signals
   // so visible convoys can reflect the actual market nudges.
   std::unordered_map<sim::SystemId, sim::TrafficLedger> trafficLedgerBySystem;
 
@@ -2875,6 +2871,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   double tradeMixStepKg = 1.0;
   int tradeMixLinesShown = 3;
   bool tradeMixSimulateImpact = true;
+  bool tradeMixBeamSearch = false;
+  int tradeMixBeamWidth = 24;
 
 
   // Docking state
@@ -2968,6 +2966,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::ProceduralLabWindowState proceduralLabWindow{};
   game::ProceduralMeshLabWindowState proceduralMeshLabWindow{};
   game::ProceduralGalaxyLabWindowState proceduralGalaxyLabWindow{};
+  game::ProceduralTradeSystemsLabWindowState proceduralTradeSystemsLabWindow{};
   game::SpectralMieLabWindowState spectralMieLabWindow{};
   game::GaussianSurfelReconstructionLabWindowState gaussianSurfelReconLabWindow{};
 
@@ -3595,6 +3594,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralGalaxyLab", "Procedural Galaxy Lab", "Visual", 70, false, true}, &proceduralGalaxyLabWindow.open,
                                 {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralTradeSystemsLab", "Procedural Trade Systems", "Visual", 70, false, true}, &proceduralTradeSystemsLabWindow.open,
+                                {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"SpectralMieLab", "Spectral Mie Lab", "Visual", 70, false, true}, &spectralMieLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"GaussianSurfelReconLab", "Gaussian Surfel Reconstruction Lab", "Visual", 70, false, true}, &gaussianSurfelReconLabWindow.open,
@@ -3776,7 +3777,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   // Ensure the ambient traffic sim has advanced and record shipments so convoy signals
   // can reflect the actual economy nudges.
   sim::TrafficLedger& trafficLedger = trafficLedgerBySystem[sys.stub.id];
-  sim::simulateNpcTradeTraffic(universe, sys, timeDays, trafficDayStampBySystem,
+  sim::simulateNpcTradeTrafficTransit(universe, sys, timeDays, trafficDayStampBySystem,
                               /*kMaxBackfillDays=*/14, &trafficLedger);
 
   std::vector<core::u64> resolved;
@@ -3917,7 +3918,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     std::vector<sim::TrafficConvoyView> views;
 
     // Prefer replaying recorded NPC trade shipments as convoys so the visible traffic layer
-    // matches the market nudges done by simulateNpcTradeTraffic(...).
+    // matches the market nudges done by simulateNpcTradeTrafficTransit(...).
     auto itLedger = trafficLedgerBySystem.find(sys.stub.id);
     if (itLedger != trafficLedgerBySystem.end()) {
       views = sim::generateTrafficConvoysFromLedger(itLedger->second,
@@ -4021,126 +4022,77 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     repByFaction[factionId] = clampRep(getRep(factionId) + delta);
   };
 
-auto getBounty = [&](core::u32 factionId) -> double {
-  auto it = bountyByFaction.find(factionId);
-  return it == bountyByFaction.end() ? 0.0 : std::max(0.0, it->second);
-};
+  // --- Law ledger (bounties / fines / vouchers) -----------------------------
+  auto getBounty = [&](core::u32 factionId) -> double {
+    return lawLedger.bounty(factionId);
+  };
 
-auto addBounty = [&](core::u32 factionId, double deltaCr) {
-  if (factionId == 0) return;
-  bountyByFaction[factionId] = std::max(0.0, getBounty(factionId) + deltaCr);
-};
+  auto addBounty = [&](core::u32 factionId, double deltaCr) {
+    lawLedger.addBounty(factionId, deltaCr);
+  };
 
-auto clearBounty = [&](core::u32 factionId) {
-  if (factionId == 0) return;
-  bountyByFaction[factionId] = 0.0;
-};
+  auto clearBounty = [&](core::u32 factionId) {
+    lawLedger.clearBounty(factionId);
+  };
 
-auto getFine = [&](core::u32 factionId) -> double {
-  auto it = fineByFaction.find(factionId);
-  return it == fineByFaction.end() ? 0.0 : std::max(0.0, it->second.amountCr);
-};
+  auto getFine = [&](core::u32 factionId) -> double {
+    return lawLedger.fine(factionId);
+  };
 
-auto getFineDueDay = [&](core::u32 factionId) -> double {
-  auto it = fineByFaction.find(factionId);
-  return it == fineByFaction.end() ? 0.0 : it->second.dueDay;
-};
+  auto getFineDueDay = [&](core::u32 factionId) -> double {
+    return lawLedger.fineDueDay(factionId);
+  };
 
-auto clearFine = [&](core::u32 factionId) {
-  if (factionId == 0) return;
-  fineByFaction.erase(factionId);
-};
+  auto clearFine = [&](core::u32 factionId) {
+    lawLedger.clearFine(factionId);
+  };
 
-// Add to an outstanding fine ledger for this faction (unpaid minor offenses).
-// dueDay is interpreted as the "earliest due" date across outstanding fines.
-auto addFine = [&](core::u32 factionId, double deltaCr, double dueDay) {
-  if (factionId == 0) return;
-  if (!(deltaCr > 1e-9)) return;
+  // Add to an outstanding fine ledger for this faction (unpaid minor offenses).
+  // dueDay is interpreted as the "earliest due" date across outstanding fines.
+  auto addFine = [&](core::u32 factionId, double deltaCr, double dueDay) {
+    lawLedger.addFine(factionId, deltaCr, dueDay);
+  };
 
-  auto& e = fineByFaction[factionId];
-  e.amountCr = std::max(0.0, e.amountCr + deltaCr);
+  // Pay down a fine (returns amount actually paid).
+  auto payFine = [&](core::u32 factionId, double desiredCr) -> double {
+    return lawLedger.payFine(factionId, credits, desiredCr);
+  };
 
-  if (e.dueDay <= 0.0) e.dueDay = dueDay;
-  else e.dueDay = std::min(e.dueDay, dueDay);
-};
+  auto fmtDueIn = [&](double dueDay) -> std::string {
+    if (!(dueDay > 0.0)) return "n/a";
+    const double remDays = std::max(0.0, dueDay - timeDays);
+    const double remHours = remDays * 24.0;
+    if (remHours < 48.0) return std::to_string((int)std::ceil(remHours)) + "h";
+    return std::to_string((int)std::ceil(remDays)) + "d";
+  };
 
-// Pay down a fine (returns amount actually paid).
-auto payFine = [&](core::u32 factionId, double desiredCr) -> double {
-  if (factionId == 0) return 0.0;
-  auto it = fineByFaction.find(factionId);
-  if (it == fineByFaction.end()) return 0.0;
+  // Convert overdue fines into bounties (warrants).
+  auto processOverdueFines = [&]() {
+    const auto conversions = lawLedger.processOverdueFines(timeDays, 0.25);
+    for (const auto& c : conversions) {
+      addRep(c.factionId, -1.5);
 
-  const double owed = std::max(0.0, it->second.amountCr);
-  const double pay = std::min(std::max(0.0, desiredCr), std::min(std::max(0.0, credits), owed));
-  if (pay > 1e-9) {
-    credits = std::max(0.0, credits - pay);
-    it->second.amountCr = std::max(0.0, it->second.amountCr - pay);
-  }
-  if (it->second.amountCr <= 1e-6) {
-    fineByFaction.erase(it);
-  }
-  return pay;
-};
+      // Slight security escalation so the player feels the consequences immediately.
+      policeHeat = std::clamp(policeHeat + 0.75, 0.0, 6.0);
+      policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (120.0 / 86400.0));
 
-auto fmtDueIn = [&](double dueDay) -> std::string {
-  if (!(dueDay > 0.0)) return "n/a";
-  const double remDays = std::max(0.0, dueDay - timeDays);
-  const double remHours = remDays * 24.0;
-  if (remHours < 48.0) return std::to_string((int)std::ceil(remHours)) + "h";
-  return std::to_string((int)std::ceil(remDays)) + "d";
-};
-
-// Convert overdue fines into bounties (warrants).
-auto processOverdueFines = [&]() {
-  if (fineByFaction.empty()) return;
-
-  std::vector<core::u32> overdue;
-  overdue.reserve(fineByFaction.size());
-
-  for (const auto& kv : fineByFaction) {
-    const core::u32 fid = kv.first;
-    const FineEntry& e = kv.second;
-    if (fid == 0) continue;
-    if (!(e.amountCr > 1e-6)) continue;
-    if (!(e.dueDay > 0.0)) continue;
-    if (timeDays > e.dueDay) overdue.push_back(fid);
-  }
-
-  for (core::u32 fid : overdue) {
-    auto it = fineByFaction.find(fid);
-    if (it == fineByFaction.end()) continue;
-
-    const double fineCr = std::max(0.0, it->second.amountCr);
-    const double lateFee = std::max(0.0, fineCr * 0.25); // 25% penalty
-    clearFine(fid);
-
-    addBounty(fid, fineCr + lateFee);
-    addRep(fid, -1.5);
-
-    // Slight security escalation so the player feels the consequences immediately.
-    policeHeat = std::clamp(policeHeat + 0.75, 0.0, 6.0);
-    policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (120.0 / 86400.0));
-
-    toast(toasts,
-          "Unpaid fine in " + factionName(fid) + " is overdue. Converted to bounty: "
-            + std::to_string((int)std::round(fineCr + lateFee)) + " cr.",
-          4.2);
-  }
-};
+      toast(toasts,
+            "Unpaid fine in " + factionName(c.factionId) + " is overdue. Converted to bounty: "
+              + std::to_string((int)std::round(c.bountyAddedCr)) + " cr.",
+            4.2);
+    }
+  };
 
   auto getVoucher = [&](core::u32 factionId) -> double {
-    auto it = bountyVoucherByFaction.find(factionId);
-    return it == bountyVoucherByFaction.end() ? 0.0 : std::max(0.0, it->second);
+    return lawLedger.voucher(factionId);
   };
 
   auto addVoucher = [&](core::u32 factionId, double deltaCr) {
-    if (factionId == 0) return;
-    bountyVoucherByFaction[factionId] = std::max(0.0, getVoucher(factionId) + deltaCr);
+    lawLedger.addVoucher(factionId, deltaCr);
   };
 
   auto clearVoucher = [&](core::u32 factionId) {
-    if (factionId == 0) return;
-    bountyVoucherByFaction[factionId] = 0.0;
+    lawLedger.clearVoucher(factionId);
   };
 
 auto commitCrime = [&](core::u32 factionId, double bountyAddCr, double repPenalty, const std::string& reason, bool showToast = true) {
@@ -4858,8 +4810,8 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
 
   // Record a destroyed / interdicted traffic convoy so it cannot be re-spawned by re-entering the system.
-  // Also applies a small-but-real market impact by removing the shipment units from the destination
-  // station's inventory (background traffic already applied the shipment; this counteracts it).
+  // Also applies a small-but-real market impact by reducing the in-flight shipment units so fewer
+  // units arrive at the destination (convoys are now tied to actual cargo-in-transit).
   auto interdictTrafficConvoy = [&](const Contact& dead, double lostUnits) {
     if (!dead.trafficConvoy) return;
 
@@ -4892,24 +4844,33 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
       st = &trafficInterdictionsById.emplace(convoyId, d).first->second;
     }
 
-    // Apply market impact (destination loses the *additional* units).
-    if (st && st->systemId != 0 && st->toStation != 0 && deltaUnits > 0.0 && currentSystem) {
-      const sim::Station* dst = nullptr;
-      for (const auto& stn : currentSystem->stations) {
-        if (stn.id == st->toStation) { dst = &stn; break; }
-      }
+    // Apply market impact by reducing units from the in-flight shipment (so fewer arrive).
+    if (st && st->systemId != 0 && deltaUnits > 0.0 && currentSystem) {
+      auto itLed = trafficLedgerBySystem.find(st->systemId);
+      if (itLed != trafficLedgerBySystem.end()) {
+        auto& led = itLed->second;
 
-      if (dst) {
-        auto& econState = universe.stationEconomy(*dst, timeDays);
-        const double removed = econ::takeInventory(econState, dst->economyModel, st->commodity, deltaUnits);
+        double removed = 0.0;
+        for (auto& sh : led.shipments) {
+          if (sh.id == convoyId) {
+            removed = std::min(sh.units, deltaUnits);
+            sh.units = std::max(0.0, sh.units - deltaUnits);
+            break;
+          }
+        }
 
-        // Small toast so the player understands that convoys are now "real".
+        // Remove empty shipments so they cannot be delivered later.
         if (removed > 0.0) {
+          led.shipments.erase(
+              std::remove_if(led.shipments.begin(), led.shipments.end(),
+                             [&](const sim::TrafficShipment& s) { return s.id == convoyId && s.units <= 1e-6; }),
+              led.shipments.end());
+
+          // Small toast so the player understands that convoys are now "real".
           char buf[256];
-          std::snprintf(buf, sizeof(buf), "Traffic disrupted: -%.0f %s at %s",
+          std::snprintf(buf, sizeof(buf), "Traffic disrupted: -%.0f %s (in transit)",
                         std::round(removed),
-                        econ::commodityDef(st->commodity).name,
-                        dst->name.c_str());
+                        econ::commodityDef(st->commodity).name);
           toast(toasts, buf, 3.5);
         }
       }
@@ -5793,28 +5754,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	                      return a.asteroidId < b.asteroidId;
 	                    });
 
-	          s.bounties.clear();
-	          for (const auto& [fid, b] : bountyByFaction) {
-	            if (b > 0.0) s.bounties.push_back({fid, b});
-	          }
-	          std::sort(s.bounties.begin(), s.bounties.end(),
-	                    [](const sim::FactionBounty& a, const sim::FactionBounty& b) {
-	                      return a.factionId < b.factionId;
-	                    });
-
-	          s.fines.clear();
-	          for (const auto& [fid, fi] : fineByFaction) {
-	            if (fi.amountCr > 0.0) s.fines.push_back({fid, fi.amountCr, fi.dueDay});
-	          }
-	          std::sort(s.fines.begin(), s.fines.end(),
-	                    [](const sim::FactionFine& a, const sim::FactionFine& b) {
-	                      return a.factionId < b.factionId;
-	                    });
-
-	          s.bountyVouchers.clear();
-	          for (const auto& [fid, v] : bountyVoucherByFaction) {
-	            if (v > 0.0) s.bountyVouchers.push_back({fid, v});
-	          }
+	          // Law / crime ledger
+	          lawLedger.exportToSave(s);
 
           // Background traffic stamps
           s.trafficStamps.clear();
@@ -6026,48 +5967,40 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	              asteroidRemainingById[a.asteroidId] = std::max(0.0, a.remainingUnits);
 	            }
 
-	            bountyByFaction.clear();
-	            for (const auto& b : s.bounties) bountyByFaction[b.factionId] = b.bountyCr;
-	            bountyVoucherByFaction.clear();
-	            for (const auto& v : s.bountyVouchers) bountyVoucherByFaction[v.factionId] = v.bountyCr;
-
-	            fineByFaction.clear();
-	            for (const auto& fi : s.fines) {
-	              FineEntry e{};
-	              e.amountCr = std::max(0.0, fi.fineCr);
-	              e.dueDay = fi.dueDay;
-	              if (fi.factionId != 0 && e.amountCr > 1e-6) {
-	                fineByFaction[fi.factionId] = e;
-	              }
-	            }
+	            // Law / crime ledger (bounties, vouchers, fines)
+	            lawLedger.importFromSave(s);
 
                 // Background traffic stamps
                 trafficDayStampBySystem.clear();
                 for (const auto& t : s.trafficStamps) {
                   trafficDayStampBySystem[t.systemId] = t.dayStamp;
                 }
-
-                // Restore recent traffic shipments into per-system ledgers so convoy signals
-                // remain consistent after load (even when no new day has advanced).
+                // Restore traffic shipments into per-system ledgers.
+                //
+                // NOTE: v30+ saves are "transit-mode" where shipments represent in-flight cargo that
+                // is delivered on arrival. Older saves already applied shipment inventory deltas
+                // instantly, so restoring their shipments would double-deliver cargo.
                 trafficLedgerBySystem.clear();
-                for (const auto& sh : s.trafficShipments) {
-                  sim::TrafficShipment tsh{};
-                  tsh.id = sh.id;
-                  tsh.systemId = sh.systemId;
-                  tsh.dayStamp = sh.dayStamp;
-                  tsh.fromStation = sh.fromStation;
-                  tsh.toStation = sh.toStation;
-                  tsh.factionId = sh.factionId;
-                  tsh.commodity = sh.commodity;
-                  tsh.units = sh.units;
-                  tsh.departDay = sh.departDay;
-                  tsh.arriveDay = sh.arriveDay;
-                  tsh.distKm = sh.distKm;
-                  tsh.speedKmS = sh.speedKmS;
-                  trafficLedgerBySystem[tsh.systemId].record(std::move(tsh));
-                }
-                for (auto& kv : trafficLedgerBySystem) {
-                  kv.second.prune(timeDays);
+                if (s.version >= 30) {
+                  for (const auto& sh : s.trafficShipments) {
+                    sim::TrafficShipment tsh{};
+                    tsh.id = sh.id;
+                    tsh.systemId = sh.systemId;
+                    tsh.dayStamp = sh.dayStamp;
+                    tsh.fromStation = sh.fromStation;
+                    tsh.toStation = sh.toStation;
+                    tsh.factionId = sh.factionId;
+                    tsh.commodity = sh.commodity;
+                    tsh.units = sh.units;
+                    tsh.departDay = sh.departDay;
+                    tsh.arriveDay = sh.arriveDay;
+                    tsh.distKm = sh.distKm;
+                    tsh.speedKmS = sh.speedKmS;
+                    trafficLedgerBySystem[tsh.systemId].record(std::move(tsh));
+                  }
+                  for (auto& kv : trafficLedgerBySystem) {
+                    kv.second.prune(timeDays);
+                  }
                 }
 
                 // Restore disrupted traffic convoys (anti-farm + economy impact persistence).
@@ -11981,185 +11914,120 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                     }
 
                     const sim::SystemSecurityProfile sec = effectiveSystemSecurityProfile(*currentSystem);
-                    const double value01 = std::clamp(cargoValueCr / 25000.0, 0.0, 1.0);
 
-                    // Local RNG for this encounter so we don't perturb unrelated spawn ordering too much.
-                    core::SplitMix64 crng(core::hashCombine(universe.seed() ^ core::fnv1a64("traffic_convoy_spawn"), s.id));
-                    auto randUnitLocal = [&]() -> math::Vec3d {
-                      math::Vec3d v{crng.range(-1.0, 1.0), crng.range(-1.0, 1.0), crng.range(-1.0, 1.0)};
-                      const double L = v.length();
-                      if (L < 1e-6) return math::Vec3d{1, 0, 0};
-                      return v / L;
-                    };
-
-                    const math::Vec3d basePos = s.posKm + randUnitLocal() * crng.range(3000.0, 12000.0);
-                    const math::Vec3d baseVel = s.trafficState.velKmS;
-
-                    // Convoy leader (trader) carrying the shipment's cargo.
-                    Contact convoy{};
-                    convoy.alive = true;
-                    convoy.id = s.id; // stable: ties contact to the lane convoy id (prevents duplicate spawns)
-                    convoy.role = ContactRole::Trader;
-                    convoy.groupId = s.id;
-                    convoy.factionId = (s.trafficConvoy.factionId != 0) ? s.trafficConvoy.factionId : currentSystem->stub.factionId;
-
-                    convoy.trafficConvoy = true;
-                    convoy.trafficConvoyId = s.id;
-                    convoy.trafficFromStationId = s.trafficConvoy.fromStation;
-                    convoy.trafficToStationId = s.trafficConvoy.toStation;
-                    convoy.trafficArriveDay = s.trafficConvoy.arriveDay;
-
-                    convoy.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
-                    convoy.tradeDestStationIndex = stationIndexById(s.trafficConvoy.toStation);
-
-                    convoy.name = "Traffic Convoy";
-                    convoy.tradeCommodity = s.trafficConvoy.commodity;
-                    convoy.tradeUnits = units;
-                    convoy.tradeCapacityKg = std::max(80.0, units * def.massKg);
-                    convoy.tradeCargoValueCr = cargoValueCr;
-                    convoy.cargoValueCr = cargoValueCr;
-
-                    convoy.tradeSupercruiseSpeedKmS = std::clamp(s.trafficState.speedKmS, 250.0, 18000.0);
-                    convoy.tradeSupercruiseDropDistKm = 90000.0;
-
-                    const int thrMk = 1 + (value01 > 0.65);
-                    const int shieldMk = 1 + (sec.security01 > 0.55);
-                    const int distMk = 1 + (sec.security01 > 0.75);
-
-                    configureContactLoadout(convoy,
-                                            ShipHullClass::Hauler,
-                                            thrMk,
-                                            shieldMk,
-                                            distMk,
-                                            WeaponType::MiningLaser,
-                                            /*hullMul=*/0.70 + 0.10 * value01,
-                                            /*shieldMul=*/0.70 + 0.08 * value01,
-                                            /*regenMul=*/0.0,
-                                            /*accelMul=*/0.78,
-                                            /*aiSkill=*/0.42);
-                    convoy.pips = {4, 1, 1};
-                    sim::normalizePips(convoy.pips);
-
-                    convoy.ship.setPositionKm(basePos);
-                    convoy.ship.setVelocityKmS(baseVel);
-                    convoy.ship.setOrientation(quatFromTo({0, 0, 1}, s.trafficState.dir));
-
-                    const core::u64 convoyId = convoy.id;
-                    contacts.push_back(std::move(convoy));
-
-                    // Escorts scale with system security and cargo value (none in anarchy).
-                    int escortCount = 0;
-                    if (currentSystem->stub.factionId != 0) {
-                      if (sec.security01 > 0.70) escortCount = 2;
-                      else if (sec.security01 > 0.55) escortCount = 1;
-                      if (value01 > 0.85 && escortCount < 3 && crng.nextUnit() < 0.55) ++escortCount;
-                    }
-                    escortCount = std::clamp(escortCount, 0, 3);
-
-                    core::u64 escortLeaderId = 0;
-                    for (int ei = 0; ei < escortCount; ++ei) {
-                      Contact p{};
-                      p.alive = true;
-                      p.id = allocWorldId();
-                      if (ei == 0) escortLeaderId = p.id;
-
-                      p.role = ContactRole::Police;
-                      p.groupId = convoyId;
-                      p.leaderId = (ei == 0) ? 0 : escortLeaderId;
-                      p.followId = convoyId;
-                      p.factionId = currentSystem->stub.factionId;
-                      p.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
-                      p.name = (ei == 0) ? "Convoy Escort" : "Escort";
-
-                      const int tier = std::clamp(1 + (value01 > 0.65) + (sec.security01 > 0.75), 1, 3);
-                      const WeaponType w = (tier >= 3 && ei == 0) ? WeaponType::Railgun : WeaponType::PulseLaser;
-
-                      const int tMk = 2;
-                      const int sMk = 1;
-                      const int dMk = tier;
-
-                      const sim::ShipDerivedStats dsTmp = sim::computeShipDerivedStats(ShipHullClass::Scout, tMk, sMk, dMk);
-                      const double regenPerSimMin = npcShieldRegenPerSec * 60.0;
-                      const double targetRegenPerSimMin = regenPerSimMin * (1.0 + 0.12 * (double)(tier - 1));
-                      const double regenMul =
-                          (dsTmp.shieldRegenPerSimMin > 1e-9) ? (targetRegenPerSimMin / dsTmp.shieldRegenPerSimMin) : 0.0;
-
-                      configureContactLoadout(p,
-                                              ShipHullClass::Scout,
-                                              tMk,
-                                              sMk,
-                                              dMk,
-                                              w,
-                                              /*hullMul=*/0.86 * (1.0 + 0.10 * (double)(tier - 1)),
-                                              /*shieldMul=*/0.88 * (1.0 + 0.10 * (double)(tier - 1)),
-                                              /*regenMul=*/regenMul,
-                                              /*accelMul=*/0.80 * (1.0 + 0.10 * (double)(tier - 1)),
-                                              /*aiSkill=*/(ei == 0) ? 0.70 : 0.60);
-                      p.pips = {2, 2, 2};
-                      sim::normalizePips(p.pips);
-
-                      p.ship.setPositionKm(basePos + randUnitLocal() * crng.range(14000.0, 24000.0));
-                      p.ship.setVelocityKmS(baseVel + randUnitLocal() * crng.range(0.0, 0.6));
-                      contacts.push_back(std::move(p));
-                    }
-
-                    // Raiders scale with piracy and cargo value.
+                    // Count current pirates before spawning this encounter.
                     int alivePiratesNow = 0;
                     for (const auto& c : contacts) {
                       if (c.alive && c.role == ContactRole::Pirate) ++alivePiratesNow;
                     }
 
-                    const double risk01 = std::clamp(0.12 + 0.65 * sec.piracy01 + 0.35 * value01 - 0.55 * sec.security01, 0.0, 0.90);
-                    if (alivePiratesNow < 10 && crng.nextUnit() < risk01) {
-                      int count = 2 + (crng.nextUnit() < 0.55);
-                      if (risk01 > 0.60 && crng.nextUnit() < 0.45) ++count;
-                      if (risk01 > 0.82 && crng.nextUnit() < 0.25) ++count;
-                      count = std::clamp(count, 2, 5);
+                    sim::TrafficConvoyEncounterParams ep{};
+                    ep.npcShieldRegenPerSec = npcShieldRegenPerSec;
+                    const bool lawfulSystem = (currentSystem->stub.factionId != 0);
 
-                      core::u64 leaderId = 0;
-                      for (int i = 0; i < count; ++i) {
-                        Contact p{};
-                        p.alive = true;
-                        p.id = allocWorldId();
-                        if (i == 0) leaderId = p.id;
+                    const auto plan = sim::planTrafficConvoyEncounter(universe.seed(),
+                                                                      s.id,
+                                                                      cargoValueCr,
+                                                                      sec,
+                                                                      lawfulSystem,
+                                                                      alivePiratesNow,
+                                                                      ep);
 
-                        p.role = ContactRole::Pirate;
-                        p.groupId = convoyId;
-                        p.leaderId = (i == 0) ? 0 : leaderId;
-                        p.hostileToPlayer = true;
-                        p.attackTargetId = convoyId;
-                        p.name = (i == 0) ? "Raid Leader" : "Raider";
+                    if (plan.ok && !plan.npcs.empty()) {
+                      const math::Vec3d baseVel = s.trafficState.velKmS;
+                      const core::u64 convoyGroupId = s.id;
 
-                        const bool leader = (i == 0);
-                        const double statMul = leader ? 1.22 : (0.88 + 0.22 * crng.nextUnit());
-                        const int tMk = leader ? 2 : 1;
-                        const int dMk = leader ? 2 : 1;
+                      core::u64 escortLeaderId = 0;
+                      core::u64 pirateLeaderId = 0;
 
-                        WeaponType w = WeaponType::Cannon;
-                        const double r = crng.nextUnit();
-                        if (leader) w = (r < 0.55) ? WeaponType::Railgun : WeaponType::Cannon;
-                        else w = (r < 0.55) ? WeaponType::Cannon : WeaponType::BeamLaser;
+                      for (const auto& spec : plan.npcs) {
+                        Contact c{};
+                        c.alive = true;
+                        c.groupId = convoyGroupId;
 
-                        configureContactLoadout(p,
-                                                ShipHullClass::Fighter,
-                                                tMk,
-                                                /*sMk=*/1,
-                                                dMk,
-                                                w,
-                                                /*hullMul=*/0.95 * statMul,
-                                                /*shieldMul=*/0.67 * statMul,
-                                                /*regenMul=*/leader ? 0.70 : 0.63,
-                                                /*accelMul=*/leader ? 0.72 : 0.70,
-                                                /*aiSkill=*/leader ? 0.68 : 0.55);
-                        p.pips = {1, 3, 2};
-                        sim::normalizePips(p.pips);
+                        if (spec.role == sim::TrafficEncounterNpcRole::Trader) {
+                          // Convoy leader (stable id ties contact to the lane convoy id).
+                          c.id = convoyGroupId;
+                          c.role = ContactRole::Trader;
+                          c.factionId = (s.trafficConvoy.factionId != 0) ? s.trafficConvoy.factionId : currentSystem->stub.factionId;
 
-                        p.ship.setPositionKm(basePos + randUnitLocal() * crng.range(52000.0, 90000.0));
-                        p.ship.setVelocityKmS(baseVel + randUnitLocal() * crng.range(0.0, 1.2));
-                        contacts.push_back(std::move(p));
+                          c.trafficConvoy = true;
+                          c.trafficConvoyId = convoyGroupId;
+                          c.trafficFromStationId = s.trafficConvoy.fromStation;
+                          c.trafficToStationId = s.trafficConvoy.toStation;
+                          c.trafficArriveDay = s.trafficConvoy.arriveDay;
+
+                          c.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
+                          c.tradeDestStationIndex = stationIndexById(s.trafficConvoy.toStation);
+
+                          c.name = "Traffic Convoy";
+                          c.tradeCommodity = s.trafficConvoy.commodity;
+                          c.tradeUnits = units;
+                          c.tradeCapacityKg = std::max(80.0, units * def.massKg);
+                          c.tradeCargoValueCr = cargoValueCr;
+                          c.cargoValueCr = cargoValueCr;
+
+                          c.tradeSupercruiseSpeedKmS = std::clamp(s.trafficState.speedKmS, 250.0, 18000.0);
+                          c.tradeSupercruiseDropDistKm = 90000.0;
+                        } else if (spec.role == sim::TrafficEncounterNpcRole::Police) {
+                          c.id = allocWorldId();
+                          c.role = ContactRole::Police;
+                          c.factionId = currentSystem->stub.factionId;
+                          c.followId = convoyGroupId;
+                          c.homeStationIndex = stationIndexById(s.trafficConvoy.fromStation);
+
+                          if (spec.leader) {
+                            escortLeaderId = c.id;
+                            c.leaderId = 0;
+                            c.name = "Convoy Escort";
+                          } else {
+                            c.leaderId = escortLeaderId;
+                            c.name = "Escort";
+                          }
+                        } else {
+                          c.id = allocWorldId();
+                          c.role = ContactRole::Pirate;
+                          c.factionId = 0;
+                          c.hostileToPlayer = true;
+                          c.attackTargetId = convoyGroupId;
+
+                          if (spec.leader) {
+                            pirateLeaderId = c.id;
+                            c.leaderId = 0;
+                            c.name = "Raid Leader";
+                          } else {
+                            c.leaderId = pirateLeaderId;
+                            c.name = "Raider";
+                          }
+                        }
+
+                        configureContactLoadout(c,
+                                                spec.hullClass,
+                                                spec.thrusterMk,
+                                                spec.shieldMk,
+                                                spec.distributorMk,
+                                                spec.weapon,
+                                                spec.hullMul,
+                                                spec.shieldMul,
+                                                spec.regenMul,
+                                                spec.accelMul,
+                                                spec.aiSkill);
+                        c.pips = spec.pips;
+                        sim::normalizePips(c.pips);
+
+                        c.ship.setPositionKm(s.posKm + spec.posOffsetKm);
+                        c.ship.setVelocityKmS(baseVel + spec.velOffsetKmS);
+
+                        if (spec.role == sim::TrafficEncounterNpcRole::Trader) {
+                          c.ship.setOrientation(quatFromTo({0, 0, 1}, s.trafficState.dir));
+                        }
+
+                        contacts.push_back(std::move(c));
                       }
 
-                      toast(toasts, "Ambush! Raiders drop on a traffic convoy.", 3.0);
+                      if (plan.ambush) {
+                        toast(toasts, "Ambush! Raiders drop on a traffic convoy.", 3.0);
+                      }
                     }
                   }
                 }
@@ -12543,7 +12411,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       // --- Background NPC trade traffic (market nudging) ---
       if (currentSystem) {
         auto& trafficLedger = trafficLedgerBySystem[currentSystem->stub.id];
-        sim::simulateNpcTradeTraffic(universe, *currentSystem, timeDays, trafficDayStampBySystem,
+        sim::simulateNpcTradeTrafficTransit(universe, *currentSystem, timeDays, trafficDayStampBySystem,
                                      /*kMaxBackfillDays=*/14, &trafficLedger);
       }
 
@@ -15990,6 +15858,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralTradeSystemsLabWindow(proceduralTradeSystemsLabWindow, universe, currentSystem, (float)timeRealSec,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawSpectralMieLabWindow(spectralMieLabWindow, (float)timeRealSec,
@@ -19916,7 +19787,7 @@ if (trajCache.valid) {
 
 	  {
 	    double totalVouchers = 0.0;
-	    for (const auto& kv : bountyVoucherByFaction) totalVouchers += std::max(0.0, kv.second);
+	    for (const auto& kv : lawLedger.vouchers()) totalVouchers += std::max(0.0, kv.second);
 	    if (totalVouchers > 0.0) {
 	      ImGui::Text("Bounty vouchers: %.0f cr (redeem at matching faction stations)", totalVouchers);
 	    }
@@ -23629,7 +23500,7 @@ if (canTrade) {
   // Interstellar Factors: pay fines from other jurisdictions at a surcharge (major stations only).
   if (station.type == econ::StationType::TradeHub || station.type == econ::StationType::Shipyard) {
     double otherFines = 0.0;
-    for (const auto& kv : fineByFaction) {
+    for (const auto& kv : lawLedger.fines()) {
       if (kv.first == station.factionId) continue;
       otherFines += kv.second.amountCr;
     }
@@ -23637,28 +23508,17 @@ if (canTrade) {
       const double feeRate = 0.20; // 20% service fee
       ImGui::TextDisabled("Interstellar Factors fee: %.0f%%", feeRate * 100.0);
       if (ImGui::SmallButton("Pay ALL other-jurisdiction fines")) {
-        double total = 0.0;
-        for (const auto& kv : fineByFaction) {
-          if (kv.first == station.factionId) continue;
-          total += kv.second.amountCr;
-        }
-        const double cost = total * (1.0 + feeRate);
-        if (credits + 1e-6 >= cost && total > 0.0) {
-          credits -= cost;
-          // Clear everything except this station's faction fines.
-          std::vector<core::u32> clearIds;
-          for (const auto& kv : fineByFaction) {
-            if (kv.first == station.factionId) continue;
-            clearIds.push_back(kv.first);
-          }
-          for (core::u32 fid : clearIds) clearFine(fid);
-          toast(toasts, "Interstellar Factors: cleared fines -" + std::to_string((int)std::round(cost)) + " cr.", 2.6);
+        const auto res = lawLedger.payAllOtherFines(station.factionId, credits, feeRate);
+        if (res.paidCr > 0.0) {
+          toast(toasts,
+                "Interstellar Factors: cleared fines -" + std::to_string((int)std::round(res.paidCr)) + " cr.",
+                2.6);
         } else {
           toast(toasts, "Not enough credits.", 2.0);
         }
       }
       ImGui::SameLine();
-      ImGui::TextDisabled("(%.0f cr total)", otherFines * 1.20);
+      ImGui::TextDisabled("(%.0f cr total)", otherFines * (1.0 + feeRate));
     }
   }
 
@@ -23677,7 +23537,7 @@ if (canTrade) {
 	  // Small hint if you have vouchers elsewhere
 	  {
 	    double other = 0.0;
-	    for (const auto& kv : bountyVoucherByFaction) {
+	    for (const auto& kv : lawLedger.vouchers()) {
 	      if (kv.first == station.factionId) continue;
 	      other += kv.second;
 	    }
@@ -24236,6 +24096,24 @@ if (canTrade) {
                   tradeMixDayStamp = -1;
                 }
 
+                ImGui::SameLine();
+                bool beam = tradeMixBeamSearch;
+                if (ImGui::Checkbox("Beam search", &beam)) {
+                  tradeMixBeamSearch = beam;
+                  tradeMixDayStamp = -1;
+                }
+                if (ImGui::IsItemHovered()) {
+                  ImGui::SetTooltip("Beam search keeps multiple partial cargo mixes to avoid myopic choices (especially with credit limits). Slower than greedy.");
+                }
+
+                if (tradeMixBeamSearch) {
+                  int bw = std::max(1, tradeMixBeamWidth);
+                  if (ImGui::SliderInt("Beam width", &bw, 1, 64)) {
+                    tradeMixBeamWidth = bw;
+                    tradeMixDayStamp = -1;
+                  }
+                }
+
                 int linesShown = std::max(1, tradeMixLinesShown);
                 if (ImGui::SliderInt("Lines shown", &linesShown, 1, 6)) {
                   tradeMixLinesShown = linesShown;
@@ -24356,6 +24234,10 @@ if (canTrade) {
                 scan.stepKg = tradeMixStepKg;
                 scan.maxBuyCreditsCr = 0.0; // display mode: ignore player credits
                 scan.simulatePriceImpact = tradeMixSimulateImpact;
+
+                scan.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch
+                                                 : econ::CargoManifestPlanner::Greedy;
+                scan.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
 
                 scan.minNetProfit = tradeMinNetProfit;
                 scan.includeSameSystem = tradeIncludeSameSystem;
@@ -24585,6 +24467,9 @@ if (canTrade) {
                           mp.stepKg = tradeMixStepKg;
                           mp.maxBuyCreditsCr = credits;
                           mp.simulatePriceImpact = tradeMixSimulateImpact;
+                          mp.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch
+                                                   : econ::CargoManifestPlanner::Greedy;
+                          mp.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
 
                           const auto plan = econ::bestManifestForCargo(fromEcon,
                                                                        fromSt->economyModel,

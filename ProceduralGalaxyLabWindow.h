@@ -4,6 +4,7 @@
 #include "stellar/math/Vec3.h"
 #include "stellar/proc/GalaxyGenerator.h"
 #include "stellar/proc/GalaxyRegions.h"
+#include "stellar/proc/Hyperlanes.h"
 #include "stellar/sim/Celestial.h"
 #include "stellar/sim/Faction.h"
 
@@ -30,11 +31,12 @@ struct ProceduralGalaxyLabWindowState {
   bool autoRegenerate{true};
   bool colorByFaction{false};
   bool colorByRegion{false};
-  bool colorByCluster{false};
-  bool colorByMorphology{false};
   bool showArmGuides{true};
-  bool showMorphGuides{true};
   bool showLegend{true};
+  // Hyperlane overlay (procedural sparse navigation/trade corridor graph).
+  bool showHyperlanes{false};
+  proc::HyperlaneParams hyperlaneParams{};
+
 
   // Galaxy regions (Worley/Voronoi). Used for visualization only.
   double regionCellSizeLy{900.0};
@@ -47,12 +49,10 @@ struct ProceduralGalaxyLabWindowState {
   // Cached per-stub region kind/id for preview rendering.
   std::vector<proc::GalaxyRegionKind> stubRegionKind{};
   std::vector<core::u64> stubRegionId{};
+  // Cached hyperlane overlay.
+  std::vector<proc::HyperlaneEdge> hyperlanes{};
+  double lastLaneMs{0.0};
 
-  // Cached per-stub cluster influence (0..1) for preview rendering.
-  std::vector<float> stubCluster01{};
-
-  // Cached per-stub morphology influence (0..1) for preview rendering.
-  std::vector<float> stubMorph01{};
   double lastGenMs{0.0};
 };
 

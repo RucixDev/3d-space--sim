@@ -1,9 +1,11 @@
 #pragma once
 
 #include "stellar/core/StableHash.h"
+#include "stellar/sim/Faction.h"
 #include "stellar/sim/System.h"
 
 #include <cstddef>
+#include <vector>
 
 namespace stellar::sim {
 
@@ -38,6 +40,44 @@ inline core::u64 signatureSystemStub(const SystemStub& s) {
   h.addInt(s.planetCount);
   h.addInt(s.stationCount);
   h.addU32(s.factionId);
+  return h.value();
+}
+
+// Deterministic signature for a list of SystemStubs.
+//
+// Notes:
+//  - This function does NOT sort the input; callers should feed a stable order.
+inline core::u64 signatureSystemStubList(const std::vector<SystemStub>& stubs) {
+  core::StableHash64 h;
+  h.addU64(static_cast<core::u64>(stubs.size()));
+  for (const auto& s : stubs) {
+    h.addU64(signatureSystemStub(s));
+  }
+  return h.value();
+}
+
+inline core::u64 signatureFaction(const Faction& f) {
+  core::StableHash64 h;
+  h.addU32(f.id);
+  h.addString(f.name);
+  h.addDoubleQ(f.homePosLy.x);
+  h.addDoubleQ(f.homePosLy.y);
+  h.addDoubleQ(f.homePosLy.z);
+  h.addDoubleQ(f.color.x);
+  h.addDoubleQ(f.color.y);
+  h.addDoubleQ(f.color.z);
+  h.addDoubleQ(f.influenceRadiusLy);
+  h.addDoubleQ(f.taxRate);
+  h.addDoubleQ(f.industryBias);
+  return h.value();
+}
+
+inline core::u64 signatureFactionList(const std::vector<Faction>& factions) {
+  core::StableHash64 h;
+  h.addU64(static_cast<core::u64>(factions.size()));
+  for (const auto& f : factions) {
+    h.addU64(signatureFaction(f));
+  }
   return h.value();
 }
 
@@ -97,6 +137,15 @@ inline core::u64 signatureStarSystem(const StarSystem& sys) {
 
   h.addU64(static_cast<core::u64>(sys.stations.size()));
   for (const auto& s : sys.stations) signatureStation(h, s);
+  return h.value();
+}
+
+// Deterministic signature for a full StarSystem plus the faction set used to
+// interpret it.
+inline core::u64 signatureStarSystem(const StarSystem& sys, const std::vector<Faction>& factions) {
+  core::StableHash64 h;
+  h.addU64(signatureStarSystem(sys));
+  h.addU64(signatureFactionList(factions));
   return h.value();
 }
 

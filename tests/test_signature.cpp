@@ -1,7 +1,7 @@
-#include "stellar/core/StableHash.h"
 #include "stellar/sim/Signature.h"
 #include "stellar/sim/Universe.h"
 
+#include <algorithm>
 #include <iostream>
 
 using namespace stellar;
@@ -14,23 +14,22 @@ int test_signature() {
   sim::Universe u(1337);
   const math::Vec3d posLy{0, 0, 0};
 
-  const auto stubs = u.queryNearby(posLy, 120.0, 64);
+  auto stubs = u.queryNearby(posLy, 120.0, 64);
   if (stubs.empty()) {
     std::cerr << "[test_signature] expected non-empty stub list\n";
     return 1;
   }
 
-  core::StableHash64 h;
-  for (const auto& s : stubs) {
-    h.addU64(sim::signatureSystemStub(s));
-  }
+  // Ensure the signature is based on content, not incidental query ordering.
+  std::sort(stubs.begin(), stubs.end(),
+            [](const sim::SystemStub& a, const sim::SystemStub& b) { return a.id < b.id; });
 
-  const core::u64 stubListSig = h.value();
-  const core::u64 expectedStubListSig = 6216983436330206766ull;
+  const core::u64 stubListSig = sim::signatureSystemStubList(stubs);
+  const core::u64 expectedStubListSig = 7978128231034067079ull;
 
   const auto& sys0 = u.getSystem(stubs.front().id, &stubs.front());
-  const core::u64 sys0Sig = sim::signatureStarSystem(sys0);
-  const core::u64 expectedSys0Sig = 5099655091060190414ull;
+  const core::u64 sys0Sig = sim::signatureStarSystem(sys0, u.factions());
+  const core::u64 expectedSys0Sig = 7801071842472395155ull;
 
   int fails = 0;
   if (stubListSig != expectedStubListSig) {

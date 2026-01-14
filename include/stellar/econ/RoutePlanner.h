@@ -73,9 +73,14 @@ std::vector<RouteOpportunity> bestRoutesForCargo(const StationEconomyState& from
 // manifest planner can recommend a *mix* of commodities that jointly maximizes
 // trip profit under a cargo mass limit.
 //
-// The default planner is a greedy "marginal profit per kg" allocator that can
-// optionally simulate price impact by updating station inventories as it fills
-// the hold. This approximates the best mix when prices respond to inventory.
+// The manifest planner supports multiple algorithms:
+//  - Greedy: fastest, picks the best current marginal profit/kg each step.
+//  - BeamSearch: keeps multiple partial allocations to avoid myopic traps,
+//                especially under credit limits and when price impact is enabled.
+enum class CargoManifestPlanner : core::u8 {
+  Greedy = 0,
+  BeamSearch = 1,
+};
 
 struct CargoManifestParams {
   // Cargo constraint
@@ -88,8 +93,14 @@ struct CargoManifestParams {
   double fromFeeRate{0.0};
   double toFeeRate{0.0};
 
+  // Planner selection.
+  CargoManifestPlanner planner{CargoManifestPlanner::Greedy};
+
+  // Beam-search knobs (only used when planner==BeamSearch).
+  std::size_t beamWidth{24};
+
   // Optimization knobs
-  double stepKg{1.0};              // resolution of the greedy allocator
+  double stepKg{1.0};              // resolution of the allocator (kg per step)
   double maxBuyCreditsCr{0.0};     // <= 0 => ignore player credits
   bool simulatePriceImpact{true};  // if true, inventory changes affect prices while planning
 };

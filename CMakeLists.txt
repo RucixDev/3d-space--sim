@@ -119,6 +119,11 @@ set(STELLAR_CORE_SOURCES
   src/ui/WindowRegistry.cpp
 
   src/proc/Noise.cpp
+  src/proc/GalaxyHazards.cpp
+  src/proc/GalaxyRegions.cpp
+  src/proc/GalaxyClusters.cpp
+  src/proc/Hyperlanes.cpp
+  src/proc/HyperlaneRouter.cpp
   # Procedural geometry generators (CPU-side; safe for headless builds).
   src/render/ProceduralAsteroid.cpp
   src/render/SdfMesher.cpp
@@ -133,7 +138,14 @@ set(STELLAR_CORE_SOURCES
   src/render/AutoExposure.cpp
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
+  src/proc/GalaxyMorphology.cpp
   src/proc/SystemGenerator.cpp
+  src/proc/TradeProfile.cpp
+  src/proc/TradeEconomy.cpp
+  src/proc/TradeRoutes.cpp
+  src/proc/TradePrices.cpp
+  src/proc/TradeIntel.cpp
+  src/proc/TradeFlow.cpp
   src/proc/MiePhase.cpp
   src/proc/PhaseMultipleScattering.cpp
 
@@ -172,6 +184,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/PowerDistributor.cpp
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
+  src/sim/LawLedger.cpp
+  src/sim/BlackMarket.cpp
   src/sim/Extortion.cpp
   src/sim/NpcCombatAI.cpp
   src/sim/CargoJettisonPlanner.cpp
@@ -190,9 +204,11 @@ set(STELLAR_CORE_SOURCES
   src/sim/Logbook.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
+  src/sim/TrafficTransit.cpp
   src/sim/TrafficLedger.cpp
   src/sim/TrafficLanes.cpp
   src/sim/TrafficConvoyLayer.cpp
+  src/sim/TrafficConvoyEncounter.cpp
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
   src/sim/TradeRunPlanner.cpp
@@ -291,6 +307,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/ProceduralLabWindow.cpp
     apps/stellar_game/ProceduralMeshLabWindow.cpp
     apps/stellar_game/ProceduralGalaxyLabWindow.cpp
+    apps/stellar_game/ProceduralTradeSystemsLabWindow.cpp
     apps/stellar_game/SpectralMieLabWindow.cpp
     apps/stellar_game/GaussianSurfelReconstructionLabWindow.cpp
     apps/stellar_game/Screenshot.cpp

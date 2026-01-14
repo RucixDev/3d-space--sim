@@ -7,6 +7,7 @@
 #include "stellar/proc/GalaxyGenerator.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/BlackMarket.h"
 #include "stellar/sim/Law.h"
 #include "stellar/sim/FactionProfile.h"
 #include "stellar/sim/PoliceScan.h"
@@ -237,6 +238,7 @@ static void printHelp() {
             << "\n"
             << "Law / contraband (headless):\n"
             << "  --law                 Print law + contraband profile for the chosen station\n"
+            << "  --blackMarket         Print black market access + pricing multipliers for the chosen station\n"
             << "  --faction <id>         Override faction id (default: station faction)\n"
             << "  --lawRep <r>           Player reputation used for bribe chance (default: 0)\n"
             << "  --heat <h>             Player heat used for bribe chance (default: 0)\n"
@@ -545,6 +547,7 @@ int main(int argc, char** argv) {
   (void)args.getInt("acceptOffer", acceptOffer);
 
   const bool doLaw = args.hasFlag("law");
+  const bool doBlackMarket = args.hasFlag("blackMarket");
   core::u32 lawFactionOverride = 0;
   {
     unsigned long long v = 0;
@@ -1480,7 +1483,7 @@ int main(int argc, char** argv) {
 
     const core::u32 factionId = (lawFactionOverride != 0) ? lawFactionOverride : st.factionId;
     const sim::LawProfile law = sim::lawProfile(seed, factionId);
-    const std::string illegalList = sim::illegalCommodityListString(seed, factionId);
+    const std::string illegalList = sim::illegalCommodityListStringForStation(seed, factionId, st.id, st.type);
 
     const double fineCr = law.contrabandFineCr(lawIllegalValueCr);
     const double bribeChance = sim::bribeOfferChance(law, lawRep, lawHeat, lawIllegalValueCr);
@@ -1563,6 +1566,123 @@ int main(int argc, char** argv) {
                 << " bribeChance=" << std::fixed << std::setprecision(3) << bribeChance
                 << " bribe=" << std::fixed << std::setprecision(1) << bribeCr
                 << " (rep=" << lawRep << " heat=" << lawHeat << ")\n";
+    }
+  }
+
+  if (doBlackMarket && !systems.empty()) {
+    fromSysIdx = std::min(fromSysIdx, systems.size() - 1);
+
+    const auto& fromStub = systems[fromSysIdx];
+    const auto& fromSys = u.getSystem(fromStub.id, &fromStub);
+    if (fromSys.stations.empty()) {
+      std::cerr << "\n[blackMarket] system has no stations\n";
+      return 1;
+    }
+
+    fromStationIdx = std::min(fromStationIdx, fromSys.stations.size() - 1);
+    const auto& st = fromSys.stations[fromStationIdx];
+
+    const core::u32 factionId = (lawFactionOverride != 0) ? lawFactionOverride : st.factionId;
+    const sim::LawProfile law = sim::lawProfile(seed, factionId);
+    const sim::SystemSecurityProfile sec = sim::systemSecurityProfile(seed, fromSys);
+
+    const sim::BlackMarketProfile bm = sim::blackMarketProfile(seed, fromStub.id, st, sec, law, timeDays, lawRep);
+
+    const std::string illegalList = sim::illegalCommodityListStringForStation(seed, factionId, st.id, st.type);
+    const double effectiveSellMul = bm.bidMul * (1.0 - bm.fenceCut);
+
+    // Build a small set of illegal commodity quotes for this station.
+    auto& stEcon = u.stationEconomy(st, timeDays);
+
+    struct OneQuote {
+      econ::CommodityId cid{econ::CommodityId::Food};
+      econ::MarketQuote official{};
+      econ::MarketQuote black{};
+    };
+    std::vector<OneQuote> qs;
+
+    const core::u32 mask = sim::illegalCommodityMaskForStation(seed, factionId, st.id, st.type);
+    const std::size_t maxBits = std::min<std::size_t>(econ::kCommodityCount, 32);
+    for (std::size_t i = 0; i < maxBits; ++i) {
+      if ((mask & (1u << i)) == 0u) continue;
+      const auto cid = (econ::CommodityId)i;
+      const auto off = econ::quote(stEcon, st.economyModel, cid, 0.10);
+      const auto blk = sim::applyBlackMarketQuote(off, bm);
+      qs.push_back({cid, off, blk});
+      if (qs.size() >= 8) break;
+    }
+
+    if (json) {
+      j.key("blackMarket");
+      j.beginObject();
+      j.key("systemId"); j.value((unsigned long long)fromStub.id);
+      j.key("stationId"); j.value((unsigned long long)st.id);
+      j.key("systemName"); j.value(fromStub.name);
+      j.key("stationName"); j.value(st.name);
+      j.key("factionId"); j.value((unsigned long long)factionId);
+      j.key("illegal"); j.value(illegalList);
+
+      j.key("profile");
+      j.beginObject();
+      j.key("available"); j.value(bm.available);
+      j.key("access01"); j.value(bm.access01);
+      j.key("risk01"); j.value(bm.risk01);
+      j.key("fenceCut"); j.value(bm.fenceCut);
+      j.key("bidMul"); j.value(bm.bidMul);
+      j.key("askMul"); j.value(bm.askMul);
+      j.key("effectiveSellMul"); j.value(effectiveSellMul);
+      j.key("stingChance"); j.value(bm.stingChance);
+      j.endObject();
+
+      j.key("quotes");
+      j.beginArray();
+      for (const auto& q : qs) {
+        j.beginObject();
+        j.key("commodity"); j.value(econ::commodityCode(q.cid));
+        j.key("official");
+        j.beginObject();
+        j.key("mid"); j.value(q.official.mid);
+        j.key("ask"); j.value(q.official.ask);
+        j.key("bid"); j.value(q.official.bid);
+        j.endObject();
+        j.key("black");
+        j.beginObject();
+        j.key("mid"); j.value(q.black.mid);
+        j.key("ask"); j.value(q.black.ask);
+        j.key("bid"); j.value(q.black.bid);
+        j.endObject();
+        j.endObject();
+      }
+      j.endArray();
+
+      j.endObject();
+    } else {
+      std::cout << "\n--- Black Market @ " << fromStub.name << " / " << st.name << " (day=" << timeDays << ") ---\n";
+      std::cout << "Jurisdiction: " << factionId << "  Illegal: " << illegalList << "\n";
+      std::cout << "Available today: " << (bm.available ? "yes" : "no")
+                << "  access=" << std::fixed << std::setprecision(2) << bm.access01
+                << "  risk=" << std::fixed << std::setprecision(2) << bm.risk01
+                << "  sting=" << std::fixed << std::setprecision(2) << bm.stingChance
+                << "\n";
+      std::cout << "Pricing: bidMul=" << std::fixed << std::setprecision(2) << bm.bidMul
+                << "  fenceCut=" << std::fixed << std::setprecision(2) << bm.fenceCut
+                << "  effectiveSellMul=" << std::fixed << std::setprecision(2) << effectiveSellMul
+                << "  askMul=" << std::fixed << std::setprecision(2) << bm.askMul
+                << "\n";
+
+      if (qs.empty()) {
+        std::cout << "No illegal commodities found for this port.\n";
+      } else {
+        std::cout << "Sample quotes (official -> black market):\n";
+        for (const auto& q : qs) {
+          std::cout << "  " << econ::commodityCode(q.cid)
+                    << "  offBid=" << std::fixed << std::setprecision(0) << q.official.bid
+                    << "  bmBid=" << std::fixed << std::setprecision(0) << q.black.bid
+                    << "  offAsk=" << std::fixed << std::setprecision(0) << q.official.ask
+                    << "  bmAsk=" << std::fixed << std::setprecision(0) << q.black.ask
+                    << "\n";
+        }
+      }
     }
   }
 

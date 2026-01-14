@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stellar/econ/Commodity.h"
+#include "stellar/econ/RoutePlanner.h"
 #include "stellar/sim/System.h"
 
 #include <cstddef>
@@ -133,6 +134,10 @@ struct TradeManifestScanParams {
   double stepKg{1.0};
   double maxBuyCreditsCr{0.0};   // <= 0 => ignore player credits
   bool simulatePriceImpact{true};
+
+  // Planner selection.
+  econ::CargoManifestPlanner planner{econ::CargoManifestPlanner::Greedy};
+  std::size_t beamWidth{24};
 
   // Filtering.
   double minNetProfit{0.0}; // min net profit per trip (after fees)
