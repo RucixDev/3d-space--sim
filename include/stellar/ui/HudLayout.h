@@ -15,6 +15,7 @@ namespace stellar::ui {
 // via imgui.ini.
 enum class HudWidgetId : core::u8 {
   Radar = 0,
+  Ship,
   Objective,
   Threat,
   Jump,

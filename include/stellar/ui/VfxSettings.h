@@ -16,7 +16,7 @@ namespace stellar::ui {
 // The VFX Lab started as an experimentation panel; VfxSettings makes those tweaks
 // part of the base game by persisting them to disk.
 struct VfxSettings {
-  int version{2};
+  int version{3};
   bool autoSaveOnExit{true};
 
   // --- Background ---

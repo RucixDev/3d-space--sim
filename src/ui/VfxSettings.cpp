@@ -39,6 +39,7 @@ static const char* surfaceKindToString(render::SurfaceKind k) {
     case render::SurfaceKind::GasGiant: return "gas";
     case render::SurfaceKind::Star: return "star";
     case render::SurfaceKind::Clouds: return "clouds";
+    case render::SurfaceKind::CityLights: return "city_lights";
     default: return "rocky";
   }
 }
@@ -52,6 +53,7 @@ static bool surfaceKindFromString(const std::string& s, render::SurfaceKind* out
   if (t == "gas" || t == "gasgiant" || t == "gas_giant") { *out = render::SurfaceKind::GasGiant; return true; }
   if (t == "star" || t == "sun") { *out = render::SurfaceKind::Star; return true; }
   if (t == "clouds" || t == "cloud") { *out = render::SurfaceKind::Clouds; return true; }
+  if (t == "city_lights" || t == "citylights" || t == "lights" || t == "city") { *out = render::SurfaceKind::CityLights; return true; }
   return false;
 }
 
@@ -84,6 +86,14 @@ bool saveVfxSettingsToFile(const VfxSettings& s, const std::string& path) {
   f << "procSkyStarProbability " << s.proceduralSky.starProbability << "\n";
   f << "procSkyStarSize " << s.proceduralSky.starSize << "\n";
   f << "procSkyStarTwinkle " << s.proceduralSky.starTwinkle << "\n";
+  f << "procSkyStarClusterStrength " << s.proceduralSky.starClusterStrength << "\n";
+  f << "procSkyStarClusterFrequency " << s.proceduralSky.starClusterFrequency << "\n";
+  f << "procSkyStarSpikeStrength " << s.proceduralSky.starSpikeStrength << "\n";
+  f << "procSkyMilkyWayEnabled " << (s.proceduralSky.milkyWayEnabled ? 1 : 0) << "\n";
+  f << "procSkyMilkyWayIntensity " << s.proceduralSky.milkyWayIntensity << "\n";
+  f << "procSkyMilkyWayFrequency " << s.proceduralSky.milkyWayFrequency << "\n";
+  f << "procSkyMilkyWayBandPower " << s.proceduralSky.milkyWayBandPower << "\n";
+  f << "procSkyMilkyWayDust " << s.proceduralSky.milkyWayDust << "\n";
   f << "procSkyNebulaEnabled " << (s.proceduralSky.nebulaEnabled ? 1 : 0) << "\n";
   f << "procSkyNebulaIntensity " << s.proceduralSky.nebulaIntensity << "\n";
   f << "procSkyNebulaFrequency " << s.proceduralSky.nebulaFrequency << "\n";
@@ -236,6 +246,12 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
       std::string v; ss >> v; bool b = s.proceduralSkyEnabled; if (parseBool(v, &b)) s.proceduralSkyEnabled = b;
       continue;
     }
+    if (key == "procSkyMilkyWayEnabled") {
+      std::string v; ss >> v;
+      bool b = s.proceduralSky.milkyWayEnabled;
+      if (parseBool(v, &b)) s.proceduralSky.milkyWayEnabled = b;
+      continue;
+    }
     if (key == "procSkyNebulaEnabled") {
       std::string v; ss >> v; bool b = s.proceduralSky.nebulaEnabled; if (parseBool(v, &b)) s.proceduralSky.nebulaEnabled = b;
       continue;
@@ -359,6 +375,13 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
     if (key == "procSkyStarProbability") { ss >> s.proceduralSky.starProbability; continue; }
     if (key == "procSkyStarSize") { ss >> s.proceduralSky.starSize; continue; }
     if (key == "procSkyStarTwinkle") { ss >> s.proceduralSky.starTwinkle; continue; }
+    if (key == "procSkyStarClusterStrength") { ss >> s.proceduralSky.starClusterStrength; continue; }
+    if (key == "procSkyStarClusterFrequency") { ss >> s.proceduralSky.starClusterFrequency; continue; }
+    if (key == "procSkyStarSpikeStrength") { ss >> s.proceduralSky.starSpikeStrength; continue; }
+    if (key == "procSkyMilkyWayIntensity") { ss >> s.proceduralSky.milkyWayIntensity; continue; }
+    if (key == "procSkyMilkyWayFrequency") { ss >> s.proceduralSky.milkyWayFrequency; continue; }
+    if (key == "procSkyMilkyWayBandPower") { ss >> s.proceduralSky.milkyWayBandPower; continue; }
+    if (key == "procSkyMilkyWayDust") { ss >> s.proceduralSky.milkyWayDust; continue; }
     if (key == "procSkyNebulaIntensity") { ss >> s.proceduralSky.nebulaIntensity; continue; }
     if (key == "procSkyNebulaFrequency") { ss >> s.proceduralSky.nebulaFrequency; continue; }
     if (key == "procSkyNebulaThreshold") { ss >> s.proceduralSky.nebulaThreshold; continue; }

@@ -28,7 +28,11 @@ enum class SurfaceKind : core::u8 {
   Star,
   // Cloud layer alpha mask (RGB is near-white, A encodes density).
   // Intended to be rendered as a slightly larger UV-sphere shell with alpha blending.
-  Clouds
+  Clouds,
+
+  // Night-side city lights emissive map (RGB encodes emission, A=1).
+  // Intended to be combined in MeshRenderer on the planet's night side.
+  CityLights
 };
 
 struct SurfaceImage {
@@ -42,6 +46,9 @@ struct SurfaceImage {
 //
 // For SurfaceKind::Clouds, RGB is near-white and alpha encodes cloud density.
 // Render the resulting texture as a slightly larger shell around the planet.
+
+// For SurfaceKind::CityLights, RGB encodes emissive city lights intended to be
+// added on the planet's night side (in the mesh shader / renderer).
 SurfaceImage generateSurfaceTexture(SurfaceKind kind, core::u64 seed, int widthPx);
 
 // Generate a deterministic tangent-space normal map (RGBA8) for a given surface kind.

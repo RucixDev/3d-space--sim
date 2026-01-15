@@ -11,6 +11,7 @@ namespace stellar::render {
 //
 // Renders a full-screen triangle with a fragment shader that synthesizes:
 //  - stars (grid-jittered, seeded)
+//  - a galaxy band (Milky Way-style glow + dust lanes)
 //  - a cheap volumetric-ish nebula (few-step raymarch through seeded 3D value noise)
 //
 // Intended usage (caller controlled):
@@ -35,6 +36,24 @@ struct ProceduralSkySettings {
   float starSize{1.0f};
   // 0 disables time-varying twinkle.
   float starTwinkle{0.20f};
+
+  // Boosts star density/brightness in coherent clumps (0 disables).
+  float starClusterStrength{0.65f};
+  // Frequency of the cluster field on the unit sphere (higher = smaller clusters).
+  float starClusterFrequency{1.25f};
+  // Strength of diffraction spikes on rare bright stars.
+  float starSpikeStrength{0.25f};
+
+  // ---- Milky Way ----
+  bool milkyWayEnabled{true};
+  // Additive galactic glow intensity (HDR).
+  float milkyWayIntensity{0.85f};
+  // Base frequency for the galactic structure noise field.
+  float milkyWayFrequency{1.15f};
+  // Higher -> narrower band.
+  float milkyWayBandPower{2.4f};
+  // Strength of dark dust lanes (0..1).
+  float milkyWayDust{0.55f};
 
   // ---- Nebula ----
   bool nebulaEnabled{true};

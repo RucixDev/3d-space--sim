@@ -111,6 +111,7 @@ set(STELLAR_CORE_SOURCES
   src/ui/HudSettings.cpp
   src/ui/VfxSettings.cpp
   src/ui/ProceduralUi.cpp
+  src/ui/ProceduralShipHud.cpp
   src/ui/AudioSettings.cpp
   src/ui/Livery.cpp
   src/ui/UiLayoutProfiles.cpp
@@ -227,6 +228,9 @@ set(STELLAR_CORE_SOURCES
 set(STELLAR_RENDER_SOURCES
   src/render/Gl.cpp
   src/render/Shader.cpp
+  src/render/ShaderToy.cpp
+  src/render/ShaderToyParams.cpp
+  src/render/ShaderToyGraph.cpp
   src/render/GaussianSurfels.cpp
   src/render/Texture.cpp
   src/render/FrameGraph.cpp
@@ -242,6 +246,7 @@ set(STELLAR_RENDER_SOURCES
   src/render/AtmosphereRenderer.cpp
   src/render/VolumetricAtmosphereRenderer.cpp
   src/render/ProceduralSky.cpp
+  src/render/StarCoronaRenderer.cpp
   src/render/Starfield.cpp
   src/render/Nebula.cpp
   src/render/ParticleSystem.cpp
@@ -287,6 +292,7 @@ set_target_properties(stellar_sandbox PROPERTIES
 if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
   add_executable(stellar_game
     apps/stellar_game/main.cpp
+    apps/stellar_game/ShipHudOverlay.cpp
     apps/stellar_game/ActionWheel.cpp
     apps/stellar_game/AudioEngine.cpp
     apps/stellar_game/CommandPalette.cpp
@@ -306,6 +312,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/PorkchopPlot.cpp
     apps/stellar_game/ProceduralLabWindow.cpp
     apps/stellar_game/ProceduralMeshLabWindow.cpp
+    apps/stellar_game/ProceduralShaderLabWindow.cpp
     apps/stellar_game/ProceduralGalaxyLabWindow.cpp
     apps/stellar_game/ProceduralSystemLabWindow.cpp
     apps/stellar_game/ProceduralTradeSystemsLabWindow.cpp

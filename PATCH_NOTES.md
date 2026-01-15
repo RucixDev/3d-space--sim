@@ -1,5 +1,252 @@
 # Patch Notes
 
+## Round 50 — Procedural cratered planets (seam-free impact synthesis + ejecta rays)
+
+This round focuses on an under-developed procedural generation area: **planet surface detail**.
+The existing noise-based albedo/height fields looked good at a distance, but lacked the kind of “readable” structure
+(craters, rims, ejecta) that sells scale when you fly close.
+
+### What changed
+
+- Added a **multi-scale crater field** for **Rocky / Desert / Ice** surfaces:
+  - Seam-free (evaluated on the **unit sphere**).
+  - Uses a lightweight **Worley-style nearest-feature lookup** over a jittered integer grid.
+  - Shapes each impact into a **bowl + raised rim + ejecta ring**.
+  - Large impacts optionally include **directional ejecta rays** (streaks) in the outer ring.
+
+- The crater field affects both:
+  - **Albedo** (darkened bowls, brighter rims/ejecta)
+  - **Height** (feeds directly into the procedural **normal map** pipeline)
+
+- Implemented in **both** paths so visuals remain consistent:
+  - CPU surface synthesis (`render::ProceduralPlanet`)
+  - GPU surface cache synthesis (`render::GpuSurfaceCache` fragment shader)
+
+### Files changed/added
+
+- `src/render/ProceduralPlanet.cpp`
+- `src/render/GpuSurfaceCache.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## Round 49 — Shader parameters pipeline (DSL → uniforms → UI → serialization)
+
+**Big focus:** making procedural shaders *controllable* (and shareable) by introducing a ShaderToy-style parameter pipeline.
+
+### Added
+- **Comment-driven parameter DSL** parsed from shader code across all passes:
+  - `// @group <name>` ... `// @endgroup`
+  - `// @param <type> <name> ["Label"] ...`
+  - Types: `float`, `int`, `bool`, `vec2`, `vec3`, `color`
+- **Auto-injected uniform block**: the graph now injects the parsed `uniform` declarations into every pass wrapper *before* the `#line 1` reset, keeping compile error line numbers aligned to user code.
+- **Procedural Shader Lab → Parameters panel**:
+  - live sliders / toggles / vector drags / color picker
+  - filter box, per-group layout, “Reset to defaults”, and an “Advanced” mode (shows GLSL type + uniform name + copy uniform block).
+- **.stoy serialization**: optional `PARAMS_BEGIN`/`PARAMS_END` block storing UI overrides, loaded back automatically.
+
+### Tweaks
+- Reaction Diffusion preset now exposes key values (F/K/du/dv/paint radius/edge gain/etc.) via the new `// @param` system.
+
+### Fixes
+- Fixed a broken `uiWindows.add(...)` block in `apps/stellar_game/main.cpp` that could prevent compilation.
+- Added `HudWidgetId::Ship` to `include/stellar/ui/HudLayout.h` to match the existing Ship HUD layout logic.
+
+## Round 48 — Procedural Shader Lab v2: multi-pass ShaderToy graph (Buffers A–D), channel routing, feedback & reaction-diffusion preset
+
+This round pushes the most under-developed area: **procedural generation shaders**.
+Instead of a single fullscreen snippet, the lab now supports a **ShaderToy-like multi-pass workflow** (Buffer A–D + Image)
+so you can build feedback-driven simulations (reaction diffusion, trails, ping-pong filters, etc.) directly in-engine.
+
+### What's new
+
+- **Multi-pass ShaderToy graph runner (`ShaderToyGraph`)**
+  - Renders **Buffer A → Buffer B → Buffer C → Buffer D → Image** every frame.
+  - Each pass can sample up to **4 inputs** (`iChannel0..3`) routed from any buffer.
+  - Feedback “just works”: when a buffer samples itself, it reads the **previous frame** (classic ping-pong).
+
+- **ShaderToy wrapper upgraded**
+  - Added common uniforms: `iTimeDelta`, `iFrame`, `iPass`.
+  - Added channels: `iChannel0..3` + `iChannelResolution[4]`.
+  - Null channels automatically bind a **1×1 black** texture so sampling is always defined.
+
+- **Procedural Shader Lab UI overhaul**
+  - Edit any pass (Image / Buffer A–D) with per-pass:
+    - enable/disable (buffers)
+    - resolution scaling (1× / 1⁄2× / 1⁄4×)
+    - channel routing drop-downs for `iChannel0..3`
+  - Preview any buffer output or the final Image output.
+  - New sim controls: pause, single-step, fixed time-step, and buffer reset.
+
+- **New multi-pass preset: Reaction Diffusion (Gray–Scott)**
+  - Buffer A performs the simulation with self-feedback.
+  - Image visualizes the evolving chemical fields.
+  - Mouse painting injects perturbations into the sim.
+
+- **Graph save/load format (`.stoy`)**
+  - Save & load the full graph (all pass codes + routing + scales) as a single text file.
+  - Live reload works for `.stoy` files too.
+
+### Files touched
+
+- `include/stellar/render/ShaderToy.h`
+- `src/render/ShaderToy.cpp`
+- `include/stellar/render/ShaderToyGraph.h` *(new)*
+- `src/render/ShaderToyGraph.cpp` *(new)*
+- `apps/stellar_game/ProceduralShaderLabWindow.h`
+- `apps/stellar_game/ProceduralShaderLabWindow.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 44 — Procedural Sky v2: seeded Milky Way glow, star clustering, blackbody colors + dithered nebula compositing
+
+This round shifts focus to an under-developed part of *rendering*: **procedural background fidelity**.
+The Procedural Sky shader is now closer to “space-sim-grade” — with a seeded Milky Way band, coherent star clustering,
+more believable star colors, and less raymarch banding.
+
+### What's new
+
+- **Seeded Milky Way layer (optional)**
+  - Adds a seam-free galactic band with **clumps** and **dust lanes**.
+  - Galactic orientation is deterministic per sky seed (so it varies between systems while staying stable).
+
+- **Star clustering + diffraction spikes**
+  - A coherent cluster field biases star probability and brightness into **sparkly clumps** (mostly along the galactic plane).
+  - Rare bright stars can render subtle **diffraction spikes**.
+
+- **Blackbody-ish star colors**
+  - Stars sample a temperature distribution (cooler stars are more common) and approximate blackbody RGB for richer variety.
+
+- **Nebula raymarch improvements**
+  - Adds per-pixel jitter to reduce banding at low step counts.
+  - Uses cheap front-to-back compositing for more “volumetric” depth and to prevent over-bright fog.
+
+- **VFX settings persistence + UI**
+  - Added Milky Way + cluster parameters to VFX settings (now **v3**) and exposed them in the VFX UI.
+
+### Files touched
+
+- `include/stellar/render/ProceduralSky.h`
+- `src/render/ProceduralSky.cpp`
+- `include/stellar/ui/VfxSettings.h`
+- `src/ui/VfxSettings.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_vfx_settings.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 43 — Procedural Ship HUD v4: segment-display readouts (14‑seg vector font) + HUD settings fidelity
+
+This round continues to invest in the **procedural Ship HUD** — specifically the most under-developed part of the cockpit feel: **how values are presented**.
+
+Instead of rendering the important readouts (speed, shield %, FSD state, etc.) as normal UI text, the HUD can now render them in a **procedural 14‑segment-style display** (vector strokes), with optional glitch‑driven segment dropouts.
+
+### What's new
+
+- **Segment-display value readouts (optional)**
+  - New `Ship HUD → Segment readouts` toggle.
+  - Renders value strings using a stylized **14‑segment / starburst** display approximation (digits + A‑Z + punctuation).
+  - Includes a subtle **soft glow** pass to keep it readable against dark backgrounds.
+  - When Ship HUD **Glitch FX** is enabled, the seg-display can deterministically **drop segments** per time-slice to read as “signal instability” (not random flicker).
+
+- **HUD settings + command palette integration**
+  - Added `shipHudSegmentText` to `HudSettings` (**v5**) and persisted it to `hud_settings.txt`.
+  - Added a HUD settings UI checkbox and a command palette action: **Toggle Ship HUD segment readouts**.
+
+- **Fix: HUD settings dirty tracking missed Ship HUD fields**
+  - `hudSettingsEquivalent(...)` now correctly compares all Ship HUD fields (detail level, glitch/decor/glyphs/microtext, seed/nonce, and segment text).
+  - This makes “Unsaved changes” detection and Save/Discard behavior consistent when tweaking the Ship HUD.
+
+### Files touched
+
+- `apps/stellar_game/ShipHudOverlay.h/.cpp`
+- `apps/stellar_game/main.cpp`
+- `include/stellar/ui/HudSettings.h` / `src/ui/HudSettings.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 42 — Procedural Ship HUD v3: squarified treemap layout + Attitude (navball-lite) instrument
+
+This round keeps focus on the **procedural Ship HUD** and pushes it into a more pilotable, “ship-grade” cockpit surface:
+
+- The **layout generator** has been upgraded from a greedy BSP split to a **squarified treemap** packer, producing
+  more readable, squarer panels (especially important for circular instruments).
+- A new **Attitude** instrument adds a “navball-lite” display: a horizon + pitch ladder + roll, with **prograde**
+  (velocity) and **gravity** direction markers when available.
+
+### What's new
+
+- **Squarified treemap panel packing**
+  - Replaced the previous recursive split layout with a deterministic squarified treemap algorithm.
+  - Produces significantly better aspect ratios for panels without sacrificing determinism.
+  - Adds subtle procedural variety by randomizing row placement and fill direction while staying seed-stable.
+
+- **New instrument: `ShipHudInstrument::Attitude`**
+  - Adds an attitude indicator inspired by real-world artificial horizons and spaceflight FDAIs:
+    - Horizon line + pitch ladder (±10/20/30°)
+    - Roll handling via horizon rotation
+    - Prograde marker (ship velocity direction in ship-local angles)
+    - Gravity marker (down vector in ship-local angles when gravity is present)
+  - The Attitude panel is automatically included at **detail level ≥ 2**.
+
+- **Smarter reference frame selection**
+  - Near meaningful gravity: the indicator uses **gravity up** (−g) so the horizon is “local.”
+  - In deep space: it falls back to an **orbit-plane up** reference (pos × vel) to avoid a misleading “star gravity horizon.”
+
+### Files touched
+
+- `include/stellar/ui/ProceduralShipHud.h` / `src/ui/ProceduralShipHud.cpp`
+- `apps/stellar_game/ShipHudOverlay.h/.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_ship_hud_plan.cpp`
+
+---
+
+## Round 41 — Procedural Ship HUD v2: themed skins, glyph atlas, circuit decor, panel dropouts + overlay refactor
+
+This round revisits an under-developed area: the **procedural Ship HUD**.
+The previous version proved the concept (procedural layout + basic gauges), but it lacked the
+**rich procedural “skin” layer** that makes a HUD feel like a manufactured instrument panel.
+
+### What's new
+
+- **Dedicated Ship HUD renderer module**
+  - Added `apps/stellar_game/ShipHudOverlay.h/.cpp`.
+  - `main.cpp` now computes telemetry once and hands rendering to `ui::drawShipHudOverlay(...)`.
+  - The overlay contains a small ring-buffer helper (`ShipHudHistory`) so sparklines stay consistent.
+
+- **Seed-derived HUD theme variant (`ProceduralShipHudPlan::themeVariant`)**
+  - Each generated plan now includes a stable, deterministic theme selector.
+  - Renderers can use this to vary line weight, corner rounding, tick density, and decoration style.
+
+- **Procedural panel decor (opt-in)**
+  - Deterministic circuit traces / hatch / radar / barcode motifs per panel.
+  - Designed to be subtle (alpha-controlled) and scale with detail level.
+
+- **Procedural glyph icons + microtext (opt-in)**
+  - Vector glyph per instrument (speed, shield, heat, fuel, pips, fsd, throttle, target, cargo, g-force).
+  - Small deterministic microtext “calibration/data” blocks for authenticity.
+
+- **Improved gauge rendering**
+  - Added tick marks (major/minor) to arcs/dials.
+  - Added more consistent value formatting and “danger” behavior.
+
+- **Panel-level glitch dropouts (opt-in)**
+  - If glitch FX is enabled, individual panels can briefly lose signal and show procedural noise.
+  - Dropouts are deterministic per time-slice to read as “signal loss” rather than random flicker.
+
+- **HUD settings expanded + persisted (HudSettings v4)**
+  - New toggles: decor, glyphs, microtext, panel dropouts.
+  - New scalar: decor alpha.
+  - All settings are saved/loaded in `HudSettings`.
+
+- **Tests**
+  - Added `test_ship_hud_plan.cpp`: determinism + packing/overlap sanity checks for ship HUD plans.
+
 ## Round 39 — Procedural rings v2: ringlets, micro-divisions, spiral density waves, spokes + SystemLab preview
 
 This round targets a previously **underdeveloped visual proc-gen module**: **planetary rings**.
@@ -581,3 +828,107 @@ The legacy in-sector Poisson sampling can produce very tight clumps (or near-col
   - Cluster generation controls (strength, cell size, chance/cell, radius, jitter, falloff)
   - "Color: cluster" mode + legend + tooltip cluster details
 - Added `tests/test_galaxy_clusters.cpp` deterministic regression test.
+
+
+## Round 45 — Procedural night-side city lights (emissive planet pass)
+
+This round focuses on an under-developed rendering cue: **making the night side of planets feel alive**.
+
+### What changed
+
+- Added a new procedural surface kind: **`SurfaceKind::CityLights`**.
+  - CPU path: `ProceduralPlanet::generateSurfaceTexture()` now supports it.
+  - GPU path: `GpuSurfaceCache` shader now supports it.
+  - The lights distribution is *sparse*, land-biased, coastline-biased, and includes a mix of clusters + filamentary “corridors”.
+
+- Extended **`MeshRenderer`** with an **optional emissive texture**:
+  - Emissive is additive on top of lighting.
+  - A configurable terminator fade reveals emissive mostly on the night side using `smoothstep(start,end,-dot(N,L))`.
+
+- Integrated city lights into the main world render path:
+  - Deterministic per-planet probability (seeded), scaled by surface type.
+  - Added UI controls in **World visuals**:
+    - enable/disable
+    - intensity
+    - chance
+    - terminator fade start/end
+
+- Added city lights thumbnails to the **Surface generator preview** panel.
+
+### Files changed
+
+- include/stellar/render/ProceduralPlanet.h
+- src/render/ProceduralPlanet.cpp
+- src/render/GpuSurfaceCache.cpp
+- include/stellar/render/MeshRenderer.h
+- src/render/MeshRenderer.cpp
+- apps/stellar_game/main.cpp
+- src/ui/VfxSettings.cpp
+
+
+## Round 46 — Procedural star corona (animated emissive shell)
+
+This round tackles an underdeveloped rendering cue: **making the system star feel alive**.
+
+### What changed
+
+- Added a new renderer: **`render::StarCoronaRenderer`**.
+  - Draws an **additive emissive shell** (usually a slightly scaled UV sphere).
+  - Uses **seam-free 3D FBM noise** sampled on the unit sphere to break up the limb glow.
+  - Adds animated **streamer rays** and **prominence lobes** aligned to a deterministic per-star axis.
+  - Tuned for HDR/bloom friendliness (cheap but cinematic).
+
+- Integrated into the world forward pass:
+  - Drawn right after the star surface.
+  - Controlled via the **World Visuals** window (enable, intensity, shell scale, rim power, noise, animation speed, streamer + prominence shaping, re-roll).
+  - Treated as optional: if the shader fails to compile, the game logs a warning and continues.
+
+### Files changed/added
+
+- `include/stellar/render/StarCoronaRenderer.h` *(new)*
+- `src/render/StarCoronaRenderer.cpp` *(new)*
+- `CMakeLists.txt`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 47 — Procedural Shader Lab (live-edit GLSL sketches)
+
+This round focuses on an under-developed part of procedural generation: **iterating on shaders fast**.
+Instead of baking everything into C++ strings or rebuilding for each tweak, you now get a **ShaderToy-style**
+workflow directly inside the game.
+
+### What changed
+
+- Added **`render::ShaderToy`** (a tiny fullscreen shader runner):
+  - Wraps a user snippet into a valid **GLSL 330** fragment shader.
+  - Injects **common procedural uniforms** (`iResolution`, `iTime`, `iMouse`, `iSeed`) plus an optional **camera** (`iCam*`).
+  - Injects a small, reusable GLSL “micro-library”:
+    - integer-hash based value noise (2D/3D)
+    - `fbm2/fbm3`, `worley2`, `warp2`
+    - `palette()` + a couple SDF helpers (`sdSphere/sdBox`)
+    - `rayDirFromUv()` + a simple tonemap
+  - Uses `#line 1` before the snippet so driver error logs point at your **snippet line numbers**.
+
+- Added a new in-game window: **Procedural Shader Lab**.
+  - Live snippet editor + **compile** button + error log.
+  - Built-in presets:
+    - Template
+    - Domain Warped Nebula
+    - Voronoi Circuits
+    - Raymarch Tunnel
+  - Renders to a preview `RenderTarget2D` and displays it in ImGui.
+  - Supports **mouse interaction** in the preview (fills `iMouse`) and a simple **orbit camera** for 3D sketches.
+  - File workflow:
+    - load/save shader snippet to a path
+    - optional “live reload” (polls `last_write_time`)
+
+### Files changed/added
+
+- `include/stellar/render/ShaderToy.h` *(new)*
+- `src/render/ShaderToy.cpp` *(new)*
+- `apps/stellar_game/ProceduralShaderLabWindow.h` *(new)*
+- `apps/stellar_game/ProceduralShaderLabWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`

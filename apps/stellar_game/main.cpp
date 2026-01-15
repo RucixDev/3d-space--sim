@@ -36,6 +36,7 @@
 #include "stellar/render/ProceduralSky.h"
 #include "stellar/render/RenderTarget.h"
 #include "stellar/render/AtmosphereRenderer.h"
+#include "stellar/render/StarCoronaRenderer.h"
 #include "stellar/render/VolumetricAtmosphereRenderer.h"
 #include "stellar/render/Starfield.h"
 #include "stellar/render/Nebula.h"
@@ -48,6 +49,7 @@
 #include "stellar/ui/HudSettings.h"
 #include "stellar/ui/VfxSettings.h"
 #include "stellar/ui/ProceduralUi.h"
+#include "stellar/ui/ProceduralShipHud.h"
 #include "stellar/ui/AudioSettings.h"
 #include "stellar/ui/Livery.h"
 #include "stellar/ui/UiSettings.h"
@@ -135,11 +137,14 @@
 #include "PorkchopPlot.h"
 #include "ProceduralLabWindow.h"
 #include "ProceduralMeshLabWindow.h"
+#include "ProceduralShaderLabWindow.h"
 #include "ProceduralGalaxyLabWindow.h"
 #include "ProceduralSystemLabWindow.h"
 #include "ProceduralTradeSystemsLabWindow.h"
 #include "SpectralMieLabWindow.h"
 #include "GaussianSurfelReconstructionLabWindow.h"
+
+#include "ShipHudOverlay.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -1650,6 +1655,20 @@ int main(int argc, char** argv) {
   }
   atmosphereRenderer.setMesh(&sphere);
 
+  // Procedural emissive star corona (optional). This is purely a rendering cue
+  // (HDR-friendly additive shell) and is safe to disable if shader compilation fails.
+  render::StarCoronaRenderer starCoronaRenderer;
+  bool starCoronaAvailable = true;
+  {
+    std::string coronaErr;
+    if (!starCoronaRenderer.init(&coronaErr)) {
+      core::log(core::LogLevel::Warn, "StarCoronaRenderer disabled: " + coronaErr);
+      starCoronaAvailable = false;
+    } else {
+      starCoronaRenderer.setMesh(&sphere);
+    }
+  }
+
   render::VolumetricAtmosphereRenderer volumetricAtmosphereRenderer;
   if (!volumetricAtmosphereRenderer.init(&err)) {
     core::log(core::LogLevel::Error, err);
@@ -1947,6 +1966,14 @@ int main(int argc, char** argv) {
           && feq(x.starProbability, y.starProbability)
           && feq(x.starSize, y.starSize)
           && feq(x.starTwinkle, y.starTwinkle)
+          && feq(x.starClusterStrength, y.starClusterStrength)
+          && feq(x.starClusterFrequency, y.starClusterFrequency)
+          && feq(x.starSpikeStrength, y.starSpikeStrength)
+          && x.milkyWayEnabled == y.milkyWayEnabled
+          && feq(x.milkyWayIntensity, y.milkyWayIntensity)
+          && feq(x.milkyWayFrequency, y.milkyWayFrequency)
+          && feq(x.milkyWayBandPower, y.milkyWayBandPower)
+          && feq(x.milkyWayDust, y.milkyWayDust)
           && x.nebulaEnabled == y.nebulaEnabled
           && feq(x.nebulaIntensity, y.nebulaIntensity)
           && feq(x.nebulaFrequency, y.nebulaFrequency)
@@ -2081,9 +2108,31 @@ int main(int argc, char** argv) {
   bool worldStarUnlit = true;
   float worldStarIntensity = 3.5f; // HDR multiplier; affects bloom
 
+  // Procedural star corona (emissive additive shell).
+  bool worldStarCoronaEnabled = true;
+  float worldStarCoronaIntensity = 1.05f;
+  float worldStarCoronaShellScale = 1.085f;
+  float worldStarCoronaRimPower = 4.8f;
+  float worldStarCoronaNoiseFrequency = 3.25f;
+  float worldStarCoronaNoiseStrength = 0.75f;
+  float worldStarCoronaFlowSpeed = 0.12f;
+  float worldStarCoronaStreamerStrength = 0.55f;
+  float worldStarCoronaStreamerSharpness = 5.0f;
+  float worldStarCoronaProminenceStrength = 0.65f;
+  int worldStarCoronaProminenceCount = 7;
+  float worldStarCoronaProminenceSharpness = 3.2f;
+  float worldStarCoronaPulseStrength = 0.08f;
+  core::u64 worldStarCoronaSeedNonce = 0;
+
   // Procedural normal maps (tangent-space) derived from the same seeded noise as the albedo.
   bool worldNormalMapsEnabled = true;
   float worldNormalStrength = 1.0f;   // multiplier applied in shader
+  // Night-side emissive: procedural city lights map (added in MeshRenderer).
+  bool worldCityLightsEnabled = true;
+  float worldCityLightsIntensity = 1.35f;
+  float worldCityLightsChance = 0.28f; // per-planet probability (scaled by surface type)
+  float worldCityLightsNightFadeStart = 0.02f; // smoothstep(start,end,-dot(N,L))
+  float worldCityLightsNightFadeEnd = 0.30f;
   float worldSpecularStrength = 0.08f; // simple Blinn-Phong highlight
   float worldShininess = 48.0f;
 
@@ -2967,6 +3016,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::PhotoModeWindowState photoModeWindow{};
   game::ProceduralLabWindowState proceduralLabWindow{};
   game::ProceduralMeshLabWindowState proceduralMeshLabWindow{};
+  game::ProceduralShaderLabWindowState proceduralShaderLabWindow{};
   game::ProceduralGalaxyLabWindowState proceduralGalaxyLabWindow{};
   game::ProceduralSystemLabWindowState proceduralSystemLabWindow{};
   game::ProceduralTradeSystemsLabWindowState proceduralTradeSystemsLabWindow{};
@@ -3026,8 +3076,31 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   // HUD overlays
   bool showRadarHud = true;
+  bool showShipHud = true;
   double radarRangeKm = 220000.0;
   int radarMaxBlips = 72;
+
+  // Ship HUD: procedural instrument cluster (seeded layout + simple telemetry).
+  int shipHudDetailLevel = 2; // 0=minimal .. 3=max
+  bool shipHudShowSparklines = true;
+  bool shipHudGlitchFx = true;
+  bool shipHudPanelDropouts = true;
+  bool shipHudShowDecor = true;
+  float shipHudDecorAlpha = 0.35f;
+  bool shipHudShowGlyphs = true;
+  bool shipHudShowMicrotext = true;
+  bool shipHudSegmentText = false;
+  bool shipHudSeedFromLoadout = true;
+  core::u64 shipHudSeedManual = core::fnv1a64("ship_hud");
+  core::u64 shipHudSeedNonce = 0;
+
+  ui::ProceduralShipHudPlan shipHudPlan = ui::makeProceduralShipHudPlan(shipHudSeedManual, shipHudDetailLevel);
+  core::u64 shipHudPlanSeedApplied = shipHudPlan.seed;
+  int shipHudPlanDetailApplied = shipHudPlan.detailLevel;
+
+  ui::ShipHudHistory shipHudHistory{};
+  math::Vec3d shipHudPrevVelKmS{0, 0, 0};
+  bool shipHudPrevVelInit = false;
 
   // HUD palette / cosmetics (colors + overlay opacity). These map to HudSettings (v2).
   float hudOverlayBgAlpha = 0.35f;
@@ -3106,6 +3179,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     }
 
     showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+    showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
     objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
     hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
     hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -3118,6 +3192,20 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     hudSettings.objectiveHudEnabled = objectiveHudEnabled;
     hudSettings.threatHudEnabled = hudThreatOverlayEnabled;
     hudSettings.jumpHudEnabled = hudJumpOverlay;
+
+    hudSettings.shipHudEnabled = showShipHud;
+    hudSettings.shipHudDetailLevel = shipHudDetailLevel;
+    hudSettings.shipHudShowSparklines = shipHudShowSparklines;
+    hudSettings.shipHudGlitchFx = shipHudGlitchFx;
+    hudSettings.shipHudPanelDropouts = shipHudPanelDropouts;
+    hudSettings.shipHudShowDecor = shipHudShowDecor;
+    hudSettings.shipHudDecorAlpha = shipHudDecorAlpha;
+    hudSettings.shipHudShowGlyphs = shipHudShowGlyphs;
+    hudSettings.shipHudShowMicrotext = shipHudShowMicrotext;
+    hudSettings.shipHudSegmentText = shipHudSegmentText;
+    hudSettings.shipHudSeedFromLoadout = shipHudSeedFromLoadout;
+    hudSettings.shipHudSeed = (std::uint64_t)shipHudSeedManual;
+    hudSettings.shipHudSeedNonce = (std::uint64_t)shipHudSeedNonce;
 
     hudSettings.radarRangeKm = radarRangeKm;
     hudSettings.radarMaxBlips = radarMaxBlips;
@@ -3173,6 +3261,20 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     objectiveHudEnabled = s.objectiveHudEnabled;
     hudThreatOverlayEnabled = s.threatHudEnabled;
     hudJumpOverlay = s.jumpHudEnabled;
+
+    showShipHud = s.shipHudEnabled;
+    shipHudDetailLevel = s.shipHudDetailLevel;
+    shipHudShowSparklines = s.shipHudShowSparklines;
+    shipHudGlitchFx = s.shipHudGlitchFx;
+    shipHudPanelDropouts = s.shipHudPanelDropouts;
+    shipHudShowDecor = s.shipHudShowDecor;
+    shipHudDecorAlpha = s.shipHudDecorAlpha;
+    shipHudShowGlyphs = s.shipHudShowGlyphs;
+    shipHudShowMicrotext = s.shipHudShowMicrotext;
+    shipHudSegmentText = s.shipHudSegmentText;
+    shipHudSeedFromLoadout = s.shipHudSeedFromLoadout;
+    shipHudSeedManual = (core::u64)s.shipHudSeed;
+    shipHudSeedNonce = (core::u64)s.shipHudSeedNonce;
 
     radarRangeKm = s.radarRangeKm;
     radarMaxBlips = s.radarMaxBlips;
@@ -3232,6 +3334,19 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
         && a.objectiveHudEnabled == b.objectiveHudEnabled
         && a.threatHudEnabled == b.threatHudEnabled
         && a.jumpHudEnabled == b.jumpHudEnabled
+        && a.shipHudEnabled == b.shipHudEnabled
+        && a.shipHudDetailLevel == b.shipHudDetailLevel
+        && a.shipHudShowSparklines == b.shipHudShowSparklines
+        && a.shipHudGlitchFx == b.shipHudGlitchFx
+        && a.shipHudPanelDropouts == b.shipHudPanelDropouts
+        && a.shipHudShowDecor == b.shipHudShowDecor
+        && feq(a.shipHudDecorAlpha, b.shipHudDecorAlpha)
+        && a.shipHudShowGlyphs == b.shipHudShowGlyphs
+        && a.shipHudShowMicrotext == b.shipHudShowMicrotext
+        && a.shipHudSegmentText == b.shipHudSegmentText
+        && a.shipHudSeedFromLoadout == b.shipHudSeedFromLoadout
+        && a.shipHudSeed == b.shipHudSeed
+        && a.shipHudSeedNonce == b.shipHudSeedNonce
         && deq(a.radarRangeKm, b.radarRangeKm)
         && a.radarMaxBlips == b.radarMaxBlips
         && a.offscreenTargetIndicator == b.offscreenTargetIndicator
@@ -3594,6 +3709,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralLab", "Procedural Lab", "Visual", 70, false, true}, &proceduralLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralMeshLab", "Procedural Mesh Lab", "Visual", 70, false, true}, &proceduralMeshLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralShaderLab", "Procedural Shader Lab", "Visual", 70, false, true}, &proceduralShaderLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralGalaxyLab", "Procedural Galaxy Lab", "Visual", 70, false, true}, &proceduralGalaxyLabWindow.open,
                                 {}, {}, {}});
@@ -6360,6 +6477,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         if (key(controls.actions.hudLayoutSave) && !io.WantCaptureKeyboard) {
           // Sync enabled toggles into the layout before saving.
           hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+          hudLayout.widget(ui::HudWidgetId::Ship).enabled = showShipHud;
           hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
           hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
           hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
@@ -6376,6 +6494,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           if (ui::loadFromFile(hudLayoutPath, loaded)) {
             hudLayout = loaded;
             showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+            showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
             objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
             hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
             hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -6389,6 +6508,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         if (key(controls.actions.hudLayoutReset) && !io.WantCaptureKeyboard) {
           hudLayout = ui::makeDefaultHudLayout();
           showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
           objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
           hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
           hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -13260,9 +13380,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     {
       const math::Vec3d cp = cam.position();
       meshRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+      if (starCoronaAvailable) {
+        starCoronaRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+        starCoronaRenderer.setTimeSeconds((float)timeRealSec);
+      }
     }
 
     atmosphereRenderer.setViewProj(viewF, projF);
+    if (starCoronaAvailable) {
+      starCoronaRenderer.setViewProj(viewF, projF);
+    }
     atmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
     volumetricAtmosphereRenderer.setViewProj(viewF, projF);
     volumetricAtmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
@@ -14655,6 +14782,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         meshRenderer.setUnlit(false);
       }
 
+      // Optional: procedural emissive star corona (additive shell). This is intentionally
+      // independent of the planet atmosphere renderers and is seeded per-system.
+      if (starCoronaAvailable && worldStarCoronaEnabled) {
+        render::StarCoronaSettings cs{};
+        const core::u64 cSeed64 = core::hashCombine(
+            core::hashCombine(starSurfaceSeed, core::fnv1a64("star_corona")),
+            worldStarCoronaSeedNonce);
+        cs.seed = (int)(cSeed64 & 0x7fffffffULL);
+        cs.intensity = worldStarCoronaIntensity;
+        cs.rimPower = worldStarCoronaRimPower;
+        cs.noiseFrequency = worldStarCoronaNoiseFrequency;
+        cs.noiseStrength = worldStarCoronaNoiseStrength;
+        cs.flowSpeed = worldStarCoronaFlowSpeed;
+        cs.streamerStrength = worldStarCoronaStreamerStrength;
+        cs.streamerSharpness = worldStarCoronaStreamerSharpness;
+        cs.prominenceStrength = worldStarCoronaProminenceStrength;
+        cs.prominenceCount = worldStarCoronaProminenceCount;
+        cs.prominenceSharpness = worldStarCoronaProminenceSharpness;
+        cs.pulseStrength = worldStarCoronaPulseStrength;
+
+        starCoronaRenderer.setSettings(cs);
+
+        render::InstanceData coronaInst = starSphereInst;
+        coronaInst.sx *= worldStarCoronaShellScale;
+        coronaInst.sy *= worldStarCoronaShellScale;
+        coronaInst.sz *= worldStarCoronaShellScale;
+
+        glDepthMask(GL_FALSE);
+        tmp.clear();
+        tmp.push_back(coronaInst);
+        starCoronaRenderer.drawInstances(tmp);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+      }
+
       // Planets (per-type procedural surfaces)
       for (const auto& pd : planetSurfaceDraws) {
         const auto& surf = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
@@ -14669,11 +14831,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         } else {
           meshRenderer.setNormalTexture(nullptr);
         }
+
+        // Optional city lights emissive map (night side).
+        const render::Texture2D* emissivePtr = nullptr;
+        if (worldCityLightsEnabled) {
+          float typeMul = 0.0f;
+          switch (pd.surface) {
+            case render::SurfaceKind::Ocean: typeMul = 1.0f; break;
+            case render::SurfaceKind::Rocky: typeMul = 0.80f; break;
+            case render::SurfaceKind::Desert: typeMul = 0.55f; break;
+            case render::SurfaceKind::Ice: typeMul = 0.15f; break;
+            default: typeMul = 0.0f; break;
+          }
+
+          if (typeMul > 0.0f && worldCityLightsChance > 0.0f && worldCityLightsIntensity > 0.0f) {
+            core::SplitMix64 rr(core::hashCombine(pd.surfaceSeed, core::fnv1a64("city_lights_presence")));
+            const double p = std::clamp((double)worldCityLightsChance * (double)typeMul, 0.0, 1.0);
+            if (rr.chance(p)) {
+              const auto& eTex = (worldUseGpuSurfaceCache && gpuSurfaceCache.isInited())
+                                   ? gpuSurfaceCache.albedo(render::SurfaceKind::CityLights, pd.surfaceSeed, worldSurfaceTexWidth)
+                                   : surfaceTexCache.get(render::SurfaceKind::CityLights, pd.surfaceSeed, worldSurfaceTexWidth);
+              emissivePtr = &eTex;
+            }
+          }
+        }
+
+        meshRenderer.setEmissiveTexture(emissivePtr);
+        meshRenderer.setEmissiveStrength(worldCityLightsIntensity);
+        meshRenderer.setEmissiveNightFade(worldCityLightsNightFadeStart, worldCityLightsNightFadeEnd);
+
         tmp.clear();
         tmp.push_back(pd.inst);
         meshRenderer.drawInstances(tmp);
       }
       meshRenderer.setNormalTexture(nullptr);
+      meshRenderer.setEmissiveTexture(nullptr);
 
       // Cloud shell (alpha-blended) on top of the planet surface.
       if (worldCloudsEnabled && !planetCloudDraws.empty()) {
@@ -15185,6 +15377,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Keep persisted toggles synced with runtime settings so saving is always accurate.
     hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+    hudLayout.widget(ui::HudWidgetId::Ship).enabled = showShipHud;
     hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
     hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
     hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
@@ -15254,6 +15447,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (ImGui::BeginMenu("HUD")) {
         ImGui::MenuItem(withKey("Radar", controls.actions.toggleRadarHud).c_str(), nullptr, &showRadarHud);
+        ImGui::MenuItem("Ship", nullptr, &showShipHud);
         ImGui::MenuItem("Objective", nullptr, &objectiveHudEnabled);
         ImGui::MenuItem("Threat", nullptr, &hudThreatOverlayEnabled);
         ImGui::MenuItem("Jump", nullptr, &hudJumpOverlay);
@@ -15277,6 +15471,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         if (ImGui::MenuItem(withKey("Save HUD layout", controls.actions.hudLayoutSave).c_str())) {
           hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+          hudLayout.widget(ui::HudWidgetId::Ship).enabled = showShipHud;
           hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
           hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
           hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
@@ -15288,6 +15483,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           if (ui::loadFromFile(hudLayoutPath, loaded)) {
             hudLayout = loaded;
             showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+            showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
             objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
             hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
             hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -15299,6 +15495,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (ImGui::MenuItem(withKey("Reset HUD layout", controls.actions.hudLayoutReset).c_str())) {
           hudLayout = ui::makeDefaultHudLayout();
           showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
           objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
           hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
           hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -15848,6 +16045,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       if (ImGui::Button(saveLabel.c_str())) {
         // Sync enabled toggles into the layout before saving.
         hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+        hudLayout.widget(ui::HudWidgetId::Ship).enabled = showShipHud;
         hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
         hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
         hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;
@@ -15864,6 +16062,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (ui::loadFromFile(hudLayoutPath, loaded)) {
           hudLayout = loaded;
           showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
           objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
           hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
           hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -15877,6 +16076,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       if (ImGui::Button(resetLabel.c_str())) {
         hudLayout = ui::makeDefaultHudLayout();
         showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+        showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
         objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
         hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
         hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -15906,6 +16106,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
           // Keep toggles coherent with the layout (generator preserves enabled flags).
           showRadarHud = hudLayout.widget(ui::HudWidgetId::Radar).enabled;
+          showShipHud = hudLayout.widget(ui::HudWidgetId::Ship).enabled;
           objectiveHudEnabled = hudLayout.widget(ui::HudWidgetId::Objective).enabled;
           hudThreatOverlayEnabled = hudLayout.widget(ui::HudWidgetId::Threat).enabled;
           hudJumpOverlay = hudLayout.widget(ui::HudWidgetId::Jump).enabled;
@@ -15992,6 +16193,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         };
 
         row(ui::HudWidgetId::Radar, &showRadarHud);
+        row(ui::HudWidgetId::Ship, &showShipHud);
         row(ui::HudWidgetId::Objective, &objectiveHudEnabled);
         row(ui::HudWidgetId::Threat, &hudThreatOverlayEnabled);
         row(ui::HudWidgetId::Jump, &hudJumpOverlay);
@@ -16030,6 +16232,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralMeshLabWindow(proceduralMeshLabWindow, (float)timeRealSec,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralShaderLabWindow(proceduralShaderLabWindow, (float)timeRealSec,
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
@@ -16245,6 +16450,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         };
 
         drawPivot(ui::HudWidgetId::Radar, showRadarHud);
+        drawPivot(ui::HudWidgetId::Ship, showShipHud);
         drawPivot(ui::HudWidgetId::Objective, objectiveHudEnabled);
         drawPivot(ui::HudWidgetId::Threat, hudThreatOverlayEnabled);
         drawPivot(ui::HudWidgetId::Jump, hudJumpOverlay);
@@ -17344,6 +17550,273 @@ if (showRadarHud && currentSystem) {
 }
 
 
+// Ship HUD (procedural instrument cluster)
+if (showShipHud) {
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings;
+#ifdef IMGUI_HAS_DOCK
+  flags |= ImGuiWindowFlags_NoDocking;
+#endif
+  flags |= ImGuiWindowFlags_NoFocusOnAppearing;
+  flags |= ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+  const auto& wLay = hudLayout.widget(ui::HudWidgetId::Ship);
+  const float uiScale = std::max(0.6f, wLay.scale);
+
+  auto computeLoadoutSeed = [&]() -> core::u64 {
+    core::u64 s = core::fnv1a64("ship_hud_loadout");
+    s = core::hashCombine(s, (core::u64)shipHullClass);
+    s = core::hashCombine(s, (core::u64)thrusterMk);
+    s = core::hashCombine(s, (core::u64)powerplantMk);
+    s = core::hashCombine(s, (core::u64)shieldMk);
+    s = core::hashCombine(s, (core::u64)distributorMk);
+    s = core::hashCombine(s, (core::u64)weaponPrimary);
+    s = core::hashCombine(s, (core::u64)weaponSecondary);
+    s = core::hashCombine(s, (core::u64)fuelScoopMk);
+    s = core::hashCombine(s, (core::u64)smuggleHoldMk);
+    return s;
+  };
+
+  const core::u64 baseSeed = shipHudSeedFromLoadout ? computeLoadoutSeed() : shipHudSeedManual;
+  const core::u64 desiredSeed = core::hashCombine(baseSeed, shipHudSeedNonce);
+
+  if (desiredSeed != shipHudPlanSeedApplied || shipHudDetailLevel != shipHudPlanDetailApplied) {
+    shipHudPlan = ui::makeProceduralShipHudPlan(desiredSeed, shipHudDetailLevel);
+    shipHudPlanSeedApplied = shipHudPlan.seed;
+    shipHudPlanDetailApplied = shipHudPlan.detailLevel;
+  }
+
+  // Gather a few values once.
+  const double speedKmS = ship.velocityKmS.length();
+  const float shieldFrac =
+    (playerShieldMax > 0.0) ? (float)std::clamp(playerShield / playerShieldMax, 0.0, 1.0) : 0.0f;
+  const float hullFrac =
+    (playerHullMax > 0.0) ? (float)std::clamp(playerHull / playerHullMax, 0.0, 1.0) : 0.0f;
+  const float heatFrac = (float)std::clamp(heat / 100.0, 0.0, 1.0);
+  const float fuelFrac =
+    (playerFuelMax > 0.0) ? (float)std::clamp(playerFuel / playerFuelMax, 0.0, 1.0) : 0.0f;
+
+  // Update telemetry history at a fixed rate for sparklines.
+  ui::shipHudHistoryUpdate(shipHudHistory, dtReal, speedKmS, shieldFrac, hullFrac, heatFrac, fuelFrac);
+
+  // Find nearest contact distance for the Target panel (simple but useful).
+  double nearestKm = 0.0;
+  bool hasNearest = false;
+  if (currentSystem) {
+    for (const Contact& c : contacts) {
+      if (!c.isValid() || c.isPlayer) continue;
+      const double d = (c.ship.positionKm - ship.positionKm).length();
+      if (!hasNearest || d < nearestKm) {
+        hasNearest = true;
+        nearestKm = d;
+      }
+    }
+  }
+
+  // Precompute G-force (optional panel).
+  double gForce = 0.0;
+  {
+    if (shipHudPrevVelInit) {
+      const double dt = std::max(1e-6, dtReal);
+      const math::Vec3d dv = ship.velocityKmS - shipHudPrevVelKmS;
+      const double accelMs2 = dv.length() * 1000.0 / dt;
+      gForce = accelMs2 / 9.81;
+    } else {
+      shipHudPrevVelInit = true;
+    }
+    shipHudPrevVelKmS = ship.velocityKmS;
+  }
+
+  // FSD telemetry (used by the procedural Ship HUD).
+  float fsdFrac = 0.0f;
+  char fsdText[32]{};
+  if (fsdState == FsdState::Charging) {
+    fsdFrac = (float)std::clamp(1.0 - (fsdChargeRemainingSec / kFsdChargeSec), 0.0, 1.0);
+    std::snprintf(fsdText, sizeof(fsdText), "CHG %d%%", (int)std::lround(fsdFrac * 100.0f));
+  } else if (fsdState == FsdState::Jumping) {
+    const double total = std::max(1e-6, fsdTravelTotalSec);
+    fsdFrac = (float)std::clamp(1.0 - (fsdTravelRemainingSec / total), 0.0, 1.0);
+    std::snprintf(fsdText, sizeof(fsdText), "JMP %d%%", (int)std::lround(fsdFrac * 100.0f));
+  } else {
+    const double readyInSec = std::max(0.0, (fsdReadyDay - timeDays) * 86400.0);
+    if (readyInSec > 0.05) {
+      // Cooldown pulse
+      const float f = (float)std::clamp(1.0 - (readyInSec / kFsdCooldownSec), 0.0, 1.0);
+      fsdFrac = f;
+      std::snprintf(fsdText, sizeof(fsdText), "CD %.1fs", readyInSec);
+    } else {
+      fsdFrac = 1.0f;
+      std::snprintf(fsdText, sizeof(fsdText), "READY");
+    }
+  }
+
+  const float throttleFrac = (float)std::clamp((input.thrustLocal.z + 1.0) * 0.5, 0.0, 1.0);
+  const double cargoCr = cargoValueEstimateCr();
+
+  ui::ShipHudOverlayTelemetry tel{};
+  tel.speedKmS = speedKmS;
+  tel.shieldFrac = shieldFrac;
+  tel.hullFrac = hullFrac;
+  tel.heatFrac = heatFrac;
+  tel.fuelFrac = fuelFrac;
+  tel.pipSys = distributorPips.sys;
+  tel.pipEng = distributorPips.eng;
+  tel.pipWep = distributorPips.wep;
+  tel.fsdFrac = fsdFrac;
+  std::snprintf(tel.fsdText, sizeof(tel.fsdText), "%s", fsdText);
+  tel.throttleFrac = throttleFrac;
+  tel.hasNearest = hasNearest;
+  tel.nearestKm = nearestKm;
+  tel.cargoCr = cargoCr;
+  tel.gForce = gForce;
+  tel.timeRealSec = timeRealSec;
+
+  // --- Attitude instrument telemetry ---------------------------------------
+  // Reference selection:
+  //  - near a gravity well: use gravity up (-g)
+  //  - otherwise: use orbit plane normal (pos x vel) for a stable inertial reference
+  {
+    math::Vec3d refUp = {0, 1, 0};
+    math::Vec3d gWorld = {0, 0, 0};
+    double gMag = 0.0;
+
+    if (currentSystem) {
+      gWorld = sim::systemGravityAccelKmS2(*currentSystem, timeDays, ship.positionKm(), gravityParams);
+      gMag = gWorld.length();
+    }
+
+    const double gMs2 = gMag * 1000.0;
+    const double gG = (gMs2 > 0.0) ? (gMs2 / 9.80665) : 0.0;
+
+    // Only switch to a gravity horizon when it's meaningfully strong. Otherwise a star's tiny
+    // radial field tends to create a "fake" horizon in deep space.
+    const bool useGravityRef = (gMag > 1e-12) && (gG > 0.0025);
+
+    if (useGravityRef) {
+      refUp = (-gWorld).normalized();
+      tel.attitudeUsesGravity = true;
+      tel.attitudeRefG = (float)gG;
+    } else {
+      // Orbit plane normal via angular momentum (pos x vel).
+      math::Vec3d h = math::cross(ship.positionKm(), ship.velocityKmS);
+      if (h.lengthSq() > 1e-12) refUp = h.normalized();
+      else refUp = ship.up().normalized();
+
+      // Stabilize sign so the indicator doesn't flip around the Y axis.
+      if (refUp.y < 0.0) refUp = -refUp;
+
+      tel.attitudeUsesGravity = false;
+      tel.attitudeRefG = 0.0f;
+    }
+
+    tel.attitudeValid = (refUp.lengthSq() > 1e-12);
+
+    // Pitch/roll relative to the chosen reference frame.
+    if (tel.attitudeValid) {
+      const math::Vec3d f = ship.forward().normalized();
+      const math::Vec3d r = ship.right().normalized();
+
+      const double sp = std::clamp(math::dot(f, refUp), -1.0, 1.0);
+      tel.attitudePitchDeg = (float)math::radToDeg(std::asin(sp));
+
+      math::Vec3d refRight = math::cross(refUp, f);
+      if (refRight.lengthSq() < 1e-12) refRight = math::cross(refUp, r);
+      if (refRight.lengthSq() < 1e-12) refRight = r;
+      refRight = refRight.normalized();
+
+      const math::Vec3d cr = math::cross(refRight, r);
+      const double sr = math::dot(cr, f);
+      const double crl = math::dot(refRight, r);
+      tel.attitudeRollDeg = (float)math::radToDeg(std::atan2(sr, crl));
+    } else {
+      tel.attitudePitchDeg = 0.0f;
+      tel.attitudeRollDeg = 0.0f;
+    }
+
+    // Ship-local prograde marker (velocity direction)
+    {
+      const double vMag = ship.velocityKmS.length();
+      tel.progradeValid = vMag > 1e-9;
+      if (tel.progradeValid) {
+        const math::Vec3d v = ship.velocityKmS / vMag;
+        const math::Vec3d sr = ship.right().normalized();
+        const math::Vec3d su = ship.up().normalized();
+        const math::Vec3d sf = ship.forward().normalized();
+        const double lx = math::dot(v, sr);
+        const double ly = math::dot(v, su);
+        const double lz = math::dot(v, sf);
+        tel.progradeYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
+        tel.progradePitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
+      } else {
+        tel.progradeYawDeg = 0.0f;
+        tel.progradePitchDeg = 0.0f;
+      }
+    }
+
+    // Ship-local gravity marker (down vector)
+    tel.gravityValid = gMag > 1e-12;
+    if (tel.gravityValid) {
+      const math::Vec3d gDir = gWorld / gMag; // points down
+      const math::Vec3d sr = ship.right().normalized();
+      const math::Vec3d su = ship.up().normalized();
+      const math::Vec3d sf = ship.forward().normalized();
+      const double lx = math::dot(gDir, sr);
+      const double ly = math::dot(gDir, su);
+      const double lz = math::dot(gDir, sf);
+      tel.gravityYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
+      tel.gravityPitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
+    } else {
+      tel.gravityYawDeg = 0.0f;
+      tel.gravityPitchDeg = 0.0f;
+    }
+  }
+
+
+  ui::ShipHudOverlayConfig cfg{};
+  cfg.showSparklines = shipHudShowSparklines;
+  cfg.glitchFx = shipHudGlitchFx;
+  cfg.panelDropouts = shipHudPanelDropouts;
+  cfg.showDecor = shipHudShowDecor;
+  cfg.decorAlpha = shipHudDecorAlpha;
+  cfg.showGlyphs = shipHudShowGlyphs;
+  cfg.showMicrotext = shipHudShowMicrotext;
+  cfg.segmentText = shipHudSegmentText;
+
+  ui::ShipHudOverlayPalette pal{};
+  pal.primary = hudColorPrimary;
+  pal.accent = hudColorAccent;
+  pal.danger = hudColorDanger;
+  pal.grid = hudColorGrid;
+  pal.text = hudColorText;
+  pal.background = hudColorBackground;
+
+  const float windowBgAlpha = hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha;
+  ImGui::SetNextWindowBgAlpha(windowBgAlpha);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(hudColorBackground.r, hudColorBackground.g, hudColorBackground.b, 1.0f));
+
+  hudSetNextWindowPosFromLayout(ui::HudWidgetId::Ship);
+  ImGui::SetNextWindowSize(
+    ImVec2(shipHudPlan.baseWidthPx * uiScale, shipHudPlan.baseHeightPx * uiScale),
+    ImGuiCond_Always);
+
+  if (hudLayoutEditMode) ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+  if (ImGui::Begin("Ship HUD##shipHud", nullptr, flags)) {
+    if (hudLayoutEditMode) hudCaptureWindowPosToLayout(ui::HudWidgetId::Ship);
+
+    ImGui::SetWindowFontScale(uiScale);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 winPos = ImGui::GetWindowPos();
+    const ImVec2 winSize = ImGui::GetWindowSize();
+
+    ui::drawShipHudOverlay(draw, winPos, winSize, uiScale, shipHudPlan, shipHudHistory, tel, cfg, pal);
+  }
+  ImGui::End();
+  if (hudLayoutEditMode) ImGui::PopStyleVar();
+  ImGui::PopStyleColor();
+}
+
+
+
 // Objective HUD overlay (tracked mission summary)
 if (objectiveHudEnabled) {
   sim::Mission* tracked = nullptr;
@@ -17923,7 +18396,7 @@ if (showVfx) {
     ImGui::Checkbox("Enabled##procSky", &vfxProceduralSkyEnabled);
 
     ImGui::TextDisabled(
-        "When enabled, the background is rendered by a full-screen procedural shader (seeded stars + cheap volumetric nebula).\n"
+        "When enabled, the background is rendered by a full-screen procedural shader (seeded stars + Milky Way glow + cheap volumetric nebula).\n"
         "This replaces the point-sprite Starfield + Nebula layers below.");
 
     if (vfxProceduralSkyEnabled) {
@@ -17944,6 +18417,19 @@ if (showVfx) {
         ImGui::SliderFloat("Star probability##procSky", &vfxProceduralSky.starProbability, 0.0f, 0.30f, "%.3f");
         ImGui::SliderFloat("Star size##procSky", &vfxProceduralSky.starSize, 0.25f, 3.0f, "%.2f");
         ImGui::SliderFloat("Star twinkle##procSky", &vfxProceduralSky.starTwinkle, 0.0f, 1.0f, "%.2f");
+
+        ImGui::SeparatorText("Star shaping");
+        ImGui::SliderFloat("Cluster strength##procSky", &vfxProceduralSky.starClusterStrength, 0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Cluster frequency##procSky", &vfxProceduralSky.starClusterFrequency, 0.1f, 4.0f, "%.2f");
+        ImGui::SliderFloat("Spike strength##procSky", &vfxProceduralSky.starSpikeStrength, 0.0f, 1.0f, "%.2f");
+      }
+
+      if (ImGui::CollapsingHeader("Milky Way##procSky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Milky Way enabled##procSky", &vfxProceduralSky.milkyWayEnabled);
+        ImGui::SliderFloat("Milky Way intensity##procSky", &vfxProceduralSky.milkyWayIntensity, 0.0f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Milky Way frequency##procSky", &vfxProceduralSky.milkyWayFrequency, 0.2f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Band power##mwProcSky", &vfxProceduralSky.milkyWayBandPower, 1.0f, 5.0f, "%.2f");
+        ImGui::SliderFloat("Dust strength##procSky", &vfxProceduralSky.milkyWayDust, 0.0f, 1.0f, "%.2f");
       }
 
       if (ImGui::CollapsingHeader("Nebula##procSky", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -20782,6 +21268,58 @@ if (showWorldVisuals) {
     ImGui::Checkbox("Unlit star", &worldStarUnlit);
 
     ImGui::Separator();
+    ImGui::TextDisabled("Star corona (procedural emissive shell)");
+
+    if (!starCoronaAvailable) {
+      ImGui::TextDisabled("(StarCoronaRenderer unavailable: shader compilation failed)");
+      ImGui::BeginDisabled(true);
+    }
+
+    ImGui::Checkbox("Star corona enabled", &worldStarCoronaEnabled);
+    if (worldStarCoronaEnabled) {
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona intensity", &worldStarCoronaIntensity, 0.0f, 6.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona shell scale", &worldStarCoronaShellScale, 1.01f, 1.25f, "%.3f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona rim power", &worldStarCoronaRimPower, 1.5f, 12.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona noise freq", &worldStarCoronaNoiseFrequency, 0.5f, 9.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona noise strength", &worldStarCoronaNoiseStrength, 0.0f, 2.5f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona flow speed", &worldStarCoronaFlowSpeed, 0.0f, 1.0f, "%.3f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona streamer strength", &worldStarCoronaStreamerStrength, 0.0f, 3.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona streamer sharpness", &worldStarCoronaStreamerSharpness, 0.5f, 12.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona prominence strength", &worldStarCoronaProminenceStrength, 0.0f, 3.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderInt("Corona prominence count", &worldStarCoronaProminenceCount, 1, 24, "%d");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona prominence sharpness", &worldStarCoronaProminenceSharpness, 0.5f, 10.0f, "%.2f");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona pulse strength", &worldStarCoronaPulseStrength, 0.0f, 0.35f, "%.3f");
+
+      if (ImGui::Button("Re-roll corona")) {
+        worldStarCoronaSeedNonce++;
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("(changes look deterministically)");
+    } else {
+      ImGui::TextDisabled("(star corona disabled)");
+    }
+
+    if (!starCoronaAvailable) {
+      ImGui::EndDisabled();
+    }
+
+    ImGui::Separator();
     ImGui::TextDisabled("Material shading");
 
     ImGui::Checkbox("Normal maps (procedural)", &worldNormalMapsEnabled);
@@ -20790,6 +21328,29 @@ if (showWorldVisuals) {
       ImGui::SliderFloat("Normal strength", &worldNormalStrength, 0.0f, 3.0f, "%.2f");
     } else {
       ImGui::TextDisabled("(normal maps disabled)");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Night-side emissive");
+
+    ImGui::Checkbox("City lights (emissive)", &worldCityLightsEnabled);
+    if (worldCityLightsEnabled) {
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("City lights intensity", &worldCityLightsIntensity, 0.0f, 6.0f, "%.2f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("City lights chance", &worldCityLightsChance, 0.0f, 1.0f, "%.2f");
+      ImGui::SameLine();
+      ImGui::TextDisabled("(scaled by surface type)");
+
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("City lights terminator start", &worldCityLightsNightFadeStart, 0.0f, 0.25f, "%.3f");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("City lights terminator end", &worldCityLightsNightFadeEnd, 0.05f, 0.75f, "%.3f");
+      if (worldCityLightsNightFadeEnd < worldCityLightsNightFadeStart) {
+        worldCityLightsNightFadeEnd = worldCityLightsNightFadeStart;
+      }
+    } else {
+      ImGui::TextDisabled("(city lights disabled)");
     }
 
     ImGui::SetNextItemWidth(260.0f);
@@ -21015,6 +21576,12 @@ if (showWorldVisuals) {
       preview(render::SurfaceKind::GasGiant, "Gas Giant", core::hashCombine(base, core::fnv1a64("surf_gas")));
       ImGui::TableNextColumn();
       preview(render::SurfaceKind::Clouds, "Clouds", core::hashCombine(base, core::fnv1a64("surf_clouds")));
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::CityLights, "City Lights", core::hashCombine(base, core::fnv1a64("surf_lights_a")));
+      ImGui::TableNextColumn();
+      preview(render::SurfaceKind::CityLights, "City Lights (alt)", core::hashCombine(base, core::fnv1a64("surf_lights_b")));
       ImGui::EndTable();
     }
 
@@ -28062,6 +28629,7 @@ if (showContacts) {
         ImGui::TextDisabled("Presets (applied immediately; click Save to persist):");
         if (ImGui::Button("Combat")) {
           showRadarHud = true;
+          showShipHud = true;
           objectiveHudEnabled = true;
           hudThreatOverlayEnabled = true;
           hudJumpOverlay = true;
@@ -28080,6 +28648,7 @@ if (showContacts) {
         ImGui::SameLine();
         if (ImGui::Button("Exploration")) {
           showRadarHud = true;
+          showShipHud = true;
           objectiveHudEnabled = true;
           hudThreatOverlayEnabled = true;
           hudJumpOverlay = true;
@@ -28098,6 +28667,7 @@ if (showContacts) {
         ImGui::SameLine();
         if (ImGui::Button("Cinematic")) {
           showRadarHud = false;
+          showShipHud = false;
           objectiveHudEnabled = false;
           hudThreatOverlayEnabled = false;
           hudJumpOverlay = false;
@@ -28112,11 +28682,48 @@ if (showContacts) {
         if (ImGui::CollapsingHeader("Overlays", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::Checkbox("Radar HUD", &showRadarHud);
           ImGui::SameLine();
+          ImGui::Checkbox("Ship", &showShipHud);
+          ImGui::SameLine();
           ImGui::Checkbox("Objective", &objectiveHudEnabled);
           ImGui::SameLine();
           ImGui::Checkbox("Threat", &hudThreatOverlayEnabled);
           ImGui::SameLine();
           ImGui::Checkbox("Jump", &hudJumpOverlay);
+
+          if (ImGui::TreeNodeEx("Ship HUD (procedural)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SliderInt("Detail level##shipHud", &shipHudDetailLevel, 0, 3);
+            ImGui::Checkbox("Telemetry sparklines##shipHud", &shipHudShowSparklines);
+            ImGui::SameLine();
+            ImGui::Checkbox("Glitch FX##shipHud", &shipHudGlitchFx);
+            ImGui::SameLine();
+            ImGui::Checkbox("Panel dropouts##shipHud", &shipHudPanelDropouts);
+
+            ImGui::Checkbox("Decor (procedural)##shipHud", &shipHudShowDecor);
+            ImGui::SameLine();
+            ImGui::Checkbox("Glyph icons##shipHud", &shipHudShowGlyphs);
+            ImGui::SameLine();
+            ImGui::Checkbox("Microtext##shipHud", &shipHudShowMicrotext);
+            ImGui::SameLine();
+            ImGui::Checkbox("Segment readouts##shipHud", &shipHudSegmentText);
+            if (shipHudShowDecor) {
+              ImGui::SliderFloat("Decor alpha##shipHud", &shipHudDecorAlpha, 0.0f, 1.0f, "%.2f");
+            }
+
+            ImGui::Checkbox("Seed from loadout##shipHud", &shipHudSeedFromLoadout);
+            if (!shipHudSeedFromLoadout) {
+              ImGui::SetNextItemWidth(240.0f);
+              ImGui::InputScalar("Manual seed##shipHud", ImGuiDataType_U64, &shipHudSeedManual, nullptr, nullptr, "%llu");
+            }
+
+            ImGui::SetNextItemWidth(240.0f);
+            ImGui::InputScalar("Seed nonce##shipHud", ImGuiDataType_U64, &shipHudSeedNonce, nullptr, nullptr, "%llu");
+            ImGui::SameLine();
+            if (ImGui::Button("Reroll##shipHud")) {
+              shipHudSeedNonce += 1;
+            }
+
+            ImGui::TreePop();
+          }
 
           ImGui::Checkbox("Tactical overlay", &showTacticalOverlay);
           ImGui::SameLine();
@@ -28615,6 +29222,13 @@ if (showContacts) {
 
       // HUD
       addItem("Toggle Radar HUD", std::string("HUD • ") + onOff(showRadarHud), game::chordLabel(controls.actions.toggleRadarHud), 70, [&]() { showRadarHud = !showRadarHud; });
+      addItem("Toggle Ship HUD", std::string("HUD • ") + onOff(showShipHud), std::string(), 70, [&]() { showShipHud = !showShipHud; });
+      addItem("Reroll Ship HUD", "HUD • regenerate procedural layout", std::string(), 62, [&]() { shipHudSeedNonce += 1; });
+      addItem("Toggle Ship HUD decor", std::string("HUD • ") + onOff(shipHudShowDecor), std::string(), 55, [&]() { shipHudShowDecor = !shipHudShowDecor; });
+      addItem("Toggle Ship HUD glyph icons", std::string("HUD • ") + onOff(shipHudShowGlyphs), std::string(), 55, [&]() { shipHudShowGlyphs = !shipHudShowGlyphs; });
+      addItem("Toggle Ship HUD microtext", std::string("HUD • ") + onOff(shipHudShowMicrotext), std::string(), 55, [&]() { shipHudShowMicrotext = !shipHudShowMicrotext; });
+      addItem("Toggle Ship HUD segment readouts", std::string("HUD • ") + onOff(shipHudSegmentText), std::string(), 55, [&]() { shipHudSegmentText = !shipHudSegmentText; });
+      addItem("Toggle Ship HUD panel dropouts", std::string("HUD • ") + onOff(shipHudPanelDropouts), std::string(), 50, [&]() { shipHudPanelDropouts = !shipHudPanelDropouts; });
       addItem("Toggle Tactical overlay", std::string("HUD • ") + onOff(showTacticalOverlay), game::chordLabel(controls.actions.toggleTacticalOverlay), 70, [&]() { showTacticalOverlay = !showTacticalOverlay; });
       addItem("Toggle HUD edit mode", std::string("HUD • ") + onOff(hudLayoutEditMode), game::chordLabel(controls.actions.hudLayoutToggleEdit), 60, [&]() { hudLayoutEditMode = !hudLayoutEditMode; });
 
@@ -29025,6 +29639,7 @@ draw_command_palette:
   // Persist HUD layout on exit (optional).
   if (hudLayoutAutoSaveOnExit) {
     hudLayout.widget(ui::HudWidgetId::Radar).enabled = showRadarHud;
+    hudLayout.widget(ui::HudWidgetId::Ship).enabled = showShipHud;
     hudLayout.widget(ui::HudWidgetId::Objective).enabled = objectiveHudEnabled;
     hudLayout.widget(ui::HudWidgetId::Threat).enabled = hudThreatOverlayEnabled;
     hudLayout.widget(ui::HudWidgetId::Jump).enabled = hudJumpOverlay;

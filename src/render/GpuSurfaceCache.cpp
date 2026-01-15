@@ -44,18 +44,12 @@ uniform vec2 uInvSize; // (1/w, 1/h)
 out vec4 FragColor;
 
 const float PI = 3.1415926535897932384626433832795;
-const float TWO_PI = 6.2831853071795864769252867665590;
 
 float clamp01(float x) { return clamp(x, 0.0, 1.0); }
 
 // Quintic fade (Perlin-style): 6t^5 - 15t^4 + 10t^3
 float fade(float t) {
   return t*t*t*(t*(t*6.0 - 15.0) + 10.0);
-}
-
-float smoothstep01(float e0, float e1, float x) {
-  float t = clamp01((x - e0) / (e1 - e0));
-  return t * t * (3.0 - 2.0 * t);
 }
 
 uint pcg_hash(uint v) {
@@ -122,37 +116,127 @@ float fbm3D(vec3 p, uint seed, int octaves, float lacunarity, float gain) {
   return sum;
 }
 
-float ampSum(int octaves, float gain) {
-  float amp = 0.5;
-  float s = 0.0;
-  for (int i = 0; i < 8; ++i) {
-    if (i >= octaves) break;
-    s += amp;
-    amp *= gain;
+float smoothstep01(float e0, float e1, float x) {
+  float t = clamp01((x - e0) / (e1 - e0));
+  return t * t * (3.0 - 2.0 * t);
+}
+
+
+// -----------------------------------------------------------------------------
+// Crater field synthesis (Worley-style nearest feature on p*freq).
+//
+// This is deliberately tiny and deterministic so the GPU surface cache can
+// produce "impact" detail without any lookup textures.
+
+float u01(uint h) { return float(h) / 4294967295.0; }
+
+struct CraterSample {
+  float h;
+  float bowl;
+  float rim;
+  float ejecta;
+};
+
+void worleyNearest(vec3 x, uint seed, out float outDist, out vec3 outFeature, out uint outId) {
+  ivec3 base = ivec3(floor(x));
+  float minD = 1.0e9;
+  uint bestId = 0u;
+  vec3 bestF = vec3(0.0);
+
+  for (int dz = -1; dz <= 1; ++dz) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base + ivec3(dx, dy, dz);
+        uvec3 uc = uvec3(c);
+
+        uint id = pcg_hash(uc.x + pcg_hash(uc.y + pcg_hash(uc.z + seed)));
+
+        float rx = u01(pcg_hash(id ^ 0xA531u));
+        float ry = u01(pcg_hash(id ^ 0xC0DEu));
+        float rz = u01(pcg_hash(id ^ 0xBEEFu));
+
+        vec3 f = vec3(c) + vec3(rx, ry, rz);
+        float d = length(x - f);
+
+        if (d < minD) {
+          minD = d;
+          bestId = id;
+          bestF = f;
+        }
+      }
+    }
   }
-  return max(1.0e-6, s);
+
+  outDist = minD;
+  outId = bestId;
+  outFeature = bestF;
 }
 
-float fbm01(vec3 p, uint seed, int octaves, float lacunarity, float gain) {
-  return clamp01(fbm3D(p, seed, octaves, lacunarity, gain) / ampSum(octaves, gain));
+CraterSample craterLayer(vec3 p, uint seed, float freq, float amp, bool withRays) {
+  vec3 x = p * freq;
+
+  float dist;
+  vec3 feature;
+  uint id;
+  worleyNearest(x, seed, dist, feature, id);
+
+  float radius = mix(0.28, 0.58, u01(pcg_hash(id ^ 0xC0DEC0DEu)));
+  float depthScale = mix(0.75, 1.40, u01(pcg_hash(id ^ 0xBEEF1234u)));
+
+  float d = dist / max(1.0e-6, radius);
+
+  float t = clamp01(1.0 - d);
+  float bowl = t * t;
+
+  float rim = smoothstep01(0.86, 1.0, d) * (1.0 - smoothstep01(1.0, 1.14, d));
+
+  float ejectaRing = smoothstep01(1.0, 1.08, d) * (1.0 - smoothstep01(1.08, 1.70, d));
+  float ejecta = ejectaRing;
+
+  if (withRays && ejectaRing > 1.0e-5) {
+    vec3 cpos = feature / freq;
+    vec3 cdir = (length(cpos) > 1.0e-6) ? normalize(cpos) : p;
+
+    vec3 up = (abs(cdir.y) > 0.85) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t0 = normalize(cross(up, cdir));
+    vec3 t1 = cross(cdir, t0);
+
+    vec3 v = p - cdir * dot(p, cdir);
+    float vLen = length(v);
+    if (vLen > 1.0e-6) {
+      v /= vLen;
+      float ang = atan(dot(v, t1), dot(v, t0));
+
+      float rayCount = float(6 + int(pcg_hash(id ^ 0x51DEu) % 15u));
+      float phase = u01(pcg_hash(id ^ 0xA11CE5u)) * (2.0 * PI);
+
+      float rv = 0.5 + 0.5 * cos(ang * rayCount + phase);
+      rv = pow(clamp01(rv), 5.0);
+      ejecta *= mix(0.35, 1.0, rv);
+    }
+  }
+
+  CraterSample out;
+  out.h = (-amp * depthScale * bowl) + (amp * 0.45 * rim) + (amp * 0.10 * ejectaRing);
+  out.bowl = bowl;
+  out.rim = rim;
+  out.ejecta = ejecta;
+  return out;
 }
 
-float ridged01(float n01) {
-  return 1.0 - abs(n01 * 2.0 - 1.0);
+CraterSample craterField(vec3 p, uint seed) {
+  CraterSample a = craterLayer(p, seed ^ 0xC7A73u, 2.2, 0.10, true);
+  CraterSample b = craterLayer(p, seed ^ 0xF00Du,  7.5, 0.05, false);
+  CraterSample c = craterLayer(p, seed ^ 0xB16D0u, 16.0, 0.02, false);
+
+  CraterSample out;
+  out.h = a.h + b.h + c.h;
+  out.bowl = max(a.bowl, max(b.bowl * 0.75, c.bowl * 0.50));
+  out.rim = max(a.rim, max(b.rim * 0.75, c.rim * 0.50));
+  out.ejecta = max(a.ejecta, max(b.ejecta * 0.65, c.ejecta * 0.45));
+  return out;
 }
 
-vec3 noiseVec3(vec3 p, uint seed, float freq) {
-  vec3 q = p * freq;
-  float x = fbm01(q, seed ^ 0xA11CE5u, 4, 2.0, 0.5) - 0.5;
-  float y = fbm01(q, seed ^ 0xBADC0FFEu, 4, 2.0, 0.5) - 0.5;
-  float z = fbm01(q, seed ^ 0xC0FFEEu, 4, 2.0, 0.5) - 0.5;
-  return vec3(x, y, z);
-}
-
-vec3 warpDir(vec3 p, uint seed, float freq, float amp) {
-  vec3 w = noiseVec3(p, seed, freq);
-  return normalize(p + w * amp);
-}
 
 vec3 latLonToSphere(float lat, float lon) {
   float cosLat = cos(lat);
@@ -162,694 +246,265 @@ vec3 latLonToSphere(float lat, float lon) {
   return vec3(cosLat * cosLon, sinLat, cosLat * sinLon);
 }
 
-vec3 randDir(uint seed, uint idx, uint salt) {
-  float u = hash01(uvec3(idx, 0u, salt), seed);
-  float v = hash01(uvec3(idx, 1u, salt), seed);
-  float z = u * 2.0 - 1.0;
-  float phi = TWO_PI * v;
-  float r = sqrt(max(0.0, 1.0 - z*z));
-  return vec3(r * cos(phi), z, r * sin(phi));
-}
-
-// -----------------------------------------------------------------------------
-// Tectonic plates (spherical Voronoi), craters, vortices
-
-const uint SALT_PLATE  = 0x504C4154u; // 'PLAT'
-const uint SALT_CRATER = 0x43524154u; // 'CRAT'
-const uint SALT_VGAS   = 0x56474153u; // 'VGAS'
-const uint SALT_VCLD   = 0x56434C44u; // 'VCLD'
-
-int plateBaseCount(int kind) {
-  if (kind == 0) return 26; // Rocky
-  if (kind == 1) return 22; // Desert
-  if (kind == 2) return 18; // Ocean
-  if (kind == 3) return 20; // Ice
-  if (kind == 4) return 12; // Gas
-  if (kind == 6) return 12; // Clouds
-  return 0;
-}
-
-int plateCount(int kind, uint seed) {
-  int base = plateBaseCount(kind);
-  if (base <= 0) return 0;
-  int jitter = int(pcg_hash(seed ^ (SALT_PLATE + uint(kind) * 101u)) % 11u) - 4; // -4..+6
-  return clamp(base + jitter, 8, 48);
-}
-
-float plateHeightBias(int kind, uint seed, int idx) {
-  float t = hash01(uvec3(uint(idx), 2u, SALT_PLATE), seed);
-  if (kind == 2) {
-    // Bias towards smaller values so water dominates.
-    return pow(t, 1.35);
-  }
-  if (kind == 4 || kind == 6) {
-    return mix(0.35, 0.65, t);
-  }
-  return mix(0.25, 0.85, t);
-}
-
-float plateTempBias(int kind, uint seed, int idx) {
-  float t = hash01(uvec3(uint(idx), 3u, SALT_PLATE), seed);
-  if (kind == 2) return mix(-0.12, 0.12, t);
-  if (kind == 4 || kind == 6) return mix(-0.08, 0.08, t);
-  return mix(-0.10, 0.10, t);
-}
-
-float plateMoistBias(int kind, uint seed, int idx) {
-  float t = hash01(uvec3(uint(idx), 4u, SALT_PLATE), seed);
-  if (kind == 2) return mix(-0.20, 0.20, t);
-  if (kind == 4 || kind == 6) return mix(-0.08, 0.08, t);
-  return mix(-0.10, 0.10, t);
-}
-
-struct PlateSample {
-  int idx;
-  float boundary01;
-  float bestDot;
-  float secondDot;
-};
-
-PlateSample samplePlates(vec3 p, uint seed, int kind) {
-  PlateSample s;
-  s.idx = 0;
-  s.boundary01 = 0.0;
-  s.bestDot = -2.0;
-  s.secondDot = -2.0;
-
-  int count = plateCount(kind, seed);
-  if (count <= 0) return s;
-
-  float best = -2.0;
-  float second = -2.0;
-  int bestIdx = 0;
-
-  uint plateSeed = seed ^ SALT_PLATE;
-  for (int i = 0; i < 48; ++i) {
-    if (i >= count) break;
-    vec3 d = randDir(plateSeed, uint(i), SALT_PLATE);
-    float dd = dot(p, d);
-    if (dd > best) {
-      second = best;
-      best = dd;
-      bestIdx = i;
-    } else if (dd > second) {
-      second = dd;
-    }
-  }
-
-  float diff = best - second;
-  float t = clamp01((0.11 - diff) / 0.11);
-  s.idx = bestIdx;
-  s.bestDot = best;
-  s.secondDot = second;
-  s.boundary01 = smoothstep01(0.0, 1.0, t);
-  return s;
-}
-
-int craterCount(int kind, uint seed) {
-  // Oceans/gas/stars/clouds do not use this crater field.
-  if (kind == 2 || kind == 4 || kind == 5 || kind == 6) return 0;
-
-  int base = 48;
-  if (kind == 1) base = 38;
-  if (kind == 3) base = 52;
-
-  int jitter = int(pcg_hash(seed ^ SALT_CRATER) % 27u) - 10; // -10..+16
-  return clamp(base + jitter, 0, 96);
-}
-
-float applyCraters(float h, vec3 p, uint seed, int kind, float strengthMul,
-                  out float craterInterior01, out float craterRim01) {
-  craterInterior01 = 0.0;
-  craterRim01 = 0.0;
-
-  int count = craterCount(kind, seed);
-  if (count <= 0 || strengthMul <= 0.0) return h;
-
-  float rMinDeg = 4.0;
-  float rMaxDeg = 18.0;
-  float depthBase = 0.085;
-  float rimBase = 0.25;
-
-  if (kind == 1) { // Desert
-    rMinDeg = 5.0;
-    rMaxDeg = 20.0;
-    depthBase = 0.070;
-    rimBase = 0.22;
-  } else if (kind == 3) { // Ice
-    rMinDeg = 6.0;
-    rMaxDeg = 22.0;
-    depthBase = 0.080;
-    rimBase = 0.28;
-  }
-
-  uint craterSeed = seed ^ SALT_CRATER;
-
-  for (int i = 0; i < 96; ++i) {
-    if (i >= count) break;
-    uint idx = uint(i);
-
-    vec3 dir = randDir(craterSeed, idx, SALT_CRATER);
-
-    float tR = hash01(uvec3(idx, 2u, SALT_CRATER), seed);
-    float rad = radians(mix(rMinDeg, rMaxDeg, tR));
-    float cosR = cos(rad);
-    float invSpan = 1.0 / max(1.0e-6, (1.0 - cosR));
-
-    float d = dot(p, dir);
-    if (d <= cosR) continue;
-
-    float t = clamp01((d - cosR) * invSpan); // 0=edge -> 1=center
-    float w = smoothstep01(0.0, 1.0, t);
-
-    float depth = depthBase * mix(0.65, 1.15, hash01(uvec3(idx, 3u, SALT_CRATER), seed));
-    float rim = clamp(rimBase * mix(0.85, 1.15, hash01(uvec3(idx, 4u, SALT_CRATER), seed)), 0.0, 1.0);
-
-    h -= depth * strengthMul * w;
-    craterInterior01 = max(craterInterior01, w);
-
-    if (rim > 0.0) {
-      float ring = smoothstep01(0.06, 0.22, t) * (1.0 - smoothstep01(0.22, 0.58, t));
-      h += depth * strengthMul * rim * ring;
-      craterRim01 = max(craterRim01, ring);
-    }
-  }
-
-  return clamp01(h);
-}
-
-int vortexCount(uint seed, uint salt) {
-  // 3..8
-  return int(3u + (pcg_hash(seed ^ salt) % 6u));
-}
-
-vec3 vortexTint(int i, uint seed) {
-  int v = (i + int(seed & 7u)) % 5;
-  if (v == 0) return vec3(0.95, 0.60, 0.45);
-  if (v == 1) return vec3(0.85, 0.92, 1.00);
-  if (v == 2) return vec3(1.00, 0.92, 0.70);
-  if (v == 3) return vec3(0.72, 0.78, 0.86);
-  return vec3(0.92, 0.82, 0.62);
-}
-
-// -----------------------------------------------------------------------------
-// Biomes
-
-vec3 biomeColor(float temp01, float moist01) {
-  temp01 = clamp01(temp01);
-  moist01 = clamp01(moist01);
-
-  vec3 desert = vec3(0.86, 0.78, 0.45);
-  vec3 savanna = vec3(0.62, 0.70, 0.32);
-  vec3 grass = vec3(0.34, 0.60, 0.26);
-  vec3 forest = vec3(0.16, 0.42, 0.18);
-  vec3 jungle = vec3(0.12, 0.50, 0.22);
-  vec3 steppe = vec3(0.55, 0.50, 0.26);
-  vec3 tundra = vec3(0.62, 0.62, 0.54);
-
-  if (temp01 < 0.22) {
-    float s = smoothstep01(0.00, 0.20, (0.22 - temp01) / 0.22);
-    return mix(tundra, vec3(0.90, 0.95, 1.00), s);
-  }
-
-  if (temp01 < 0.42) {
-    if (moist01 > 0.55) return mix(steppe, forest, (moist01 - 0.55) / 0.45);
-    return mix(tundra, steppe, moist01 / 0.55);
-  }
-
-  if (temp01 < 0.72) {
-    if (moist01 > 0.70) return mix(forest, jungle, (moist01 - 0.70) / 0.30);
-    if (moist01 > 0.45) return mix(grass, forest, (moist01 - 0.45) / 0.25);
-    if (moist01 > 0.25) return mix(savanna, grass, (moist01 - 0.25) / 0.20);
-    return mix(desert, savanna, moist01 / 0.25);
-  }
-
-  if (moist01 > 0.70) return jungle;
-  if (moist01 > 0.48) return mix(savanna, jungle, (moist01 - 0.48) / 0.22);
-  if (moist01 > 0.30) return mix(desert, savanna, (moist01 - 0.30) / 0.18);
-  return desert;
-}
-
-// -----------------------------------------------------------------------------
-// Surface functions
-
 float surfaceCloudAlpha(uint seed, vec3 p, float lat, float lon) {
-  vec3 q = warpDir(p, seed ^ 0xC10Du, 2.2, 0.22);
-
-  float n1 = fbm01(q * 3.6, seed ^ 0xC10Du, 6, 2.0, 0.5);
-  float n2 = fbm01(q * 10.5 + vec3(0.0, lat * 0.35, lon * 0.15), seed ^ 0xBEEFu, 4, 2.1, 0.55);
+  // Cloud density based on layered FBM.
+  float n1 = fbm3D(p * 3.6, seed ^ 0xC10Du, 6, 2.0, 0.5);
+  float n2 = fbm3D(p * 10.5 + vec3(0.0, lat * 0.35, lon * 0.15), seed ^ 0xBEEFu, 4, 2.1, 0.55);
   float n = 0.65 * n1 + 0.35 * n2;
-  float d = smoothstep01(0.55, 0.82, n);
-
-  float bandWarp = fbm01(q * 2.8, seed ^ 0xC1A0u, 4, 2.0, 0.55);
-  float band = 0.5 + 0.5 * sin(lat * (10.0 + 8.0 * bandWarp) + (n2 - 0.5) * 3.0);
-  d *= 0.78 + 0.22 * band;
-
-  // Storms.
-  int count = vortexCount(seed, SALT_VCLD);
-  uint vSeed = seed ^ SALT_VCLD;
-  for (int i = 0; i < 10; ++i) {
-    if (i >= count) break;
-
-    vec3 dir0 = randDir(vSeed, uint(i), SALT_VCLD);
-    dir0.y = clamp(dir0.y, -0.92, 0.92);
-    vec3 dir = normalize(dir0);
-
-    float radDeg = mix(8.0, 28.0, hash01(uvec3(uint(i), 2u, SALT_VCLD), seed));
-    float cosR = cos(radians(radDeg));
-    float invSpan = 1.0 / max(1.0e-6, (1.0 - cosR));
-
-    float dd = dot(p, dir);
-    if (dd <= cosR) continue;
-
-    float u = clamp01((dd - cosR) * invSpan);
-    float w = smoothstep01(0.0, 1.0, u);
-    float str = mix(0.35, 0.85, hash01(uvec3(uint(i), 3u, SALT_VCLD), seed));
-
-    float swirl = 0.5 + 0.5 * sin(lon * 4.5 + lat * 7.0 + float(seed & 7u));
-    d += (swirl * 0.55 + 0.45) * w * str * 0.30;
-  }
-
+  float d = smoothstep01(0.55, 0.80, n);
+  // Subtle latitude banding.
+  float band = 0.5 + 0.5 * sin(lat * 8.0 + (n2 - 0.5) * 3.0);
+  d *= 0.80 + 0.20 * band;
   return clamp01(d);
 }
 
 float surfaceHeight(int kind, uint seed, vec3 p, float lat, float lon) {
   // Height fields are intentionally approximate; only relative variation matters.
-
-  // Shared plate warp for rocky/desert/ocean/ice.
-  vec3 pWarp = p;
-  if (kind == 0) pWarp = warpDir(p, seed ^ 0xA11CE5u, 2.1, 0.22);
-  if (kind == 1) pWarp = warpDir(p, seed ^ 0xD35E7u, 1.8, 0.18);
-  if (kind == 2) pWarp = warpDir(p, seed ^ 0x0CE4u, 1.6, 0.20);
-  if (kind == 3) pWarp = warpDir(p, seed ^ 0x1CEu,  1.9, 0.16);
-
   if (kind == 0) { // Rocky
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-
-    float macro = fbm01(pWarp * 2.8, seed ^ 0xA11CE5u, 6, 2.0, 0.5);
-    float rN = fbm01(pWarp * 7.5, seed ^ 0xBADC0FFEu, 4, 2.1, 0.55);
-    float ridged = ridged01(rN);
-    float dust = fbm01(pWarp * 15.0, seed ^ 0xC0FFEEu, 3, 2.4, 0.55);
-
-    float mountain = pow(ps.boundary01, 1.65) * (0.18 + 0.22 * dust);
-
-    float h = clamp01(0.52 * plateH + 0.30 * macro + 0.18 * ridged + mountain);
+    float e0 = fbm3D(p * 2.8, seed ^ 0xA11CE5u, 6, 2.0, 0.5);
+    float e  = clamp01((e0 - 0.25) * 1.35);
+    float r0 = fbm3D(p * 7.5, seed ^ 0xBADC0FFEu, 4, 2.1, 0.55);
+    float ridged = 1.0 - abs(r0 * 2.0 - 1.0);
+    float dust = fbm3D(p * 15.0, seed ^ 0xC0FFEEu, 3, 2.4, 0.55);
+    float h = clamp01(0.70 * e + 0.30 * ridged);
     h = clamp01(h * (0.92 + 0.10 * dust));
 
-    float cIn, cRim;
-    h = applyCraters(h, p, seed, kind, 1.0, cIn, cRim);
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    h = clamp01(h + cs.h);
+
     return h;
   }
-
   if (kind == 1) { // Desert
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-
-    float macro = fbm01(pWarp * 2.2, seed ^ 0xD35E7u, 6, 2.0, 0.5);
-    float warp = fbm01(pWarp * 3.4, seed ^ 0x51DEu, 4, 2.1, 0.55);
-
+    float e0 = fbm3D(p * 2.2, seed ^ 0xD35E7u, 6, 2.0, 0.5);
+    float e  = clamp01((e0 - 0.22) * 1.30);
+    float warp = fbm3D(p * 3.4, seed ^ 0x51DEu, 4, 2.1, 0.55);
     float band = 0.5 + 0.5 * sin((lat * 16.0) + (lon * 2.2) + (warp - 0.5) * 3.2);
-
-    float rock = fbm01(pWarp * 6.0, seed ^ 0x0BADC0DEu, 4, 2.1, 0.52);
+    float rock = fbm3D(p * 6.0, seed ^ 0x0BADC0DEu, 4, 2.1, 0.52);
     float rockMask = smoothstep01(0.70, 0.88, rock);
+    float h = 0.78 * e + 0.22 * band;
+    h += rockMask * 0.12;
 
-    float mountain = pow(ps.boundary01, 1.55) * (0.12 + 0.16 * rock);
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    h = clamp01(h + cs.h * 0.85);
 
-    float h = clamp01(0.55 * plateH + 0.22 * macro + 0.20 * band + 0.08 * rockMask + mountain);
-    float cIn, cRim;
-    h = applyCraters(h, p, seed, kind, 0.75, cIn, cRim);
     return h;
   }
-
   if (kind == 2) { // Ocean
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-
-    float macro = fbm01(pWarp * 2.1, seed ^ 0x0CE4u, 6, 2.0, 0.5);
-    float detail = fbm01(pWarp * 6.5, seed ^ 0xE1E7u, 5, 2.1, 0.55);
-
-    float mountain = pow(ps.boundary01, 1.85) * (0.18 + 0.26 * detail);
-    float elevRaw = clamp01(0.68 * plateH + 0.32 * macro + mountain);
-
-    float tSea = float((uint(uSeedLo) >> 11u) & 255u) / 255.0;
-    float sea = 0.50 + tSea * 0.09;
-
-    float land = smoothstep01(sea - 0.02, sea + 0.02, elevRaw);
-    float landElev = clamp01((elevRaw - sea) / max(1.0e-6, (1.0 - sea)));
-
-    float wave = fbm01(pWarp * 18.0, seed ^ 0xA57EA11Cu, 3, 2.2, 0.55);
-    float hOcean = 0.03 * (wave - 0.5) * (0.85 + 0.15 * abs(sin(lat)));
-    float hLand = 0.18 + 0.82 * landElev;
-
+    float n = fbm3D(p * 2.1, seed ^ 0x0CE4u, 6, 2.0, 0.5);
+    float land = smoothstep01(0.48, 0.55, n);
+    float e0 = fbm3D(p * 6.5, seed ^ 0xE1E7u, 5, 2.1, 0.55);
+    float elev = clamp01((e0 - 0.30) * 1.55);
+    float wave = fbm3D(p * 18.0, seed ^ 0xA57EA11Cu, 3, 2.2, 0.55);
+    float hOcean = 0.03 * (wave - 0.5);
+    float hLand = 0.25 + 0.75 * elev;
     return clamp01(mix(hOcean, hLand, land));
   }
-
   if (kind == 3) { // Ice
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
+    float n = fbm3D(p * 3.3, seed ^ 0x1CEu, 6, 2.0, 0.5);
+    float crack = fbm3D(p * 20.0, seed ^ 0xC24Cu, 3, 2.4, 0.55);
+    float crackMask = smoothstep01(0.76, 0.93, crack);
+    float h = clamp01((n - 0.22) * 1.35);
+    h = clamp01(h + 0.22 * crackMask);
 
-    float n = fbm01(pWarp * 3.3, seed ^ 0x1CEu, 6, 2.0, 0.5);
-    float crack = fbm01(pWarp * 20.0, seed ^ 0xC24Cu, 3, 2.4, 0.55);
-    float crackMask = smoothstep01(0.78, 0.93, crack);
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    h = clamp01(h + cs.h * 0.65);
 
-    float ridge = pow(ps.boundary01, 1.35) * 0.28;
-
-    float h = clamp01(0.52 * plateH + 0.32 * n + 0.16 * crackMask + ridge);
-
-    float eq = 1.0 - abs(sin(lat));
-    float ripple = fbm01(pWarp * 9.0, seed ^ 0xF00Du, 4, 2.1, 0.55);
-    h = clamp01(h + (ripple - 0.5) * 0.05 * eq);
-
-    float cIn, cRim;
-    h = applyCraters(h, p, seed, kind, 0.85, cIn, cRim);
     return h;
   }
-
   if (kind == 4) { // GasGiant
-    vec3 q = warpDir(p, seed ^ 0x6A59u, 2.6, 0.25);
-    float warp = fbm01(q * 2.6, seed ^ 0x6A59u, 5, 2.0, 0.55);
-
-    float bandFreq = 20.0 + 10.0 * warp;
-    float band = 0.5 + 0.5 * sin((lat * bandFreq) + (warp - 0.5) * 4.2);
-    float turb = fbm01(q * 7.0, seed ^ 0x7B3Bu, 4, 2.1, 0.55);
-
+    float warp = fbm3D(p * 2.6, seed ^ 0x6A59u, 5, 2.0, 0.55);
+    float band = 0.5 + 0.5 * sin((lat * 22.0) + (warp - 0.5) * 4.2);
+    float turb = fbm3D(p * 7.0, seed ^ 0x7B3Bu, 4, 2.1, 0.55);
     float h = 0.5 + 0.10 * (band - 0.5) + 0.08 * (turb - 0.5);
-
-    int count = vortexCount(seed, SALT_VGAS);
-    uint vSeed = seed ^ SALT_VGAS;
-    for (int i = 0; i < 10; ++i) {
-      if (i >= count) break;
-
-      vec3 dir0 = randDir(vSeed, uint(i), SALT_VGAS);
-      dir0.y = clamp(dir0.y, -0.92, 0.92);
-      vec3 dir = normalize(dir0);
-
-      float radDeg = mix(8.0, 28.0, hash01(uvec3(uint(i), 2u, SALT_VGAS), seed));
-      float cosR = cos(radians(radDeg));
-      float invSpan = 1.0 / max(1.0e-6, (1.0 - cosR));
-
-      float dd = dot(p, dir);
-      if (dd <= cosR) continue;
-
-      float u = clamp01((dd - cosR) * invSpan);
-      float w = smoothstep01(0.0, 1.0, u);
-      float str = mix(0.35, 0.85, hash01(uvec3(uint(i), 3u, SALT_VGAS), seed));
-      float swirl = 0.5 + 0.5 * sin(lon * 3.2 + lat * 5.1 + float(seed & 7u));
-      h += (swirl - 0.5) * 0.08 * w * str;
-    }
-
     return clamp01(h);
   }
-
   if (kind == 5) { // Star
-    float coarse = fbm01(p * 5.0, seed ^ 0x57A4u, 5, 2.0, 0.55);
-    float fine   = fbm01(p * 18.0, seed ^ 0xF1AEu, 3, 2.4, 0.55);
+    float coarse = fbm3D(p * 5.0, seed ^ 0x57A4u, 5, 2.0, 0.55);
+    float fine   = fbm3D(p * 18.0, seed ^ 0xF1AEu, 3, 2.4, 0.55);
     float h = 0.55 + 0.55 * coarse + 0.20 * (fine - 0.5);
     return clamp01(h);
   }
-
   if (kind == 6) { // Clouds
     return surfaceCloudAlpha(seed, p, lat, lon);
   }
-
+  if (kind == 7) { // CityLights
+    // Emissive-only map; keep normals essentially flat by returning a constant.
+    return 0.5;
+  }
   return 0.5;
 }
 
-vec3 surfaceAlbedo(int kind, uint seed, vec3 p, float lat, float lon, out float outAlpha) {
-  outAlpha = 1.0;
-
-  int paletteIx = int((uint(uSeedLo) >> 21u) & 7u);
-
-  vec3 pWarp = p;
-  if (kind == 0) pWarp = warpDir(p, seed ^ 0xA11CE5u, 2.1, 0.22);
-  if (kind == 1) pWarp = warpDir(p, seed ^ 0xD35E7u, 1.8, 0.18);
-  if (kind == 2) pWarp = warpDir(p, seed ^ 0x0CE4u, 1.6, 0.20);
-  if (kind == 3) pWarp = warpDir(p, seed ^ 0x1CEu,  1.9, 0.16);
-
+vec3 surfaceAlbedo(int kind, uint seed, vec3 p, float lat, float lon) {
   if (kind == 0) { // Rocky
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-
-    float macro = fbm01(pWarp * 2.8, seed ^ 0xA11CE5u, 6, 2.0, 0.5);
-    float rN = fbm01(pWarp * 7.5, seed ^ 0xBADC0FFEu, 4, 2.1, 0.55);
-    float ridged = ridged01(rN);
-    float dust = fbm01(pWarp * 15.0, seed ^ 0xC0FFEEu, 3, 2.4, 0.55);
-
-    float mountain = pow(ps.boundary01, 1.65) * (0.18 + 0.22 * dust);
-    float h = clamp01(0.52 * plateH + 0.30 * macro + 0.18 * ridged + mountain);
-    h = clamp01(h * (0.92 + 0.10 * dust));
-
-    float craterIn, craterRim;
-    h = applyCraters(h, p, seed, kind, 1.0, craterIn, craterRim);
-
+    float e0 = fbm3D(p * 2.8, seed ^ 0xA11CE5u, 6, 2.0, 0.5);
+    float e  = clamp01((e0 - 0.25) * 1.35);
+    float r0 = fbm3D(p * 7.5, seed ^ 0xBADC0FFEu, 4, 2.1, 0.55);
+    float ridged = 1.0 - abs(r0 * 2.0 - 1.0);
+    float dust = fbm3D(p * 15.0, seed ^ 0xC0FFEEu, 3, 2.4, 0.55);
     vec3 baseLo = vec3(0.18, 0.16, 0.15);
     vec3 baseHi = vec3(0.62, 0.56, 0.48);
-    if ((paletteIx % 3) == 1) {
-      baseLo = vec3(0.20, 0.12, 0.10);
-      baseHi = vec3(0.70, 0.46, 0.32);
-    } else if ((paletteIx % 3) == 2) {
-      baseLo = vec3(0.10, 0.10, 0.12);
-      baseHi = vec3(0.46, 0.46, 0.50);
-    }
-
-    vec3 col = mix(baseLo, baseHi, h);
+    vec3 col = mix(baseLo, baseHi, e);
     col = mix(col, col * 0.65, (1.0 - ridged) * 0.35);
     col *= (0.85 + 0.28 * dust);
-
-    col = mix(col, vec3(0.74, 0.72, 0.70), ps.boundary01 * 0.18);
-
-    col = mix(col, col * 0.55, craterIn * 0.55);
-    col = mix(col, vec3(0.95, 0.93, 0.90), craterRim * 0.28);
-
-    float speck = fbm01(pWarp * 26.0, seed ^ 0xFEEDBEEFu, 2, 2.5, 0.6);
-    float speckMask = smoothstep01(0.84, 0.97, speck);
+    float speck = fbm3D(p * 26.0, seed ^ 0xFEEDBEEFu, 2, 2.5, 0.6);
+    float speckMask = smoothstep01(0.82, 0.96, speck);
     col = mix(col, vec3(0.88, 0.84, 0.78), speckMask * 0.32);
 
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    col = mix(col, col * 0.55, cs.bowl * 0.25);
+    col = mix(col, vec3(0.92, 0.90, 0.86), cs.rim * 0.35);
+    col = mix(col, vec3(0.88, 0.84, 0.78), cs.ejecta * 0.18);
+
     return col;
   }
-
   if (kind == 1) { // Desert
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-
-    float macro = fbm01(pWarp * 2.2, seed ^ 0xD35E7u, 6, 2.0, 0.5);
-    float warp = fbm01(pWarp * 3.4, seed ^ 0x51DEu, 4, 2.1, 0.55);
-    float band = 0.5 + 0.5 * sin((lat * 16.0) + (lon * 2.2) + (warp - 0.5) * 3.2);
-    float rock = fbm01(pWarp * 6.0, seed ^ 0x0BADC0DEu, 4, 2.1, 0.52);
-    float rockMask = smoothstep01(0.70, 0.88, rock);
-    float mountain = pow(ps.boundary01, 1.55) * (0.12 + 0.16 * rock);
-
-    float h = clamp01(0.55 * plateH + 0.22 * macro + 0.20 * band + 0.08 * rockMask + mountain);
-
-    float craterIn, craterRim;
-    h = applyCraters(h, p, seed, kind, 0.75, craterIn, craterRim);
-
+    float e0 = fbm3D(p * 2.2, seed ^ 0xD35E7u, 6, 2.0, 0.5);
+    float e  = clamp01((e0 - 0.22) * 1.30);
     vec3 sandLo = vec3(0.62, 0.52, 0.28);
     vec3 sandHi = vec3(0.92, 0.86, 0.50);
-    if ((paletteIx & 1) != 0) {
-      sandLo = vec3(0.56, 0.34, 0.22);
-      sandHi = vec3(0.88, 0.62, 0.40);
-    }
-
-    vec3 col = mix(sandLo, sandHi, clamp01(0.35 + 0.65 * macro));
+    vec3 col = mix(sandLo, sandHi, e);
+    float warp = fbm3D(p * 3.4, seed ^ 0x51DEu, 4, 2.1, 0.55);
+    float band = 0.5 + 0.5 * sin((lat * 16.0) + (lon * 2.2) + (warp - 0.5) * 3.2);
     col *= (0.90 + 0.18 * band);
+    float rock = fbm3D(p * 6.0, seed ^ 0x0BADC0DEu, 4, 2.1, 0.52);
+    float rockMask = smoothstep01(0.70, 0.88, rock);
+    col = mix(col, vec3(0.36, 0.30, 0.22), rockMask * 0.55);
 
-    col = mix(col, vec3(0.34, 0.28, 0.22), rockMask * 0.65);
-    col = mix(col, vec3(0.70, 0.64, 0.52), ps.boundary01 * 0.16);
-
-    col = mix(col, col * 0.62, craterIn * 0.50);
-    col = mix(col, vec3(0.98, 0.94, 0.86), craterRim * 0.18);
-
-    col = mix(col, col * 0.92, (1.0 - h) * 0.25);
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    col = mix(col, col * 0.75, cs.bowl * 0.22);
+    col = mix(col, vec3(0.97, 0.93, 0.78), cs.rim * 0.28);
+    col = mix(col, vec3(0.96, 0.92, 0.84), cs.ejecta * 0.22);
 
     return col;
   }
-
   if (kind == 2) { // Ocean
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-
-    float plateH = plateHeightBias(kind, seed, ps.idx);
-    float macro = fbm01(pWarp * 2.1, seed ^ 0x0CE4u, 6, 2.0, 0.5);
-    float detail = fbm01(pWarp * 6.5, seed ^ 0xE1E7u, 5, 2.1, 0.55);
-    float mountain = pow(ps.boundary01, 1.85) * (0.18 + 0.26 * detail);
-    float elevRaw = clamp01(0.68 * plateH + 0.32 * macro + mountain);
-
-    float tSea = float((uint(uSeedLo) >> 11u) & 255u) / 255.0;
-    float sea = 0.50 + tSea * 0.09;
-
-    float land = smoothstep01(sea - 0.02, sea + 0.02, elevRaw);
-    float landElev = clamp01((elevRaw - sea) / max(1.0e-6, (1.0 - sea)));
-    float coast = clamp01(1.0 - abs(elevRaw - sea) * 22.0);
-
-    vec3 waterDeep = vec3(0.02, 0.07, 0.20);
-    vec3 waterShallow = vec3(0.07, 0.26, 0.52);
-    if ((paletteIx & 2) != 0) {
-      waterDeep = vec3(0.03, 0.09, 0.18);
-      waterShallow = vec3(0.08, 0.30, 0.40);
-    }
+    float n = fbm3D(p * 2.1, seed ^ 0x0CE4u, 6, 2.0, 0.5);
+    float land = smoothstep01(0.48, 0.55, n);
+    float e0 = fbm3D(p * 6.5, seed ^ 0xE1E7u, 5, 2.1, 0.55);
+    float elev = clamp01((e0 - 0.30) * 1.55);
+    float coast = clamp01(1.0 - abs(n - 0.52) * 18.0);
+    vec3 waterDeep = vec3(0.03, 0.08, 0.22);
+    vec3 waterShallow = vec3(0.07, 0.22, 0.45);
     vec3 water = mix(waterDeep, waterShallow, coast);
-
-    float lat01 = abs(sin(lat));
-
-    float temp = 1.0 - pow(lat01, 0.95);
-    temp += plateTempBias(kind, seed, ps.idx);
-    temp -= landElev * 0.35;
-    temp = clamp01(temp);
-
-    float moist = fbm01(pWarp * 3.5, seed ^ 0xC0A57u, 5, 2.0, 0.5);
-    moist = clamp01((moist - 0.35) * 1.45);
-    moist *= (0.62 + 0.38 * cos(lat * 2.0));
-    moist = clamp01(moist + plateMoistBias(kind, seed, ps.idx));
-
-    vec3 landCol = biomeColor(temp, moist);
-
-    // Beaches.
-    float beach = coast * (1.0 - smoothstep01(sea + 0.01, sea + 0.04, elevRaw));
-    landCol = mix(landCol, vec3(0.92, 0.86, 0.62), beach);
-
-    float mountainMask = max(smoothstep01(0.72, 0.92, landElev), ps.boundary01 * 0.55);
-    landCol = mix(landCol, vec3(0.52, 0.50, 0.48), mountainMask * 0.55);
-
-    float snowLat = smoothstep01(0.62, 0.88, lat01);
-    float snowElev = smoothstep01(0.80, 0.98, landElev);
-    float snow = clamp01(max(snowLat, snowElev) * (0.55 + 0.45 * (1.0 - temp)));
-    landCol = mix(landCol, vec3(0.90, 0.95, 1.00), snow);
-
+    vec3 landLo = vec3(0.12, 0.30, 0.16);
+    vec3 landHi = vec3(0.52, 0.46, 0.26);
+    vec3 landCol = mix(landLo, landHi, elev);
     vec3 col = mix(water, landCol, land);
 
-    float cloud = fbm01(pWarp * 4.0, seed ^ 0xC10Du, 5, 2.0, 0.5);
-    float cloudMask = smoothstep01(0.74, 0.93, cloud) * (1.0 - land * 0.35);
-    col = mix(col, vec3(1.0), cloudMask * 0.08);
-
+    float cap = smoothstep01(0.62, 0.90, abs(sin(lat)));
+    if (cap > 1.0e-6) {
+      float capNoise = fbm3D(p * 9.0, seed ^ 0xC4F5u, 3, 2.2, 0.55);
+      float capMask = cap * (0.65 + 0.35 * capNoise);
+      col = mix(col, vec3(0.90, 0.95, 1.00), capMask);
+    }
+    float cloudN = fbm3D(p * 4.0, seed ^ 0xC10Du, 5, 2.0, 0.5);
+    float cloud = smoothstep01(0.70, 0.92, cloudN) * (1.0 - land * 0.25);
+    col = mix(col, vec3(1.0), cloud * 0.10);
     return col;
   }
-
   if (kind == 3) { // Ice
-    PlateSample ps = samplePlates(pWarp, seed, kind);
-    float plateH = plateHeightBias(kind, seed, ps.idx);
+    float n = fbm3D(p * 3.3, seed ^ 0x1CEu, 6, 2.0, 0.5);
+    vec3 iceLo = vec3(0.70, 0.84, 0.94);
+    vec3 iceHi = vec3(0.95, 0.99, 1.00);
+    vec3 col = mix(iceLo, iceHi, clamp01((n - 0.22) * 1.35));
+    float crack = fbm3D(p * 20.0, seed ^ 0xC24Cu, 3, 2.4, 0.55);
+    float crackMask = smoothstep01(0.76, 0.93, crack);
+    col = mix(col, vec3(0.25, 0.35, 0.40), crackMask * 0.22);
+    col *= (0.92 + 0.16 * fbm3D(p * 12.0, seed ^ 0xF00Du, 3, 2.1, 0.55));
 
-    float n = fbm01(pWarp * 3.3, seed ^ 0x1CEu, 6, 2.0, 0.5);
-    float crack = fbm01(pWarp * 20.0, seed ^ 0xC24Cu, 3, 2.4, 0.55);
-    float crackMask = smoothstep01(0.78, 0.93, crack);
-    float ridge = pow(ps.boundary01, 1.35) * 0.28;
-
-    float h = clamp01(0.52 * plateH + 0.32 * n + 0.16 * crackMask + ridge);
-
-    float craterIn, craterRim;
-    h = applyCraters(h, p, seed, kind, 0.85, craterIn, craterRim);
-
-    vec3 iceLo = vec3(0.70, 0.82, 0.95);
-    vec3 iceHi = vec3(0.93, 0.98, 1.00);
-    vec3 col = mix(iceLo, iceHi, clamp01(0.15 + 0.85 * n));
-
-    col = mix(col, vec3(0.28, 0.32, 0.38), crackMask * 0.35);
-
-    float dust = fbm01(pWarp * 10.0, seed ^ 0x1CEDu, 4, 2.1, 0.55);
-    float eq = 1.0 - abs(sin(lat));
-    float dustMask = clamp01((dust - 0.45) * 1.45) * eq;
-    col = mix(col, vec3(0.62, 0.56, 0.44), dustMask * 0.35);
-
-    col = mix(col, vec3(0.86, 0.90, 0.98), ps.boundary01 * 0.10);
-
-    col = mix(col, col * 0.75, craterIn * 0.55);
-    col = mix(col, vec3(1.0), craterRim * 0.18);
-
-    float pole = smoothstep01(0.62, 0.92, abs(sin(lat)));
-    col = mix(col, vec3(0.92, 0.98, 1.00), pole * 0.15);
+    CraterSample cs = craterField(p, seed ^ 0xC0DEF00Du);
+    float bowl = cs.bowl * 0.65;
+    float rim = cs.rim * 0.65;
+    float ej = cs.ejecta * 0.55;
+    col = mix(col, vec3(0.62, 0.74, 0.86), bowl * 0.18);
+    col = mix(col, vec3(0.98, 1.00, 1.00), rim * 0.25);
+    col = mix(col, vec3(0.90, 0.96, 1.00), ej * 0.16);
 
     return col;
   }
-
   if (kind == 4) { // GasGiant
-    vec3 q = warpDir(p, seed ^ 0x6A59u, 2.6, 0.25);
-    float warp = fbm01(q * 2.6, seed ^ 0x6A59u, 5, 2.0, 0.55);
-    float bandFreq = 22.0 + 12.0 * warp;
-    float band = 0.5 + 0.5 * sin((lat * bandFreq) + (warp - 0.5) * 4.2);
-    float fine = fbm01(q * 12.0, seed ^ 0x6A5Au, 3, 2.3, 0.55);
-    float turb = fbm01(q * 7.0, seed ^ 0x7B3Bu, 4, 2.1, 0.55);
-
-    float t = clamp01(0.60 * band + 0.25 * turb + 0.15 * fine);
-
-    vec3 lo = vec3(0.84, 0.68, 0.42);
-    vec3 hi = vec3(0.96, 0.88, 0.66);
-    if ((paletteIx & 1) != 0) {
-      lo = vec3(0.70, 0.76, 0.86);
-      hi = vec3(0.95, 0.94, 0.88);
-    }
-
-    vec3 col = mix(lo, hi, t);
-
-    float pole = smoothstep01(0.55, 0.92, abs(sin(lat)));
-    col = mix(col, vec3(0.68, 0.76, 0.88), pole * 0.18);
-
-    int count = vortexCount(seed, SALT_VGAS);
-    uint vSeed = seed ^ SALT_VGAS;
-    for (int i = 0; i < 10; ++i) {
-      if (i >= count) break;
-
-      vec3 dir0 = randDir(vSeed, uint(i), SALT_VGAS);
-      dir0.y = clamp(dir0.y, -0.92, 0.92);
-      vec3 dir = normalize(dir0);
-
-      float radDeg = mix(8.0, 28.0, hash01(uvec3(uint(i), 2u, SALT_VGAS), seed));
-      float cosR = cos(radians(radDeg));
-      float invSpan = 1.0 / max(1.0e-6, (1.0 - cosR));
-
-      float dd = dot(p, dir);
-      if (dd <= cosR) continue;
-
-      float u = clamp01((dd - cosR) * invSpan);
-      float w = smoothstep01(0.0, 1.0, u);
-      float str = mix(0.35, 0.85, hash01(uvec3(uint(i), 3u, SALT_VGAS), seed));
-
-      float swirl = 0.5 + 0.5 * sin(lon * 2.8 + lat * 7.5 + float(seed & 7u));
-      float local = clamp01(t + (swirl - 0.5) * 0.25 * w * str);
-      col = mix(col, mix(lo, hi, local), 0.35 * w * str);
-
-      col = mix(col, vortexTint(i, seed), w * str * 0.65);
-    }
-
-    return col;
+    float warp = fbm3D(p * 2.6, seed ^ 0x6A59u, 5, 2.0, 0.55);
+    float band = 0.5 + 0.5 * sin((lat * 22.0) + (warp - 0.5) * 4.2);
+    float turb = fbm3D(p * 7.0, seed ^ 0x7B3Bu, 4, 2.1, 0.55);
+    vec3 a = vec3(0.86, 0.68, 0.46);
+    vec3 b = vec3(0.98, 0.90, 0.74);
+    vec3 c = vec3(0.66, 0.44, 0.32);
+    vec3 col = mix(a, b, band);
+    col = mix(col, c, (turb - 0.5) * 0.35);
+    // Occasional storm spots.
+    float spot = fbm3D(p * 14.0, seed ^ 0xA11CEu, 3, 2.2, 0.55);
+    float spotMask = smoothstep01(0.80, 0.93, spot);
+    col = mix(col, vec3(1.0, 0.92, 0.80), spotMask * 0.25);
+    return clamp(col, 0.0, 1.0);
   }
-
   if (kind == 5) { // Star
-    float coarse = fbm01(p * 5.0, seed ^ 0x57A4u, 5, 2.0, 0.55);
-    float fine   = fbm01(p * 18.0, seed ^ 0xF1AEu, 3, 2.4, 0.55);
-    float t = clamp01(0.65 * coarse + 0.35 * fine);
-
-    vec3 c0 = vec3(1.00, 0.70, 0.18);
-    vec3 c1 = vec3(1.00, 0.92, 0.58);
-    if ((paletteIx & 1) != 0) {
-      c0 = vec3(1.00, 0.84, 0.52);
-      c1 = vec3(1.00, 0.98, 0.86);
-    }
-
-    vec3 col = mix(c0, c1, t);
-
-    float spot = fbm01(p * 9.0, seed ^ 0xABCDEFu, 4, 2.0, 0.5);
-    float spotMask = smoothstep01(0.78, 0.92, spot);
-    col = mix(col, col * 0.82, spotMask * 0.25);
-
-    return col;
+    float coarse = fbm3D(p * 5.0, seed ^ 0x57A4u, 5, 2.0, 0.55);
+    float fine   = fbm3D(p * 18.0, seed ^ 0xF1AEu, 3, 2.4, 0.55);
+    float grain  = fbm3D(p * 42.0, seed ^ 0xABCDEFu, 2, 2.4, 0.55);
+    float h = clamp01(0.55 + 0.55 * coarse + 0.20 * (fine - 0.5));
+    vec3 base = mix(vec3(0.95, 0.62, 0.22), vec3(1.0, 0.92, 0.70), clamp01(h));
+    base *= (1.15 + 0.20 * (grain - 0.5));
+    // Hot granules.
+    float hot = smoothstep01(0.78, 0.95, fine);
+    base = mix(base, vec3(1.35, 1.10, 0.65), hot * 0.35);
+    return base;
   }
-
-  if (kind == 6) { // Clouds
-    outAlpha = surfaceCloudAlpha(seed, p, lat, lon);
+  if (kind == 6) { // Clouds (RGB near-white, alpha density)
     return vec3(0.94, 0.97, 1.00);
   }
+  if (kind == 7) { // CityLights
+    float cont = fbm3D(p * 2.1, seed ^ 0x0CE4u, 6, 2.0, 0.5);
+    float land = smoothstep01(0.48, 0.55, cont);
+    float coast = clamp01(1.0 - abs(cont - 0.52) * 18.0);
 
+    float latW = pow(abs(cos(lat)), 0.30);
+
+    float pop0 = fbm3D(p * 6.0, seed ^ 0xC1717u, 5, 2.1, 0.55);
+    float pop1 = fbm3D(p * 14.0 + vec3(12.3, -7.1, 3.7), seed ^ 0xB16D0u, 4, 2.2, 0.55);
+    float pop = clamp01(0.65 * pop0 + 0.35 * pop1);
+
+    float cluster = smoothstep01(0.72, 0.92, pop);
+
+    float r0 = fbm3D(p * 22.0 + vec3(4.1, -9.7, 2.6), seed ^ 0x70ADu, 3, 2.3, 0.55);
+    float rid = 1.0 - abs(r0 * 2.0 - 1.0);
+    float roads = smoothstep01(0.78, 0.94, rid) * (0.30 + 0.70 * cluster);
+
+    float mega0 = fbm3D(p * 1.6 + vec3(19.7, -5.2, 11.3), seed ^ 0x31E6Au, 4, 2.0, 0.5);
+    float mega = smoothstep01(0.78, 0.95, mega0);
+    mega *= mega;
+
+    float d = land * latW * (0.60 * cluster + 0.25 * roads + 0.55 * mega * (0.35 + 0.65 * coast));
+    d *= (0.35 + 0.65 * coast);
+
+    float hole = fbm3D(p * 4.5 + vec3(-7.1, 2.2, -3.3), seed ^ 0x4011Eu, 4, 2.0, 0.5);
+    d *= (1.0 - 0.55 * smoothstep01(0.55, 0.80, hole));
+
+    d = smoothstep01(0.08, 0.28, d);
+    d = pow(clamp01(d), 1.25);
+
+    float spark = fbm3D(p * 55.0, seed ^ 0x5A2F01u, 2, 2.5, 0.6);
+    float sparkMask = smoothstep01(0.74, 0.93, spark);
+    d = clamp01(d * (1.0 + 0.35 * sparkMask));
+
+    float warmT = clamp01(0.65 + 0.35 * float((seed >> 16u) & 0xFFu) / 255.0);
+    vec3 cool = vec3(0.72, 0.88, 1.00);
+    vec3 warm = vec3(1.00, 0.84, 0.58);
+    vec3 tint = mix(cool, warm, warmT);
+
+    return tint * d;
+  }
   return vec3(0.6);
 }
 
 float kindScaleForNormal(int kind) {
-  if (kind == 0) return 1.25; // Rocky
+  if (kind == 0) return 1.35; // Rocky
   if (kind == 1) return 1.05; // Desert
   if (kind == 2) return 0.85; // Ocean
-  if (kind == 3) return 1.10; // Ice
-  if (kind == 4) return 0.22; // Gas
-  if (kind == 5) return 0.34; // Star
-  if (kind == 6) return 0.60; // Clouds
+  if (kind == 3) return 1.05; // Ice
+  if (kind == 4) return 0.20; // Gas
+  if (kind == 5) return 0.30; // Star
+  if (kind == 6) return 0.55; // Clouds
+  if (kind == 7) return 0.0; // CityLights
   return 1.0;
 }
 
@@ -868,8 +523,11 @@ void main() {
   vec3 p = latLonToSphere(lat, lon);
 
   if (uMode == 0) {
-    float a;
-    vec3 col = surfaceAlbedo(uKind, seed, p, lat, lon, a);
+    vec3 col = surfaceAlbedo(uKind, seed, p, lat, lon);
+    float a = 1.0;
+    if (uKind == 6) {
+      a = surfaceCloudAlpha(seed, p, lat, lon);
+    }
     FragColor = vec4(col, a);
     return;
   }

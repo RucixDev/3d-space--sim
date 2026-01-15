@@ -184,10 +184,12 @@ void applyProceduralHudLayout(core::u64 seed, HudLayout& inOut) {
   const float objScale = inOut.widget(HudWidgetId::Objective).scale;
   const float threatScale = inOut.widget(HudWidgetId::Threat).scale;
   const float jumpScale = inOut.widget(HudWidgetId::Jump).scale;
+  const float shipScale = inOut.widget(HudWidgetId::Ship).scale;
   const bool radarEnabled = inOut.widget(HudWidgetId::Radar).enabled;
   const bool objEnabled = inOut.widget(HudWidgetId::Objective).enabled;
   const bool threatEnabled = inOut.widget(HudWidgetId::Threat).enabled;
   const bool jumpEnabled = inOut.widget(HudWidgetId::Jump).enabled;
+  const bool shipEnabled = inOut.widget(HudWidgetId::Ship).enabled;
 
   // Start from defaults, then procedurally vary positions.
   HudLayout l = makeDefaultHudLayout();
@@ -242,15 +244,28 @@ void applyProceduralHudLayout(core::u64 seed, HudLayout& inOut) {
     placeCorner(HudWidgetId::Threat, x, top + rng.range<float>(0.22f, 0.30f), px, 0.0f);
   }
 
+  // Ship HUD: place opposite the radar to balance the lower HUD area.
+  {
+    const bool radarLeft = (l.widget(HudWidgetId::Radar).pivotX < 0.5f);
+    placeCorner(HudWidgetId::Ship,
+                radarLeft ? right : left,
+                bottom,
+                radarLeft ? 1.0f : 0.0f,
+                1.0f);
+  }
+
+
   // Restore user tuning.
   l.widget(HudWidgetId::Radar).scale = radarScale;
   l.widget(HudWidgetId::Objective).scale = objScale;
   l.widget(HudWidgetId::Threat).scale = threatScale;
   l.widget(HudWidgetId::Jump).scale = jumpScale;
+  l.widget(HudWidgetId::Ship).scale = shipScale;
   l.widget(HudWidgetId::Radar).enabled = radarEnabled;
   l.widget(HudWidgetId::Objective).enabled = objEnabled;
   l.widget(HudWidgetId::Threat).enabled = threatEnabled;
   l.widget(HudWidgetId::Jump).enabled = jumpEnabled;
+  l.widget(HudWidgetId::Ship).enabled = shipEnabled;
 
   // Clamp positions to the [0..1] range (paranoia; should already be valid).
   for (auto& w : l.widgets) {

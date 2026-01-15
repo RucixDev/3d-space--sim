@@ -71,6 +71,21 @@ bool saveHudSettingsToFile(const HudSettings& s, const std::string& path) {
   f << "threatHudEnabled " << (s.threatHudEnabled ? 1 : 0) << "\n";
   f << "jumpHudEnabled " << (s.jumpHudEnabled ? 1 : 0) << "\n";
 
+  // Ship HUD
+  f << "shipHudEnabled " << (s.shipHudEnabled ? 1 : 0) << "\n";
+  f << "shipHudDetailLevel " << s.shipHudDetailLevel << "\n";
+  f << "shipHudShowSparklines " << (s.shipHudShowSparklines ? 1 : 0) << "\n";
+  f << "shipHudGlitchFx " << (s.shipHudGlitchFx ? 1 : 0) << "\n";
+  f << "shipHudPanelDropouts " << (s.shipHudPanelDropouts ? 1 : 0) << "\n";
+  f << "shipHudShowDecor " << (s.shipHudShowDecor ? 1 : 0) << "\n";
+  f << "shipHudDecorAlpha " << s.shipHudDecorAlpha << "\n";
+  f << "shipHudShowGlyphs " << (s.shipHudShowGlyphs ? 1 : 0) << "\n";
+  f << "shipHudShowMicrotext " << (s.shipHudShowMicrotext ? 1 : 0) << "\n";
+  f << "shipHudSegmentText " << (s.shipHudSegmentText ? 1 : 0) << "\n";
+  f << "shipHudSeedFromLoadout " << (s.shipHudSeedFromLoadout ? 1 : 0) << "\n";
+  f << "shipHudSeed " << s.shipHudSeed << "\n";
+  f << "shipHudSeedNonce " << s.shipHudSeedNonce << "\n";
+
   // Radar
   f << "radarRangeKm " << s.radarRangeKm << "\n";
   f << "radarMaxBlips " << s.radarMaxBlips << "\n";
@@ -177,6 +192,34 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
     } else if (key == "jumphudenabled" || key == "jumphud" || key == "jump") {
       s.jumpHudEnabled = readBool(s.jumpHudEnabled);
 
+    } else if (key == "shiphudenabled" || key == "shiphud" || key == "ship") {
+      s.shipHudEnabled = readBool(s.shipHudEnabled);
+    } else if (key == "shiphuddetaillevel" || key == "shiphuddetail" || key == "shipdetail") {
+      ss >> s.shipHudDetailLevel;
+    } else if (key == "shiphudshowsparklines" || key == "shiphudsparklines" || key == "sparklines") {
+      s.shipHudShowSparklines = readBool(s.shipHudShowSparklines);
+    } else if (key == "shiphudglitchfx" || key == "shiphudglitch" || key == "glitchfx") {
+      s.shipHudGlitchFx = readBool(s.shipHudGlitchFx);
+    } else if (key == "shiphudpaneldropouts" || key == "shiphuddropouts" || key == "shiphuddrops") {
+      s.shipHudPanelDropouts = readBool(s.shipHudPanelDropouts);
+    } else if (key == "shiphudshowdecor" || key == "shiphuddecor" || key == "decor") {
+      s.shipHudShowDecor = readBool(s.shipHudShowDecor);
+    } else if (key == "shiphuddecoralpha" || key == "shiphuddecoropacity" || key == "decoralpha") {
+      ss >> s.shipHudDecorAlpha;
+    } else if (key == "shiphudshowglyphs" || key == "shiphudglyphs" || key == "glyphs") {
+      s.shipHudShowGlyphs = readBool(s.shipHudShowGlyphs);
+    } else if (key == "shiphudshowmicrotext" || key == "shiphudmicrotext" || key == "microtext") {
+      s.shipHudShowMicrotext = readBool(s.shipHudShowMicrotext);
+
+    } else if (key == "shiphudsegmenttext" || key == "shiphudsegment" || key == "segmenttext" || key == "segment") {
+      s.shipHudSegmentText = readBool(s.shipHudSegmentText);
+    } else if (key == "shiphudseedfromloadout" || key == "shiphudseedloadout" || key == "shipseedloadout") {
+      s.shipHudSeedFromLoadout = readBool(s.shipHudSeedFromLoadout);
+    } else if (key == "shiphudseed" || key == "shiphudmanualseed" || key == "shipseed") {
+      ss >> s.shipHudSeed;
+    } else if (key == "shiphudseednonce" || key == "shiphudnonce" || key == "shiphudrerollnonce") {
+      ss >> s.shipHudSeedNonce;
+
     } else if (key == "radarrangekm" || key == "radarrange") {
       ss >> s.radarRangeKm;
     } else if (key == "radarmaxblips" || key == "radarblips") {
@@ -266,6 +309,9 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
   // Clamp to sane ranges.
   s.radarRangeKm = std::clamp(s.radarRangeKm, 25000.0, 1200000.0);
   s.radarMaxBlips = std::clamp(s.radarMaxBlips, 8, 256);
+
+  s.shipHudDetailLevel = std::clamp(s.shipHudDetailLevel, 0, 3);
+  s.shipHudDecorAlpha = std::clamp(s.shipHudDecorAlpha, 0.0f, 1.0f);
 
   s.reticleSizePx = std::clamp(s.reticleSizePx, 8.0f, 160.0f);
   s.reticleAlpha = std::clamp(s.reticleAlpha, 0.0f, 1.0f);

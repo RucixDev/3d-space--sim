@@ -39,6 +39,15 @@ HudLayout makeDefaultHudLayout() {
     w.enabled = true;
   }
   {
+    auto& w = l.widget(HudWidgetId::Ship);
+    w.posNormX = 0.02f;
+    w.posNormY = 0.985f;
+    w.pivotX = 0.0f;
+    w.pivotY = 1.0f;
+    w.scale = 1.0f;
+    w.enabled = true;
+  }
+  {
     auto& w = l.widget(HudWidgetId::Objective);
     w.posNormX = 0.985f;
     w.posNormY = 0.02f;
@@ -75,6 +84,7 @@ const char* toString(HudWidgetId id) {
     case HudWidgetId::Objective: return "Objective";
     case HudWidgetId::Threat: return "Threat";
     case HudWidgetId::Jump: return "Jump";
+    case HudWidgetId::Ship: return "Ship";
     default: return "Unknown";
   }
 }
@@ -85,6 +95,7 @@ std::optional<HudWidgetId> widgetFromString(const std::string& s) {
   if (k == "objective" || k == "objectives") return HudWidgetId::Objective;
   if (k == "threat" || k == "pirate" || k == "pirates") return HudWidgetId::Threat;
   if (k == "jump" || k == "fsd" || k == "hyperspace") return HudWidgetId::Jump;
+  if (k == "ship" || k == "shiphud" || k == "instruments") return HudWidgetId::Ship;
   return std::nullopt;
 }
 

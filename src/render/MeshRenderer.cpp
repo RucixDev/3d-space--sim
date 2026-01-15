@@ -61,6 +61,12 @@ uniform sampler2D uNormalTex;
 uniform float uUseNormalMap;
 uniform float uNormalStrength;
 
+uniform sampler2D uEmissiveTex;
+uniform float uUseEmissive;
+uniform float uEmissiveStrength;
+uniform float uEmissiveNightFadeStart;
+uniform float uEmissiveNightFadeEnd;
+
 uniform float uUnlit;
 uniform vec3 uLightPos;
 uniform vec3 uCameraPos;
@@ -101,7 +107,8 @@ void main() {
 
   // Point-light position in world space (the star sits at the origin in the prototype).
   vec3 l = normalize(uLightPos - vWorldPos);
-  float diff = max(dot(n, l), 0.0);
+  float ndotl = dot(n, l);
+  float diff = max(ndotl, 0.0);
 
   vec4 t = texture(uTex, vUv);
   vec3 tex = t.rgb;
@@ -117,6 +124,15 @@ void main() {
     float s = pow(max(dot(n, h), 0.0), max(uShininess, 1.0));
     col += vec3(s * uSpecularStrength);
   }
+
+  // Optional emissive pass (e.g., night-side city lights).
+  if (uUseEmissive > 0.5 && uEmissiveStrength > 0.0) {
+    vec3 e = texture(uEmissiveTex, vUv).rgb;
+    // Reveal emissive primarily on the night side; fade across the terminator.
+    float night = smoothstep(uEmissiveNightFadeStart, uEmissiveNightFadeEnd, -ndotl);
+    col += e * (uEmissiveStrength * night);
+  }
+
 
   float a = 1.0;
   if (uAlphaFromTex > 0.5) {
@@ -155,6 +171,11 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
   shader_.setUniform1i("uNormalTex", 1);
   shader_.setUniform1f("uUseNormalMap", normalTex_ ? 1.0f : 0.0f);
   shader_.setUniform1f("uNormalStrength", normalStrength_);
+  shader_.setUniform1i("uEmissiveTex", 2);
+  shader_.setUniform1f("uUseEmissive", emissiveTex_ ? 1.0f : 0.0f);
+  shader_.setUniform1f("uEmissiveStrength", emissiveStrength_);
+  shader_.setUniform1f("uEmissiveNightFadeStart", emissiveNightFadeStart_);
+  shader_.setUniform1f("uEmissiveNightFadeEnd", emissiveNightFadeEnd_);
   shader_.setUniform1f("uUnlit", unlit_ ? 1.0f : 0.0f);
   shader_.setUniform3f("uLightPos", lightPos_[0], lightPos_[1], lightPos_[2]);
   shader_.setUniform3f("uCameraPos", cameraPos_[0], cameraPos_[1], cameraPos_[2]);
@@ -165,6 +186,8 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
 
   if (tex_) tex_->bind(0);
   if (normalTex_) normalTex_->bind(1);
+  if (emissiveTex_) emissiveTex_->bind(2);
+  else if (tex_) tex_->bind(2);
 
   // Bind mesh VAO and configure instance attributes
   mesh_->bind();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 
 namespace stellar::ui {
 
@@ -29,7 +30,10 @@ struct HudSettings {
   // File format version.
   // 1: core toggles/tuning (radar/combat/tactical)
   // 2: adds HUD palette + overlay cosmetics (colors, background alpha, tint flags)
-  int version{2};
+  // 3: adds procedural Ship HUD settings
+  // 4: adds procedural Ship HUD cosmetics (decor/glyphs/microtext/dropouts)
+  // 5: adds Ship HUD segment-display readouts (procedural vector text)
+  int version{5};
 
   // Persist this file on exit.
   bool autoSaveOnExit{true};
@@ -39,6 +43,21 @@ struct HudSettings {
   bool objectiveHudEnabled{true};
   bool threatHudEnabled{true};
   bool jumpHudEnabled{true};
+
+  // Procedural Ship HUD (instrument cluster)
+  bool shipHudEnabled{true};
+  int shipHudDetailLevel{2}; // 0=minimal .. 3=max
+  bool shipHudShowSparklines{true};
+  bool shipHudGlitchFx{true};
+  bool shipHudPanelDropouts{true};
+  bool shipHudShowDecor{true};
+  float shipHudDecorAlpha{0.35f}; // 0..1 (multiplies grid color)
+  bool shipHudShowGlyphs{true};
+  bool shipHudShowMicrotext{true};
+  bool shipHudSegmentText{false}; // procedural 14-seg segment-display readouts for values
+  bool shipHudSeedFromLoadout{true};
+  std::uint64_t shipHudSeed{0};       // used when seedFromLoadout=false
+  std::uint64_t shipHudSeedNonce{0};  // increments when user "rerolls" the procedural layout
 
   // --- Radar ---
   double radarRangeKm{220000.0};

@@ -41,6 +41,18 @@ public:
   void setNormalTexture(const Texture2D* tex) { normalTex_ = tex; }
   void setNormalStrength(float strength) { normalStrength_ = strength; }
 
+  // Optional emissive map (added on top of lighting).
+  // When set, the fragment shader can reveal the emissive texture on the night side
+  // based on the dot(N,L) term.
+  void setEmissiveTexture(const Texture2D* tex) { emissiveTex_ = tex; }
+  void setEmissiveStrength(float strength) { emissiveStrength_ = strength; }
+  // Controls how emissive fades in across the terminator.
+  // start/end are applied as smoothstep(start,end,-dot(N,L)).
+  void setEmissiveNightFade(float start, float end) {
+    emissiveNightFadeStart_ = start;
+    emissiveNightFadeEnd_ = end;
+  }
+
   // When enabled, skips directional lighting and renders the mesh as emissive/unlit.
   // Useful for stars, UI 3D previews, and debug visualizations.
   void setUnlit(bool unlit) { unlit_ = unlit; }
@@ -83,12 +95,17 @@ private:
   const Mesh* mesh_{nullptr};
   const Texture2D* tex_{nullptr};
   const Texture2D* normalTex_{nullptr};
+  const Texture2D* emissiveTex_{nullptr};
   bool unlit_{false};
 
 	float lightPos_[3]{0.0f, 0.0f, 0.0f};
 	float cameraPos_[3]{0.0f, 0.0f, 0.0f};
 
   float normalStrength_{1.0f};
+
+  float emissiveStrength_{1.0f};
+  float emissiveNightFadeStart_{0.02f};
+  float emissiveNightFadeEnd_{0.25f};
   float specularStrength_{0.08f};
   float shininess_{48.0f};
 
