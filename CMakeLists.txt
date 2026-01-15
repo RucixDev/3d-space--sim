@@ -1,325 +1,682 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.22)
 
-project(stellar_forge LANGUAGES CXX)
+project(ProcIsoCity
+  VERSION 0.2.0
+  DESCRIPTION "Procedurally-generated, open-source isometric city-building simulation (no external art assets)."
+  LANGUAGES C CXX
+)
 
-include(FetchContent)
-include(CTest)
+# ---- Options ----
+option(PROCISOCITY_BUILD_APP "Build the interactive raylib application" ON)
+option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
+option(PROCISOCITY_BUILD_CLI "Build headless command-line tools" ON)
 
-# Legacy option preserved for older build scripts / README snippets.
-# Prefer STELLAR_ENABLE_RENDER + STELLAR_ENABLE_IMGUI going forward.
-option(STELLAR_BUILD_GAME "(DEPRECATED) Build the SDL/OpenGL game prototype" ON)
+# Only relevant when PROCISOCITY_BUILD_APP=ON
+option(PROCISOCITY_USE_SYSTEM_RAYLIB "Use system-installed raylib instead of FetchContent" OFF)
 
-option(STELLAR_ENABLE_RENDER "Build OpenGL/SDL rendering module and the game app" ON)
-option(STELLAR_ENABLE_IMGUI  "Enable Dear ImGui UI (requires STELLAR_ENABLE_RENDER)" ON)
-
-if (NOT STELLAR_BUILD_GAME)
-  set(STELLAR_ENABLE_RENDER OFF CACHE BOOL "" FORCE)
-  set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
-endif()
-
-option(STELLAR_FETCH_SDL2 "Fetch SDL2 if not found via find_package (render builds only)" ON)
-option(STELLAR_FETCH_IMGUI "Fetch Dear ImGui (render+imgui builds only)" ON)
-
+# ---- Language ----
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ---- Dependencies (conditional) ----
-set(STELLAR_SDL_TARGET "")
-set(IMGUI_TARGET "")
+# ---- Warnings / compiler options ----
+# We keep warning levels *per target* to avoid drowning in warnings from third-party
+# dependencies (raylib and its bundled single-file libs).
+if (MSVC)
+  # CMake injects a default warning level (/W3) for MSVC. If we also set /W4 we
+  # end up with D9025 ("overriding '/W4' with '/W3'"). Strip any /W* flags from
+  # the global flags so each target can choose its own warning level.
+  foreach(flag_var
+          CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_C_FLAGS_MINSIZEREL
+          CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_MINSIZEREL)
+    if(DEFINED ${flag_var})
+      string(REGEX REPLACE "/W[0-4]" "" ${flag_var} "${${flag_var}}")
+    endif()
+  endforeach()
+endif()
 
-if (STELLAR_ENABLE_RENDER)
-  find_package(OpenGL QUIET)
-  if (NOT OpenGL_FOUND)
-    message(WARNING "OpenGL not found. Disabling STELLAR_ENABLE_RENDER/STELLAR_ENABLE_IMGUI. Configure with -DSTELLAR_ENABLE_RENDER=OFF for headless builds, or install OpenGL development packages.")
-    set(STELLAR_ENABLE_RENDER OFF CACHE BOOL "" FORCE)
-    set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
+function(procisocity_set_strict_warnings target)
+  if (MSVC)
+    target_compile_options(${target} PRIVATE /W4 $<$<COMPILE_LANGUAGE:CXX>:/permissive->)
   else()
-
-  # SDL2
-  find_package(SDL2 CONFIG QUIET)
-  if (NOT SDL2_FOUND AND STELLAR_FETCH_SDL2)
-    message(STATUS "SDL2 not found via find_package. Fetching SDL2...")
-    set(SDL_TEST OFF CACHE BOOL "" FORCE)
-    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-    set(SDL_STATIC ON CACHE BOOL "" FORCE)
-
-    FetchContent_Declare(
-      sdl2
-      GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-      GIT_TAG release-2.30.9
-    )
-    FetchContent_MakeAvailable(sdl2)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
+endfunction()
 
-  # Determine SDL target name
-  if (TARGET SDL2::SDL2)
-    set(STELLAR_SDL_TARGET SDL2::SDL2)
-  elseif (TARGET SDL2-static)
-    set(STELLAR_SDL_TARGET SDL2-static)
-  elseif (TARGET SDL2)
-    set(STELLAR_SDL_TARGET SDL2)
-  endif()
+# ---- Core library (no raylib dependency) ----
+add_library(isocity_core
+  src/isocity/Checksum.cpp
+  src/isocity/Compression.cpp
+  src/isocity/GltfExport.cpp
+  src/isocity/GeoJsonExport.cpp
+  src/isocity/OsmImport.cpp
+  src/isocity/Suite.cpp
+  src/isocity/Blueprint.cpp
+  src/isocity/WorldTiling.cpp
+  src/isocity/MeshExport.cpp
+  src/isocity/WorldMeshBuilder.cpp
+  src/isocity/RoadGraphExport.cpp
+  src/isocity/RoadGraphTrafficExport.cpp
+  src/isocity/Districting.cpp
+  src/isocity/FloodFill.cpp
+  src/isocity/CityBlocks.cpp
+  src/isocity/Vectorize.cpp
+  src/isocity/CityBlockGraph.cpp
+  src/isocity/BlockDistricting.cpp
+  src/isocity/Script.cpp
+  src/isocity/AutoBuild.cpp
+  src/isocity/Replay.cpp
+  src/isocity/ReplayCapture.cpp
+  src/isocity/WorldPatch.cpp
+  src/isocity/WorldPatchJson.cpp
+  src/isocity/World.cpp
+  src/isocity/WorldDiff.cpp
+  src/isocity/WorldTransform.cpp
+  src/isocity/ProcGen.cpp
+  src/isocity/Erosion.cpp
+  src/isocity/DepressionFill.cpp
+  src/isocity/FloodRisk.cpp
+  src/isocity/Evacuation.cpp
+  src/isocity/EvacuationScenario.cpp
+  src/isocity/Hydrology.cpp
+  src/isocity/Contours.cpp
+  src/isocity/Isochrone.cpp
+  src/isocity/TransitPlanner.cpp
+  src/isocity/TransitPlannerExport.cpp
+  src/isocity/Sim.cpp
+  src/isocity/Services.cpp
+  src/isocity/ServiceOptimizer.cpp
+  src/isocity/FlowField.cpp
+  src/isocity/Traffic.cpp
+  src/isocity/Goods.cpp
+  src/isocity/TradeMarket.cpp
+  src/isocity/ParkOptimizer.cpp
+  src/isocity/LandValue.cpp
+  src/isocity/DistrictStats.cpp
+  src/isocity/ZoneAccess.cpp
+  src/isocity/SaveLoad.cpp
+  src/isocity/Export.cpp
+  src/isocity/Export3D.cpp
+  src/isocity/ImageIO.cpp
+  src/isocity/Soft3D.cpp
+  src/isocity/GfxQuantize.cpp
+  src/isocity/GfxAtlasFx.cpp
+  src/isocity/GfxMipmaps.cpp
+  src/isocity/GfxOutlines.cpp
+  src/isocity/GfxPacker.cpp
+  src/isocity/GfxTilesetAtlas.cpp
+  src/isocity/GfxPalette.cpp
+  src/isocity/GfxBuildings.cpp
+  src/isocity/GfxFacilities.cpp
+  src/isocity/GfxProps.cpp
+  src/isocity/GfxTileset.cpp
+  src/isocity/Heightmap.cpp
+  src/isocity/Hash.cpp
+  src/isocity/EditHistory.cpp
+  src/isocity/Pathfinding.cpp
+  src/isocity/RoadGraph.cpp
+  src/isocity/RoadGraphRouting.cpp
+  src/isocity/RoadGraphTraffic.cpp
+  src/isocity/RoadGraphResilience.cpp
+  src/isocity/RoadResilienceBypass.cpp
+  src/isocity/RoadGraphCentrality.cpp
+  src/isocity/RoadGraphCentralityExport.cpp
+  src/isocity/RoadUpgradePlanner.cpp
+  src/isocity/RoadUpgradePlannerExport.cpp
+  src/isocity/PolicyOptimizer.cpp
+  src/isocity/PolicyOptimizerExport.cpp
+  src/isocity/ZoneParcels.cpp
+  src/isocity/StreetNames.cpp
+  src/isocity/Cartography.cpp
+  src/isocity/TourPlanner.cpp
+  src/isocity/Wayfinding.cpp
+  src/isocity/Json.cpp
+  src/isocity/ConfigIO.cpp
+)
 
-  if (STELLAR_SDL_TARGET STREQUAL "")
-    message(FATAL_ERROR "SDL2 target not found. Install SDL2 or enable STELLAR_FETCH_SDL2.")
-  endif()
+target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-  # Dear ImGui (optional)
-  if (STELLAR_ENABLE_IMGUI AND STELLAR_FETCH_IMGUI)
-    FetchContent_Declare(
-      imgui
-      GIT_REPOSITORY https://github.com/ocornut/imgui.git
-      GIT_TAG v1.91.2-docking
-    )
-    FetchContent_MakeAvailable(imgui)
+procisocity_set_strict_warnings(isocity_core)
 
-    add_library(imgui_lib STATIC
-      ${imgui_SOURCE_DIR}/imgui.cpp
-      ${imgui_SOURCE_DIR}/imgui_demo.cpp
-      ${imgui_SOURCE_DIR}/imgui_draw.cpp
-      ${imgui_SOURCE_DIR}/imgui_tables.cpp
-      ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
-    )
-    target_include_directories(imgui_lib PUBLIC
-      ${imgui_SOURCE_DIR}
-      ${imgui_SOURCE_DIR}/backends
-    )
-    target_link_libraries(imgui_lib PUBLIC ${STELLAR_SDL_TARGET} OpenGL::GL)
-    target_compile_definitions(imgui_lib PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
-    set(IMGUI_TARGET imgui_lib)
-  endif()
-  endif() # OpenGL_FOUND
+# Some platforms still need libm explicitly for <cmath>.
+if (UNIX AND NOT APPLE)
+  target_link_libraries(isocity_core PUBLIC m)
 endif()
 
-# ---- Library ----
-set(STELLAR_CORE_SOURCES
-  src/core/Assert.cpp
-  src/core/Hash.cpp
-  src/core/Log.cpp
-  src/core/CVar.cpp
-  src/core/Profiler.cpp
-  src/core/ChromeTrace.cpp
+# ---- App (raylib) ----
+if (PROCISOCITY_BUILD_APP)
+  # Dependencies (raylib)
+  if (PROCISOCITY_USE_SYSTEM_RAYLIB)
+    find_package(raylib REQUIRED)
+  else()
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET OFF)
 
-  src/ui/Bookmarks.cpp
-  src/ui/FuzzySearch.cpp
-  src/ui/LogBuffer.cpp
-  src/ui/HudLayout.cpp
-  src/ui/HudSettings.cpp
-  src/ui/VfxSettings.cpp
-  src/ui/ProceduralUi.cpp
-  src/ui/AudioSettings.cpp
-  src/ui/Livery.cpp
-  src/ui/UiLayoutProfiles.cpp
-  src/ui/UiSettings.cpp
-  src/ui/UiWorkspaces.cpp
-  src/ui/WindowRegistry.cpp
+    # raylib release tag used by this template (raylib 5.5).
+    # You can update this later once you’re ready.
+    FetchContent_Declare(
+      raylib
+      GIT_REPOSITORY https://github.com/raysan5/raylib.git
+      GIT_TAG 5.5
+      GIT_SHALLOW TRUE
+    )
 
-  src/proc/Noise.cpp
-  src/proc/GalaxyHazards.cpp
-  src/proc/GalaxyRegions.cpp
-  src/proc/GalaxyClusters.cpp
-  src/proc/Hyperlanes.cpp
-  src/proc/HyperlaneRouter.cpp
-  # Procedural geometry generators (CPU-side; safe for headless builds).
-  src/render/ProceduralAsteroid.cpp
-  src/render/SdfMesher.cpp
-  src/render/SdfDualContouring.cpp
-  src/render/MeshSimplify.cpp
-  src/render/GltfExport.cpp
-  src/render/SdfGraph.cpp
-  src/render/ProceduralArtifact.cpp
-  # Procedural render presets (CPU-side; safe for headless builds).
-  src/render/ProceduralPostFX.cpp
-  src/render/ProceduralCompositor.cpp
-  src/render/AutoExposure.cpp
-  src/proc/NameGenerator.cpp
-  src/proc/GalaxyGenerator.cpp
-  src/proc/GalaxyMorphology.cpp
-  src/proc/SystemGenerator.cpp
-  src/proc/TradeProfile.cpp
-  src/proc/TradeEconomy.cpp
-  src/proc/TradeRoutes.cpp
-  src/proc/TradePrices.cpp
-  src/proc/TradeIntel.cpp
-  src/proc/TradeFlow.cpp
-  src/proc/MiePhase.cpp
-  src/proc/PhaseMultipleScattering.cpp
+    # Keep raylib lean for an app/game.
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
-  src/sim/Faction.cpp
-  src/sim/FactionProfile.cpp
-  src/sim/Orbit.cpp
-  src/sim/Gravity.cpp
-  src/sim/Atmosphere.cpp
-  src/sim/OrbitalMechanics.cpp
-  src/sim/TrajectoryPredictor.cpp
-  src/sim/TrajectoryAnalysis.cpp
-  src/sim/ManeuverComputer.cpp
-  src/sim/ManeuverProgramComputer.cpp
-  src/sim/LambertSolver.cpp
-  src/sim/LambertPlanner.cpp
-  src/sim/Ship.cpp
-  src/sim/Ballistics.cpp
-  src/sim/Combat.cpp
-  src/sim/Countermeasures.cpp
-  src/sim/MissileDefense.cpp
-  src/sim/FlightController.cpp
-  src/sim/NavAssistComputer.cpp
-  src/sim/SupercruiseComputer.cpp
-  src/sim/Interdiction.cpp
-  src/sim/EncounterDirector.cpp
-  src/sim/SquadTactics.cpp
-  src/sim/SecurityModel.cpp
-  src/sim/SystemSecurityDynamics.cpp
-  src/sim/SystemEvents.cpp
-  src/sim/SystemConditions.cpp
-  src/sim/Docking.cpp
-  src/sim/DockingComputer.cpp
-  src/sim/DockingClearanceService.cpp
-  src/sim/ThermalSystem.cpp
-  src/sim/FuelScoopSystem.cpp
-  src/sim/PowerDistributor.cpp
-  src/sim/Law.cpp
-  src/sim/PoliceScan.cpp
-  src/sim/LawLedger.cpp
-  src/sim/BlackMarket.cpp
-  src/sim/Extortion.cpp
-  src/sim/NpcCombatAI.cpp
-  src/sim/CargoJettisonPlanner.cpp
-  src/sim/Distress.cpp
-  src/sim/Derelict.cpp
-  src/sim/ResourceField.cpp
-  src/sim/Mining.cpp
-  src/sim/TrafficEscort.cpp
-  src/sim/Signals.cpp
-  src/sim/Industry.cpp
-  src/sim/IndustryService.cpp
-  src/sim/IndustryScanner.cpp
-  src/sim/Warehouse.cpp
-  src/sim/ShipyardService.cpp
-  src/sim/Insurance.cpp
-  src/sim/Logbook.cpp
-  src/sim/SaveGame.cpp
-  src/sim/Traffic.cpp
-  src/sim/TrafficTransit.cpp
-  src/sim/TrafficLedger.cpp
-  src/sim/TrafficLanes.cpp
-  src/sim/TrafficConvoyLayer.cpp
-  src/sim/TrafficConvoyEncounter.cpp
-  src/sim/TradeScanner.cpp
-  src/sim/TradeLoopScanner.cpp
-  src/sim/TradeRunPlanner.cpp
-  src/sim/MarketAnalysis.cpp
-  src/sim/Universe.cpp
-  src/sim/NavRoute.cpp
-  src/sim/MissionAssist.cpp
-  src/sim/MissionLogic.cpp
+    FetchContent_MakeAvailable(raylib)
 
-  src/econ/Commodity.cpp
-  src/econ/Economy.cpp
-  src/econ/Market.cpp
-  src/econ/RoutePlanner.cpp
-)
+    # raylib (and its bundled single-file dependencies) generate a lot of warnings on MSVC.
+    # Suppress warnings for the third-party target so the build output focuses on our code.
+    if (TARGET raylib)
+      get_target_property(_raylib_imported raylib IMPORTED)
+      if (NOT _raylib_imported)
+        if (MSVC)
+          target_compile_options(raylib PRIVATE /W0)
+        else()
+          target_compile_options(raylib PRIVATE -w)
+        endif()
+      endif()
+    endif()
+  endif()
 
-set(STELLAR_RENDER_SOURCES
-  src/render/Gl.cpp
-  src/render/Shader.cpp
-  src/render/GaussianSurfels.cpp
-  src/render/Texture.cpp
-  src/render/FrameGraph.cpp
-  src/render/TextureReadback.cpp
-  src/render/GpuSurfaceCache.cpp
-  src/render/GpuParticleField.cpp
-  src/render/ProceduralSprite.cpp
-  src/render/ProceduralGraph.cpp
-  src/render/SdfRaymarcher.cpp
-  src/render/ProceduralPlanet.cpp
-  src/render/ProceduralRings.cpp
-  src/render/ProceduralLivery.cpp
-  src/render/AtmosphereRenderer.cpp
-  src/render/VolumetricAtmosphereRenderer.cpp
-  src/render/ProceduralSky.cpp
-  src/render/Starfield.cpp
-  src/render/Nebula.cpp
-  src/render/ParticleSystem.cpp
-  src/render/PostFX.cpp
-  src/render/RenderTarget.cpp
-  src/render/Mesh.cpp
-  src/render/Camera.cpp
-  src/render/MeshRenderer.cpp
-  src/render/PointRenderer.cpp
-  src/render/LineRenderer.cpp
-)
+  add_executable(proc_isocity
+    src/main.cpp
 
-add_library(stellar STATIC
-  ${STELLAR_CORE_SOURCES}
-  $<$<BOOL:${STELLAR_ENABLE_RENDER}>:${STELLAR_RENDER_SOURCES}>
-)
+    src/isocity/Config.hpp
+    src/isocity/Hash.hpp
+    src/isocity/Console.hpp
+    src/isocity/Console.cpp
+    src/isocity/Game.hpp
+    src/isocity/Game.cpp
 
-add_library(stellar::stellar ALIAS stellar)
+    src/isocity/Iso.hpp
+    src/isocity/Noise.hpp
+    src/isocity/Random.hpp
 
-target_include_directories(stellar PUBLIC
-  ${PROJECT_SOURCE_DIR}/include
-)
+    src/isocity/World.hpp
+    src/isocity/ProcGen.hpp
+    src/isocity/Sim.hpp
+    src/isocity/TradeMarket.hpp
+    src/isocity/SaveLoad.hpp
+    src/isocity/EditHistory.hpp
 
-target_compile_features(stellar PUBLIC cxx_std_20)
-
-if (STELLAR_ENABLE_RENDER)
-  target_link_libraries(stellar PUBLIC
-    OpenGL::GL
-    ${STELLAR_SDL_TARGET}
+    src/isocity/Renderer.hpp
+    src/isocity/GpuGeom.hpp
+    src/isocity/VisualPrefs.hpp
+    src/isocity/Renderer.cpp
+    src/isocity/GpuGeom.cpp
+    src/isocity/Ui.cpp
+    src/isocity/VisualPrefs.cpp
+    src/isocity/PostFxSettings.hpp
+    src/isocity/PostFx.hpp
+    src/isocity/PostFx.cpp
   )
+
+  target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity PRIVATE isocity_core raylib)
+
+  # raylib pulls in Windows headers; prevent `min`/`max` macro pollution that
+  # breaks std::min/std::max in our sources.
   if (WIN32)
-    target_link_libraries(stellar PUBLIC gdi32)
+    target_compile_definitions(proc_isocity PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+
+  procisocity_set_strict_warnings(proc_isocity)
+
+  # Convenience: copy DLLs on Windows when using MSVC + shared builds.
+  if (WIN32 AND TARGET raylib)
+    add_custom_command(TARGET proc_isocity POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:raylib>
+        $<TARGET_FILE_DIR:proc_isocity>
+      COMMENT "Copying raylib runtime next to the executable (if needed)"
+    )
   endif()
 endif()
 
-# ---- Apps ----
-add_executable(stellar_sandbox apps/stellar_sandbox/main.cpp)
-target_link_libraries(stellar_sandbox PRIVATE stellar::stellar)
-set_target_properties(stellar_sandbox PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/apps
-)
+# ---- CLI (headless) ----
+if (PROCISOCITY_BUILD_CLI)
+  add_executable(proc_isocity_cli
+    src/cli/main.cpp
 
-if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
-  add_executable(stellar_game
-    apps/stellar_game/main.cpp
-    apps/stellar_game/ActionWheel.cpp
-    apps/stellar_game/AudioEngine.cpp
-    apps/stellar_game/CommandPalette.cpp
-    apps/stellar_game/ControlsWindow.cpp
-    apps/stellar_game/MarketDashboardWindow.cpp
-  apps/stellar_game/LogbookWindow.cpp
-    apps/stellar_game/TradePlannerWindow.cpp
-    apps/stellar_game/ConsoleWindow.cpp
-    apps/stellar_game/LogWindow.cpp
-    apps/stellar_game/CVarWindow.cpp
-    apps/stellar_game/ProfilerWindow.cpp
-    apps/stellar_game/FlightRecorderWindow.cpp
-    apps/stellar_game/CinematicCameraWindow.cpp
-    apps/stellar_game/OrbitAnalyzerWindow.cpp
-    apps/stellar_game/TrafficLanesWindow.cpp
-    apps/stellar_game/SystemConditionsWindow.cpp
-    apps/stellar_game/PorkchopPlot.cpp
-    apps/stellar_game/ProceduralLabWindow.cpp
-    apps/stellar_game/ProceduralMeshLabWindow.cpp
-    apps/stellar_game/ProceduralGalaxyLabWindow.cpp
-    apps/stellar_game/ProceduralTradeSystemsLabWindow.cpp
-    apps/stellar_game/SpectralMieLabWindow.cpp
-    apps/stellar_game/GaussianSurfelReconstructionLabWindow.cpp
-    apps/stellar_game/Screenshot.cpp
-    apps/stellar_game/PhotoModeWindow.cpp
+    src/isocity/Hash.hpp
   )
-  target_link_libraries(stellar_game PRIVATE stellar::stellar ${IMGUI_TARGET})
-  set_target_properties(stellar_game PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/apps
+
+  target_include_directories(proc_isocity_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_cli PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_cli)
+
+  # Save diff tool (headless): compare two save files and emit a summary + optional diff artifacts.
+  add_executable(proc_isocity_diff
+    src/cli/diff.cpp
   )
+
+  target_include_directories(proc_isocity_diff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_diff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_diff)
+
+  # Save inspector (headless): print a fast header/metadata summary without loading the full world.
+  add_executable(proc_isocity_inspect
+    src/cli/inspect.cpp
+  )
+
+  target_include_directories(proc_isocity_inspect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_inspect PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_inspect)
+
+  # Config tool (headless): dump/apply ProcGenConfig and SimConfig embedded in a save.
+  add_executable(proc_isocity_config
+    src/cli/config.cpp
+  )
+
+  target_include_directories(proc_isocity_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_config PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_config)
+
+
+  # Script runner (headless): apply deterministic editing/simulation scripts for regression testing.
+  add_executable(proc_isocity_script
+    src/cli/script.cpp
+  )
+
+  target_include_directories(proc_isocity_script PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_script PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_script)
+
+  # Auto-build tool (headless): deterministic "city bot" growth for rapid scenario generation.
+  add_executable(proc_isocity_autobuild
+    src/cli/autobuild.cpp
+  )
+
+  target_include_directories(proc_isocity_autobuild PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_autobuild PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_autobuild)
+
+  # Binary patch tool (headless): create/apply compact diffs between saves.
+  add_executable(proc_isocity_patch
+    src/cli/patch.cpp
+  )
+
+  target_include_directories(proc_isocity_patch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_patch PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_patch)
+
+  # Replay tool (headless): pack/inspect/play deterministic replay journals.
+  add_executable(proc_isocity_replay
+    src/cli/replay.cpp
+  )
+
+  target_include_directories(proc_isocity_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_replay PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_replay)
+
+  # Blueprint tool (headless): capture/apply rectangular stamps of a save.
+  add_executable(proc_isocity_blueprint
+    src/cli/blueprint.cpp
+  )
+
+  target_include_directories(proc_isocity_blueprint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blueprint PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blueprint)
+
+  # Scenario suite runner (headless): run many scripts/replays and emit CI-friendly reports.
+  add_executable(proc_isocity_suite
+    src/cli/suite.cpp
+  )
+
+  target_include_directories(proc_isocity_suite PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_suite PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_suite)
+
+  # Timelapse tool (headless): run the simulator forward and export an isometric frame sequence.
+  add_executable(proc_isocity_timelapse
+    src/cli/timelapse.cpp
+  )
+
+  target_include_directories(proc_isocity_timelapse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_timelapse PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_timelapse)
+
+
+  # World transform tool (headless): rotate/mirror/crop entire saves.
+  add_executable(proc_isocity_transform
+    src/cli/transform.cpp
+  )
+
+  target_include_directories(proc_isocity_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_transform PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_transform)
+
+
+  # Heightmap tool (headless): import/export raster heightmaps.
+  add_executable(proc_isocity_heightmap
+    src/cli/heightmap.cpp
+  )
+
+  target_include_directories(proc_isocity_heightmap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_heightmap PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_heightmap)
+
+  # Hydrology tool (headless): analyze terrain flow accumulation / rivers / basins.
+  add_executable(proc_isocity_hydrology
+    src/cli/hydrology.cpp
+  )
+
+  target_include_directories(proc_isocity_hydrology PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_hydrology PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_hydrology)
+
+  # Contours tool (headless): extract topographic contour lines and terrain analysis rasters.
+  add_executable(proc_isocity_contours
+    src/cli/contours.cpp
+  )
+
+  target_include_directories(proc_isocity_contours PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_contours PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_contours)
+
+
+  # Isochrone tool (headless): accessibility heatmaps + isochrone polygons.
+  add_executable(proc_isocity_isochrone
+    src/cli/isochrone.cpp
+  )
+
+  target_include_directories(proc_isocity_isochrone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_isochrone PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_isochrone)
+
+
+
+
+  # Road graph export tool (headless): export compressed road network graphs to DOT/JSON/CSV.
+  add_executable(proc_isocity_roadgraph
+    src/cli/roadgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_roadgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadgraph)
+
+  # Street naming + parcel addressing (headless): deterministic street names and addresses.
+  add_executable(proc_isocity_streetnames
+    src/cli/streetnames.cpp
+  )
+
+  target_include_directories(proc_isocity_streetnames PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_streetnames PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_streetnames)
+
+  # Cartography poster exporter: labeled isometric overview (streets + districts) -> PNG/JSON.
+  add_executable(proc_isocity_cartography
+    src/cli/cartography.cpp
+  )
+
+  target_include_directories(proc_isocity_cartography PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_cartography PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_cartography)
+
+  # Wayfinding tool (headless): geocode addresses/intersections and emit turn-by-turn routes.
+  add_executable(proc_isocity_wayfind
+    src/cli/wayfind.cpp
+  )
+
+  target_include_directories(proc_isocity_wayfind PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_wayfind PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_wayfind)
+
+  # Tour guide tool (headless): synthesize POIs and generate a walkable itinerary + poster.
+  add_executable(proc_isocity_tour
+    src/cli/tour.cpp
+  )
+
+  target_include_directories(proc_isocity_tour PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_tour PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_tour)
+
+
+  # Pathfinding tool (headless): query paths on the road/land grid and road-build planner.
+  add_executable(proc_isocity_path
+    src/cli/path.cpp
+  )
+
+  target_include_directories(proc_isocity_path PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_path PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_path)
+
+  # Road centrality tool (headless): betweenness centrality on the compressed road graph.
+  add_executable(proc_isocity_roadcentrality
+    src/cli/roadcentrality.cpp
+  )
+
+  target_include_directories(proc_isocity_roadcentrality PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadcentrality PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadcentrality)
+
+  # Traffic graph export tool (headless): compute commute traffic and aggregate onto the road graph.
+  add_executable(proc_isocity_trafficgraph
+    src/cli/trafficgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_trafficgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_trafficgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_trafficgraph)
+
+  # Goods graph export tool (headless): compute goods flow, aggregate onto road graph, and export OD.
+  add_executable(proc_isocity_goodsgraph
+    src/cli/goodsgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_goodsgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_goodsgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_goodsgraph)
+
+  # Transit line planning tool (headless): plan bus-line style corridors from simulated demand.
+  add_executable(proc_isocity_transitplan
+    src/cli/transitplan.cpp
+  )
+
+  target_include_directories(proc_isocity_transitplan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_transitplan PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_transitplan)
+
+
+  # Park placement tool (headless): suggest new parks based on underserved demand.
+  add_executable(proc_isocity_parkopt
+    src/cli/parkopt.cpp
+  )
+
+  target_include_directories(proc_isocity_parkopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_parkopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_parkopt)
+
+  # Civic services placement tool (headless): suggest education/health/safety facilities.
+  add_executable(proc_isocity_servicesopt
+    src/cli/servicesopt.cpp
+  )
+
+  target_include_directories(proc_isocity_servicesopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_servicesopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_servicesopt)
+
+
+  # Flood/ponding tool (headless): sea-level inundation + Priority-Flood depression depth.
+  add_executable(proc_isocity_floodrisk
+    src/cli/floodrisk.cpp
+  )
+
+  target_include_directories(proc_isocity_floodrisk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_floodrisk PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_floodrisk)
+
+  add_executable(proc_isocity_evac
+    src/cli/evacuation.cpp
+  )
+  target_include_directories(proc_isocity_evac PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_evac PRIVATE isocity_core)
+  procisocity_set_strict_warnings(proc_isocity_evac)
+
+  # Road upgrades tool (headless): propose road-level upgrades under a budget based on combined flows.
+  add_executable(proc_isocity_roadupgrades
+    src/cli/roadupgrades.cpp
+  )
+
+  target_include_directories(proc_isocity_roadupgrades PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadupgrades PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadupgrades)
+
+  # Policy optimizer tool (headless): search tax/maintenance policy space under an objective.
+  add_executable(proc_isocity_policyopt
+    src/cli/policyopt.cpp
+  )
+
+  target_include_directories(proc_isocity_policyopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_policyopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_policyopt)
+
+
+
+
+  # Road resilience tool (headless): identify bridge edges/articulation nodes and suggest bypass roads.
+  add_executable(proc_isocity_roadresilience
+    src/cli/roadresilience.cpp
+  )
+
+  target_include_directories(proc_isocity_roadresilience PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadresilience PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadresilience)
+
+
+
+  # City blocks tool (headless): extract road-separated land blocks and export metrics.
+  add_executable(proc_isocity_blocks
+    src/cli/blocks.cpp
+  )
+
+  target_include_directories(proc_isocity_blocks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blocks PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blocks)
+
+  # Block-based district assignment tool.
+  add_executable(proc_isocity_blockdistricts
+    src/cli/blockdistricts.cpp
+  )
+
+  target_include_directories(proc_isocity_blockdistricts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blockdistricts PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blockdistricts)
+
+
+
+  # Mesh exporter (headless): export a save/world to Wavefront OBJ+MTL for debugging/interop.
+  add_executable(proc_isocity_mesh
+    src/cli/mesh.cpp
+  )
+
+  target_include_directories(proc_isocity_mesh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_mesh PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_mesh)
+
+  # PPM diff tool (headless): compare two PPM images (P6) and optionally write a diff visualization.
+  add_executable(proc_isocity_imagediff
+    src/cli/imagediff.cpp
+  )
+
+  target_include_directories(proc_isocity_imagediff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_imagediff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_imagediff)
+
+  # District report tool (headless): per-district stats + GeoJSON/SVG vector exports.
+  add_executable(proc_isocity_districtreport
+    src/cli/districtreport.cpp
+  )
+
+  target_include_directories(proc_isocity_districtreport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_districtreport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_districtreport)
+
+  # Map export tool (headless): export a world as a single GeoJSON FeatureCollection.
+  add_executable(proc_isocity_mapexport
+    src/cli/mapexport.cpp
+  )
+
+  target_include_directories(proc_isocity_mapexport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_mapexport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_mapexport)
+
+  # OSM import tool (headless): import an OpenStreetMap (OSM XML) extract into a new save.
+  add_executable(proc_isocity_osmimport
+    src/cli/osmimport.cpp
+  )
+
+  target_include_directories(proc_isocity_osmimport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_osmimport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_osmimport)
+
+
+  # Tileset generator tool (headless): export procedural tile textures as a sprite atlas PNG (+ optional JSON metadata).
+  add_executable(proc_isocity_tileset
+    src/cli/tileset.cpp
+  )
+
+  target_include_directories(proc_isocity_tileset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_tileset PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_tileset)
+
 endif()
 
-# ---- Tests ----
-if (BUILD_TESTING)
-  add_subdirectory(tests)
+# ---- Tests (headless) ----
+if (PROCISOCITY_BUILD_TESTS)
+  enable_testing()
+
+  add_executable(proc_isocity_tests
+    tests/ProcIsoCityTests.cpp
+  )
+  target_link_libraries(proc_isocity_tests PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_tests)
+
+  add_test(NAME proc_isocity_tests COMMAND proc_isocity_tests)
 endif()
