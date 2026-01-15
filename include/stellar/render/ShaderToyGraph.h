@@ -124,8 +124,6 @@ private:
   int outW_{1};
   int outH_{1};
 
-  // Extra wrapper header appended before each pass' user code.
-  std::string userHeader_{};
 
   void clearRtIfInited_(PassState& p);
   const Texture2D* resolveChannelTexture_(ShaderToyPass currentPass, ShaderToyChannelSource src) const;

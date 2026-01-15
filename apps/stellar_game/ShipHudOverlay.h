@@ -94,6 +94,16 @@ struct ShipHudOverlayTelemetry {
   float progradeYawDeg{0.0f};
   float progradePitchDeg{0.0f};
 
+  // Ship-local retrograde direction (opposite of velocity) expressed as yaw/pitch (degrees).
+  bool retrogradeValid{false};
+  float retrogradeYawDeg{0.0f};
+  float retrogradePitchDeg{0.0f};
+
+  // Ship-local direction to the nearest contact expressed as yaw/pitch (degrees).
+  bool targetDirValid{false};
+  float targetYawDeg{0.0f};
+  float targetPitchDeg{0.0f};
+
   // Ship-local gravity direction (down vector) expressed as yaw/pitch (degrees).
   bool gravityValid{false};
   float gravityYawDeg{0.0f};

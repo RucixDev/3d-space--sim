@@ -221,7 +221,7 @@ std::string ShaderToyParamSet::buildUniformDecls() const {
   return ss.str();
 }
 
-void ShaderToyParamSet::applyToShader(ShaderProgram& shader) const {
+void ShaderToyParamSet::applyToShader(const ShaderProgram& shader) const {
   const int n = (int)defs.size();
   if (n == 0) return;
   if ((int)values.size() != n) return;

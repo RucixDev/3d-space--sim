@@ -86,10 +86,6 @@ void ShaderToyGraph::setUserHeader(std::string_view extraHeader) {
   userHeader_.assign(extraHeader.data(), extraHeader.size());
 }
 
-void ShaderToyGraph::setUserHeader(std::string_view extraHeader) {
-  userHeader_.assign(extraHeader.data(), extraHeader.size());
-}
-
 void ShaderToyGraph::setPassSettings(ShaderToyPass pass, const ShaderToyGraphPassSettings& s) {
   PassState& p = passes_[idx(pass)];
   p.settings = s;

@@ -1,5 +1,39 @@
 # Patch Notes
 
+## Round 51 — Ship HUD nav markers + build fixes (MSVC)
+
+This round targets the most under-developed area introduced recently: **the procedural Ship HUD**, along with a set of
+blocking **MSVC build issues** that snuck in during the last patch.
+
+### Added
+
+- **Attitude instrument nav markers**:
+  - **Retrograde marker** (opposite your current velocity) so you can quickly orient for braking / rendezvous.
+  - **Nearest-contact bearing marker** (ship-local yaw/pitch to the closest contact) for fast situational awareness without a full target-lock system.
+
+### Fixes
+
+- Fixed MSVC error where `ShaderToyParamSet::applyToShader()` required a non-const `ShaderProgram&` even though uniforms are set through const methods.
+- Removed accidental **duplicate definitions** in `ShaderToyGraph` (`userHeader_` member + `setUserHeader()` implementation).
+- Added missing `RenderTarget2D::isInited()` accessor used by procedural render systems.
+- Split the large `GpuSurfaceCache` GLSL fragment source into multiple literals to avoid MSVC’s per-literal size limit (`C2026: string too big`).
+- Fixed Ship HUD telemetry compilation errors by using `Ship::positionKm()` / `Ship::velocityKmS()` getters consistently, and by referencing the correct fuel variables.
+
+### Files changed/added
+
+- `include/stellar/render/ShaderToyParams.h`
+- `src/render/ShaderToyParams.cpp`
+- `include/stellar/render/ShaderToyGraph.h`
+- `src/render/ShaderToyGraph.cpp`
+- `include/stellar/render/RenderTarget.h`
+- `src/render/GpuSurfaceCache.cpp`
+- `apps/stellar_game/ShipHudOverlay.h`
+- `apps/stellar_game/ShipHudOverlay.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+
 ## Round 50 — Procedural cratered planets (seam-free impact synthesis + ejecta rays)
 
 This round focuses on an under-developed procedural generation area: **planet surface detail**.

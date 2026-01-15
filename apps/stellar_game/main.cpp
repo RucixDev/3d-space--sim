@@ -17566,7 +17566,6 @@ if (showShipHud) {
     core::u64 s = core::fnv1a64("ship_hud_loadout");
     s = core::hashCombine(s, (core::u64)shipHullClass);
     s = core::hashCombine(s, (core::u64)thrusterMk);
-    s = core::hashCombine(s, (core::u64)powerplantMk);
     s = core::hashCombine(s, (core::u64)shieldMk);
     s = core::hashCombine(s, (core::u64)distributorMk);
     s = core::hashCombine(s, (core::u64)weaponPrimary);
@@ -17586,30 +17585,49 @@ if (showShipHud) {
   }
 
   // Gather a few values once.
-  const double speedKmS = ship.velocityKmS.length();
+  const double speedKmS = ship.velocityKmS().length();
   const float shieldFrac =
     (playerShieldMax > 0.0) ? (float)std::clamp(playerShield / playerShieldMax, 0.0, 1.0) : 0.0f;
   const float hullFrac =
     (playerHullMax > 0.0) ? (float)std::clamp(playerHull / playerHullMax, 0.0, 1.0) : 0.0f;
   const float heatFrac = (float)std::clamp(heat / 100.0, 0.0, 1.0);
   const float fuelFrac =
-    (playerFuelMax > 0.0) ? (float)std::clamp(playerFuel / playerFuelMax, 0.0, 1.0) : 0.0f;
+    (fuelMax > 0.0) ? (float)std::clamp(fuel / fuelMax, 0.0, 1.0) : 0.0f;
 
   // Update telemetry history at a fixed rate for sparklines.
   ui::shipHudHistoryUpdate(shipHudHistory, dtReal, speedKmS, shieldFrac, hullFrac, heatFrac, fuelFrac);
 
   // Find nearest contact distance for the Target panel (simple but useful).
+  // Also compute a ship-local bearing so the Attitude instrument can render a target marker.
   double nearestKm = 0.0;
   bool hasNearest = false;
+  math::Vec3d nearestRelKm{0, 0, 0};
   if (currentSystem) {
     for (const Contact& c : contacts) {
-      if (!c.isValid() || c.isPlayer) continue;
-      const double d = (c.ship.positionKm - ship.positionKm).length();
+      if (c.id == 0) continue;
+      const math::Vec3d delta = c.ship.positionKm() - ship.positionKm();
+      const double d = delta.length();
       if (!hasNearest || d < nearestKm) {
         hasNearest = true;
         nearestKm = d;
+        nearestRelKm = delta;
       }
     }
+  }
+
+  bool targetDirValid = hasNearest && (nearestKm > 1e-9);
+  float targetYawDeg = 0.0f;
+  float targetPitchDeg = 0.0f;
+  if (targetDirValid) {
+    const math::Vec3d dir = nearestRelKm / nearestKm;
+    const math::Vec3d sr = ship.right().normalized();
+    const math::Vec3d su = ship.up().normalized();
+    const math::Vec3d sf = ship.forward().normalized();
+    const double lx = math::dot(dir, sr);
+    const double ly = math::dot(dir, su);
+    const double lz = math::dot(dir, sf);
+    targetYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
+    targetPitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
   }
 
   // Precompute G-force (optional panel).
@@ -17617,13 +17635,13 @@ if (showShipHud) {
   {
     if (shipHudPrevVelInit) {
       const double dt = std::max(1e-6, dtReal);
-      const math::Vec3d dv = ship.velocityKmS - shipHudPrevVelKmS;
+      const math::Vec3d dv = ship.velocityKmS() - shipHudPrevVelKmS;
       const double accelMs2 = dv.length() * 1000.0 / dt;
       gForce = accelMs2 / 9.81;
     } else {
       shipHudPrevVelInit = true;
     }
-    shipHudPrevVelKmS = ship.velocityKmS;
+    shipHudPrevVelKmS = ship.velocityKmS();
   }
 
   // FSD telemetry (used by the procedural Ship HUD).
@@ -17666,6 +17684,9 @@ if (showShipHud) {
   tel.throttleFrac = throttleFrac;
   tel.hasNearest = hasNearest;
   tel.nearestKm = nearestKm;
+  tel.targetDirValid = targetDirValid;
+  tel.targetYawDeg = targetYawDeg;
+  tel.targetPitchDeg = targetPitchDeg;
   tel.cargoCr = cargoCr;
   tel.gForce = gForce;
   tel.timeRealSec = timeRealSec;
@@ -17697,7 +17718,7 @@ if (showShipHud) {
       tel.attitudeRefG = (float)gG;
     } else {
       // Orbit plane normal via angular momentum (pos x vel).
-      math::Vec3d h = math::cross(ship.positionKm(), ship.velocityKmS);
+      math::Vec3d h = math::cross(ship.positionKm(), ship.velocityKmS());
       if (h.lengthSq() > 1e-12) refUp = h.normalized();
       else refUp = ship.up().normalized();
 
@@ -17732,23 +17753,40 @@ if (showShipHud) {
       tel.attitudeRollDeg = 0.0f;
     }
 
-    // Ship-local prograde marker (velocity direction)
+    // Ship-local prograde / retrograde marker (velocity direction)
     {
-      const double vMag = ship.velocityKmS.length();
+      const double vMag = ship.velocityKmS().length();
       tel.progradeValid = vMag > 1e-9;
+      tel.retrogradeValid = tel.progradeValid;
       if (tel.progradeValid) {
-        const math::Vec3d v = ship.velocityKmS / vMag;
+        const math::Vec3d v = ship.velocityKmS() / vMag;
         const math::Vec3d sr = ship.right().normalized();
         const math::Vec3d su = ship.up().normalized();
         const math::Vec3d sf = ship.forward().normalized();
-        const double lx = math::dot(v, sr);
-        const double ly = math::dot(v, su);
-        const double lz = math::dot(v, sf);
-        tel.progradeYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
-        tel.progradePitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
+
+        // Prograde
+        {
+          const double lx = math::dot(v, sr);
+          const double ly = math::dot(v, su);
+          const double lz = math::dot(v, sf);
+          tel.progradeYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
+          tel.progradePitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
+        }
+
+        // Retrograde
+        {
+          const math::Vec3d rv = -v;
+          const double lx = math::dot(rv, sr);
+          const double ly = math::dot(rv, su);
+          const double lz = math::dot(rv, sf);
+          tel.retrogradeYawDeg = (float)math::radToDeg(std::atan2(lx, lz));
+          tel.retrogradePitchDeg = (float)math::radToDeg(std::atan2(ly, lz));
+        }
       } else {
         tel.progradeYawDeg = 0.0f;
         tel.progradePitchDeg = 0.0f;
+        tel.retrogradeYawDeg = 0.0f;
+        tel.retrogradePitchDeg = 0.0f;
       }
     }
 

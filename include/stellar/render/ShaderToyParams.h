@@ -95,7 +95,7 @@ struct ShaderToyParamSet {
 
   // Applies the current parameter values as uniforms to a linked program.
   // (Safe to call even if some uniforms are optimized out.)
-  void applyToShader(ShaderProgram& shader) const;
+  void applyToShader(const ShaderProgram& shader) const;
 
   // Schema equality ignores UI-only data and ordering, and only checks that
   // `name -> type` matches. This is useful to detect when *recompiling all

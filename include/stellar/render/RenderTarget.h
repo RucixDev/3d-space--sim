@@ -28,6 +28,8 @@ public:
   int width() const { return w_; }
   int height() const { return h_; }
 
+  bool isInited() const { return inited_; }
+
 private:
   void destroy();
   bool createOrResize(int w, int h, std::string* outError = nullptr);

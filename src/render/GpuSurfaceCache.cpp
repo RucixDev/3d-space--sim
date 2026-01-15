@@ -30,7 +30,7 @@ void main() {
 // uMode:
 //   0 -> output RGBA albedo
 //   1 -> output RGBA tangent-space normal (XYZ encoded into RGB, A=1)
-static const char* kFS = R"GLSL(
+static const char* kFS_0 = R"GLSL(
 #version 330 core
 
 in vec2 vUv;
@@ -467,7 +467,11 @@ vec3 surfaceAlbedo(int kind, uint seed, vec3 p, float lat, float lon) {
 
     float r0 = fbm3D(p * 22.0 + vec3(4.1, -9.7, 2.6), seed ^ 0x70ADu, 3, 2.3, 0.55);
     float rid = 1.0 - abs(r0 * 2.0 - 1.0);
-    float roads = smoothstep01(0.78, 0.94, rid) * (0.30 + 0.70 * cluster);
+)GLSL";
+
+// NOTE: MSVC has a relatively small per-literal size limit; keep large GLSL sources
+// split into multiple literals and concatenate at runtime.
+static const char* kFS_1 = R"GLSL(    float roads = smoothstep01(0.78, 0.94, rid) * (0.30 + 0.70 * cluster);
 
     float mega0 = fbm3D(p * 1.6 + vec3(19.7, -5.2, 11.3), seed ^ 0x31E6Au, 4, 2.0, 0.5);
     float mega = smoothstep01(0.78, 0.95, mega0);
@@ -577,6 +581,12 @@ void main() {
 
 )GLSL";
 
+static const std::string& fullFragmentSource_() {
+  static const std::string s = std::string(kFS_0) + std::string(kFS_1);
+  return s;
+}
+
+
 static core::i32 bitcastU32ToI32(core::u32 u) {
   core::i32 s = 0;
   static_assert(sizeof(s) == sizeof(u));
@@ -608,7 +618,7 @@ bool GpuSurfaceCache::init(std::string* outError) {
   if (inited_) return true;
 
   std::string err;
-  if (!shader_.build(kVS, kFS, &err)) {
+  if (!shader_.build(kVS, fullFragmentSource_(), &err)) {
     if (outError) *outError = err;
     destroy();
     return false;

@@ -960,6 +960,21 @@ static void drawAttitudeIndicator(ImDrawList* draw,
     draw->AddLine(ImVec2(m.x, m.y - rr), ImVec2(m.x, m.y + rr), colAcc, lineThick);
   }
 
+
+  // Retrograde marker (opposite velocity vector)
+  if (t.retrogradeValid) {
+    const float maxA = 60.0f;
+    const float ox = std::clamp(t.retrogradeYawDeg / maxA, -1.0f, 1.0f) * (r * 0.70f);
+    const float oy = std::clamp(-t.retrogradePitchDeg / maxA, -1.0f, 1.0f) * (r * 0.70f);
+    ImVec2 m = clampPointToCircle(c, r * 0.80f, ImVec2(c.x + ox, c.y + oy));
+
+    const float rr = 6.0f * uiScale;
+    draw->AddCircle(m, rr, colText, 18, lineThick);
+    draw->AddLine(ImVec2(m.x - rr, m.y - rr), ImVec2(m.x + rr, m.y + rr), colText, lineThick);
+    draw->AddLine(ImVec2(m.x - rr, m.y + rr), ImVec2(m.x + rr, m.y - rr), colText, lineThick);
+  }
+
+
   // Gravity marker (down vector)
   if (t.gravityValid) {
     const float maxA = 60.0f;
@@ -974,6 +989,26 @@ static void drawAttitudeIndicator(ImDrawList* draw,
     draw->AddTriangleFilled(a0, b0, c0, colPrim);
     draw->AddTriangle(a0, b0, c0, colGrid, lineThick);
   }
+
+
+  // Target direction marker (nearest contact)
+  if (t.targetDirValid) {
+    const float maxA = 60.0f;
+    const float ox = std::clamp(t.targetYawDeg / maxA, -1.0f, 1.0f) * (r * 0.72f);
+    const float oy = std::clamp(-t.targetPitchDeg / maxA, -1.0f, 1.0f) * (r * 0.72f);
+    ImVec2 m = clampPointToCircle(c, r * 0.82f, ImVec2(c.x + ox, c.y + oy));
+
+    const float rr = 6.0f * uiScale;
+    ImVec2 p0(m.x, m.y - rr);
+    ImVec2 p1(m.x + rr, m.y);
+    ImVec2 p2(m.x, m.y + rr);
+    ImVec2 p3(m.x - rr, m.y);
+    draw->AddLine(p0, p1, colPrim, lineThick);
+    draw->AddLine(p1, p2, colPrim, lineThick);
+    draw->AddLine(p2, p3, colPrim, lineThick);
+    draw->AddLine(p3, p0, colPrim, lineThick);
+  }
+
 
   // Reference label strip
   {
