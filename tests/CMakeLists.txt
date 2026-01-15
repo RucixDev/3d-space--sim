@@ -18,6 +18,7 @@ list(SORT STELLAR_TEST_SOURCES)
 if (NOT STELLAR_ENABLE_RENDER)
   list(FILTER STELLAR_TEST_SOURCES EXCLUDE REGEX "test_frame_graph\\.cpp$")
   list(FILTER STELLAR_TEST_SOURCES EXCLUDE REGEX "test_surface_normalmap\\.cpp$")
+  list(FILTER STELLAR_TEST_SOURCES EXCLUDE REGEX "test_rings\\.cpp$")
 endif()
 
 # ---- Generate a registry TU that maps file base-names -> test function symbols ----

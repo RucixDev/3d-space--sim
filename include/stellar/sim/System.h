@@ -38,6 +38,7 @@ struct StarSystem {
   SystemStub stub{};
   Star star{};
   std::vector<Planet> planets{};
+  std::vector<Moon> moons{};
   std::vector<Station> stations{};
 };
 

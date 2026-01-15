@@ -57,6 +57,29 @@ struct Planet {
   OrbitElements orbit{};
 };
 
+// A satellite orbiting a parent planet (not the star).
+//
+// NOTE: This is intentionally lightweight and procedural-only for now.
+// It is generated deterministically from a system seed and does not
+// participate in saving/loading yet.
+struct Moon {
+  // Stable identifier for UI/selection/logging. Deterministic from the system
+  // id + parent index + local index.
+  core::u64 id{0};
+
+  std::string name;
+  PlanetType type{PlanetType::Rocky};
+  double radiusEarth{0.27};
+  double massEarth{0.01};
+
+  // Orbit elements are expressed in AU and angles in radians, matching
+  // OrbitElements, but the orbit is *relative to the parent planet*.
+  OrbitElements orbit{};
+
+  // Index into StarSystem::planets.
+  core::u32 parentPlanetIndex{0};
+};
+
 struct SystemStub {
   SystemId id{0};
   core::u64 seed{0};

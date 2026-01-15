@@ -73,6 +73,15 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
   const math::Vec3d anchorPosKm = stationPosKm(*anchor, anchorTimeDays);
   const double anchorCommsKm = std::max(0.0, anchor->commsRangeKm);
 
+  // Prefer aligning procedural belts/sheets to the anchor station's orbital plane.
+  // (Cross(position, velocity) gives an angular-momentum direction.)
+  math::Vec3d preferredPlaneN = math::cross(anchorPosKm, stationVelKmS(*anchor, anchorTimeDays));
+  if (preferredPlaneN.lengthSq() > 1e-12) {
+    preferredPlaneN = preferredPlaneN.normalized();
+  } else {
+    preferredPlaneN = {0.0, 0.0, 0.0};
+  }
+
   // System-stable key used by the renderer/game prototype as a base for procedural ids.
   // (We keep this scheme here so it can be shared when the game integrates this module.)
   const core::u64 sysKey = core::hashCombine(universeSeed, static_cast<core::u64>(system.stub.id));
@@ -82,7 +91,7 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
 
   // --- Persistent resource fields ---
   if (params.resourceFieldCount > 0) {
-    out.resourceFields = generateResourceFields(universeSeed, system.stub.id, anchorPosKm, anchorCommsKm, params.resourceFieldCount);
+    out.resourceFields = generateResourceFields(universeSeed, system.stub.id, anchorPosKm, anchorCommsKm, params.resourceFieldCount, preferredPlaneN);
     out.sites.reserve(out.sites.size() + out.resourceFields.fields.size());
     for (const auto& f : out.resourceFields.fields) {
       SignalSite s{};

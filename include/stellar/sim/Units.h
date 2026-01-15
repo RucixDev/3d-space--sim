@@ -37,4 +37,14 @@ inline math::Vec3d planetVelKmS(const Planet& p, double timeDays) {
   return auPerDayToKmS(orbitVelocity3DAU(p.orbit, timeDays));
 }
 
+// Moons orbit their parent planet; these helpers compose the parent planet's
+// star-centric state with the moon's planet-centric orbit.
+inline math::Vec3d moonPosKm(const Planet& parent, const Moon& m, double timeDays) {
+  return planetPosKm(parent, timeDays) + auToKm(orbitPosition3DAU(m.orbit, timeDays));
+}
+
+inline math::Vec3d moonVelKmS(const Planet& parent, const Moon& m, double timeDays) {
+  return planetVelKmS(parent, timeDays) + auPerDayToKmS(orbitVelocity3DAU(m.orbit, timeDays));
+}
+
 } // namespace stellar::sim

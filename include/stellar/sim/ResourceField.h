@@ -37,6 +37,45 @@ enum class ResourceFieldLayout : core::u8 {
 };
 
 const char* resourceFieldKindName(ResourceFieldKind k);
+const char* resourceFieldLayoutName(ResourceFieldLayout l);
+
+// Sub-structure features used to make fields feel less uniform.
+//
+// These are *not* persisted; they are generated deterministically from the
+// field id and returned in ResourceFieldPlan for UI/debug and for any gameplay
+// systems that want to bias behavior toward "hot" regions.
+enum class ResourceFieldFeatureKind : core::u8 {
+  Hotspot = 0,   // localized density increase (belt clumps, cluster pockets)
+  Gap = 1,       // localized density decrease (belt gaps)
+  Streak = 2,    // filament/stream inside a sheet
+  Spokes = 3,    // subtle periodic modulation along a belt
+};
+
+const char* resourceFieldFeatureKindName(ResourceFieldFeatureKind k);
+
+// Generic feature descriptor.
+//
+// Interpretation notes:
+//  - For Torus features: angleRad is the belt angle (field-local X/Z plane).
+//    width is an angular half-width in radians.
+//  - For Sheet streaks: angleRad is the streak direction in the X/Z plane.
+//    width is a half-width in km.
+//  - For Cluster hotspots: localPos is a normalized local-space center (roughly
+//    in [-1,1]^3) and width is a gaussian sigma in normalized units.
+struct ResourceFieldFeature {
+  core::u64 fieldId{0};
+  ResourceFieldFeatureKind kind{ResourceFieldFeatureKind::Hotspot};
+
+  double angleRad{0.0};
+  double width{0.0};
+  double strength01{0.0};
+
+  // Optional extra parameter (e.g., spokes frequency).
+  double param{0.0};
+
+  // Optional local-space position (used by Cluster hotspots).
+  math::Vec3d localPos{0.0, 0.0, 0.0};
+};
 
 // Deterministically generated "resource field" signal/site.
 //
@@ -92,12 +131,19 @@ struct ResourceAsteroid {
 
   econ::CommodityId yield{econ::CommodityId::Ore};
 
+  // Local density/structure weight in [0,1].
+  //
+  // This is useful for UI/debug visualization and for gameplay systems that
+  // want to bias scanning/mining behavior toward pockets/clumps.
+  double density01{1.0};
+
   // Baseline yield capacity before depletion/persistence overrides.
   double baseUnits{120.0};
 };
 
 struct ResourceFieldPlan {
   std::vector<ResourceFieldSite> fields;
+  std::vector<ResourceFieldFeature> features;
   std::vector<ResourceAsteroid> asteroids;
 };
 
@@ -107,6 +153,8 @@ struct ResourceFieldPlan {
 //  - Stable deterministic IDs (tagged with kDeterministicWorldIdBit)
 //  - Positions are stable relative to the caller-supplied anchor position
 //    (so they "move" with orbiting stations if the anchor moves)
+//  - Optional preferred plane normal lets callers align belts/sheets to a
+//    meaningful orbital plane (e.g., the anchor station's orbit normal)
 //  - Yield mixes are stable and suitable for scan/HUD readouts
 //
 // NOTE: This function does not apply depletion persistence; callers should apply
@@ -115,7 +163,23 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
                                         SystemId systemId,
                                         const math::Vec3d& anchorPosKm,
                                         double anchorCommsRangeKm,
-                                        int fieldCount = 3);
+                                        int fieldCount = 3,
+                                        math::Vec3d preferredPlaneNormalKm = {0.0, 0.0, 0.0});
+
+// Helper: return all features that belong to a given field id.
+std::vector<ResourceFieldFeature> filterFeaturesForField(const std::vector<ResourceFieldFeature>& features,
+                                                         core::u64 fieldId);
+
+// Evaluate the deterministic "structure density" for a position inside a
+// resource field.
+//
+// This is the same density function used by the generator to bias Poisson-ish
+// placement and to scale yield.
+//
+// Returns a value in [0,1] where 0 is a "void" and 1 is a hotspot.
+double resourceFieldDensity01(const ResourceFieldSite& site,
+                              const std::vector<ResourceFieldFeature>& features,
+                              const math::Vec3d& worldPosKm);
 
 // Helper: return all asteroids that belong to a given field id.
 std::vector<ResourceAsteroid> filterAsteroidsForField(const std::vector<ResourceAsteroid>& asteroids,

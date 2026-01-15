@@ -1,5 +1,212 @@
 # Patch Notes
 
+## Round 39 — Procedural rings v2: ringlets, micro-divisions, spiral density waves, spokes + SystemLab preview
+
+This round targets a previously **underdeveloped visual proc-gen module**: **planetary rings**.
+The old generator produced nice broad bands, but it lacked the *fine structure* that makes rings feel alive.
+
+### What's new
+
+- **Richer, physically-inspired ring structure** in `generateRingTexture(...)`
+  - Multi-scale radial banding (coarse + fine) with periodic warp (seam-free at u=0/1).
+  - Dozens of **ringlets** (narrow high-density stripes), including occasional **arc-like segments** (azimuth-localized).
+  - A mix of **major divisions** and many **micro-gaps** (thin carved lanes).
+  - Stylized **spiral density waves** (integer azimuthal modes → seamless wrapping).
+  - Anisotropic **wake-like streak noise** plus rare **spokes** (radial dark features).
+  - Warm-dusty vs cold-icy palettes, with subtle radial tinting and ringlet highlights.
+
+- **Procedural System Lab: Rings inspector + CPU preview**
+  - New **Rings** panel shows per-planet predicted ring presence/variant (mirrors the logic in `main.cpp`).
+  - Click a planet to preview its ring texture (CPU raster via ImDrawList, no GL texture needed).
+  - Includes a radial mean-density plot and a few tweak knobs (chance/opacity, preview resolution, variant).
+
+- **Tests**
+  - New `test_rings.cpp`: determinism, seam continuity, and basic alpha/color sanity checks.
+  - `tests/CMakeLists.txt`: excludes `test_rings.cpp` when `STELLAR_ENABLE_RENDER` is disabled.
+
+### Files changed
+
+- `src/render/ProceduralRings.cpp`
+- `apps/stellar_game/ProceduralSystemLabWindow.h`
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `tests/test_rings.cpp`
+- `tests/CMakeLists.txt`
+
+## Round 38 — Procedural resource fields v3: structural sub-features + density-aware blue-noise + heatmap
+
+This round revisits the resource-field generator and pushes it into *believable belt structure* territory:
+**gaps, clumps, streaks, and density-driven placement/yields** — while staying fully deterministic.
+
+### What's new
+
+- **Deterministic structural features per field** (derived from field id)
+  - Torus belts: angular **gaps** (resonant “lanes”), multiple **hotspot clumps**, optional low-amplitude **spokes**.
+  - Sheet fields: filament **streaks/streams**.
+  - Cluster pockets: internal **hotspots/subclusters**.
+  - Exposed via a new `ResourceFieldFeature` list on `ResourceFieldPlan`.
+
+- **Density field + adaptive blue-noise placement**
+  - New `sim::resourceFieldDensity01(...)` returns a stable density value in `[0..1]` for any point in a field.
+  - The Mitchell-style best-candidate selection now uses **density-aware clearance**:
+    - tighter packing in hotspots
+    - looser packing in voids/gaps
+  - `ResourceAsteroid` stores `density01`, and `baseUnits` scales with density (richer cores, poorer edges).
+
+- **Procedural System Lab: stronger inspection tools**
+  - Fixed star-class display (`Star::cls`).
+  - Resource field table now shows a compact **structure summary**.
+  - Selected field view lists features + shows mean asteroid density.
+  - Scatter preview adds an optional **density heatmap** overlay + optional density-colored points.
+
+- **API polish**
+  - Added `resourceFieldLayoutName(...)` and `resourceFieldFeatureKindName(...)`.
+  - Added `filterFeaturesForField(...)` helper.
+
+- **Tests**
+  - `test_resource_field.cpp` now validates:
+    - feature determinism + presence per field
+    - asteroid `density01` range + consistency with `resourceFieldDensity01()`
+
+### Files changed
+
+- `include/stellar/sim/ResourceField.h`
+- `src/sim/ResourceField.cpp`
+- `apps/stellar_game/ProceduralSystemLabWindow.h`
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `tests/test_resource_field.cpp`
+- `PATCH_NOTES.md`
+
+## Round 37 — Procedural resource fields v2: orbital-plane belts + QMC blue-noise placement + inspector
+
+This round targets an under-developed procedural loop: **mining sites / resource fields**.
+The project already had deterministic field generation, but the distributions could look clumpy and the
+field orientation was essentially arbitrary. This update makes fields feel more *astrophysical* and adds
+a dedicated inspector so you can iterate on the generator quickly.
+
+### What's new
+
+- **Low-discrepancy sampling utility (`core::LowDiscrepancy`)**
+  - Header-only Halton helpers used for procedural candidate sampling.
+
+- **Resource field placement upgraded to deterministic “best-candidate” blue-noise**
+  - Each asteroid picks the best of a fixed Halton candidate set (Mitchell-style) to maximize clearance.
+  - Dramatically reduces visible clumping while keeping determinism and avoiding unbounded rejection loops.
+
+- **Optional orbital-plane alignment for belts/sheets**
+  - `sim::generateResourceFields(...)` now accepts a *preferred plane normal*.
+  - `sim::generateSystemSignals(...)` computes the anchor station's orbit normal and passes it through,
+    so belts/sheets align with the local “ecliptic”.
+
+- **Procedural System Lab upgraded with a Signals/Resource Fields inspector**
+  - Live generation controls (resource field count + optional signal categories).
+  - Resource field table (kind/layout/radii/arc/richness/commodities/id).
+  - Selected-field details: yield mix + a 2D asteroid scatter preview in field-local coordinates.
+  - Clipboard export for quick debugging.
+
+- **Tests**
+  - `test_resource_field.cpp` now also validates preferred-plane alignment.
+
+### Files added/changed
+
+- `include/stellar/core/LowDiscrepancy.h` *(new)*
+- `include/stellar/sim/ResourceField.h`
+- `src/sim/ResourceField.cpp`
+- `src/sim/Signals.cpp`
+- `apps/stellar_game/ProceduralSystemLabWindow.h`
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_resource_field.cpp`
+
+## Round 36 — Planet surface proc-gen v2: tectonic plates, craters, biomes, storms
+
+This round targets the most under-developed part of the pipeline: **planetary surface generation**.
+The old surfaces were intentionally “good enough” noise; this update makes planets read as *worlds*:
+large-scale coherent structure (plates/continents), mid-scale features (mountain belts/cracks), and
+micro detail (craters/speckle) — while staying **deterministic** and cache-friendly.
+
+### What’s new
+
+- **Tectonic plate field (spherical Voronoi)** for rocky / desert / ocean / ice
+  - Deterministically generated plate sites on the unit sphere.
+  - Plate boundaries produce mountain belts / ridges.
+  - Domain warping breaks up hard Voronoi edges into organic coastlines and belts.
+
+- **Crater field stamping** (rocky / desert / ice)
+  - Deterministic crater catalogs per body (direction, angular radius, depth, rim).
+  - Craters affect both **height** (for normals) and **albedo** (interior darkening + rim brightening).
+
+- **Ocean worlds get real biomes**
+  - Continents emerge from the plate field + macro noise.
+  - A lightweight lat/elevation/moisture model assigns **desert / savanna / grass / forest / jungle / tundra / snow**.
+  - Beaches and shallow-water tinting make coastlines pop.
+
+- **Gas giants + clouds: storms & vortices**
+  - Banding is now domain-warped (less “stripey”).
+  - Deterministic vortices create large storm spots + swirling structure.
+
+- **Major CPU-side performance win for normal maps**
+  - Normal map generation now precomputes a height map once and then does finite differences.
+  - This is ~4× cheaper for heavy surfaces (plates + crater loops), and reduces hitches when new bodies stream in.
+
+- **GPU surface synthesis updated**
+  - The `GpuSurfaceCache` fragment shader now mirrors the new plate/crater/biome/storm logic so the default
+    GPU path gets the same visual upgrade.
+
+### Files changed/added
+
+- `src/render/ProceduralPlanet.cpp`
+- `src/render/GpuSurfaceCache.cpp`
+
+## Round 35 — Procedural moons + System Lab
+
+This round fills a major “system-level proc-gen” gap by generating **planet-centric moons**
+with reasonable orbital stability constraints (Hill sphere), and gives you a new in-game
+lab window to inspect the generated architecture.
+
+### What's new
+
+- **Procedural moons in `proc::SystemGenerator`**
+  - Each planet can spawn 0–N moons based on type/mass and available stable orbit space.
+  - Moon orbits are constrained to a fraction of the host planet’s **Hill radius** and are
+    spaced outward with log-ish separation.
+  - **Determinism-preserving design:** moons use a *separate RNG stream per planet*
+    seeded from `SystemStub.seed`, so existing downstream draws (stations, names, etc.)
+    are not perturbed.
+
+- **New sim primitive: `sim::Moon` + `StarSystem::moons`**
+  - Lightweight procedural-only data: `id`, `name`, `type`, `massEarth`, `radiusEarth`,
+    planet-centric `OrbitElements`, and `parentPlanetIndex`.
+
+- **New helpers in `sim::Units`**
+  - `moonPosKm(parentPlanet, moon, tDays)` and `moonVelKmS(...)` compose parent + moon
+    states for rendering/physics.
+
+- **World rendering now draws moons**
+  - Moons get the same planet surface pipeline (procedural surface + normals + optional clouds +
+    atmosphere rim/volumetric) with conservative “air retention” heuristics to avoid tiny moons
+    looking like mini-Earths.
+  - For now moons are **ambience-only** (not targetable/scan targets) to keep the gameplay/UI
+    surface area stable while the new body class settles.
+
+- **New window: Procedural System Lab**
+  - Browse the **current system** or type any system id.
+  - Inspect star parameters, planet table, and a dedicated moons table with Hill-radius fractions.
+
+- **Tests**
+  - Added `test_system_moons.cpp` to validate determinism and basic orbital sanity.
+
+### Files added/changed
+
+- `include/stellar/sim/Celestial.h`
+- `include/stellar/sim/System.h`
+- `include/stellar/sim/Units.h`
+- `src/proc/SystemGenerator.cpp`
+- `apps/stellar_game/main.cpp`
+- `apps/stellar_game/ProceduralSystemLabWindow.h` *(new)*
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp` *(new)*
+- `CMakeLists.txt`
+- `tests/test_system_moons.cpp` *(new)*
+
 ## Round 34 — Galaxy morphology field (bar + ring + warp + flare)
 
 This round adds a **streaming-safe macro morphology field** that layers cleanly with existing inhomogeneity controls

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 
 // NOTE:
 // This file intentionally stays deterministic from (SystemStub.seed + galaxy factions).
@@ -113,6 +114,206 @@ static void setPlanetMassRadius(sim::Planet& p, core::SplitMix64& rng) {
       p.radiusEarth = rr(0.3, 1.8);
       p.massEarth = rr(0.1, 6.0);
       break;
+  }
+}
+
+// -------------------------
+// Moons (procedural only)
+// -------------------------
+//
+// IMPORTANT: These helpers intentionally use their own RNG stream(s) seeded
+// from SystemStub.seed, so adding moons does NOT perturb downstream draws for
+// stations, names, or economy state.
+
+static constexpr double kEarthMassSol = 3.0034146856628466e-6;    // M_earth / M_sun
+static constexpr double kEarthRadiusAU = 4.258750455597227e-5;    // R_earth in AU
+
+static double planetMassSol(const sim::Planet& p) {
+  return std::max(0.0, p.massEarth) * kEarthMassSol;
+}
+
+static double planetRadiusAU(const sim::Planet& p) {
+  return std::max(0.0, p.radiusEarth) * kEarthRadiusAU;
+}
+
+// Hill radius of a planet around its star (AU).
+static double hillRadiusAU(const sim::Planet& p, const sim::Star& star) {
+  const double mStar = std::max(0.08, star.massSol);
+  const double mPlanet = planetMassSol(p);
+  if (mPlanet <= 0.0 || p.orbit.semiMajorAxisAU <= 0.0) return 0.0;
+  return p.orbit.semiMajorAxisAU * std::cbrt(mPlanet / (3.0 * mStar));
+}
+
+static sim::PlanetType pickMoonType(const sim::Planet& host,
+                                    double hostSemiMajorAU,
+                                    const sim::Star& star,
+                                    core::SplitMix64& rng) {
+  // Rough temperature proxy: use star luminosity to compute an Earth-normalized
+  // "distance" scale. Colder systems bias moons toward icy.
+  const double L = std::max(1e-6, star.luminositySol);
+  const double aEq = std::sqrt(L);
+  const double aRel = (aEq > 1e-9) ? (hostSemiMajorAU / aEq) : hostSemiMajorAU;
+
+  const double r = rng.nextDouble();
+
+  // Moons should never be gas giants.
+  if (host.type == sim::PlanetType::GasGiant) {
+    // Beyond ~2 AU (scaled by luminosity), most large moons are icy.
+    if (aRel > 2.0) {
+      if (r < 0.75) return sim::PlanetType::Ice;
+      if (r < 0.93) return sim::PlanetType::Rocky;
+      return sim::PlanetType::Ocean;
+    }
+    // Inner systems: mostly rocky/volcanic (we approximate with Rocky/Desert).
+    if (r < 0.65) return sim::PlanetType::Rocky;
+    if (r < 0.90) return sim::PlanetType::Desert;
+    return sim::PlanetType::Ocean;
+  }
+
+  // Terrestrial planets: rare moons, typically rocky/icy depending on distance.
+  if (aRel > 1.5) {
+    return (r < 0.75) ? sim::PlanetType::Ice : sim::PlanetType::Rocky;
+  }
+  return (r < 0.85) ? sim::PlanetType::Rocky : sim::PlanetType::Desert;
+}
+
+static void setMoonMassRadius(sim::Moon& m, core::SplitMix64& rng) {
+  auto rr = [&](double a, double b) { return rng.range(a, b); };
+
+  // Radius ranges (Earth radii). Keep them modest so moons read visually as moons.
+  switch (m.type) {
+    case sim::PlanetType::Ocean:
+      m.radiusEarth = rr(0.07, 0.40);
+      break;
+    case sim::PlanetType::Ice:
+      m.radiusEarth = rr(0.05, 0.35);
+      break;
+    case sim::PlanetType::Desert:
+      m.radiusEarth = rr(0.05, 0.38);
+      break;
+    case sim::PlanetType::Rocky:
+    default:
+      m.radiusEarth = rr(0.05, 0.42);
+      break;
+  }
+
+  // Simple density proxy relative to Earth.
+  double density = 1.0;
+  switch (m.type) {
+    case sim::PlanetType::Ice: density = rr(0.55, 0.75); break;
+    case sim::PlanetType::Ocean: density = rr(0.65, 0.90); break;
+    case sim::PlanetType::Desert: density = rr(0.85, 1.05); break;
+    case sim::PlanetType::Rocky:
+    default: density = rr(0.90, 1.20); break;
+  }
+
+  // Mass ~ density * radius^3 (Earth units).
+  const double r = std::max(0.01, m.radiusEarth);
+  m.massEarth = std::clamp(density * (r * r * r), 1e-5, 0.25);
+}
+
+static std::string moonSuffix(std::size_t idx) {
+  // a, b, c... (wrap after z)
+  const char c = static_cast<char>('a' + (idx % 26));
+  return std::string(1, c);
+}
+
+static void appendMoonsForPlanet(std::vector<sim::Moon>& out,
+                                 const sim::SystemStub& stub,
+                                 const sim::Star& star,
+                                 const sim::Planet& host,
+                                 std::size_t hostIndex) {
+  // Separate stream per host planet.
+  const core::u64 stream = core::seedFromText("proc.moons.v1");
+  core::SplitMix64 rng(core::hashCombine(stub.seed, core::hashCombine(stream, (core::u64)hostIndex)));
+
+  // Quick gate: tiny bodies rarely hold moons.
+  if (host.massEarth < 0.12 || host.radiusEarth < 0.25) return;
+
+  // Stable satellite band.
+  const double hill = hillRadiusAU(host, star);
+  if (hill <= 0.0) return;
+
+  // Prograde stable region is ~0.5 R_H; we stay comfortably inside.
+  const double aMaxAU = hill * 0.45;
+
+  // Inner cutoff: a few tens of host radii (above Roche + atmosphere).
+  const double hostRAU = planetRadiusAU(host);
+  const double aMinAU = std::max(hostRAU * rng.range(10.0, 22.0), 1.0e-6);
+
+  if (!(aMaxAU > aMinAU * 1.35)) return;
+
+  // Target moon count by host type. Placement may produce fewer due to spacing.
+  int target = 0;
+  switch (host.type) {
+    case sim::PlanetType::GasGiant:
+      target = rng.range(2, 8);
+      break;
+    case sim::PlanetType::Ice:
+      target = rng.chance(0.65) ? rng.range(1, 4) : rng.range(0, 2);
+      break;
+    case sim::PlanetType::Ocean:
+      target = rng.chance(0.25) ? rng.range(1, 2) : 0;
+      break;
+    case sim::PlanetType::Desert:
+    case sim::PlanetType::Rocky:
+    default:
+      target = (host.massEarth > 0.8 && rng.chance(0.30)) ? rng.range(1, 2) : 0;
+      break;
+  }
+
+  // If the host is a gas giant and has room for satellites, guarantee at least one.
+  if (host.type == sim::PlanetType::GasGiant) target = std::max(1, target);
+
+  const std::size_t baseCount = out.size();
+  const std::size_t hardCap = 32; // total moons per system cap (safety)
+
+  double aAU = rng.range(aMinAU * 1.20, aMinAU * 3.00);
+  for (int i = 0; i < target; ++i) {
+    if (out.size() >= hardCap) break;
+
+    if (i == 0) {
+      aAU = rng.range(aMinAU * 1.20, aMinAU * 3.00);
+    } else {
+      aAU *= rng.range(1.40, 2.25);
+    }
+
+    if (aAU > aMaxAU) break;
+
+    sim::Moon m{};
+    m.parentPlanetIndex = static_cast<core::u32>(hostIndex);
+    m.id = core::hashCombine(stub.id, core::hashCombine((core::u64)hostIndex, (core::u64)i));
+    m.name = host.name + " " + moonSuffix((std::size_t)i);
+    m.type = pickMoonType(host, host.orbit.semiMajorAxisAU, star, rng);
+    setMoonMassRadius(m, rng);
+
+    // Orbit: align roughly with the host's orbital plane.
+    m.orbit.semiMajorAxisAU = aAU;
+    m.orbit.eccentricity = rng.range(0.0, 0.06);
+
+    // Small mutual inclination offsets (degrees).
+    const double dInc = math::degToRad(rng.range(-2.0, 2.0));
+    m.orbit.inclinationRad = host.orbit.inclinationRad + dInc;
+    m.orbit.ascendingNodeRad = host.orbit.ascendingNodeRad + rng.range(-0.35, 0.35);
+    m.orbit.argPeriapsisRad = rng.range(0.0, math::kPi * 2.0);
+    m.orbit.meanAnomalyAtEpochRad = rng.range(0.0, math::kPi * 2.0);
+    m.orbit.epochDays = 0.0;
+
+    // Period: Kepler (a in AU, M in solar masses -> P in years).
+    const double mHostSol = std::max(1e-12, planetMassSol(host));
+    const double years = std::sqrt((aAU * aAU * aAU) / mHostSol);
+    m.orbit.periodDays = years * 365.25;
+
+    out.push_back(std::move(m));
+  }
+
+  // Keep moons for the host sorted by semi-major axis to make lab/debug views stable.
+  if (out.size() > baseCount + 1) {
+    std::sort(out.begin() + static_cast<std::ptrdiff_t>(baseCount), out.end(),
+              [](const sim::Moon& a, const sim::Moon& b) {
+                if (a.parentPlanetIndex != b.parentPlanetIndex) return a.parentPlanetIndex < b.parentPlanetIndex;
+                return a.orbit.semiMajorAxisAU < b.orbit.semiMajorAxisAU;
+              });
   }
 }
 
@@ -304,6 +505,13 @@ sim::StarSystem generateSystem(core::u64 universeSeed,
     setPlanetMassRadius(p, rng);
 
     sys.planets.push_back(std::move(p));
+  }
+
+  // Moons (procedural-only): generated from a separate RNG stream per planet so
+  // we don't perturb downstream RNG draws (stations, etc.).
+  sys.moons.clear();
+  for (std::size_t i = 0; i < sys.planets.size(); ++i) {
+    appendMoonsForPlanet(sys.moons, stub, sys.star, sys.planets[i], i);
   }
 
   // ---------------------------------------------------------------------------

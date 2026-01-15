@@ -136,6 +136,7 @@
 #include "ProceduralLabWindow.h"
 #include "ProceduralMeshLabWindow.h"
 #include "ProceduralGalaxyLabWindow.h"
+#include "ProceduralSystemLabWindow.h"
 #include "ProceduralTradeSystemsLabWindow.h"
 #include "SpectralMieLabWindow.h"
 #include "GaussianSurfelReconstructionLabWindow.h"
@@ -488,6 +489,7 @@ static render::Texture2D makeRadialSpriteTextureRGBA(int size,
       rgba[i + 2] = 255;
       rgba[i + 3] = alpha;
     }
+
   }
 
   render::Texture2D out;
@@ -2966,6 +2968,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::ProceduralLabWindowState proceduralLabWindow{};
   game::ProceduralMeshLabWindowState proceduralMeshLabWindow{};
   game::ProceduralGalaxyLabWindowState proceduralGalaxyLabWindow{};
+  game::ProceduralSystemLabWindowState proceduralSystemLabWindow{};
   game::ProceduralTradeSystemsLabWindowState proceduralTradeSystemsLabWindow{};
   game::SpectralMieLabWindowState spectralMieLabWindow{};
   game::GaussianSurfelReconstructionLabWindowState gaussianSurfelReconLabWindow{};
@@ -3593,6 +3596,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralMeshLab", "Procedural Mesh Lab", "Visual", 70, false, true}, &proceduralMeshLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralGalaxyLab", "Procedural Galaxy Lab", "Visual", 70, false, true}, &proceduralGalaxyLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralSystemLab", "Procedural System Lab", "Visual", 70, false, true}, &proceduralSystemLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralTradeSystemsLab", "Procedural Trade Systems", "Visual", 70, false, true}, &proceduralTradeSystemsLabWindow.open,
                                 {}, {}, {}});
@@ -13314,11 +13319,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       particleVerts.clear();
     }
 
-    // ---- Build instances (star + planets) ----
+    // ---- Build instances (star + planets + moons) ----
     // We keep a fallback 'spheres' vector (checker-textured) and also track per-body
     // procedural surface seeds for the optional procedural planet textures.
     std::vector<render::InstanceData> spheres;
-    spheres.reserve(1 + currentSystem->planets.size());
+    const std::size_t nPlanetLikeBodies = currentSystem->planets.size() + currentSystem->moons.size();
+    spheres.reserve(1 + nPlanetLikeBodies);
 
     struct PlanetSurfaceDraw {
       render::InstanceData inst;
@@ -13326,7 +13332,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       core::u64 surfaceSeed;
     };
     std::vector<PlanetSurfaceDraw> planetSurfaceDraws;
-    planetSurfaceDraws.reserve(currentSystem->planets.size());
+    planetSurfaceDraws.reserve(nPlanetLikeBodies);
 
     struct PlanetCloudDraw {
       render::InstanceData inst;
@@ -13334,7 +13340,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       float alphaMul;
     };
     std::vector<PlanetCloudDraw> planetCloudDraws;
-    planetCloudDraws.reserve(currentSystem->planets.size());
+    planetCloudDraws.reserve(nPlanetLikeBodies);
 
     struct PlanetRingDraw {
       render::InstanceData inst;
@@ -13346,10 +13352,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     planetRingDraws.reserve(currentSystem->planets.size());
 
     std::vector<render::InstanceData> planetAtmoDraws;
-    planetAtmoDraws.reserve(currentSystem->planets.size());
+    planetAtmoDraws.reserve(nPlanetLikeBodies);
 
     std::vector<render::VolumetricAtmosphereInstance> planetAtmoVolumetricDraws;
-    planetAtmoVolumetricDraws.reserve(currentSystem->planets.size());
+    planetAtmoVolumetricDraws.reserve(nPlanetLikeBodies);
 
     // Star at origin
     float starR = 1.0f, starG = 0.95f, starB = 0.75f;
@@ -13579,6 +13585,175 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           vi.innerRadius = scale;
           vi.scaleHeight = scaleH;
           // Density multiplier folds in the old per-type artistic strength.
+          vi.densityMul = atmoStrength * (float)(am.seaLevelDensityKgM3 / 1.2);
+          vi.mieMul = mieMul;
+          planetAtmoVolumetricDraws.push_back(vi);
+        }
+      }
+    }
+
+    // Moons (planet-centric orbits). Rendered as planet-like bodies.
+    // For now these are ambience-only: not targetable/scan targets.
+    auto moonAirRetention01 = [](const sim::Moon& m) -> float {
+      // Very rough heuristic: escape velocity scales ~ sqrt(M/R).
+      // Earth => ~1.0, tiny moons => <<1.
+      const double r = std::max(0.05, m.radiusEarth);
+      const double vEscRel = std::sqrt(std::max(0.0, m.massEarth) / r);
+      const double t = std::clamp((vEscRel - 0.55) / (1.05 - 0.55), 0.0, 1.0);
+      // smoothstep
+      return (float)(t * t * (3.0 - 2.0 * t));
+    };
+
+    for (std::size_t mi = 0; mi < currentSystem->moons.size(); ++mi) {
+      const auto& m = currentSystem->moons[mi];
+      if (m.parentPlanetIndex >= currentSystem->planets.size()) continue;
+      const auto& host = currentSystem->planets[m.parentPlanetIndex];
+
+      const math::Vec3d hostPosKm = sim::orbitPosition3DAU(host.orbit, timeDays) * kAU_KM;
+      const math::Vec3d relPosKm = sim::orbitPosition3DAU(m.orbit, timeDays) * kAU_KM;
+      const math::Vec3d posKm = hostPosKm + relPosKm;
+      const math::Vec3d posU = toRenderPosU(posKm);
+
+      const double radiusKm = m.radiusEarth * kEARTH_RADIUS_KM;
+      const float scale = (float)std::max(0.06, (radiusKm / kRENDER_UNIT_KM) * 200.0);
+
+      // Fallback color palette by type (slightly muted vs primary planets).
+      float cr = 0.55f, cg = 0.55f, cb = 0.55f;
+      switch (m.type) {
+        case sim::PlanetType::Rocky:    cr = 0.55f; cg = 0.52f; cb = 0.48f; break;
+        case sim::PlanetType::Desert:   cr = 0.75f; cg = 0.66f; cb = 0.35f; break;
+        case sim::PlanetType::Ocean:    cr = 0.22f; cg = 0.40f; cb = 0.78f; break;
+        case sim::PlanetType::Ice:      cr = 0.68f; cg = 0.84f; cb = 0.95f; break;
+        case sim::PlanetType::GasGiant: cr = 0.62f; cg = 0.52f; cb = 0.40f; break; // should be rare
+        default: break;
+      }
+      const float mute = 0.92f;
+      cr *= mute;
+      cg *= mute;
+      cb *= mute;
+      spheres.push_back(makeInstUniform(posU, scale, cr, cg, cb));
+
+      const core::u64 mSurfaceSeed = core::hashCombine(
+          core::hashCombine(core::fnv1a64("moon_surface"), (core::u64)currentSystem->stub.seed),
+          (core::u64)m.id);
+      planetSurfaceDraws.push_back({makeInstUniform(posU, scale, 1.0f, 1.0f, 1.0f),
+                                    planetSurfaceKind(m.type),
+                                    mSurfaceSeed});
+
+      // ---- Secondary layers: cloud shell + atmosphere rim ----
+      const float var = (float)((mSurfaceSeed >> 24) & 0xFFull) / 255.0f;
+      const float retain = moonAirRetention01(m);
+      float cloudness = 0.0f;
+      float atmoStrength = 0.0f;
+      float atmoR = 0.45f, atmoG = 0.70f, atmoB = 1.00f;
+
+      switch (m.type) {
+        case sim::PlanetType::Rocky:
+          cloudness = 0.08f;
+          atmoStrength = 0.18f;
+          atmoR = 0.45f; atmoG = 0.70f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::Desert:
+          cloudness = 0.05f;
+          atmoStrength = 0.12f;
+          atmoR = 0.90f; atmoG = 0.78f; atmoB = 0.55f;
+          break;
+        case sim::PlanetType::Ocean:
+          cloudness = 0.20f;
+          atmoStrength = 0.30f;
+          atmoR = 0.38f; atmoG = 0.67f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::Ice:
+          cloudness = 0.12f;
+          atmoStrength = 0.14f;
+          atmoR = 0.65f; atmoG = 0.85f; atmoB = 1.00f;
+          break;
+        case sim::PlanetType::GasGiant:
+          cloudness = 0.35f;
+          atmoStrength = 0.42f;
+          atmoR = 0.55f; atmoG = 0.75f; atmoB = 1.00f;
+          break;
+        default:
+          break;
+      }
+
+      cloudness *= retain;
+      atmoStrength *= retain;
+
+      cloudness *= (0.85f + 0.30f * var);
+      atmoStrength *= (0.85f + 0.25f * var);
+
+      if (worldAtmoTintWithStar) {
+        const float tr = 0.35f + 0.65f * starR;
+        const float tg = 0.35f + 0.65f * starG;
+        const float tb = 0.35f + 0.65f * starB;
+        atmoR *= tr;
+        atmoG *= tg;
+        atmoB *= tb;
+      }
+
+      if (worldUseProceduralSurfaces && worldCloudsEnabled && cloudness > 1e-4f) {
+        core::u64 cloudSeed = core::hashCombine(mSurfaceSeed, core::fnv1a64("clouds"));
+        cloudSeed = core::hashCombine(cloudSeed, (core::u64)(int)m.type);
+
+        const double cloudScale = (double)scale * (double)worldCloudShellScale;
+        const double phase = (double)((cloudSeed >> 10) & 0xFFFFull) / 65535.0 * (2.0 * math::kPi);
+        const double speed = math::degToRad((double)worldCloudSpinDegPerSec) * (0.4 + 1.2 * (double)var);
+        const double ang = phase + timeRealSec * speed;
+        const math::Quatd q = math::Quatd::fromAxisAngle({0, 1, 0}, ang);
+
+        PlanetCloudDraw cd{};
+        cd.inst = makeInst(posU, {cloudScale, cloudScale, cloudScale}, q, 1.0f, 1.0f, 1.0f);
+        cd.cloudSeed = cloudSeed;
+        cd.alphaMul = worldCloudOpacity * cloudness;
+        planetCloudDraws.push_back(cd);
+      }
+
+      if (worldAtmospheresEnabled && atmoStrength > 1e-4f) {
+        const double atmoScale = (double)scale * (double)worldAtmoShellScale;
+        planetAtmoDraws.push_back(makeInstUniform(posU, atmoScale,
+                                                  atmoR * atmoStrength,
+                                                  atmoG * atmoStrength,
+                                                  atmoB * atmoStrength));
+      }
+
+      if (worldAtmospheresEnabled && worldAtmospheresVolumetricEnabled && atmoStrength > 1e-4f) {
+        sim::Planet mp{};
+        mp.type = m.type;
+        mp.massEarth = m.massEarth;
+        mp.radiusEarth = m.radiusEarth;
+        const sim::AtmosphereModel am = sim::atmosphereModelForPlanet(mp);
+        if (am.hasAtmosphere && am.topAltitudeKm > 0.1) {
+          const double kmToScale = 200.0 / kRENDER_UNIT_KM;
+          const float thickness = (float)(am.topAltitudeKm * kmToScale * (double)worldAtmoVolumetricThicknessMul);
+          const float outer = scale + std::max(1e-4f, thickness);
+          const float scaleH = (float)(am.scaleHeightKm * kmToScale);
+
+          float mieMul = 1.0f;
+          switch (m.type) {
+            case sim::PlanetType::Desert:   mieMul = 1.35f; break;
+            case sim::PlanetType::Ocean:    mieMul = 0.85f; break;
+            case sim::PlanetType::Ice:      mieMul = 0.95f; break;
+            case sim::PlanetType::GasGiant: mieMul = 1.10f; break;
+            default:                        mieMul = 1.0f; break;
+          }
+
+          render::VolumetricAtmosphereInstance vi{};
+          vi.px = (float)posU.x;
+          vi.py = (float)posU.y;
+          vi.pz = (float)posU.z;
+          vi.sx = outer;
+          vi.sy = outer;
+          vi.sz = outer;
+          vi.qx = 0.0f;
+          vi.qy = 0.0f;
+          vi.qz = 0.0f;
+          vi.qw = 1.0f;
+          vi.cr = atmoR;
+          vi.cg = atmoG;
+          vi.cb = atmoB;
+          vi.innerRadius = scale;
+          vi.scaleHeight = scaleH;
           vi.densityMul = atmoStrength * (float)(am.seaLevelDensityKgM3 / 1.2);
           vi.mieMul = mieMul;
           planetAtmoVolumetricDraws.push_back(vi);
@@ -15858,6 +16033,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralSystemLabWindow(proceduralSystemLabWindow, universe, currentSystem ? currentSystem->stub.id : 0, timeDays, (float)timeRealSec,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralTradeSystemsLabWindow(proceduralTradeSystemsLabWindow, universe, currentSystem, (float)timeRealSec,

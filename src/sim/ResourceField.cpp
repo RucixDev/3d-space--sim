@@ -2,6 +2,7 @@
 
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
+#include "stellar/core/LowDiscrepancy.h"
 #include "stellar/math/Math.h"
 
 #include <algorithm>
@@ -15,6 +16,25 @@ const char* resourceFieldKindName(ResourceFieldKind k) {
     case ResourceFieldKind::MetalPocket: return "Metal Pocket";
     case ResourceFieldKind::IceField: return "Ice Field";
     default: return "Resource Field";
+  }
+}
+
+const char* resourceFieldLayoutName(ResourceFieldLayout l) {
+  switch (l) {
+    case ResourceFieldLayout::Cluster: return "Cluster";
+    case ResourceFieldLayout::Torus: return "Torus";
+    case ResourceFieldLayout::Sheet: return "Sheet";
+    default: return "Layout";
+  }
+}
+
+const char* resourceFieldFeatureKindName(ResourceFieldFeatureKind k) {
+  switch (k) {
+    case ResourceFieldFeatureKind::Hotspot: return "Hotspot";
+    case ResourceFieldFeatureKind::Gap: return "Gap";
+    case ResourceFieldFeatureKind::Streak: return "Streak";
+    case ResourceFieldFeatureKind::Spokes: return "Spokes";
+    default: return "Feature";
   }
 }
 
@@ -59,20 +79,28 @@ static ResourceFieldLayout layoutFor(ResourceFieldKind k) {
   }
 }
 
-// Sample a point in the unit sphere (uniform volume) via rejection sampling.
-static math::Vec3d randInUnitSphere(core::SplitMix64& rng) {
-  for (int i = 0; i < 24; ++i) {
-    const double x = rng.range(-1.0, 1.0);
-    const double y = rng.range(-1.0, 1.0);
-    const double z = rng.range(-1.0, 1.0);
-    const double d2 = x * x + y * y + z * z;
-    if (d2 > 1e-12 && d2 <= 1.0) return {x, y, z};
-  }
-  return {0.0, 0.0, 0.0};
+// Wrap an angle to (-pi, pi].
+static double wrapAnglePi(double a) {
+  const double twoPi = 2.0 * math::kPi;
+  a = std::fmod(a + math::kPi, twoPi);
+  if (a < 0.0) a += twoPi;
+  return a - math::kPi;
 }
 
-// Generate a candidate asteroid position inside the site's layout.
-static math::Vec3d sampleLayoutPos(const ResourceFieldSite& site, core::SplitMix64& rng) {
+static double gauss01(double x, double sigma) {
+  const double s = std::max(1e-9, sigma);
+  const double t = x / s;
+  return std::exp(-0.5 * t * t);
+}
+
+static double softSat01(double x) {
+  // Smoothly map x>=0 to [0,1).
+  return 1.0 - std::exp(-std::max(0.0, x));
+}
+
+// Generate a candidate asteroid position inside the site's layout from three
+// uniform random numbers in [0,1).
+static math::Vec3d sampleLayoutPos01(const ResourceFieldSite& site, double u0, double u1, double u2) {
   constexpr double kTwoPi = 6.28318530717958647692;
 
   const math::Vec3d X = site.basisX;
@@ -85,18 +113,27 @@ static math::Vec3d sampleLayoutPos(const ResourceFieldSite& site, core::SplitMix
       const double rx = std::max(1.0, site.majorRadiusKm);
       const double ry = std::max(1.0, site.minorRadiusKm);
       const double rz = std::max(1.0, site.majorRadiusKm);
-      const math::Vec3d u = randInUnitSphere(rng);
-      return site.posKm + X * (u.x * rx) + Y * (u.y * ry) + Z * (u.z * rz);
+
+      // Uniform volume in unit sphere:
+      //  - pick a direction uniformly on the unit sphere from (u1,u2)
+      //  - pick a radius ~ cbrt(u0)
+      const double r = std::cbrt(std::clamp(u0, 0.0, 1.0));
+      const double z0 = 1.0 - 2.0 * std::clamp(u1, 0.0, 1.0);
+      const double phi = std::clamp(u2, 0.0, 1.0) * kTwoPi;
+      const double s = std::sqrt(std::max(0.0, 1.0 - z0 * z0));
+
+      const math::Vec3d dir{ s * std::cos(phi), z0, s * std::sin(phi) };
+      return site.posKm + X * (dir.x * r * rx) + Y * (dir.y * r * ry) + Z * (dir.z * r * rz);
     }
     case ResourceFieldLayout::Sheet: {
       // Uniform disc in plane (X/Z) with a small thickness along Y.
       const double R = std::max(1.0, site.majorRadiusKm);
       const double T = std::max(0.0, site.minorRadiusKm);
-      const double u0 = rng.nextDouble();
-      const double u1 = rng.nextDouble();
-      const double r = std::sqrt(std::max(0.0, u0)) * R;
-      const double th = u1 * kTwoPi;
-      const double y = rng.range(-T, T);
+
+      const double r = std::sqrt(std::max(0.0, std::clamp(u0, 0.0, 1.0))) * R;
+      const double th = std::clamp(u1, 0.0, 1.0) * kTwoPi;
+      const double y = (std::clamp(u2, 0.0, 1.0) * 2.0 - 1.0) * T;
+
       return site.posKm + X * (r * std::cos(th)) + Z * (r * std::sin(th)) + Y * y;
     }
     case ResourceFieldLayout::Torus: {
@@ -105,19 +142,17 @@ static math::Vec3d sampleLayoutPos(const ResourceFieldSite& site, core::SplitMix
       const double rTube = std::max(0.0, site.minorRadiusKm);
 
       // Arc coverage.
-      double phi = rng.nextDouble() * kTwoPi;
+      double phi = std::clamp(u0, 0.0, 1.0) * kTwoPi;
       if (site.arcRad < kTwoPi - 1e-6) {
         const double half = 0.5 * std::max(0.0, site.arcRad);
-        phi = site.arcCenterRad + rng.range(-half, half);
+        phi = site.arcCenterRad + (std::clamp(u0, 0.0, 1.0) * 2.0 - 1.0) * half;
       }
 
       const math::Vec3d radial = X * std::cos(phi) + Z * std::sin(phi);
 
       // Cross-section circle in the plane spanned by (radial, Y).
-      const double u0 = rng.nextDouble();
-      const double u1 = rng.nextDouble();
-      const double rr = std::sqrt(std::max(0.0, u0)) * rTube;
-      const double th = u1 * kTwoPi;
+      const double rr = std::sqrt(std::max(0.0, std::clamp(u1, 0.0, 1.0))) * rTube;
+      const double th = std::clamp(u2, 0.0, 1.0) * kTwoPi;
       const math::Vec3d off = radial * (rr * std::cos(th)) + Y * (rr * std::sin(th));
 
       return site.posKm + radial * R + off;
@@ -126,6 +161,12 @@ static math::Vec3d sampleLayoutPos(const ResourceFieldSite& site, core::SplitMix
 
   return site.posKm;
 }
+
+// Stochastic fallback sampler.
+static math::Vec3d sampleLayoutPos(const ResourceFieldSite& site, core::SplitMix64& rng) {
+  return sampleLayoutPos01(site, rng.nextDouble(), rng.nextDouble(), rng.nextDouble());
+}
+
 
 struct KindProfile {
   ResourceFieldKind kind{ResourceFieldKind::OreBelt};
@@ -156,11 +197,159 @@ static ResourceFieldKind pickKind(core::SplitMix64& rng) {
   return ResourceFieldKind::IceField;
 }
 
+std::vector<ResourceFieldFeature> filterFeaturesForField(const std::vector<ResourceFieldFeature>& features,
+                                                         core::u64 fieldId) {
+  std::vector<ResourceFieldFeature> out;
+  out.reserve(features.size());
+  for (const auto& f : features) {
+    if (f.fieldId == fieldId) out.push_back(f);
+  }
+  return out;
+}
+
+static math::Vec3d fieldLocalKm(const ResourceFieldSite& site, const math::Vec3d& worldPosKm) {
+  const math::Vec3d d = worldPosKm - site.posKm;
+  return {math::dot(d, site.basisX), math::dot(d, site.basisY), math::dot(d, site.basisZ)};
+}
+
+static double torusArcMask01(const ResourceFieldSite& site, double phiRad) {
+  constexpr double kTwoPi = 6.28318530717958647692;
+  if (site.layout != ResourceFieldLayout::Torus) return 1.0;
+  if (site.arcRad >= kTwoPi - 1e-6) return 1.0;
+
+  const double half = 0.5 * std::max(0.0, site.arcRad);
+  const double d = wrapAnglePi(phiRad - site.arcCenterRad);
+  // Smooth falloff at arc boundaries.
+  const double a = std::abs(d);
+  const double edge = std::max(1e-6, half);
+  if (a <= edge) {
+    // Fade over ~10 degrees to avoid hard steps in heatmaps.
+    const double fade = math::degToRad(10.0);
+    const double t = math::clamp((edge - a) / std::max(1e-6, fade), 0.0, 1.0);
+    return t;
+  }
+  return 0.0;
+}
+
+static double density01Local(const ResourceFieldSite& site,
+                             const std::vector<ResourceFieldFeature>& features,
+                             const math::Vec3d& localKm) {
+  const double x = localKm.x;
+  const double y = localKm.y;
+  const double z = localKm.z;
+
+  const double major = std::max(1.0, site.majorRadiusKm);
+  const double minor = std::max(1.0, site.minorRadiusKm);
+
+  if (site.layout == ResourceFieldLayout::Cluster) {
+    // Normalize to unit-ish ellipsoid.
+    const math::Vec3d p{x / major, y / minor, z / major};
+    const double r2 = p.lengthSq();
+    const double base = std::exp(-r2 / (2.0 * 0.62 * 0.62));
+
+    double peaks = 0.0;
+    for (const auto& f : features) {
+      if (f.fieldId != site.id) continue;
+      if (f.kind != ResourceFieldFeatureKind::Hotspot) continue;
+      const double sigma = std::max(0.05, f.width);
+      const math::Vec3d dp = p - f.localPos;
+      const double d2 = dp.lengthSq();
+      peaks += std::clamp(f.strength01, 0.0, 1.0) * std::exp(-d2 / (2.0 * sigma * sigma));
+    }
+
+    const double peak01 = softSat01(peaks);
+    const double dens = (0.25 + 0.55 * base) + 0.55 * peak01;
+    return std::clamp(dens, 0.0, 1.0);
+  }
+
+  if (site.layout == ResourceFieldLayout::Sheet) {
+    const double r = std::sqrt(x * x + z * z);
+    const double rr = std::clamp(r / major, 0.0, 1.0);
+    // Dense toward the center; fade at the outer edge.
+    double base = 1.0 - rr * rr;
+    base = base * base;
+
+    // Thin the sheet in Y.
+    const double thick = gauss01(y, minor * 0.85 + 1.0);
+
+    double peaks = 0.0;
+    for (const auto& f : features) {
+      if (f.fieldId != site.id) continue;
+      if (f.kind != ResourceFieldFeatureKind::Streak) continue;
+      const double theta = f.angleRad;
+      const double w = std::max(150.0, f.width);
+
+      // Perpendicular distance to the streak line (through the origin) in local X/Z.
+      const double d = std::abs(x * std::sin(theta) - z * std::cos(theta));
+      double s = gauss01(d, w);
+
+      // Fade streaks outward a bit so they don't dominate the whole disc.
+      s *= (0.35 + 0.65 * (1.0 - rr));
+
+      peaks += std::clamp(f.strength01, 0.0, 1.0) * s;
+    }
+
+    const double peak01 = softSat01(peaks);
+    const double dens = (0.35 + 0.65 * base) * thick * std::clamp(0.60 + 0.70 * peak01, 0.0, 1.0);
+    return std::clamp(dens, 0.0, 1.0);
+  }
+
+  // Torus (belt)
+  const double r = std::sqrt(x * x + z * z);
+  const double dr = r - major;
+  const double tube = std::sqrt(dr * dr + y * y);
+  const double tube01 = std::clamp(1.0 - tube / (minor * 1.05 + 1.0), 0.0, 1.0);
+
+  const double phi = std::atan2(z, x);
+  const double arcMask = torusArcMask01(site, phi);
+  if (arcMask <= 1e-6) return 0.0;
+
+  double dipMul = 1.0;
+  double peaks = 0.0;
+  double spokeMul = 1.0;
+
+  for (const auto& f : features) {
+    if (f.fieldId != site.id) continue;
+    if (f.kind == ResourceFieldFeatureKind::Gap) {
+      const double w = std::max(1e-4, f.width);
+      const double d = wrapAnglePi(phi - f.angleRad);
+      const double g = gauss01(d, w);
+      dipMul *= (1.0 - std::clamp(f.strength01, 0.0, 1.0) * g);
+    } else if (f.kind == ResourceFieldFeatureKind::Hotspot) {
+      const double w = std::max(1e-4, f.width);
+      const double d = wrapAnglePi(phi - f.angleRad);
+      const double g = gauss01(d, w);
+      peaks += std::clamp(f.strength01, 0.0, 1.0) * g;
+    } else if (f.kind == ResourceFieldFeatureKind::Spokes) {
+      // param encodes frequency; angleRad is phase.
+      const int m = std::clamp((int)std::llround(f.param), 3, 24);
+      const double amp = std::clamp(f.strength01, 0.0, 1.0) * std::clamp(f.width, 0.0, 1.0);
+      const double t = 0.5 + 0.5 * std::cos((double)m * (phi - f.angleRad));
+      // Blend between flat (1.0) and spokes (0.65..1.0).
+      const double spoke = 0.65 + 0.35 * t;
+      spokeMul *= math::lerp(1.0, spoke, amp);
+    }
+  }
+
+  const double peak01 = softSat01(peaks);
+  const double base = 0.22 + 0.78 * std::pow(tube01, 0.75);
+  const double ang = std::clamp(0.70 + 0.60 * peak01, 0.0, 1.0) * std::clamp(dipMul, 0.0, 1.0) * spokeMul;
+
+  return std::clamp(base * ang * arcMask, 0.0, 1.0);
+}
+
+double resourceFieldDensity01(const ResourceFieldSite& site,
+                              const std::vector<ResourceFieldFeature>& features,
+                              const math::Vec3d& worldPosKm) {
+  return density01Local(site, features, fieldLocalKm(site, worldPosKm));
+}
+
 ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
                                         SystemId systemId,
                                         const math::Vec3d& anchorPosKm,
                                         double anchorCommsRangeKm,
-                                        int fieldCount) {
+                                        int fieldCount,
+                                        math::Vec3d preferredPlaneNormalKm) {
   ResourceFieldPlan plan{};
   if (fieldCount <= 0) return plan;
 
@@ -172,6 +361,9 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
   core::SplitMix64 prng(core::hashCombine(sysKey, 0x5245534649454C44ull));
 
   plan.fields.reserve(static_cast<std::size_t>(fieldCount));
+  // Features are small and sparse; reserve a bit to avoid churn.
+  plan.features.reserve(static_cast<std::size_t>(fieldCount) * 12u);
+  plan.features.reserve(static_cast<std::size_t>(fieldCount) * 12);
 
   for (int i = 0; i < fieldCount; ++i) {
     const ResourceFieldKind kind = pickKind(prng);
@@ -203,9 +395,25 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
     // Layout geometry (stable per-field id).
     site.layout = layoutFor(kind);
     {
-      // Pick a stable plane normal for sheet/torus (and an arbitrary orientation for clusters).
-      const math::Vec3d n = randUnitVec(frng);
+      // Pick a stable plane normal for sheet/torus.
+      // If the caller provides a preferred plane normal (e.g., the anchor station's
+      // orbital angular momentum direction), align belts/sheets to that plane.
+      math::Vec3d n = preferredPlaneNormalKm;
+      if (n.lengthSq() < 1e-12) {
+        n = randUnitVec(frng);
+      }
       buildOrthonormalBasis(n, site.basisX, site.basisY, site.basisZ);
+
+      // Randomize the in-plane rotation (stable per-field) so multiple fields can share
+      // the same plane without being axis-aligned to each other.
+      constexpr double kTwoPi = 6.28318530717958647692;
+      const double rot = frng.nextDouble() * kTwoPi;
+      const double c = std::cos(rot);
+      const double s = std::sin(rot);
+      const math::Vec3d X0 = site.basisX;
+      const math::Vec3d Z0 = site.basisZ;
+      site.basisX = X0 * c + Z0 * s;
+      site.basisZ = Z0 * c - X0 * s;
 
       // Radii tuned to sit in the same overall size band as the legacy generator
       // (so field discoverability / scanning doesn't change drastically).
@@ -242,6 +450,97 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
       }
     }
 
+    // --- Structural features (gaps, hotspots, streaks, spokes) ---
+    //
+    // These are used by the density function to make fields feel less uniform
+    // while still being fully deterministic.
+    {
+      core::SplitMix64 srng(core::hashCombine(site.id, core::fnv1a64("struct")));
+      constexpr double kTwoPi = 6.28318530717958647692;
+
+      const auto add = [&](ResourceFieldFeatureKind kind) -> ResourceFieldFeature& {
+        plan.features.push_back({});
+        auto& f = plan.features.back();
+        f.fieldId = site.id;
+        f.kind = kind;
+        return f;
+      };
+
+      if (site.layout == ResourceFieldLayout::Torus) {
+        const double arcFrac = std::clamp(site.arcRad / kTwoPi, 0.0, 1.0);
+
+        // Belt gaps (think resonant depletion bands / shepherding).
+        int gapCount = srng.range(1, 3);
+        if (arcFrac < 0.80) gapCount = std::min(gapCount, 1);
+        for (int g = 0; g < gapCount; ++g) {
+          auto& f = add(ResourceFieldFeatureKind::Gap);
+          const double center = (site.arcRad < kTwoPi - 1e-6)
+                                    ? (site.arcCenterRad + srng.range(-0.45, 0.45) * site.arcRad)
+                                    : srng.range(0.0, kTwoPi);
+          f.angleRad = center;
+          f.width = srng.range(math::degToRad(8.0), math::degToRad(22.0));
+          f.strength01 = srng.range(0.55, 0.92);
+        }
+
+        // Hotspots / clumps (collision families, rubble piles).
+        int hotCount = srng.range(2, 5);
+        if (site.richness > 1.15) hotCount += 1;
+        hotCount = std::clamp(hotCount, 1, 6);
+        for (int h = 0; h < hotCount; ++h) {
+          auto& f = add(ResourceFieldFeatureKind::Hotspot);
+          const double center = (site.arcRad < kTwoPi - 1e-6)
+                                    ? (site.arcCenterRad + srng.range(-0.48, 0.48) * site.arcRad)
+                                    : srng.range(0.0, kTwoPi);
+          f.angleRad = center;
+          f.width = srng.range(math::degToRad(6.0), math::degToRad(18.0));
+          f.strength01 = srng.range(0.30, 0.95);
+        }
+
+        // Subtle azimuthal spokes (texture-like modulation).
+        if (srng.chance(0.55)) {
+          auto& f = add(ResourceFieldFeatureKind::Spokes);
+          f.angleRad = srng.range(0.0, kTwoPi);  // phase
+          f.param = (double)srng.range(6, 14);   // frequency
+          f.width = srng.range(0.35, 0.95);      // amplitude control (clamped in density fn)
+          f.strength01 = srng.range(0.25, 0.80);
+        }
+      } else if (site.layout == ResourceFieldLayout::Sheet) {
+        // Filament-like streaks.
+        int streakCount = srng.range(2, 5);
+        if (site.kind == ResourceFieldKind::IceField) streakCount += 1;
+        streakCount = std::clamp(streakCount, 1, 6);
+
+        for (int s = 0; s < streakCount; ++s) {
+          auto& f = add(ResourceFieldFeatureKind::Streak);
+          f.angleRad = srng.range(0.0, math::kPi); // direction (pi-periodic)
+          f.width = std::max(250.0, site.majorRadiusKm * srng.range(0.035, 0.095));
+          f.strength01 = srng.range(0.25, 0.90);
+        }
+      } else {
+        // Cluster pockets/sub-clumps.
+        int hotCount = srng.range(2, 4);
+        if (site.kind == ResourceFieldKind::MetalPocket) hotCount += 1;
+        hotCount = std::clamp(hotCount, 1, 6);
+
+        for (int h = 0; h < hotCount; ++h) {
+          auto& f = add(ResourceFieldFeatureKind::Hotspot);
+          // Sample a point inside a unit sphere and keep it away from the edge.
+          const double u0 = srng.nextDouble();
+          const double u1 = srng.nextDouble();
+          const double u2 = srng.nextDouble();
+
+          const double r = std::cbrt(std::clamp(u0, 0.0, 1.0)) * 0.78;
+          const double z0 = 1.0 - 2.0 * std::clamp(u1, 0.0, 1.0);
+          const double phi = std::clamp(u2, 0.0, 1.0) * kTwoPi;
+          const double s = std::sqrt(std::max(0.0, 1.0 - z0 * z0));
+
+          f.localPos = {s * std::cos(phi) * r, z0 * r, s * std::sin(phi) * r};
+          f.width = srng.range(0.14, 0.38);
+          f.strength01 = srng.range(0.35, 0.95);
+        }
+      }
+    }
+
     plan.fields.push_back(site);
 
     // --- Asteroids ---
@@ -255,6 +554,14 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
     count = std::max(count, 28);
 
     plan.asteroids.reserve(plan.asteroids.size() + static_cast<std::size_t>(count));
+
+    // Quasi-random (low discrepancy) candidate set rotation for this field.
+    // This reduces structured aliasing from pure Halton points while keeping determinism.
+    core::SplitMix64 qmcRng(core::hashCombine(site.id, core::fnv1a64("qmc")));
+    const double qmcShift0 = qmcRng.nextDouble();
+    const double qmcShift1 = qmcRng.nextDouble();
+    const double qmcShift2 = qmcRng.nextDouble();
+    constexpr int kCandidates = 16;
 
     for (int j = 0; j < count; ++j) {
       const core::u64 asteroidId = makeDeterministicWorldId(site.id, static_cast<core::u64>(j));
@@ -271,45 +578,88 @@ ResourceFieldPlan generateResourceFields(core::u64 universeSeed,
       // Size first (keeps radius stable even if we need to resample position for spacing).
       a.radiusKm = propRng.range(2500.0, 8200.0);
 
-      // --- Position (layout-aware, with simple blue-noise spacing) ---
-      // We use a deterministic rejection sampler to avoid obvious clumps/overlaps.
-      // Field sizes are small (<=42 rocks), so O(n^2) checks are fine.
+      // --- Position (layout-aware, deterministic blue-noise spacing) ---
+      //
+      // We place asteroids using a fixed-size quasi-random candidate set (Halton bases 2/3/5)
+      // and pick the candidate that maximizes clearance to previously placed asteroids in the
+      // same field (Mitchell "best-candidate" style). This tends to avoid visible clumps
+      // without relying on unbounded rejection loops.
       const double padKm = 1800.0;
       const double baseMinSep = 2.0 * a.radiusKm + padKm;
 
-      math::Vec3d pos = site.posKm;
-      bool placed = false;
-
-      // Rebuild a small local list of already-placed asteroids for this field.
-      // NOTE: This is done per asteroid so we don't need to keep an additional
-      // container in the plan; count is tiny so the overhead is negligible.
-      // We only compare against earlier asteroids in the same field.
-      for (int attempt = 0; attempt < 48 && !placed; ++attempt) {
-        pos = sampleLayoutPos(site, posRng);
-
-        const double minSep = std::max(4500.0, baseMinSep * (0.96 - 0.006 * (double)attempt));
-        placed = true;
-
-        // Compare against earlier asteroids in this field that are already in the plan.
-        // We can scan backwards a small amount; worst case is small.
-        const std::size_t scanLimit = 96; // at most 42 per field, but keep a small cap
-        std::size_t scanned = 0;
-        for (std::size_t k = plan.asteroids.size(); k > 0 && scanned < scanLimit; --k, ++scanned) {
-          const auto& prev = plan.asteroids[k - 1];
+      auto minClearanceKm = [&](const math::Vec3d& candidate, double dens01) -> double {
+        double minClear = 1.0e30;
+        for (const auto& prev : plan.asteroids) {
           if (prev.fieldId != site.id) continue;
-          const double d2 = (prev.posKm - pos).lengthSq();
-          const double req = (prev.radiusKm + a.radiusKm) * 1.85 + padKm;
-          const double req2 = std::max(minSep, req);
-          if (d2 < req2 * req2) { placed = false; break; }
+          const double d = (prev.posKm - candidate).length();
+          // Variable-density spacing: in hotspots we allow tighter packing, while
+          // voids have a slightly larger exclusion radius.
+          const double densPair = 0.5 * (std::clamp(dens01, 0.0, 1.0) + std::clamp(prev.density01, 0.0, 1.0));
+          const double sepMul = math::lerp(1.28, 0.78, densPair);
+          const double baseReq = std::max(baseMinSep, (prev.radiusKm + a.radiusKm) * 1.85 + padKm);
+          const double req = baseReq * sepMul;
+          minClear = std::min(minClear, d - req);
+        }
+        return minClear;
+      };
+
+      math::Vec3d pos = site.posKm;
+      double bestScore = -1.0e30;
+      double bestClear = -1.0e30;
+      double bestDens = 1.0;
+
+      // Bias: density is in [0,1] so this is a modest tie-breaker.
+      const double densityBiasKm = baseMinSep * 0.45;
+
+      // Candidate set: unique slice per asteroid index so patterns don't repeat.
+      for (int c = 0; c < kCandidates; ++c) {
+        const std::uint32_t idx = static_cast<std::uint32_t>(j * kCandidates + c + 1);
+        const auto h = core::halton3(idx);
+
+        const double u0 = core::frac(h.x + qmcShift0);
+        const double u1 = core::frac(h.y + qmcShift1);
+        const double u2 = core::frac(h.z + qmcShift2);
+
+        const math::Vec3d candidate = sampleLayoutPos01(site, u0, u1, u2);
+        const double dens01 = resourceFieldDensity01(site, plan.features, candidate);
+        const double clearance = minClearanceKm(candidate, dens01);
+        const double score = clearance + dens01 * densityBiasKm;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestClear = clearance;
+          bestDens = dens01;
+          pos = candidate;
         }
       }
+
+      bool placed = (bestClear >= 0.0) || (j == 0);
+
+      // Fallback stochastic search (rare; mostly triggers for unusually dense pockets).
+      for (int attempt = 0; attempt < 96 && !placed; ++attempt) {
+        const math::Vec3d candidate = sampleLayoutPos(site, posRng);
+        const double dens01 = resourceFieldDensity01(site, plan.features, candidate);
+        const double clearance = minClearanceKm(candidate, dens01);
+        if (clearance >= 0.0) {
+          pos = candidate;
+          bestDens = dens01;
+          placed = true;
+        }
+      }
+
       a.posKm = pos;
+      a.density01 = std::clamp(bestDens, 0.0, 1.0);
 
-      // Yield mix (primary dominates).
-      a.yield = propRng.chance(site.secondaryChance) ? site.secondary : site.primary;
+      // Yield mix (primary dominates). In hotspots, secondary deposits are a bit
+      // more likely to appear.
+      double secondaryChance = site.secondaryChance;
+      secondaryChance *= (0.72 + 0.70 * a.density01);
+      secondaryChance = std::clamp(secondaryChance, 0.01, 0.80);
+      a.yield = propRng.chance(secondaryChance) ? site.secondary : site.primary;
 
-      // Units scale with radius and richness; secondary goods are slightly scarcer.
+      // Units scale with radius, richness, and local density. Secondary goods are slightly scarcer.
       double baseUnits = propRng.range(90.0, 260.0) * (a.radiusKm / 5000.0) * site.richness;
+      baseUnits *= (0.80 + 0.60 * a.density01);
       if (a.yield == site.secondary) baseUnits *= 0.68;
       if (a.yield == econ::CommodityId::Water) baseUnits *= 0.80;
       a.baseUnits = std::max(1.0, baseUnits);

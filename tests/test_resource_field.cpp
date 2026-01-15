@@ -20,10 +20,13 @@ int test_resource_field() {
   const stellar::math::Vec3d anchorPosKm{1000.0, -2000.0, 500.0};
   const double commsKm = 120000.0;
 
-  const auto p0 = stellar::sim::generateResourceFields(seed, systemId, anchorPosKm, commsKm, 3);
-  const auto p1 = stellar::sim::generateResourceFields(seed, systemId, anchorPosKm, commsKm, 3);
+  const stellar::math::Vec3d planeN{0.0, 1.0, 0.0};
 
-  if (p0.fields.size() != p1.fields.size() || p0.asteroids.size() != p1.asteroids.size()) {
+  const auto p0 = stellar::sim::generateResourceFields(seed, systemId, anchorPosKm, commsKm, 3, planeN);
+  const auto p1 = stellar::sim::generateResourceFields(seed, systemId, anchorPosKm, commsKm, 3, planeN);
+
+  if (p0.fields.size() != p1.fields.size() || p0.asteroids.size() != p1.asteroids.size() ||
+      p0.features.size() != p1.features.size()) {
     std::cerr << "[test_resource_field] determinism: size mismatch\n";
     ++fails;
   }
@@ -77,12 +80,52 @@ int test_resource_field() {
       std::cerr << "[test_resource_field] basis not orthonormal-ish at i=" << i << "\n";
       ++fails;
     }
+
+    // Preferred plane normal should be honored (within tolerance).
+    const double align = stellar::math::dot(a.basisY, planeN.normalized());
+    if (align < 0.98) {
+      std::cerr << "[test_resource_field] basisY not aligned with preferred plane normal at i=" << i
+                << " (align=" << align << ")\n";
+      ++fails;
+    }
+  }
+
+  // Feature determinism.
+  const std::size_t nFeat = std::min(p0.features.size(), p1.features.size());
+  for (std::size_t i = 0; i < nFeat; ++i) {
+    const auto& a = p0.features[i];
+    const auto& b = p1.features[i];
+    if (a.fieldId != b.fieldId || a.kind != b.kind) {
+      std::cerr << "[test_resource_field] determinism: feature mismatch at i=" << i << "\n";
+      ++fails;
+      break;
+    }
+    if (!near(a.angleRad, b.angleRad, 1e-12) || !near(a.width, b.width, 1e-12) || !near(a.strength01, b.strength01, 1e-12) ||
+        !near(a.param, b.param, 1e-12) || !near3(a.localPos, b.localPos, 1e-12)) {
+      std::cerr << "[test_resource_field] determinism: feature params mismatch at i=" << i << "\n";
+      ++fails;
+      break;
+    }
   }
 
   // Build a lookup for field metadata.
   std::unordered_map<stellar::core::u64, const stellar::sim::ResourceFieldSite*> fieldById;
   fieldById.reserve(p0.fields.size() * 2 + 1);
   for (const auto& f : p0.fields) fieldById[f.id] = &f;
+
+  // Every field should have at least one structural feature.
+  for (const auto& f : p0.fields) {
+    int n = 0;
+    for (const auto& ft : p0.features) {
+      if (ft.fieldId == f.id) ++n;
+    }
+    if (n <= 0) {
+      std::cerr << "[test_resource_field] expected features for field id=" << f.id << "\n";
+      ++fails;
+      break;
+    }
+  }
+  if (fails != 0) return fails;
 
   // Asteroid ids should be deterministic and belong to known fields.
   std::size_t checked = 0;
@@ -141,6 +184,19 @@ int test_resource_field() {
           break;
         }
       }
+
+      // Density should be well-formed and match the density function at the asteroid position.
+      if (a.density01 < -1e-9 || a.density01 > 1.0 + 1e-9) {
+        std::cerr << "[test_resource_field] asteroid density01 out of range\n";
+        ++fails;
+        break;
+      }
+      const double d01 = stellar::sim::resourceFieldDensity01(*f, p0.features, a.posKm);
+      if (!near(a.density01, d01, 1e-9)) {
+        std::cerr << "[test_resource_field] asteroid density01 mismatch vs density function\n";
+        ++fails;
+        break;
+      }
     }
 
     if (a.baseUnits <= 0.0) {
@@ -153,6 +209,7 @@ int test_resource_field() {
       ++fails;
       break;
     }
+
   }
 
   // Ensure asteroids don't overlap within each field (simple check for a small sample).
