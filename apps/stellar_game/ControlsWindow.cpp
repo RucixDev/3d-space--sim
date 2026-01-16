@@ -390,6 +390,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Supercruise", a.supercruise);
   addAction("FSD Jump", a.fsdJump);
   addAction("Scanner action", a.scannerAction);
+  addAction("Sensor Ping", a.sensorPing);
   addAction("Docking clearance", a.requestDockingClearance);
   addAction("Dock/Undock", a.dockOrUndock);
   addAction("Cycle targets", a.cycleTargets);
@@ -776,6 +777,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Supercruise", controls.actions.supercruise, ad.supercruise);
     add("FSD Jump", controls.actions.fsdJump, ad.fsdJump);
     add("Scanner action", controls.actions.scannerAction, ad.scannerAction);
+    add("Sensor Ping", controls.actions.sensorPing, ad.sensorPing);
 
     add("Docking clearance", controls.actions.requestDockingClearance, ad.requestDockingClearance);
     add("Dock/Undock", controls.actions.dockOrUndock, ad.dockOrUndock);
@@ -793,6 +795,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Toggle Fuel Scoop", controls.actions.toggleFuelScoop, ad.toggleFuelScoop);
     add("Deploy Countermeasure", controls.actions.deployCountermeasure, ad.deployCountermeasure);
     add("Deploy Chaff", controls.actions.deployChaff, ad.deployChaff);
+    add("Deploy Heat Sink", controls.actions.deployHeatSink, ad.deployHeatSink);
 
     std::vector<ActionRow> filtered;
     filtered.reserve(rows.size());

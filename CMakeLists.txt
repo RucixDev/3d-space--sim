@@ -297,6 +297,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/AudioEngine.cpp
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
+    apps/stellar_game/SensorContacts.cpp
     apps/stellar_game/MarketDashboardWindow.cpp
   apps/stellar_game/LogbookWindow.cpp
     apps/stellar_game/TradePlannerWindow.cpp

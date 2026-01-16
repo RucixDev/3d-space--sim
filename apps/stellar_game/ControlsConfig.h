@@ -97,6 +97,7 @@ struct ActionBinds {
   KeyChord supercruise;
   KeyChord fsdJump;
   KeyChord scannerAction;
+  KeyChord sensorPing;
 
   KeyChord requestDockingClearance;
   KeyChord dockOrUndock;
@@ -308,6 +309,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.supercruise = {SDL_SCANCODE_H, KMOD_NONE};
   c.actions.fsdJump = {SDL_SCANCODE_J, KMOD_NONE};
   c.actions.scannerAction = {SDL_SCANCODE_K, KMOD_NONE};
+  c.actions.sensorPing = {SDL_SCANCODE_O, KMOD_CTRL};
 
   c.actions.requestDockingClearance = {SDL_SCANCODE_L, KMOD_NONE};
   c.actions.dockOrUndock = {SDL_SCANCODE_G, KMOD_NONE};
@@ -405,6 +407,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "Supercruise", a.supercruise);
   saveKeyChord(f, "FsdJump", a.fsdJump);
   saveKeyChord(f, "ScannerAction", a.scannerAction);
+  saveKeyChord(f, "SensorPing", a.sensorPing);
   saveKeyChord(f, "RequestClearance", a.requestDockingClearance);
   saveKeyChord(f, "DockOrUndock", a.dockOrUndock);
   saveKeyChord(f, "CycleTargets", a.cycleTargets);
@@ -476,6 +479,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("Supercruise", &a.supercruise);
     addB("FsdJump", &a.fsdJump);
     addB("ScannerAction", &a.scannerAction);
+    addB("SensorPing", &a.sensorPing);
     addB("RequestClearance", &a.requestDockingClearance);
     addB("DockOrUndock", &a.dockOrUndock);
     addB("CycleTargets", &a.cycleTargets);

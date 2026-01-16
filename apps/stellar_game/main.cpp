@@ -16,6 +16,7 @@
 #include "stellar/core/Clamp.h"
 #include "stellar/math/Vec2.h"
 #include "stellar/proc/Noise.h"
+#include "stellar/proc/HyperlaneRouter.h"
 #include "stellar/econ/Market.h"
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/render/Camera.h"
@@ -3503,14 +3504,36 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   // If false, edges are constrained by the ship's max range (useful for planning before refueling).
   bool navConstrainToCurrentFuelRange = true;
 
+  // Route graph mode: direct range graph (A* edges within jump range) or hyperlane corridors.
+  enum class NavGraphMode { Direct = 0, Hyperlanes = 1 };
+  NavGraphMode navGraphMode = NavGraphMode::Direct;
+
+  // Hyperlane routing tuning (used when navGraphMode == Hyperlanes).
+  proc::HyperlaneTravelParams navHyperlaneTravel{};
+  proc::HyperlaneParams navHyperlaneParams{};
+  bool navHyperlaneHazards = false;
+
+  // Default hyperlane params for player navigation.
+  // We clamp maxNeighborDistanceLy to the planner max hop each solve, so keep
+  // forceConnected off to avoid edges that exceed the ship's jump range.
+  navHyperlaneParams.neighborK = 6;
+  navHyperlaneParams.minDegree = 2;
+  navHyperlaneParams.extraEdgeChance = 0.26;
+  navHyperlaneParams.forceConnected = false;
+
   // Planner diagnostics for the currently plotted route.
   sim::RoutePlanStats navRoutePlanStats{};
   bool navRoutePlanStatsValid = false;
   NavRouteMode navRoutePlannedMode = NavRouteMode::Hops;
   bool navRoutePlannedUsedCurrentFuelRange = true;
+  NavGraphMode navRoutePlannedGraphMode = NavGraphMode::Direct;
   double navRoutePlanMaxJumpLy = 0.0;
   double navRoutePlanCostPerJump = 0.0;
   double navRoutePlanCostPerLy = 0.0;
+
+  // Extra planner metrics (hyperlane routing only).
+  bool navRoutePlannedUsedHyperlanes = false;
+  proc::HyperlanePathMetrics navRoutePlanHyperlane{};
 
   // Optional helper: when arriving in a system, auto-target a specific station (e.g. from a mission/trade suggestion).
   sim::StationId pendingArrivalTargetStationId = 0;
@@ -4476,24 +4499,72 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
     for (int attempt = 0; attempt < 6; ++attempt) {
       auto nearby = universe.queryNearby(currentSystem->stub.posLy, radius);
+
+      // Ensure start + goal stubs are included even when queryNearby hits its maxResults cap.
+      auto ensureStub = [&](const sim::SystemStub& stub) {
+        for (const auto& s : nearby) if (s.id == stub.id) return;
+        nearby.push_back(stub);
+      };
+      ensureStub(currentSystem->stub);
+      ensureStub(destStub);
+
       sim::RoutePlanStats stats{};
 
       double costPerJump = 1.0;
       double costPerLy = 0.0;
       std::vector<sim::SystemId> route;
 
-      if (navRouteMode == NavRouteMode::Hops) {
-        costPerJump = 1.0;
-        costPerLy = 0.0;
-        route = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, &stats);
-      } else if (navRouteMode == NavRouteMode::Distance) {
+      proc::HyperlanePathMetrics hyperMetrics{};
+      bool usedHyperlanes = false;
+
+      if (navGraphMode == NavGraphMode::Hyperlanes) {
+        // Route along a sparse, hazard-aware hyperlane graph rather than the full
+        // "any hop within range" graph.
+        proc::HyperlaneParams p = navHyperlaneParams;
+        p.maxNeighborDistanceLy = jrMaxLy;
+        p.forceConnected = false; // keep edges <= jump range
+        p.hazards.enabled = navHyperlaneHazards;
+        if (p.hazards.enabled) {
+          p.hazards.timeDays = timeDays;
+        }
+
+        const proc::HyperlaneNetwork net = proc::generateHyperlaneNetwork(universe.seed(), nearby, p);
+        proc::HyperlaneRouter router(net, nearby);
+        if (router.compute(currentSystem->stub.id, navHyperlaneTravel)) {
+          hyperMetrics = router.metricsTo(destSystemId);
+          if (hyperMetrics.reachable) {
+            std::vector<sim::SystemId> candidate;
+            if (router.buildPathTo(destSystemId, candidate) && sim::validateRoute(nearby, candidate, jrMaxLy)) {
+              route = std::move(candidate);
+              usedHyperlanes = true;
+
+              stats.expansions = 0;
+              stats.visited = 0;
+              stats.hops = (int)route.size() - 1;
+              stats.distanceLy = hyperMetrics.distanceLy;
+              stats.cost = hyperMetrics.costLy;
+              stats.reached = true;
+            }
+          }
+        }
+
+        // Cost-per-hop doesn't apply here; the hyperlane cost model is controlled by navHyperlaneTravel.
         costPerJump = 0.0;
-        costPerLy = 1.0;
-        route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, costPerJump, costPerLy, &stats);
+        costPerLy = 0.0;
       } else {
-        costPerJump = kFsdFuelBase;
-        costPerLy = kFsdFuelPerLy;
-        route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, costPerJump, costPerLy, &stats);
+        if (navRouteMode == NavRouteMode::Hops) {
+          costPerJump = 1.0;
+          costPerLy = 0.0;
+          route = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, &stats);
+        } else if (navRouteMode == NavRouteMode::Distance) {
+          costPerJump = 0.0;
+          costPerLy = 1.0;
+          route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, costPerJump, costPerLy, &stats);
+        } else {
+          costPerJump = kFsdFuelBase;
+          costPerLy = kFsdFuelPerLy;
+          route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSystemId, jrMaxLy, costPerJump, costPerLy, &stats);
+        }
       }
       if (!route.empty()) {
         navRoute = std::move(route);
@@ -4509,14 +4580,31 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
         navRoutePlanCostPerJump = costPerJump;
         navRoutePlanCostPerLy = costPerLy;
 
+        navRoutePlannedGraphMode = navGraphMode;
+        navRoutePlannedUsedHyperlanes = usedHyperlanes;
+        navRoutePlanHyperlane = hyperMetrics;
+
         if (showToast) {
           const double totalDist = sim::routeDistanceLy(nearby, navRoute);
           const double totalFuel = sim::routeCost(nearby, navRoute, kFsdFuelBase, kFsdFuelPerLy);
-          toast(toasts,
-                "Route plotted (" + std::to_string((int)navRoute.size() - 1) + " jumps, "
-                + std::to_string((int)std::round(totalDist)) + " ly, est fuel "
-                + std::to_string((int)std::round(totalFuel)) + ").",
-                2.4);
+
+          std::string msg;
+          msg.reserve(128);
+          msg += "Route plotted (";
+          msg += std::to_string((int)navRoute.size() - 1);
+          msg += " jumps, ";
+          msg += std::to_string((int)std::round(totalDist));
+          msg += " ly, est fuel ";
+          msg += std::to_string((int)std::round(totalFuel));
+          msg += ")";
+          if (usedHyperlanes) {
+            msg += ", lane risk ";
+            msg += std::to_string((int)std::round(hyperMetrics.risk01 * 100.0));
+            msg += "%";
+          }
+          msg += ".";
+
+          toast(toasts, msg, 2.4);
         }
         return true;
       }
@@ -26185,22 +26273,70 @@ if (showContacts) {
           return;
         }
 
+        // Work from a local copy so we can append required stubs even when the
+        // query is capped by maxResults.
+        auto nodes = nearby;
+
+        const auto& dstStub = universe.getSystem(dstId).stub;
+
+        // Ensure start + goal stubs are present.
+        auto ensureStub = [&](const sim::SystemStub& stub) {
+          for (const auto& s : nodes) if (s.id == stub.id) return;
+          nodes.push_back(stub);
+        };
+        ensureStub(currentSystem->stub);
+        ensureStub(dstStub);
+
         sim::RoutePlanStats stats{};
         double costPerJump = 1.0;
         double costPerLy = 0.0;
 
-        if (navRouteMode == NavRouteMode::Hops) {
-          costPerJump = 1.0;
-          costPerLy = 0.0;
-          navRoute = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, dstId, planMaxLy, &stats);
-        } else if (navRouteMode == NavRouteMode::Distance) {
+        proc::HyperlanePathMetrics hyperMetrics{};
+        bool usedHyperlanes = false;
+
+        if (navGraphMode == NavGraphMode::Hyperlanes) {
+          proc::HyperlaneParams p = navHyperlaneParams;
+          p.maxNeighborDistanceLy = planMaxLy;
+          p.forceConnected = false;
+          p.hazards.enabled = navHyperlaneHazards;
+          if (p.hazards.enabled) p.hazards.timeDays = timeDays;
+
+          const proc::HyperlaneNetwork net = proc::generateHyperlaneNetwork(universe.seed(), nodes, p);
+          proc::HyperlaneRouter router(net, nodes);
+          if (router.compute(currentSystem->stub.id, navHyperlaneTravel)) {
+            hyperMetrics = router.metricsTo(dstId);
+            if (hyperMetrics.reachable) {
+              std::vector<sim::SystemId> candidate;
+              if (router.buildPathTo(dstId, candidate) && sim::validateRoute(nodes, candidate, planMaxLy)) {
+                navRoute = std::move(candidate);
+                usedHyperlanes = true;
+
+                stats.expansions = 0;
+                stats.visited = 0;
+                stats.hops = (int)navRoute.size() - 1;
+                stats.distanceLy = hyperMetrics.distanceLy;
+                stats.cost = hyperMetrics.costLy;
+                stats.reached = true;
+              }
+            }
+          }
+
           costPerJump = 0.0;
-          costPerLy = 1.0;
-          navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+          costPerLy = 0.0;
         } else {
-          costPerJump = kFsdFuelBase;
-          costPerLy = kFsdFuelPerLy;
-          navRoute = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+          if (navRouteMode == NavRouteMode::Hops) {
+            costPerJump = 1.0;
+            costPerLy = 0.0;
+            navRoute = sim::plotRouteAStarHops(nodes, currentSystem->stub.id, dstId, planMaxLy, &stats);
+          } else if (navRouteMode == NavRouteMode::Distance) {
+            costPerJump = 0.0;
+            costPerLy = 1.0;
+            navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+          } else {
+            costPerJump = kFsdFuelBase;
+            costPerLy = kFsdFuelPerLy;
+            navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+          }
         }
 
         navRouteHop = 0;
@@ -26216,17 +26352,33 @@ if (showContacts) {
         navRoutePlanStatsValid = true;
         navRoutePlannedMode = navRouteMode;
         navRoutePlannedUsedCurrentFuelRange = navConstrainToCurrentFuelRange;
+        navRoutePlannedGraphMode = navGraphMode;
+        navRoutePlannedUsedHyperlanes = usedHyperlanes;
+        navRoutePlanHyperlane = hyperMetrics;
         navRoutePlanMaxJumpLy = planMaxLy;
         navRoutePlanCostPerJump = costPerJump;
         navRoutePlanCostPerLy = costPerLy;
 
-        const double totalDist = sim::routeDistanceLy(nearby, navRoute);
-        const double totalFuel = sim::routeCost(nearby, navRoute, kFsdFuelBase, kFsdFuelPerLy);
-        toast(toasts,
-              "Route plotted (" + std::to_string((int)navRoute.size() - 1)
-              + " jumps, " + std::to_string((int)std::round(totalDist))
-              + " ly, est fuel " + std::to_string((int)std::round(totalFuel)) + ").",
-              2.6);
+        const double totalDist = sim::routeDistanceLy(nodes, navRoute);
+        const double totalFuel = sim::routeCost(nodes, navRoute, kFsdFuelBase, kFsdFuelPerLy);
+
+        std::string msg;
+        msg.reserve(128);
+        msg += "Route plotted (";
+        msg += std::to_string((int)navRoute.size() - 1);
+        msg += " jumps, ";
+        msg += std::to_string((int)std::round(totalDist));
+        msg += " ly, est fuel ";
+        msg += std::to_string((int)std::round(totalFuel));
+        msg += ")";
+        if (usedHyperlanes) {
+          msg += ", lane risk ";
+          msg += std::to_string((int)std::round(hyperMetrics.risk01 * 100.0));
+          msg += "%";
+        }
+        msg += ".";
+
+        toast(toasts, msg, 2.6);
       };
 
       // Star-class tinting for the map.
@@ -26254,6 +26406,7 @@ if (showContacts) {
       static float mapHeight = 520.0f;
 
       static bool mapShowLanes = true;
+      static bool mapShowHyperlanes = false;
       static bool mapShowGrid = true;
       static bool mapShowLabels = false;
       static bool mapShowFactions = true;
@@ -26282,6 +26435,7 @@ if (showContacts) {
 
         if (ImGui::CollapsingHeader("Map options", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::Checkbox("Star lanes", &mapShowLanes); ImGui::SameLine();
+          ImGui::Checkbox("Hyperlanes", &mapShowHyperlanes); ImGui::SameLine();
           ImGui::Checkbox("Grid", &mapShowGrid); ImGui::SameLine();
           ImGui::Checkbox("Labels", &mapShowLabels);
 
@@ -26513,6 +26667,54 @@ if (showContacts) {
               const ImVec2 a = toPx(itA->second);
               const ImVec2 b = toPx(itB->second);
               draw->AddLine(a, b, IM_COL32(255, 140, 80, 210), 2.5f);
+            }
+          }
+
+          // Hyperlane overlay: deterministic sparse corridors (bandwidth + risk).
+          // Uses the same planner parameters as route plotting, but clamps edges to the planner max hop.
+          proc::HyperlaneNetwork mapHyperNet{};
+          proc::HyperlaneRouter mapHyperRouter{};
+          bool mapHyperRouterOk = false;
+          std::unordered_map<sim::SystemId, int> mapHyperDegree;
+
+          if (mapShowHyperlanes) {
+            const double mapPlanMaxLy = navConstrainToCurrentFuelRange ? jrNowLy : jrMaxLy;
+            proc::HyperlaneParams p = navHyperlaneParams;
+            p.maxNeighborDistanceLy = mapPlanMaxLy;
+            p.forceConnected = false;
+            p.hazards.enabled = navHyperlaneHazards;
+            if (p.hazards.enabled) p.hazards.timeDays = timeDays;
+
+            mapHyperNet = proc::generateHyperlaneNetwork(universe.seed(), nearby, p);
+
+            mapHyperDegree.reserve(nearby.size());
+            for (const auto& e : mapHyperNet.edges) {
+              ++mapHyperDegree[e.a];
+              ++mapHyperDegree[e.b];
+            }
+
+            mapHyperRouter.reset(mapHyperNet, nearby);
+            mapHyperRouterOk = mapHyperRouter.compute(currentSystem->stub.id, navHyperlaneTravel);
+
+            for (const auto& e : mapHyperNet.edges) {
+              auto itA = stubPosById.find(e.a);
+              auto itB = stubPosById.find(e.b);
+              if (itA == stubPosById.end() || itB == stubPosById.end()) continue;
+
+              const ImVec2 a = toPx(itA->second);
+              const ImVec2 b = toPx(itB->second);
+
+              const float bw = (float)std::clamp(e.bandwidth01, 0.0, 1.0);
+              const float rk = (float)std::clamp(e.risk01, 0.0, 1.0);
+              const float alpha = 0.08f + 0.22f * bw;
+              const int r = (int)std::clamp(60.0f + 185.0f * rk, 0.0f, 255.0f);
+              const int g = (int)std::clamp(80.0f + 160.0f * bw * (1.0f - rk), 0.0f, 255.0f);
+              const int bcol = (int)std::clamp(140.0f + 110.0f * bw, 0.0f, 255.0f);
+              const int a255 = (int)std::clamp(alpha * 255.0f, 0.0f, 255.0f);
+              const ImU32 col = IM_COL32(r, g, bcol, a255);
+
+              const float thickness = 1.0f + 1.8f * bw;
+              draw->AddLine(a, b, col, thickness);
             }
           }
 
@@ -26768,6 +26970,24 @@ if (showContacts) {
             ImGui::Text("Distance: %.1f ly", distLy);
             ImGui::Text("Stations: %d  |  Planets: %d", sys.stub.stationCount, sys.stub.planetCount);
             ImGui::Text("Faction: %s", factionName(sys.stub.factionId).c_str());
+
+
+            if (mapShowHyperlanes) {
+              const int deg = (mapHyperDegree.empty() ? 0 : (mapHyperDegree.count(hoveredId) ? mapHyperDegree[hoveredId] : 0));
+              ImGui::Text("Hyperlanes: %d connection(s)", deg);
+              if (mapHyperRouterOk) {
+                const auto hm = mapHyperRouter.metricsTo(hoveredId);
+                if (hm.reachable) {
+                  ImGui::TextDisabled("Lane route: %d hops | cost %.1f | risk %.0f%% | bottleneck bw %.0f%%",
+                                      hm.hops,
+                                      hm.costLy,
+                                      hm.risk01 * 100.0,
+                                      hm.bottleneckBandwidth01 * 100.0);
+                } else {
+                  ImGui::TextDisabled("Lane route: unreachable (try increasing scan radius / Neighbor K).");
+                }
+              }
+            }
 
             // System conditions (baseline + dynamics + events).
             {
@@ -27117,16 +27337,51 @@ if (showContacts) {
             ImGui::SeparatorText("Route planner");
 
             {
+              static const char* kGraphs[] = {"Direct (range graph)", "Hyperlanes (corridors)"};
+              int graphIdx = (int)navGraphMode;
+              if (ImGui::Combo("Graph", &graphIdx, kGraphs, 2)) {
+                navGraphMode = (NavGraphMode)graphIdx;
+              }
+            }
+
+            // Route solver settings shared by both graph types.
+            ImGui::Checkbox("Constrain edges to current-fuel range", &navConstrainToCurrentFuelRange);
+            const double planMaxLy = navConstrainToCurrentFuelRange ? jrNowLySel : jrMaxLySel;
+            ImGui::TextDisabled("Planner max hop: %.1f ly", planMaxLy);
+
+            if (navGraphMode == NavGraphMode::Direct) {
               static const char* kRouteModes[] = {"Min jumps", "Min distance", "Min fuel"};
               int modeIdx = (int)navRouteMode;
               if (ImGui::Combo("Mode", &modeIdx, kRouteModes, (int)(sizeof(kRouteModes) / sizeof(kRouteModes[0])))) {
                 navRouteMode = (NavRouteMode)modeIdx;
               }
-            }
+            } else {
+              ImGui::SeparatorText("Hyperlane travel");
+              ImGui::Checkbox("Lane hazards (drifting)", &navHyperlaneHazards);
 
-            ImGui::Checkbox("Constrain edges to current-fuel range", &navConstrainToCurrentFuelRange);
-            const double planMaxLy = navConstrainToCurrentFuelRange ? jrNowLySel : jrMaxLySel;
-            ImGui::TextDisabled("Planner max hop: %.1f ly", planMaxLy);
+              {
+                double mn = 0.0, mx = 2.0;
+                ImGui::SliderScalar("Risk weight", ImGuiDataType_Double, &navHyperlaneTravel.riskWeight, &mn, &mx, "%.2f");
+              }
+              {
+                double mn = 0.0, mx = 1.0;
+                ImGui::SliderScalar("Bandwidth bias", ImGuiDataType_Double, &navHyperlaneTravel.bandwidthBias, &mn, &mx, "%.2f");
+              }
+              {
+                double mn = 0.05, mx = 1.0;
+                ImGui::SliderScalar("Min bw factor", ImGuiDataType_Double, &navHyperlaneTravel.minBandwidthFactor, &mn, &mx, "%.2f");
+              }
+
+              ImGui::SeparatorText("Hyperlane topology");
+              ImGui::SliderInt("Neighbor K", &navHyperlaneParams.neighborK, 2, 12);
+              ImGui::SliderInt("Min degree", &navHyperlaneParams.minDegree, 1, 6);
+              {
+                double mn = 0.0, mx = 0.60;
+                ImGui::SliderScalar("Extra edge chance", ImGuiDataType_Double, &navHyperlaneParams.extraEdgeChance, &mn, &mx, "%.2f");
+              }
+
+              ImGui::TextDisabled("Note: lane edges are clamped to max hop (%.1f ly).", planMaxLy);
+            }
 
             if (ImGui::Button("Plot route")) {
               plotRouteTo(galaxySelectedSystemId);
@@ -27170,11 +27425,28 @@ if (showContacts) {
               }
 
               if (navRoutePlanStatsValid) {
-                const char* planName = (navRoutePlannedMode == NavRouteMode::Hops) ? "Min jumps"
-                                     : (navRoutePlannedMode == NavRouteMode::Distance) ? "Min distance"
-                                     : "Min fuel";
-                ImGui::TextDisabled("Planner: %s | max hop %.1f ly | expansions %d", planName, navRoutePlanMaxJumpLy, navRoutePlanStats.expansions);
-                ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly", navRoutePlanCostPerJump, navRoutePlanCostPerLy);
+                const bool usedHyper = (navRoutePlannedGraphMode == NavGraphMode::Hyperlanes);
+                const char* graphName = usedHyper ? "Hyperlanes" : "Direct";
+                const char* planName = usedHyper ? "Lane corridors"
+                                   : (navRoutePlannedMode == NavRouteMode::Hops) ? "Min jumps"
+                                   : (navRoutePlannedMode == NavRouteMode::Distance) ? "Min distance"
+                                   : "Min fuel";
+
+                ImGui::TextDisabled("Planner: %s | Graph: %s | max hop %.1f ly", planName, graphName, navRoutePlanMaxJumpLy);
+
+                if (usedHyper && navRoutePlannedUsedHyperlanes && navRoutePlanHyperlane.reachable) {
+                  ImGui::TextDisabled("Lane: cost %.1f | risk %.0f%% | bottleneck bw %.0f%% | hops %d",
+                                      navRoutePlanHyperlane.costLy,
+                                      navRoutePlanHyperlane.risk01 * 100.0,
+                                      navRoutePlanHyperlane.bottleneckBandwidth01 * 100.0,
+                                      navRoutePlanHyperlane.hops);
+                } else {
+                  ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly | expansions %d",
+                                      navRoutePlanCostPerJump,
+                                      navRoutePlanCostPerLy,
+                                      navRoutePlanStats.expansions);
+                }
+
                 ImGui::TextDisabled("Constraint: %s", navRoutePlannedUsedCurrentFuelRange ? "current-fuel range" : "max range");
               }
 
