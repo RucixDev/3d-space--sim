@@ -1,6 +1,8 @@
 #include "stellar/render/ShaderToyParams.h"
 
+#if STELLAR_ENABLE_RENDER
 #include "stellar/render/Shader.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -109,6 +111,26 @@ static bool parseInt(std::string_view s, int& outV) {
   return true;
 }
 
+static void sanitizeValueToDef(const ShaderToyParamDef& d, std::array<float, 4>& v) {
+  switch (d.type) {
+    case ShaderToyParamType::Float:
+    case ShaderToyParamType::Int:
+    case ShaderToyParamType::Bool:
+      v[1] = 0.0f;
+      v[2] = 0.0f;
+      v[3] = 0.0f;
+      break;
+    case ShaderToyParamType::Vec2:
+      v[2] = 0.0f;
+      v[3] = 0.0f;
+      break;
+    case ShaderToyParamType::Vec3:
+    case ShaderToyParamType::Color3:
+      v[3] = 0.0f;
+      break;
+  }
+}
+
 static void clampValueToDef(const ShaderToyParamDef& d, std::array<float, 4>& v) {
   const auto clamp1 = [&](int k) {
     const float lo = d.minValue[k];
@@ -121,24 +143,20 @@ static void clampValueToDef(const ShaderToyParamDef& d, std::array<float, 4>& v)
     case ShaderToyParamType::Int:
     case ShaderToyParamType::Bool:
       clamp1(0);
-      v[1] = 0.0f;
-      v[2] = 0.0f;
-      v[3] = 0.0f;
       break;
     case ShaderToyParamType::Vec2:
       clamp1(0);
       clamp1(1);
-      v[2] = 0.0f;
-      v[3] = 0.0f;
       break;
     case ShaderToyParamType::Vec3:
     case ShaderToyParamType::Color3:
       clamp1(0);
       clamp1(1);
       clamp1(2);
-      v[3] = 0.0f;
       break;
   }
+
+  sanitizeValueToDef(d, v);
 }
 
 static std::unordered_map<std::string, ShaderToyParamType> schemaMap(const ShaderToyParamSet& s) {
@@ -189,7 +207,7 @@ void ShaderToyParamSet::resetToDefaults() {
 }
 
 int ShaderToyParamSet::findIndex(std::string_view name) const {
-  const auto it = indexByName.find(std::string(name));
+  const auto it = indexByName.find(name);
   if (it == indexByName.end()) return -1;
   return it->second;
 }
@@ -200,12 +218,27 @@ const ShaderToyParamDef* ShaderToyParamSet::findDef(std::string_view name) const
   return &defs[i];
 }
 
-bool ShaderToyParamSet::setValue(std::string_view name, const std::array<float, 4>& vIn) {
-  const int i = findIndex(name);
-  if (i < 0 || i >= (int)defs.size() || i >= (int)values.size()) return false;
+bool ShaderToyParamSet::setValue(std::string_view name, const std::array<float, 4>& v) {
+  return setValue(findIndex(name), v);
+}
+
+bool ShaderToyParamSet::setValue(int index, const std::array<float, 4>& vIn) {
+  if (index < 0 || index >= (int)defs.size() || index >= (int)values.size()) return false;
   std::array<float, 4> v = vIn;
-  clampValueToDef(defs[i], v);
-  values[i] = v;
+  clampValueToDef(defs[index], v);
+  values[index] = v;
+  return true;
+}
+
+bool ShaderToyParamSet::setRawValue(std::string_view name, const std::array<float, 4>& v) {
+  return setRawValue(findIndex(name), v);
+}
+
+bool ShaderToyParamSet::setRawValue(int index, const std::array<float, 4>& vIn) {
+  if (index < 0 || index >= (int)defs.size() || index >= (int)values.size()) return false;
+  std::array<float, 4> v = vIn;
+  sanitizeValueToDef(defs[index], v);
+  values[index] = v;
   return true;
 }
 
@@ -222,6 +255,7 @@ std::string ShaderToyParamSet::buildUniformDecls() const {
 }
 
 void ShaderToyParamSet::applyToShader(const ShaderProgram& shader) const {
+#if STELLAR_ENABLE_RENDER
   const int n = (int)defs.size();
   if (n == 0) return;
   if ((int)values.size() != n) return;
@@ -253,8 +287,11 @@ void ShaderToyParamSet::applyToShader(const ShaderProgram& shader) const {
         break;
     }
   }
+#else
+  // Headless builds: the OpenGL backend is not compiled/linked.
+  (void)shader;
+#endif
 }
-
 bool ShaderToyParamSet::schemaEquals(const ShaderToyParamSet& other) const {
   if (defs.size() != other.defs.size()) return false;
   const auto a = schemaMap(*this);

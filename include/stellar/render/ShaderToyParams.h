@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -66,12 +67,27 @@ struct ShaderToyParamDef {
   float step{0.01f};
 };
 
+
+// Transparent hashing helpers so we can look up parameters by std::string_view
+// without allocating temporary std::string objects (C++20 heterogeneous lookup).
+struct ShaderToyParamNameHash {
+  using is_transparent = void;
+  std::size_t operator()(std::string_view sv) const noexcept {
+    return std::hash<std::string_view>{}(sv);
+  }
+};
+
+struct ShaderToyParamNameEq {
+  using is_transparent = void;
+  bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+};
+
 struct ShaderToyParamSet {
   std::vector<ShaderToyParamDef> defs{};
   std::vector<std::array<float, 4>> values{}; // 1:1 with defs
 
   // Fast lookup by name.
-  std::unordered_map<std::string, int> indexByName{};
+  std::unordered_map<std::string, int, ShaderToyParamNameHash, ShaderToyParamNameEq> indexByName{};
 
   bool empty() const { return defs.empty(); }
   void clear();
@@ -87,6 +103,21 @@ struct ShaderToyParamSet {
 
   // Set by name (clamped to min/max if present). Returns false if not found.
   bool setValue(std::string_view name, const std::array<float, 4>& v);
+
+  // Set by index (faster; avoids name lookup).
+  bool setValue(int index, const std::array<float, 4>& v);
+
+
+  // Set by name **without** clamping to min/max. Returns false if not found.
+  //
+  // This is intended for internal/engine-driven uniforms that exceed any UI range
+  // (e.g. world-space coordinates, radii in light-years, etc.).
+  // Unused components are still zeroed according to the parameter type.
+  bool setRawValue(std::string_view name, const std::array<float, 4>& v);
+
+  // Set by index (faster; avoids name lookup).
+  bool setRawValue(int index, const std::array<float, 4>& v);
+
 
   // Builds a uniform declaration block (GLSL) for these parameters.
   // This is inserted by ShaderToy's wrapper *before* `#line 1` so snippet

@@ -2,6 +2,7 @@
 
 #include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
+#include "stellar/proc/GalaxyVoids.h"
 #include "stellar/proc/NameGenerator.h"
 #include "stellar/proc/Noise.h"
 #include "stellar/proc/GalaxyClusters.h"
@@ -269,6 +270,11 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
                            (params_.clusterChancePerCell > 0.0) &&
                            (params_.clusterRadiusLy > 0.0);
 
+  const bool useVoids = (params_.voidStrength > 0.0) &&
+                        (params_.voidCellSizeLy > 0.0) &&
+                        (params_.voidChancePerCell > 0.0) &&
+                        (params_.voidRadiusLy > 0.0);
+
   const bool useBar = (params_.barStrength > 0.0);
   const bool useRing = (params_.ringStrength > 0.0);
 
@@ -337,6 +343,7 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
 
     const double armStrength = std::max(0.0, params_.spiralArmStrength);
     const double clusterStrength = std::clamp(params_.clusterStrength, 0.0, 10.0);
+    const double voidStrength = std::clamp(params_.voidStrength, 0.0, 10.0);
     const double barStrength = std::clamp(params_.barStrength, 0.0, 10.0);
     const double ringStrength = std::clamp(params_.ringStrength, 0.0, 10.0);
 
@@ -348,6 +355,16 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
       clusterParams.radiusJitter01 = params_.clusterRadiusJitter;
       clusterParams.strengthJitter01 = params_.clusterStrengthJitter;
       clusterParams.falloffPower = params_.clusterFalloffPower;
+    }
+
+    GalaxyVoidsParams voidParams{};
+    if (useVoids) {
+      voidParams.cellSizeLy = params_.voidCellSizeLy;
+      voidParams.chancePerCell = params_.voidChancePerCell;
+      voidParams.radiusLy = params_.voidRadiusLy;
+      voidParams.radiusJitter01 = params_.voidRadiusJitter;
+      voidParams.strengthJitter01 = params_.voidStrengthJitter;
+      voidParams.falloffPower = params_.voidFalloffPower;
     }
 
 
@@ -448,6 +465,12 @@ Sector GalaxyGenerator::generateSector(const SectorCoord& coord, const std::vect
       if (useClusters) {
         const auto cs = sampleGalaxyClusters(seed_, c.pos, clusterParams);
         mul *= (1.0 + clusterStrength * cs.cluster01);
+      }
+
+      if (useVoids) {
+        const auto vs = sampleGalaxyVoids(seed_, c.pos, voidParams);
+        const double vMul = std::clamp(1.0 - voidStrength * vs.void01, 0.0, 1.0);
+        mul *= vMul;
       }
       if (useBar) {
         mul *= (1.0 + barStrength * galaxyBarMask01(params_, c.pos.x, c.pos.y));
@@ -581,7 +604,7 @@ minsep_done:
     return sector;
   }
 
-  if (!useSpiral && !useDensityNoise && !useClusters && !useBar && !useRing) {
+  if (!useSpiral && !useDensityNoise && !useClusters && !useVoids && !useBar && !useRing) {
     // ---- Legacy smooth-disc distribution path (keep deterministic signatures stable) ----
     const int n = poisson(rng, mean);
 
@@ -641,6 +664,7 @@ minsep_done:
   const double armNoiseStrength = std::clamp(params_.spiralArmNoiseStrength, 0.0, 1.0);
   const double densityStrength = std::clamp(params_.densityNoiseStrength, 0.0, 0.99);
   const double clusterStrength = std::clamp(params_.clusterStrength, 0.0, 10.0);
+  const double voidStrength = std::clamp(params_.voidStrength, 0.0, 10.0);
   const double barStrength = std::clamp(params_.barStrength, 0.0, 10.0);
   const double ringStrength = std::clamp(params_.ringStrength, 0.0, 10.0);
 
@@ -652,6 +676,16 @@ minsep_done:
     clusterParams.radiusJitter01 = params_.clusterRadiusJitter;
     clusterParams.strengthJitter01 = params_.clusterStrengthJitter;
     clusterParams.falloffPower = params_.clusterFalloffPower;
+  }
+
+  GalaxyVoidsParams voidParams{};
+  if (useVoids) {
+    voidParams.cellSizeLy = params_.voidCellSizeLy;
+    voidParams.chancePerCell = params_.voidChancePerCell;
+    voidParams.radiusLy = params_.voidRadiusLy;
+    voidParams.radiusJitter01 = params_.voidRadiusJitter;
+    voidParams.strengthJitter01 = params_.voidStrengthJitter;
+    voidParams.falloffPower = params_.voidFalloffPower;
   }
 
   double mulMax = 1.0;
@@ -667,6 +701,8 @@ minsep_done:
     // cluster01 is clamped to [0..1], so the max multiplier is (1+clusterStrength)
     mulMax *= (1.0 + clusterStrength);
   }
+  // Voids do not increase density (they only suppress), so they don't contribute
+  // to mulMax.
   if (useBar) {
     // bar01 is clamped to [0..1], so the max multiplier is (1+barStrength)
     mulMax *= (1.0 + barStrength);
@@ -717,6 +753,12 @@ minsep_done:
     if (useClusters) {
       const auto cs = sampleGalaxyClusters(seed_, pos, clusterParams);
       mul *= (1.0 + clusterStrength * cs.cluster01);
+    }
+
+    if (useVoids) {
+      const auto vs = sampleGalaxyVoids(seed_, pos, voidParams);
+      const double vMul = std::clamp(1.0 - voidStrength * vs.void01, 0.0, 1.0);
+      mul *= vMul;
     }
     if (useBar) {
       mul *= (1.0 + barStrength * galaxyBarMask01(params_, pos.x, pos.y));

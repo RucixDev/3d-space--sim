@@ -99,6 +99,7 @@
 #include "stellar/sim/Interdiction.h"
 #include "stellar/sim/EncounterDirector.h"
 #include "stellar/sim/SquadTactics.h"
+#include "stellar/sim/Formation.h"
 #include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
@@ -10021,6 +10022,23 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   };
 
   // Contacts AI + combat
+  // Precompute stable escort slot ordering for convoy-following police ships.
+  // (Avoids every escort trying to sit on the same follow point.)
+  std::unordered_map<core::u64, std::vector<core::u64>> escortIdsByFollow;
+  escortIdsByFollow.reserve(contacts.size());
+  for (const auto& c : contacts) {
+    if (!c.alive) continue;
+    if (c.role != ContactRole::Police) continue;
+    if (c.followId == 0) continue;
+    if (c.hostileToPlayer) continue;
+    escortIdsByFollow[c.followId].push_back(c.id);
+  }
+  for (auto& kv : escortIdsByFollow) {
+    auto& ids = kv.second;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  }
+
   for (auto& c : contacts) {
     if (!c.alive) continue;
 
@@ -10666,8 +10684,40 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         const math::Vec3d to = tgtPos - c.ship.positionKm();
         if (to.lengthSq() > 1e-6) applyOrbitStrafe(c, ai, to.normalized(), npcOrbitStrafe);
 	      } else if (followTarget) {
+	        // Convoy escort behaviour: keep a deterministic formation around the followed contact.
+	        // This prevents all escorts from converging on the same chase point and produces readable
+	        // "wing" structure around convoys.
 	        const double standoff = 36000.0 + ((c.leaderId != 0) ? 5500.0 : 0.0) + (double)((c.id % 3) * 1200);
-	        chaseTarget(c.ship, ai, followTarget->ship.positionKm(), followTarget->ship.velocityKmS(), standoff, 0.22, 1.8);
+
+	        int slotIndex = 0;
+	        int slotCount = 1;
+	        if (auto it = escortIdsByFollow.find(c.followId); it != escortIdsByFollow.end()) {
+	          const auto& ids = it->second;
+	          slotCount = (int)ids.size();
+	          if (!ids.empty()) {
+	            auto f = std::lower_bound(ids.begin(), ids.end(), c.id);
+	            if (f != ids.end() && *f == c.id) slotIndex = (int)std::distance(ids.begin(), f);
+	          }
+	        }
+
+	        sim::FormationParams fp{};
+	        fp.radiusKm = standoff;
+	        fp.lateralScale = 0.55;
+	        fp.verticalScale = 0.25;
+	        fp.behindScale = 1.0;
+	        fp.rowSpacingScale = 0.55;
+	        fp.jitterKm = 1200.0;
+
+	        const sim::FormationPattern pat = sim::chooseEscortFormationPattern(slotCount);
+	        const core::u64 fseed = core::hashCombine(universe.seed(), core::hashCombine(c.followId, 0x4553434f5254ull)); // "ESCORT"
+	        const math::Vec3d leaderVel = followTarget->ship.velocityKmS();
+	        const math::Vec3d leaderFwd = (leaderVel.lengthSq() > 1e-9) ? leaderVel : followTarget->ship.forward();
+	        const sim::Basis basis = sim::makeBasisFromForward(leaderFwd, followTarget->ship.up());
+
+	        const math::Vec3d offL = sim::formationOffsetLocalKm(pat, slotIndex, slotCount, fp, fseed);
+	        const math::Vec3d desiredPos = sim::formationTargetWorldKm(followTarget->ship.positionKm(), basis, offL);
+	        const double holdDistKm = std::clamp(standoff * 0.08, 1500.0, 8000.0);
+	        chaseTarget(c.ship, ai, desiredPos, leaderVel, holdDistKm, 0.22, 1.8);
 	      } else if (currentSystem && !currentSystem->stations.empty()) {
 	        // Patrol around home station.
 	        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];

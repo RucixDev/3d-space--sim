@@ -13,6 +13,28 @@ file(GLOB STELLAR_TEST_SOURCES CONFIGURE_DEPENDS
 # Keep ordering stable across platforms/generators.
 list(SORT STELLAR_TEST_SOURCES)
 
+# ---- Sanity check: enforce the harness convention per test translation unit. ----
+#
+# Convention: each test file `test_xxx.cpp` must define exactly one global entry point:
+#   int test_xxx();
+#
+# The runner provides the only `main()`.
+foreach(src ${STELLAR_TEST_SOURCES})
+  get_filename_component(name "${src}" NAME_WE)
+
+  file(READ "${src}" _content)
+
+  string(REGEX MATCH "int[ \t]+main[ \t]*\\(" _has_main "${_content}")
+  if (_has_main)
+    message(FATAL_ERROR "Test file '${src}' defines main(). Tests must define 'int ${name}()' and rely on tests/main.cpp.")
+  endif()
+
+  string(REGEX MATCH "int[ \t]+${name}[ \t]*\\(" _has_entry "${_content}")
+  if (NOT _has_entry)
+    message(FATAL_ERROR "Test file '${src}' is missing entry point 'int ${name}()'.")
+  endif()
+endforeach()
+
 # Render-only tests.
 # (These depend on the optional OpenGL rendering backend being compiled into the library.)
 if (NOT STELLAR_ENABLE_RENDER)

@@ -33,7 +33,7 @@ struct GalaxyParams {
   // exponential disc, while keeping generation deterministic.
   //
   // By default, spiralArmCount=0, densityNoiseStrength=0, clusterStrength=0,
-  // barStrength=0, ringStrength=0, warpAmplitudeLy=0, and flareStrength=0, which
+  // voidStrength=0, barStrength=0, ringStrength=0, warpAmplitudeLy=0, and flareStrength=0, which
   // preserves the legacy distribution (and therefore deterministic regression
   // signatures).
 
@@ -64,6 +64,21 @@ struct GalaxyParams {
   double clusterRadiusJitter{0.35};
   double clusterStrengthJitter{0.35};
   double clusterFalloffPower{2.0};
+
+  // Sparse "cosmic void" bubbles (streaming-safe negative-density blobs).
+  //
+  // When voidStrength > 0, the generator samples a deterministic coarse-cell
+  // field (see GalaxyVoids) and suppresses the local mean density:
+  //   mean *= clamp01(1 - voidStrength * void01)
+  //
+  // 0 disables voids and preserves the legacy distribution.
+  double voidStrength{0.0};
+  double voidCellSizeLy{4500.0};
+  double voidChancePerCell{0.05};
+  double voidRadiusLy{2800.0};
+  double voidRadiusJitter{0.40};
+  double voidStrengthJitter{0.35};
+  double voidFalloffPower{2.0};
 
   // Galactic bar (elongated inner-disc density enhancement).
   // Strength=0 disables.

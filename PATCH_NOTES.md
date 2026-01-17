@@ -1,5 +1,319 @@
 # Patch Notes
 
+
+## Round 61 — Deterministic preview LOD sampler (jittered grid + unbiased stub reservoir)
+
+The **Procedural Galaxy Lab** preview was still using a brute-force sector scan with an early-break at `maxStubs`.
+That approach becomes *very* expensive at large view radii and also biases the preview (it fills from the first sectors in scan order).
+This round adds a **deterministic, adaptive LOD sampler** that stays fast when zoomed out while keeping the preview stable under panning.
+
+### What changed
+
+- Replaced the brute-force `min..max` sector loops in `rebuildPreview()` with an **adaptive jittered-grid sampler**:
+  - Picks an XY **stride** based on the view bounds + expected systems/sector, targeting ~O(`maxStubs`) sector generations.
+  - Anchors sampling blocks to the **world grid** so results are stable as you pan.
+  - Uses a deterministic hash (`SplitMix64`) of `(blockCoord, z, stride, pass, seed)` to choose a representative sector per block.
+  - Skips blocks outside the view circle using a fast **AABB→circle min-distance** test.
+  - Always samples a small neighborhood around the view center at full resolution, then refines with up to 2 additional passes (halving stride) if the sample is sparse.
+- Added an **unbiased stub reservoir**:
+  - Maintains a max-heap of the best `maxStubs` stubs keyed by a deterministic per-stub hash (avoids scan-order bias).
+  - Materializes the final set sorted by key for stable ordering (helpful for deterministic coloring/selection).
+- Added preview diagnostics:
+  - `previewSectorsGenerated`, `previewCandidateStubs`, and `previewSectorStrideXY` displayed in the UI.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 60 — Heatmap dirty-flag caching + optional animation (missing required glue)
+
+The GPU galaxy heatmap is an **analytic** background pass, so rendering it every frame wastes GPU time
+when the view/params are static. This round adds a **stable render-key hash** so the heatmap is only
+re-rendered when an input that affects it changes (a classic “dirty flag” approach), with an optional
+animation mode when you *do* want it to update continuously.
+
+### What changed
+
+- Added a stable **heatmap render key** (`heatmapRenderKey`) that hashes:
+  - view (center/zoom/Z slice), heatmap controls (mode/exposure/contours/LOD), and galaxy parameters.
+  - render target dimensions.
+- `renderGalaxyHeatmap(...)` now **skips the offscreen render pass** when the key and dimensions match the
+  last render (and animation is off), reusing the previous texture.
+- Added UI controls:
+  - **Animate**: forces per-frame re-render using `iTime`.
+  - **Force Re-render** button: invalidates the cache and redraws next frame.
+- Stored cache state in `ProceduralGalaxyLabWindowState` (`heatmapLastHash/LastW/LastH`).
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 59 — Unclamped internal ShaderToy uniforms + robust GL state restore (missing required glue)
+
+This round plugs two subtle but important gaps in the **ShaderToy-based procedural rendering** stack:
+
+1) **Engine-driven uniforms** (galaxy radii, world-space centers, etc.) were going through the *same* parameter pathway as UI-edited shader params, which meant they could be **accidentally clamped** to a tiny range (often `[0..1]`).
+2) The GPU heatmap pass was doing minimal OpenGL state restoration, which could subtly **perturb later rendering** (especially texture bindings / clear color) on some drivers.
+
+### What changed
+
+- Added **`ShaderToyParamSet::setRawValue(...)`**:
+  - Writes a parameter by name **without clamping** to `minValue/maxValue`.
+  - Still normalizes unused components to zero based on the parameter type (scalar/vec2/vec3/color).
+  - Intended for internal, engine-synced uniforms that naturally exceed UI ranges.
+
+- Refactored parameter normalization:
+  - Split “sanitize value shape” from “clamp to range”, so both clamped and unclamped updates share the same component rules.
+
+- Procedural Galaxy Lab heatmap glue:
+  - Switched the internal `g*` heatmap uniforms to use **`setRawValue`**.
+  - Removed the old “`max==min` disables clamping” hack from the heatmap param schema.
+
+- Added a small **RAII OpenGL state guard** around the heatmap offscreen pass:
+  - Restores framebuffer, viewport, program, VAO, enable flags, **clear color**, active texture, and the **2D bindings for texture units 0..3**.
+  - Uses the project’s SDL-loaded `gl::ActiveTexture` entry point (avoids calling `::glActiveTexture` directly, which is not exported on Windows’ legacy OpenGL import libs).
+
+### Files changed/added
+
+- `include/stellar/render/ShaderToyParams.h`
+- `src/render/ShaderToyParams.cpp`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 58 — Fix broken test harness integration + add CMake “test-lint” guardrails (missing required code)
+
+This round targets an under-developed but *critical* area: **project correctness via tests**.
+
+The bespoke test harness (in `tests/test_harness.h`) expects each `tests/test_*.cpp` translation unit to define a
+single entry point function:
+
+- `int test_xxx();`
+
+The runner in `tests/main.cpp` provides the only `main()`.
+
+Two tests in the repository (`test_galaxy_morphology.cpp`, `test_system_moons.cpp`) still defined their own `main()`,
+which caused:
+
+- **linker failures** (multiple definition of `main`), and
+- an **incomplete registry** (generated registry referenced missing `test_*` symbols).
+
+### What changed
+
+- **Converted** `tests/test_galaxy_morphology.cpp` and `tests/test_system_moons.cpp` to the required convention:
+  - `int test_galaxy_morphology()`
+  - `int test_system_moons()`
+  - Both now use the shared `CHECK(...)` macro and return `failures ? 1 : 0`.
+
+- Added a lightweight **configure-time “test-lint” sanity check** to `tests/CMakeLists.txt`:
+  - Fails CMake configuration if any `test_*.cpp` contains `int main(`.
+  - Fails CMake configuration if any `test_*.cpp` is missing its required `int test_xxx(` entry point.
+
+This prevents the same class of breakage from creeping back in later.
+
+### Files changed/added
+
+- `tests/CMakeLists.txt`
+- `tests/test_galaxy_morphology.cpp`
+- `tests/test_system_moons.cpp`
+- `PATCH_NOTES.md`
+
+## Round 57 — Heatmap now respects Center Z + Warp/Flare + hard disc thickness (missing shader glue)
+
+This round is a **completeness / correctness** pass for the GPU galaxy heatmap:
+previous rounds added shader-driven LOD and many morphology knobs, but the heatmap still behaved like a
+*2D-only* approximation.
+
+The CPU generator is truly 3D: it has a warped midplane, flared thickness, and the preview slice is centered
+at **Center Z** with a **Z Half-Range** filter. The heatmap now follows those same semantics.
+
+### What changed
+
+- **Center Z is now wired into the heatmap**:
+  - Added `gViewCenterZLy` uniform and use it to evaluate the Z-slice `[centerZ - zHalf, centerZ + zHalf]`.
+
+- **Warp + flare are now reflected in the heatmap density**:
+  - Added uniforms for warp/flare parameters (`gWarp*`, `gFlare*`).
+  - Implemented shader helpers `thicknessHalf()` and `warpZLy()` mirroring the CPU morphology helpers.
+
+- **Correct vertical slice integration with hard disc clipping**:
+  - The CPU generator hard-clips the disc to `|z - warpZ| <= halfThickness` and applies an exponential vertical falloff inside it.
+  - The heatmap now computes a **closed-form integral** of `exp(-|z-warpZ|/halfT)` over the intersection of:
+    - the preview slice, and
+    - the clipped disc slab.
+  - This prevents the heatmap from over-estimating density when `Z Half-Range` exceeds the actual (flared) thickness.
+
+- **Blob fields sampled at the correct Z**:
+  - Cluster/void blob fields are now evaluated at `z = Center Z` (instead of implicitly `z = 0`), so moving the slice in Z remains coherent.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 56 — Fix missing heatmap uniform wiring (no-clamp params) + ImGui legend ID collisions
+
+This round is a **stability / completeness** pass: it generates the missing glue that was required for the
+GPU galaxy heatmap (Rounds 54–55) to behave correctly.
+
+### What changed
+
+- **Fixed heatmap parameter clamping bug**:
+  - The heatmap builds its uniform schema programmatically using `ShaderToyParamSet`.
+  - `ShaderToyParamSet::setValue()` clamps values to `[minValue, maxValue]` when `max > min`.
+  - The default `maxValue` is `1`, which unintentionally clamped *world-scale* uniforms (radii, cell sizes, etc.)
+    to `1.0`, breaking the heatmap.
+  - Heatmap params now explicitly disable clamping by setting `max==min` (see comment in code).
+
+- **Fixed ImGui ID collisions** in the legend:
+  - Several `ImGui::ColorButton()` calls reused the same `"##"` identifiers inside loops.
+  - Added `ImGui::PushID/PopID` so every swatch has a unique ID.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 55 — Derivative-driven dynamic LOD for procedural galaxy heatmap (shader AA + blob skipping)
+
+This round targets the requested under-developed area: **procedural generation + custom rendering**, with a focus on
+**dynamic LOD implemented inside shaders**.
+
+The GPU galaxy heatmap introduced in Round 54 looked great, but at large zoom levels high-frequency FBM detail and thin
+contour lines could shimmer/alias, and the expensive cluster/void blob scans were sometimes wasted on sub-pixel features.
+
+### What changed
+
+- Added **derivative-driven procedural LOD** helpers to the ShaderToy GLSL micro-library:
+  - `featurePx()` estimates how large a feature is in screen pixels using `dFdx/dFdy`.
+  - `fbm2_lod(...)` / `fbm3_lod(...)` automatically **band-limit** FBM octaves as they become sub-pixel.
+  - Optional **energy preservation** keeps contrast more constant if desired.
+
+- Upgraded the **Procedural Galaxy Lab heatmap shader**:
+  - Spiral and density noise now use **`fbm2_lod`** when enabled.
+  - Cluster/void blob fields can now **skip** the neighborhood scan when the blob radius is sub-pixel (big perf win when zoomed out).
+  - Contour lines are now **`fwidth()` anti-aliased** so they don’t sparkle during pan/zoom.
+
+- Added new **Heatmap LOD UI controls**:
+  - Toggle Dynamic LOD.
+  - Pixel thresholds (Lo/Hi) defining when details fade out.
+  - “Energy Preserve” knob.
+  - Toggle “Skip tiny blob scans”.
+
+### Files changed/added
+
+- `src/render/ShaderToy.cpp`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 54 — GPU galaxy heatmap preview (analytic density field + contours)
+
+This round targets the requested under-developed area: **procedural generation + custom rendering**.
+The Procedural Galaxy Lab previously rendered only *discrete stubs* (points) via ImGui draw lists.
+That made it hard to reason about the *continuous* density field you are tuning (spiral arms, noise, clusters/voids, bar/ring, etc.).
+
+This patch adds a fast **GPU heatmap** rendered to an offscreen texture using the existing **ShaderToy** pipeline,
+then composited *behind* the point preview.
+
+### What changed
+
+- Added a **GPU heatmap background** to the **Procedural Galaxy Lab**:
+  - Offscreen **`render::RenderTarget2D`** sized to the preview canvas.
+  - A dedicated **ShaderToy snippet** that evaluates an analytic density model and outputs a false-color heatmap.
+  - Optional **contour lines** to make gradients/filaments easier to see at a glance.
+
+- Added new UI controls:
+  - Enable/disable heatmap.
+  - Heatmap **mode**: Density / Spiral Arms / Clusters / Voids / Morphology.
+  - Resolution (Full/Half/Quarter) to trade quality for performance.
+  - Exposure + gamma + contour count/width.
+
+- The heatmap uses a **GPU-side streaming-safe blob field** for cluster/void visualization.
+  It is deterministic and visually correlated with the CPU generator, but not guaranteed to match it *exactly*.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 53 — Procedural “cosmic voids” (streaming-safe negative-density bubbles)
+
+This round targets the under-developed area requested: **procedural generation**.
+The galaxy generator can already add *positive* structure (spiral arms, clusters, bar/ring, etc.).
+This patch adds a new complementary tool: **large-scale void bubbles** that carve *negative space* and create
+distinctive cavities/filaments without precomputing or storing global state.
+
+### What changed
+
+- Added **`proc::GalaxyVoids`**: a deterministic, streaming-safe coarse-cell field that produces smooth bubble
+  influences (`void01` in 0..1) with jittered centers/radii.
+
+- Integrated voids into **`proc::GalaxyGenerator`**:
+  - New parameters in `proc::GalaxyParams`: `voidStrength`, `voidCellSizeLy`, `voidChancePerCell`, `voidRadiusLy`,
+    `voidRadiusJitter`, `voidStrengthJitter`, `voidFalloffPower`.
+  - Density modulation (when enabled):
+    - `mean *= clamp01(1 - voidStrength * void01)`
+  - Works in **both** generation modes:
+    - legacy per-sector Poisson sampling
+    - streaming-safe minimum-separation (blue-noise-ish) placement
+  - Default settings keep `voidStrength=0`, so the legacy distribution and deterministic regression signatures remain unchanged.
+
+- Upgraded the **Procedural Galaxy Lab**:
+  - New “Cosmic Voids” parameter block.
+  - New **Color: void** visualization mode + legend.
+  - Hover tooltips show void influence and the strongest void bubble’s ID/radius.
+
+### Tests
+
+- Added `test_galaxy_voids` to validate determinism, value ranges, and “disabled” behavior.
+
+### Files changed/added
+
+- `include/stellar/proc/GalaxyVoids.h` *(new)*
+- `src/proc/GalaxyVoids.cpp` *(new)*
+- `include/stellar/proc/GalaxyGenerator.h`
+- `src/proc/GalaxyGenerator.cpp`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_galaxy_voids.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 52 — Deterministic convoy escort formations (headless Formation helpers)
+
+This round focuses on an under-developed gameplay cue: **NPC group motion**.
+Convoy escorts used to chase the exact same follow point, causing “stacking” and jittery convergences.
+Now escorts keep a readable, deterministic **wing formation** around their assigned convoy.
+
+### What changed
+
+- Added **`sim::Formation`** helpers (headless, deterministic):
+  - Formation patterns: **Trail**, **Wedge**, **Diamond**, **Ring**.
+  - A small `Basis` builder (`makeBasisFromForward`) to generate a safe orthonormal frame.
+  - Seeded per-slot jitter (optional) to avoid unnaturally perfect symmetry without introducing drift.
+
+- Upgraded police **convoy escort follow** behaviour:
+  - Escorts are assigned stable **slot indices** per `followId`.
+  - Each escort now chases its own **formation anchor** around the followed contact.
+  - The result is clearer convoy silhouettes and less "all NPCs collapse onto one point" behaviour.
+
+### Tests
+
+- Added `test_formation` to validate determinism, basic spacing sanity, and basis construction.
+
+### Files changed/added
+
+- `include/stellar/sim/Formation.h` *(new)*
+- `apps/stellar_game/main.cpp`
+- `tests/test_formation.cpp` *(new)*
+- `PATCH_NOTES.md`
+
 ## Round 51 — Ship HUD nav markers + build fixes (MSVC)
 
 This round targets the most under-developed area introduced recently: **the procedural Ship HUD**, along with a set of
@@ -964,5 +1278,256 @@ workflow directly inside the game.
 - `apps/stellar_game/ProceduralShaderLabWindow.h` *(new)*
 - `apps/stellar_game/ProceduralShaderLabWindow.cpp` *(new)*
 - `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 62 — Zero-allocation ShaderToy param updates + Heatmap param handles
+
+This round focuses on a subtle but important under-developed part of the procedural pipeline: **parameter plumbing**.
+The galaxy heatmap (and ShaderToy-driven tools in general) update dozens of uniforms per redraw; doing that through
+name-based lookups can quietly create per-frame overhead and makes schema drift harder to notice.
+
+### What changed
+
+- **`render::ShaderToyParamSet` now supports C++20 heterogeneous lookup** (transparent `std::string_view` key support)
+  so `findIndex()` no longer needs to allocate temporary `std::string` objects.
+- Added **index-based setters**:
+  - `setValue(int index, ...)` (clamped)
+  - `setRawValue(int index, ...)` (unclamped, but still sanitizes unused lanes)
+- **Procedural Galaxy Lab heatmap** caches all internal uniform indices once at init-time and then updates by index.
+  - Faster per-frame updates.
+  - Fails fast with a clear error if the internal schema ever drifts.
+- Added a small **unit test** covering the new by-index setters and the clamped vs. raw behavior.
+
+### Files changed/added
+
+- `include/stellar/render/ShaderToyParams.h`
+- `src/render/ShaderToyParams.cpp`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_shader_toy_params.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 63 — Headless-friendly ShaderToyParams module (fixes tests & unlocks offline tooling)
+
+This round addresses a **missing integration piece**: `ShaderToyParams` is largely CPU-only (parsing, schema, clamping),
+but it previously lived behind the OpenGL build flag. That meant **headless builds (no OpenGL)** could not link code that
+uses `ShaderToyParamSet` (including the new unit test), even though those parts don’t need a renderer.
+
+### What changed
+
+- **`src/render/ShaderToyParams.cpp` is now compiled in headless builds** (moved into the always-on core source list).
+- Added **feature macros** exported from CMake:
+  - `STELLAR_ENABLE_RENDER` (0/1)
+  - `STELLAR_ENABLE_IMGUI` (0/1)
+  This enables clean, compile-time gating for optional rendering code.
+- `ShaderToyParamSet::applyToShader()` is now **a no-op in headless builds**, avoiding any accidental link dependency on the
+  OpenGL shader backend when it isn’t present.
+
+### Why it matters
+
+- Fixes **link failures** when building tests without OpenGL.
+- Unlocks future **offline / CI tooling** that can parse `.stoy` graphs and validate parameter schemas in a headless build.
+
+### Files changed/added
+
+- `CMakeLists.txt`
+- `src/render/ShaderToyParams.cpp`
+- `PATCH_NOTES.md`
+
+## Round 64 — Streaming-friendly preview sector cache (LRU) + adjustable preview cap
+
+This round focuses on one of the most under-developed parts of procedural exploration: **interactive pan/zoom performance**.
+Previously, the Galaxy Lab preview regenerated every visited sector each time you nudged the view. That’s correct but wasteful
+because sector generation is deterministic.
+
+### What changed
+
+- Added a tiny, header-only `core::LruCache` utility (hash map + recency list) suitable for deterministic procedural caches.
+- **Procedural Galaxy Lab** now caches generated sector stubs in an **LRU sector cache**:
+  - Keys: sector coordinates `(x,y,z)`.
+  - Invalidates automatically when the generator *context* changes (`seed`, `GalaxyParams`, or `factionCount`).
+  - Capacity is user-controllable, with a one-click **Clear Cache** button.
+  - Diagnostics are exposed: hits/misses/evictions and an approximate cached-stub memory estimate.
+- Added a missing usability control: **Max Preview Systems** is now adjustable from the UI.
+- Added a unit test for the new LRU cache.
+
+### Files changed/added
+
+- `include/stellar/core/LruCache.h` *(new)*
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_lru_cache.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 65 — Parallel preview generation + cache-friendly insertion API
+
+This round targets a common pain point when exploring big galaxies: **preview regeneration stalls** when the view covers lots of
+sectors (large radius or high Max Preview Systems).
+
+### What changed
+
+- **Procedural Galaxy Lab** preview generation is now **parallelized on the CPU** using the existing `core::JobSystem`:
+  - Sampled sectors are partitioned into chunks and processed concurrently.
+  - Each worker keeps a local bottom‑K sample; the main thread merges those into the global bottom‑K.
+  - The selection remains **deterministic** (stable hash key per system), regardless of worker count.
+- The preview **sector cache** now stores **`shared_ptr` to immutable stub vectors**, so cached sectors can be safely shared
+  across workers without copying.
+- `core::LruCache` gained a missing but extremely useful API for expensive values:
+  - `getOrInsert(key, value)` / `getOrInsert(key, value, onEvict)` — insert a precomputed value while preserving LRU behavior.
+  - `insertOrAssign(key, value)` — replace an existing entry (touching MRU).
+- UI additions under **Preview Performance**:
+  - **Parallel Preview** toggle.
+  - **Threads (0=auto)** control.
+  - A small diagnostic showing how many worker threads were used in the last rebuild.
+
+### Files changed/added
+
+- `include/stellar/core/LruCache.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_lru_cache.cpp`
+- `PATCH_NOTES.md`
+
+## Round 66 — Hyperlane overlay in Galaxy Lab + dynamic LOD line rendering
+
+This round exposes one of the most “hidden” procedural systems in the repo: **hyperlane generation**. The procedural module
+(`proc::generateHyperlaneNetwork`) already existed and was tested, but it wasn’t wired into the main exploration tooling.
+
+### What changed
+
+- **Procedural Galaxy Lab** gained a new **Hyperlanes (Navigation Graph)** overlay:
+  - Generates a deterministic, sparse lane network (**MST + kNN + extra edges**) over the current preview slice.
+  - Optional **hazard modulation** controls (nebula/storm fields) are now tweakable from the UI.
+  - Edges can be colored by **risk** (default) or by **bandwidth**.
+- Added **dynamic LOD for lane drawing** to keep the map readable at all zoom levels:
+  - Caps rendered edges (manual or auto based on canvas size).
+  - Skips edges that become **sub‑pixel** via a minimum screen‑length threshold.
+  - Thickness and opacity scale with bandwidth.
+- Added **caching + deterministic node subset selection**:
+  - Hyperlanes are computed on at most **Max Nodes** (bottom‑K by stable hash key) so generation cost is bounded.
+  - The overlay rebuilds only when its **input hash** changes (seed, preview stubset hash, hyperlane params, node cap).
+- Added a small usability improvement: when hovering a system, the tooltip shows **hyperlane degree** and average bandwidth/risk,
+  and (optionally) highlights incident edges.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 67 - Hyperlane Route Inspector (interactive pathfinding + overlay)
+
+### What changed
+- **Procedural Galaxy Lab:** added a hyperlane **Route Inspector** that turns the generated lane graph into an interactive navigation tool:
+  - **Shift+Click** a system to set **route start**.
+  - **Ctrl+Click** a system to set **route end**.
+  - **Right-click** a system to **clear** the current route.
+  - Uses the existing **`proc::HyperlaneRouter` (Dijkstra)** to compute lowest-cost paths over the cached hyperlane subset.
+  - Adds controls for **riskWeight / bandwidthBias / minBandwidthFactor**, plus overlay **opacity/width**.
+  - Draws a **highlighted route polyline** (risk-colored segments, bandwidth-weighted width) on top of the hyperlane LOD pass.
+  - Exposes **route metrics** (cost, distance, compound risk, bottleneck bandwidth, hops) + **copy-to-clipboard** route export.
+- **Tests:** added Catch2 coverage for `HyperlaneRouter` (path choice + metrics composition).
+
+### Files changed/added
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_hyperlane_router.cpp`
+- `PATCH_NOTES.md`
+
+## Round 68 — K-shortest Hyperlane Routing (Yen + A*), multi-route overlay, and tests
+
+### What changed
+- **Core / proc:** added `proc::plotKHyperlaneRoutesAStarCost(...)` — a **loopless K-shortest path enumerator** for hyperlane graphs:
+  - Uses **A*** point-to-point search with a straight-line heuristic (admissible because hyperlane cost is always ≥ Euclidean distance).
+  - Wraps that solver with **Yen’s algorithm** to enumerate **K alternative routes** (ordered by total travel cost, deterministic tie-breaks).
+  - Returns full `HyperlanePathMetrics` for each alternative (cost, distance, compound risk, bottleneck bandwidth, hops).
+
+- **Procedural Galaxy Lab:** upgraded the Hyperlane Route Inspector to support **multiple alternative routes**:
+  - New **K Routes** slider.
+  - A selectable table of route candidates (hops / cost / dist / risk / BW).
+  - Optional **Draw alternatives** mode: renders all K routes with adjustable opacity/width, while the selected route stays bold on top.
+
+- **Tests:** added a deterministic unit test that validates ordering + metrics for a small hand-built hyperlane graph.
+
+### Files changed/added
+- `include/stellar/proc/HyperlaneKRoutes.h` *(new)*
+- `src/proc/HyperlaneKRoutes.cpp` *(new)*
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_hyperlane_k_routes.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 69 — Hyperlane Traffic Heatmap (Betweenness Centrality) + Chokepoint Overlay
+
+This round turns hyperlanes into something you can *reason* about: a lightweight **graph analytics layer** that estimates which
+lanes are likely to be “busy corridors” (and which systems are critical connectors), then exposes that in the Galaxy Lab.
+
+### What changed
+
+- **Core / proc:** added `proc::estimateHyperlaneBetweennessCentrality(...)`:
+  - Computes **edge + node betweenness centrality** over the hyperlane graph using a Brandes-style accumulation step.
+  - Uses **weighted Dijkstra** per source (weights match `HyperlaneRouter` travel cost), so “traffic” reflects **fastest routes**.
+  - Supports **deterministic approximation via source sampling** (`sampleSources`) to keep it interactive on large previews.
+
+- **Procedural Galaxy Lab:** Hyperlane overlay gained a new **Color Mode**:
+  - **Risk** (existing)
+  - **Bandwidth** (existing)
+  - **Traffic (betweenness)** *(new)*
+    - Adjustable **Traffic Samples (0=exact)**.
+    - Optional **Highlight chokepoints** (top-N highest betweenness edges are redrawn thicker on top).
+    - Extra **Traffic Width Boost** and **Traffic Alpha Boost** controls.
+    - Displays a small cache stat (compute time + max centrality).
+
+- **Route overlay integration:** when Traffic mode is active, the route polylines also use the same traffic coloring
+  (still bandwidth-whitened) so you can see whether the chosen route uses major corridors or quieter backways.
+
+- **Tests:** added a deterministic unit test for betweenness on a simple 4-node chain.
+
+### Files changed/added
+
+- `include/stellar/proc/HyperlaneCentrality.h` *(new)*
+- `src/proc/HyperlaneCentrality.cpp` *(new)*
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_hyperlane_centrality.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 70 — Hyperlane Structural Criticality (Bridges + Articulation Points) + Criticality Overlay
+
+This round adds a second, complementary graph analytics layer for hyperlanes: **structural fragility**.
+Where betweenness centrality answers “what lanes are *busy*?”, this answers “what lanes/systems are *single points of failure*?”.
+
+### What changed
+
+- **Core / proc:** added `proc::analyzeHyperlaneVulnerability(...)`:
+  - Finds **bridges** (cut-edges) and **articulation points** (cut-vertices) on the undirected hyperlane graph.
+  - Computes per-bridge **cut size** (how many nodes end up on the smaller side if the bridge fails) and per-articulation **impact**
+    (how many nodes fall outside the largest remaining component if the system disappears).
+  - Works per connected component so “impact” stays meaningful even if the lane graph is not fully connected.
+
+- **Procedural Galaxy Lab:** Hyperlane overlay gained a new **Color Mode**:
+  - **Criticality (bridges/articulation)** *(new)*
+    - Highlights fragile **bridge lanes** (thicker + hotter color for higher cut impact).
+    - Draws a ring overlay around the top **articulation systems** (radius/color scale with impact).
+    - Adds UI controls for **Top Bridges / Top Articulation**, plus width/alpha boosts.
+
+- **Route overlay integration:** when Criticality mode is active, route segments are colored by the same criticality metric
+  (so you can immediately see if the chosen path relies on bridge lanes).
+
+- **Tests / build hygiene:**
+  - Converted the Round 69 centrality test from Catch2 style to the repo’s **`test_harness`** entrypoint format.
+  - Added a deterministic unit test for bridge/articulation detection on simple graphs.
+
+### Files changed/added
+
+- `include/stellar/proc/HyperlaneVulnerability.h` *(new)*
+- `src/proc/HyperlaneVulnerability.cpp` *(new)*
+- `apps/stellar_game/ProceduralGalaxyLabWindow.h`
+- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `tests/test_hyperlane_centrality.cpp` *(rewritten to harness style)*
+- `tests/test_hyperlane_vulnerability.cpp` *(new)*
 - `CMakeLists.txt`
 - `PATCH_NOTES.md`

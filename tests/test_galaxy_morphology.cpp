@@ -6,7 +6,7 @@
 
 using namespace stellar;
 
-int main() {
+int test_galaxy_morphology() {
   int failures = 0;
 
   proc::GalaxyParams gp{};
@@ -69,8 +69,5 @@ int main() {
   CHECK(s.ring01 >= 0.0 && s.ring01 <= 1.0);
   CHECK(s.thicknessHalfLy > 0.0);
 
-  if (!failures) {
-    return 0;
-  }
-  return 1;
+  return failures ? 1 : 0;
 }

@@ -3,6 +3,8 @@
 #include "stellar/sim/Faction.h"
 #include "stellar/sim/Units.h"
 
+#include "test_harness.h"
+
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -46,7 +48,8 @@ sim::SystemStub makeTestStub(core::u64 seed) {
 
 } // namespace
 
-int main() {
+int test_system_moons() {
+  int failures = 0;
   const core::u64 universeSeed = 0xC0FFEEULL;
   const auto factions = sim::generateFactions(universeSeed, 4);
 
@@ -56,8 +59,8 @@ int main() {
     const sim::StarSystem a = proc::generateSystem(universeSeed, stub, factions);
     const sim::StarSystem b = proc::generateSystem(universeSeed, stub, factions);
 
+    CHECK(a.moons.size() == b.moons.size());
     if (a.moons.size() != b.moons.size()) {
-      std::cerr << "FAIL: moon count differs across identical generation\n";
       return 1;
     }
 
@@ -65,27 +68,21 @@ int main() {
       const auto& ma = a.moons[i];
       const auto& mb = b.moons[i];
 
-      if (ma.id != mb.id || ma.parentPlanetIndex != mb.parentPlanetIndex || ma.type != mb.type) {
-        std::cerr << "FAIL: moon identity differs at index " << i << "\n";
-        return 1;
-      }
+      CHECK(ma.id == mb.id);
+      CHECK(ma.parentPlanetIndex == mb.parentPlanetIndex);
+      CHECK(ma.type == mb.type);
 
-      if (!approxEq(ma.radiusEarth, mb.radiusEarth) || !approxEq(ma.massEarth, mb.massEarth)) {
-        std::cerr << "FAIL: moon physicals differ at index " << i << "\n";
-        return 1;
-      }
+      CHECK(approxEq(ma.radiusEarth, mb.radiusEarth));
+      CHECK(approxEq(ma.massEarth, mb.massEarth));
 
-      if (!approxEq(ma.orbit.semiMajorAxisAU, mb.orbit.semiMajorAxisAU) ||
-          !approxEq(ma.orbit.eccentricity, mb.orbit.eccentricity) ||
-          !approxEq(ma.orbit.inclinationRad, mb.orbit.inclinationRad) ||
-          !approxEq(ma.orbit.ascendingNodeRad, mb.orbit.ascendingNodeRad) ||
-          !approxEq(ma.orbit.argPeriapsisRad, mb.orbit.argPeriapsisRad) ||
-          !approxEq(ma.orbit.meanAnomalyAtEpochRad, mb.orbit.meanAnomalyAtEpochRad) ||
-          !approxEq(ma.orbit.epochDays, mb.orbit.epochDays) ||
-          !approxEq(ma.orbit.periodDays, mb.orbit.periodDays)) {
-        std::cerr << "FAIL: moon orbit differs at index " << i << "\n";
-        return 1;
-      }
+      CHECK(approxEq(ma.orbit.semiMajorAxisAU, mb.orbit.semiMajorAxisAU));
+      CHECK(approxEq(ma.orbit.eccentricity, mb.orbit.eccentricity));
+      CHECK(approxEq(ma.orbit.inclinationRad, mb.orbit.inclinationRad));
+      CHECK(approxEq(ma.orbit.ascendingNodeRad, mb.orbit.ascendingNodeRad));
+      CHECK(approxEq(ma.orbit.argPeriapsisRad, mb.orbit.argPeriapsisRad));
+      CHECK(approxEq(ma.orbit.meanAnomalyAtEpochRad, mb.orbit.meanAnomalyAtEpochRad));
+      CHECK(approxEq(ma.orbit.epochDays, mb.orbit.epochDays));
+      CHECK(approxEq(ma.orbit.periodDays, mb.orbit.periodDays));
     }
   }
 
@@ -103,14 +100,14 @@ int main() {
   }
 
   if (!found) {
-    std::cerr << "FAIL: couldn't find any moons in scan range\n";
+    CHECK(false && "couldn't find any moons in scan range");
     return 1;
   }
 
   for (const auto& m : sys.moons) {
+    CHECK(m.parentPlanetIndex < sys.planets.size());
     if (m.parentPlanetIndex >= sys.planets.size()) {
-      std::cerr << "FAIL: moon has invalid parent index\n";
-      return 1;
+      continue;
     }
 
     const auto& host = sys.planets[m.parentPlanetIndex];
@@ -118,23 +115,17 @@ int main() {
     const double aAU = m.orbit.semiMajorAxisAU;
     const double rMinAU = planetRadiusAU(host) * 4.0;
 
-    if (!(aAU > rMinAU)) {
-      std::cerr << "FAIL: moon orbit is implausibly small (inside min safe radius)\n";
-      return 1;
-    }
+    CHECK(aAU > rMinAU);
 
-    if (hillAU > 0.0 && !(aAU < hillAU * 0.50)) {
-      std::cerr << "FAIL: moon orbit exceeds stability fraction of Hill radius\n";
-      return 1;
+    if (hillAU > 0.0) {
+      CHECK(aAU < hillAU * 0.50);
     }
 
     const auto posKm = sim::moonPosKm(host, m, 0.0);
-    if (!std::isfinite(posKm.x) || !std::isfinite(posKm.y) || !std::isfinite(posKm.z)) {
-      std::cerr << "FAIL: moonPosKm returned non-finite values\n";
-      return 1;
-    }
+    CHECK(std::isfinite(posKm.x));
+    CHECK(std::isfinite(posKm.y));
+    CHECK(std::isfinite(posKm.z));
   }
 
-  std::cout << "OK: moons generated and invariants satisfied (moons=" << sys.moons.size() << ")\n";
-  return 0;
+  return failures ? 1 : 0;
 }

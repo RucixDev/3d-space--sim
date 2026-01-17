@@ -207,6 +207,82 @@ float fbm3(vec3 p) {
   return v;
 }
 
+// ---- Dynamic LOD / band-limiting helpers ----
+//
+// These helpers use screen-space derivatives (dFdx/dFdy/fwidth) to estimate
+// how quickly a procedural coordinate varies across a pixel. This allows you
+// to *band-limit* procedural detail (especially FBM octaves) automatically
+// when it becomes sub-pixel during zoom-out, reducing shimmer/aliasing.
+//
+// featurePx(): approximate feature size in pixels (bigger => smoother).
+float featurePx(vec2 p) {
+  vec2 dx = dFdx(p);
+  vec2 dy = dFdy(p);
+  float fw = max(length(dx), length(dy));
+  return 1.0 / max(1.0e-6, fw);
+}
+
+float featurePx(vec3 p) {
+  vec3 dx = dFdx(p);
+  vec3 dy = dFdy(p);
+  float fw = max(length(dx), length(dy));
+  return 1.0 / max(1.0e-6, fw);
+}
+
+// Convert a feature size (px) into a [0..1] LOD weight.
+// - pxLo: mostly filtered out below this size
+// - pxHi: fully visible above this size
+float lodWeightFromPx(float featPx, float pxLo, float pxHi) {
+  float lo = min(pxLo, pxHi);
+  float hi = max(pxLo, pxHi);
+  hi = max(hi, lo + 1.0e-3);
+  return smoothstep(lo, hi, featPx);
+}
+
+// Filtered FBM: automatically fades out high-frequency octaves as they become
+// sub-pixel.
+//
+// energyComp in [0..1]:
+//   0 => allow energy to drop (smoother / less contrast at distance)
+//   1 => renormalize by the remaining octave weights (crisper / more constant)
+float fbm2_lod(vec2 p, float pxLo, float pxHi, float energyComp) {
+  float v = 0.0;
+  float a = 0.5;
+  float wsum = 0.0;
+  mat2 m = mat2(1.6, 1.2, -1.2, 1.6);
+
+  for (int i = 0; i < 6; ++i) {
+    float w = lodWeightFromPx(featurePx(p), pxLo, pxHi);
+    v += a * noise2(p) * w;
+    wsum += a * w;
+    p = m * p;
+    a *= 0.5;
+  }
+
+  float vNorm = (wsum > 1.0e-6) ? (v / wsum) : v;
+  return mix(v, vNorm, saturate(energyComp));
+}
+
+float fbm3_lod(vec3 p, float pxLo, float pxHi, float energyComp) {
+  float v = 0.0;
+  float a = 0.5;
+  float wsum = 0.0;
+  mat3 m = mat3( 1.6,  1.2,  0.0,
+                -1.2,  1.6,  0.0,
+                 0.0,  0.0,  1.35);
+
+  for (int i = 0; i < 6; ++i) {
+    float w = lodWeightFromPx(featurePx(p), pxLo, pxHi);
+    v += a * noise3(p) * w;
+    wsum += a * w;
+    p = m * p;
+    a *= 0.5;
+  }
+
+  float vNorm = (wsum > 1.0e-6) ? (v / wsum) : v;
+  return mix(v, vNorm, saturate(energyComp));
+}
+
 // Worley / Voronoi distance (distance to nearest feature point).
 float worley2(vec2 p) {
   ivec2 ip = ivec2(floor(p));

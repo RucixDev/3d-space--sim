@@ -123,8 +123,12 @@ set(STELLAR_CORE_SOURCES
   src/proc/GalaxyHazards.cpp
   src/proc/GalaxyRegions.cpp
   src/proc/GalaxyClusters.cpp
+  src/proc/GalaxyVoids.cpp
   src/proc/Hyperlanes.cpp
   src/proc/HyperlaneRouter.cpp
+  src/proc/HyperlaneKRoutes.cpp
+  src/proc/HyperlaneCentrality.cpp
+  src/proc/HyperlaneVulnerability.cpp
   # Procedural geometry generators (CPU-side; safe for headless builds).
   src/render/ProceduralAsteroid.cpp
   src/render/SdfMesher.cpp
@@ -137,6 +141,7 @@ set(STELLAR_CORE_SOURCES
   src/render/ProceduralPostFX.cpp
   src/render/ProceduralCompositor.cpp
   src/render/AutoExposure.cpp
+  src/render/ShaderToyParams.cpp
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
   src/proc/GalaxyMorphology.cpp
@@ -229,7 +234,6 @@ set(STELLAR_RENDER_SOURCES
   src/render/Gl.cpp
   src/render/Shader.cpp
   src/render/ShaderToy.cpp
-  src/render/ShaderToyParams.cpp
   src/render/ShaderToyGraph.cpp
   src/render/GaussianSurfels.cpp
   src/render/Texture.cpp
@@ -271,6 +275,13 @@ target_include_directories(stellar PUBLIC
 )
 
 target_compile_features(stellar PUBLIC cxx_std_20)
+
+# Expose build options to C/C++ for feature-gated code paths.
+target_compile_definitions(stellar PUBLIC
+  STELLAR_ENABLE_RENDER=$<BOOL:${STELLAR_ENABLE_RENDER}>
+  STELLAR_ENABLE_IMGUI=$<BOOL:${STELLAR_ENABLE_IMGUI}>
+)
+
 
 if (STELLAR_ENABLE_RENDER)
   target_link_libraries(stellar PUBLIC
