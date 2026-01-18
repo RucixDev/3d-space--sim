@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 struct SDL_AudioSpec;
 
@@ -71,6 +72,18 @@ public:
   //  pan:  -1 (left) .. +1 (right)
   void play(Sfx sfx, float gain = 1.0f, float pan = 0.0f);
 
+  // Sample rate in Hz for the opened device (or default 48kHz if inactive).
+  float sampleRate() const { return sampleRate_; }
+
+  // Tooling: copy a snapshot of the most recent mixed output (mono) into `out`.
+  //
+  // The returned samples are ordered oldest -> newest.
+  // Returns the number of samples written (0 on failure).
+  //
+  // NOTE: This is meant for visualization/debug tooling (oscilloscope/FFT), not
+  // for gameplay-critical logic.
+  int copyRecentMono(float* out, int maxSamples) const;
+
 private:
   struct Event {
     Sfx sfx{Sfx::UiClick};
@@ -121,6 +134,12 @@ private:
   float lfoPhase_{0.0f};
   std::uint32_t noiseState_{0x12345678u};
   float thrusterNoiseLP_{0.0f};
+
+  // Debug capture ring (audio thread writes, main thread reads)
+  static constexpr std::uint32_t kCaptureSize = 1u << 16; // 65536 samples (~1.37s at 48kHz)
+  static constexpr std::uint32_t kCaptureMask = kCaptureSize - 1;
+  std::atomic<std::uint32_t> capWrite_{0};
+  std::vector<std::int16_t> capture_;
 
   struct Voice {
     Sfx sfx{Sfx::UiClick};

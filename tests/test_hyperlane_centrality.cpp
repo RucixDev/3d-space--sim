@@ -17,6 +17,8 @@ static sim::SystemStub mkStub(sim::SystemId id, double x, double y) {
 }
 
 int test_hyperlane_centrality() {
+  int failures = 0;
+
   // A simple chain graph:
   // 1 -- 2 -- 3 -- 4
   // The middle edge should have the highest betweenness (traffic).
@@ -35,7 +37,11 @@ int test_hyperlane_centrality() {
   travel.riskWeight = 0.0;
   travel.bandwidthBias = 0.0;
 
-  const auto res = proc::estimateEdgeBetweenness(net, nodes, travel, /*samples*/ 4000);
+  proc::HyperlaneBetweennessParams params;
+  params.travel = travel;
+  params.sampleSources = 0; // exact (all sources) for small graphs
+
+  const auto res = proc::estimateHyperlaneBetweennessCentrality(nodes, net, params);
   CHECK((int)res.edgeBetweenness.size() == (int)net.edges.size());
   CHECK(res.maxEdge >= 0.0);
 
@@ -47,7 +53,5 @@ int test_hyperlane_centrality() {
     CHECK(e1 >= e2);
   }
 
-  return 0;
+  return failures;
 }
-
-REGISTER_TEST(test_hyperlane_centrality);

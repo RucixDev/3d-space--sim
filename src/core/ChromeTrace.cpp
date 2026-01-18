@@ -7,6 +7,7 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace stellar::core {
@@ -44,6 +45,75 @@ static void writeThreadNameMetadata(JsonWriter& w, int pid, int tid, std::string
 static void writeDefaultMetadata(JsonWriter& w, int pid, int tid) {
   writeProcessNameMetadata(w, pid, "stellar");
   writeThreadNameMetadata(w, pid, tid, "Main");
+}
+
+static std::vector<std::uint64_t> collectThreadIds(const std::deque<ProfilerFrame>& frames) {
+  std::vector<std::uint64_t> out;
+  for (const auto& f : frames) {
+    for (const auto& e : f.events) {
+      if (e.threadId != 0) out.push_back(e.threadId);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+static std::vector<std::uint64_t> orderThreadIds(std::vector<std::uint64_t> unique,
+                                                 std::uint64_t mainId) {
+  if (unique.empty()) return unique;
+
+  if (mainId == 0) {
+    // Best-effort: keep deterministic ordering (already sorted).
+    return unique;
+  }
+
+  // If mainId wasn't observed, don't force it.
+  if (std::find(unique.begin(), unique.end(), mainId) == unique.end()) {
+    return unique;
+  }
+
+  // Move mainId to the front.
+  std::vector<std::uint64_t> out;
+  out.reserve(unique.size());
+  out.push_back(mainId);
+  for (auto id : unique) {
+    if (id == mainId) continue;
+    out.push_back(id);
+  }
+  return out;
+}
+
+static void writeThreadMetadata(JsonWriter& w,
+                                int pid,
+                                int baseTid,
+                                const std::vector<std::uint64_t>& orderedIds,
+                                std::uint64_t mainId,
+                                bool splitThreads) {
+  writeProcessNameMetadata(w, pid, "stellar");
+
+  if (!splitThreads) {
+    writeThreadNameMetadata(w, pid, baseTid, "Main");
+    return;
+  }
+
+  // If we didn't observe any events, still emit a "Main" thread so Frame spans have a home.
+  if (orderedIds.empty()) {
+    writeThreadNameMetadata(w, pid, baseTid, "Main");
+    return;
+  }
+
+  int worker = 0;
+  for (int i = 0; i < (int)orderedIds.size(); ++i) {
+    const int tid = baseTid + i;
+    const std::uint64_t id = orderedIds[(std::size_t)i];
+    if (mainId != 0 && id == mainId) {
+      writeThreadNameMetadata(w, pid, tid, "Main");
+    } else {
+      writeThreadNameMetadata(w, pid, tid, std::string("Worker ") + std::to_string(worker));
+      ++worker;
+    }
+  }
 }
 
 static void writeSpanEvent(JsonWriter& w,
@@ -88,8 +158,26 @@ static bool writeFramesImpl(std::ostream& out,
   w.key("traceEvents");
   w.beginArray();
 
-  // Emit metadata first so viewers can label the track.
-  writeDefaultMetadata(w, opt.pid, opt.tid);
+  // ----- Thread mapping + metadata -----
+  const std::uint64_t mainId = frames.front().mainThreadId;
+  const auto unique = collectThreadIds(frames);
+  const auto ordered = opt.splitThreads ? orderThreadIds(unique, mainId) : std::vector<std::uint64_t>{};
+
+  std::unordered_map<std::uint64_t, int> tidMap;
+  if (opt.splitThreads) {
+    for (int i = 0; i < (int)ordered.size(); ++i) {
+      tidMap[ordered[(std::size_t)i]] = opt.tid + i;
+    }
+  }
+
+  writeThreadMetadata(w, opt.pid, opt.tid, ordered, mainId, opt.splitThreads);
+
+  const auto tidForEvent = [&](const ProfilerEvent& e) -> int {
+    if (!opt.splitThreads) return opt.tid;
+    auto it = tidMap.find(e.threadId);
+    if (it != tidMap.end()) return it->second;
+    return opt.tid;
+  };
 
   // A scratch vector used to sort events per-frame by start time.
   std::vector<const ProfilerEvent*> sorted;
@@ -121,6 +209,7 @@ static bool writeFramesImpl(std::ostream& out,
     std::sort(sorted.begin(), sorted.end(), [](const ProfilerEvent* a, const ProfilerEvent* b) {
       if (a->startNs != b->startNs) return a->startNs < b->startNs;
       if (a->endNs != b->endNs) return a->endNs < b->endNs;
+      if (a->threadId != b->threadId) return a->threadId < b->threadId;
       return a->depth < b->depth;
     });
 
@@ -133,7 +222,7 @@ static bool writeFramesImpl(std::ostream& out,
                      /*tsUs=*/tsUs,
                      /*durUs=*/durUs,
                      /*pid=*/opt.pid,
-                     /*tid=*/opt.tid,
+                     /*tid=*/tidForEvent(*e),
                      /*depth=*/e->depth,
                      /*cat=*/"cpu");
     }
@@ -289,8 +378,20 @@ static bool writeFramesAndCountersImpl(std::ostream& out,
 
   const std::uint64_t baseNs = frames.front().startNs;
 
-  const int cpuTid = opt.tid;
-  const int counterTid = opt.tid + 1;
+  // ----- Thread mapping -----
+  const std::uint64_t mainId = frames.front().mainThreadId;
+  const auto unique = collectThreadIds(frames);
+  const auto ordered = opt.splitThreads ? orderThreadIds(unique, mainId) : std::vector<std::uint64_t>{};
+
+  std::unordered_map<std::uint64_t, int> tidMap;
+  if (opt.splitThreads) {
+    for (int i = 0; i < (int)ordered.size(); ++i) {
+      tidMap[ordered[(std::size_t)i]] = opt.tid + i;
+    }
+  }
+
+  const int cpuThreadCount = opt.splitThreads ? std::max(1, (int)ordered.size()) : 1;
+  const int counterTid = opt.tid + cpuThreadCount;
 
   JsonWriter w(out, opt.pretty);
   w.beginObject();
@@ -301,11 +402,15 @@ static bool writeFramesAndCountersImpl(std::ostream& out,
   w.beginArray();
 
   // Metadata
-  writeProcessNameMetadata(w, opt.pid, "stellar");
-  writeThreadNameMetadata(w, opt.pid, cpuTid, "Main");
-  if (!counters.empty()) {
-    writeThreadNameMetadata(w, opt.pid, counterTid, "Counters");
-  }
+  writeThreadMetadata(w, opt.pid, opt.tid, ordered, mainId, opt.splitThreads);
+  if (!counters.empty()) writeThreadNameMetadata(w, opt.pid, counterTid, "Counters");
+
+  const auto tidForEvent = [&](const ProfilerEvent& e) -> int {
+    if (!opt.splitThreads) return opt.tid;
+    auto it = tidMap.find(e.threadId);
+    if (it != tidMap.end()) return it->second;
+    return opt.tid;
+  };
 
   // CPU span events (same output as writeProfilerChromeTraceJson).
   std::vector<const ProfilerEvent*> sorted;
@@ -321,7 +426,7 @@ static bool writeFramesAndCountersImpl(std::ostream& out,
                      /*tsUs=*/frameTsUs,
                      /*durUs=*/frameDurUs,
                      /*pid=*/opt.pid,
-                     /*tid=*/cpuTid,
+                     /*tid=*/opt.tid,
                      /*depth=*/0,
                      /*cat=*/"frame");
     }
@@ -336,6 +441,7 @@ static bool writeFramesAndCountersImpl(std::ostream& out,
     std::sort(sorted.begin(), sorted.end(), [](const ProfilerEvent* a, const ProfilerEvent* b) {
       if (a->startNs != b->startNs) return a->startNs < b->startNs;
       if (a->endNs != b->endNs) return a->endNs < b->endNs;
+      if (a->threadId != b->threadId) return a->threadId < b->threadId;
       return a->depth < b->depth;
     });
 
@@ -348,7 +454,7 @@ static bool writeFramesAndCountersImpl(std::ostream& out,
                      /*tsUs=*/tsUs,
                      /*durUs=*/durUs,
                      /*pid=*/opt.pid,
-                     /*tid=*/cpuTid,
+                     /*tid=*/tidForEvent(*e),
                      /*depth=*/e->depth,
                      /*cat=*/"cpu");
     }

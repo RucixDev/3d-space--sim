@@ -108,6 +108,22 @@ static bool icontains(std::string_view hay, std::string_view needle) {
   return false;
 }
 
+static core::u64 splitmix64(core::u64& state) {
+  // Simple deterministic RNG suitable for procedural textures.
+  // https://prng.di.unimi.it/splitmix64.c (public domain reference implementation)
+  core::u64 z = (state += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+
+static float rand01(core::u64& state) {
+  // 24-bit mantissa in [0,1).
+  const core::u64 r = splitmix64(state);
+  const unsigned int x = (unsigned int)(r & 0xFFFFFFu);
+  return (float)x / 16777216.0f;
+}
+
 // -----------------------------
 // Pass / channel mapping helpers
 // -----------------------------
@@ -135,6 +151,10 @@ static const char* channelLabel(stellar::render::ShaderToyChannelSource s) {
     case S::BufferB: return "Buffer B";
     case S::BufferC: return "Buffer C";
     case S::BufferD: return "Buffer D";
+    case S::External0: return "Checker";
+    case S::External1: return "Noise";
+    case S::External2: return "Fluid";
+    case S::External3: return "Flow";
   }
   return "None";
 }
@@ -155,6 +175,12 @@ static stellar::render::ShaderToyChannelSource channelFromToken(std::string_view
   if (u == "B" || u == "BUFFERB" || u == "BUFFER_B") return S::BufferB;
   if (u == "C" || u == "BUFFERC" || u == "BUFFER_C") return S::BufferC;
   if (u == "D" || u == "BUFFERD" || u == "BUFFER_D") return S::BufferD;
+
+  // External textures (Shader Lab binds these to useful built-ins).
+  if (u == "EXT0" || u == "EXTERNAL0" || u == "CHECKER" || u == "CHK") return S::External0;
+  if (u == "EXT1" || u == "EXTERNAL1" || u == "NOISE" || u == "RNG") return S::External1;
+  if (u == "EXT2" || u == "EXTERNAL2" || u == "FLUID") return S::External2;
+  if (u == "EXT3" || u == "EXTERNAL3" || u == "FLOW" || u == "VEL" || u == "VELOCITY") return S::External3;
   return S::None;
 }
 
@@ -166,6 +192,10 @@ static const char* channelToken(stellar::render::ShaderToyChannelSource s) {
     case S::BufferB: return "B";
     case S::BufferC: return "C";
     case S::BufferD: return "D";
+    case S::External0: return "Checker";
+    case S::External1: return "Noise";
+    case S::External2: return "Fluid";
+    case S::External3: return "Flow";
   }
   return "None";
 }
@@ -348,7 +378,7 @@ static std::string saveGraphText(const ProceduralShaderLabWindowState& st) {
   ss << "# PASS <Buffer A|B|C|D|Image>\n";
   ss << "# ENABLED <0|1> (buffers only; image always enabled)\n";
   ss << "# SCALE <1|2|4>\n";
-  ss << "# CHANNELS <None|A|B|C|D> x4\n";
+  ss << "# CHANNELS <None|A|B|C|D|Checker|Noise|Fluid|Flow> x4\n";
   ss << "# PARAMS_BEGIN/END are optional overrides for `// @param ...` values\n";
   ss << "# PARAM <name> <x> <y> <z> <w>\n";
   ss << "\n";
@@ -401,6 +431,88 @@ struct GraphPreset {
 static const char* kBlackSnippet = R"GLSL(
 vec4 shaderMain(vec2 uv) {
   return vec4(0.0);
+}
+)GLSL";
+
+static const char* kInkflowBufferA = R"GLSL(
+// Inkflow (Buffer A)
+//
+// Demonstrates external iChannel textures:
+//   iChannel1: Flow (External3)  -- velocity encoded in RG (0.5 = 0)
+//   iChannel2: Fluid dye (External2)
+//   iChannel3: Noise (External1)
+//
+// @group Inkflow
+// @param float ink_advect 1.20 0.0 5.0 0.01
+// @param float ink_flowAmp 1.00 0.0 3.0 0.01
+// @param float ink_decay 0.985 0.0 1.0 0.0005
+// @param float ink_inject 0.22 0.0 1.0 0.01
+// @param float ink_noise 0.08 0.0 0.5 0.001
+// @endgroup
+
+vec2 flowAt(vec2 uv) {
+  // External3 encodes velocity in RG, 0.5=center.
+  vec2 f = texture(iChannel1, uv).rg;
+  return (f * 2.0 - 1.0);
+}
+
+vec4 shaderMain(vec2 uv) {
+  // Bootstrap with the dye field.
+  if (iFrame < 1) {
+    return vec4(texture(iChannel2, uv).rgb, 1.0);
+  }
+
+  float dt = clamp(iTimeDelta, 0.0, 0.1);
+
+  vec2 flow = ink_flowAmp * flowAt(uv);
+  // This constant is tuned against the CPU fluid's default velocity encoding.
+  vec2 uvPrev = uv - dt * ink_advect * flow * 0.25;
+
+  vec3 prev = texture(iChannel0, uvPrev).rgb;
+  vec3 dye  = texture(iChannel2, uv).rgb;
+
+  float n = texture(iChannel3, uv * 2.0 + 0.05 * iTime).r - 0.5;
+
+  vec3 col = prev * ink_decay;
+  col = mix(col, dye, ink_inject);
+  col += ink_noise * n;
+  col = max(col, vec3(0.0));
+  return vec4(col, 1.0);
+}
+)GLSL";
+
+static const char* kInkflowImage = R"GLSL(
+// Inkflow (Image)
+// Visualizes the feedback buffer with a simple palette + vignette.
+
+// @group Look
+// @param float look_contrast 1.25 0.2 2.5 0.01
+// @param float look_vignette 0.35 0.0 1.2 0.01
+// @endgroup
+
+vec4 shaderMain(vec2 uv) {
+  vec3 ink = texture(iChannel0, uv).rgb;
+  float l = clamp(dot(ink, vec3(0.3333)), 0.0, 1.0);
+
+  // A palette that reads well for both faint and saturated dye.
+  vec3 col = palette(l,
+                     vec3(0.20, 0.22, 0.25),
+                     vec3(0.55, 0.55, 0.55),
+                     vec3(1.00, 1.00, 1.00),
+                     vec3(0.00, 0.10, 0.55));
+
+  // Bring back some of the original color.
+  col = mix(col, ink, 0.25);
+  col *= look_contrast;
+
+  // Soft vignette.
+  vec2 p = uv * 2.0 - 1.0;
+  p.x *= iAspect;
+  float r2 = dot(p, p);
+  float vig = smoothstep(1.2, look_vignette, r2);
+  col *= vig;
+
+  return vec4(tonemapSimple(col), 1.0);
 }
 )GLSL";
 
@@ -618,6 +730,37 @@ vec4 shaderMain(vec2 uv) {
       },
     },
   },
+
+  {
+    "Inkflow (External fluid flow)",
+    {
+      // Buffer A (feedback ink)
+      {kInkflowBufferA, true, 1, {stellar::render::ShaderToyChannelSource::BufferA,
+                                 stellar::render::ShaderToyChannelSource::External3, // Flow
+                                 stellar::render::ShaderToyChannelSource::External2, // Dye
+                                 stellar::render::ShaderToyChannelSource::External1}}, // Noise
+      // Buffer B
+      {kBlackSnippet, false, 1, {stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None}},
+      // Buffer C
+      {kBlackSnippet, false, 1, {stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None}},
+      // Buffer D
+      {kBlackSnippet, false, 1, {stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None,
+                                stellar::render::ShaderToyChannelSource::None}},
+      // Image
+      {kInkflowImage, true, 1, {stellar::render::ShaderToyChannelSource::BufferA,
+                               stellar::render::ShaderToyChannelSource::None,
+                               stellar::render::ShaderToyChannelSource::None,
+                               stellar::render::ShaderToyChannelSource::None}},
+    },
+  },
 };
 
 static constexpr int kPresetCount = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
@@ -792,6 +935,182 @@ static void updateLiveReload(ProceduralShaderLabWindowState& st, const ToastFn& 
 }
 
 // -----------------------------
+// External iChannel textures (External0..3)
+// -----------------------------
+
+static void rebuildChecker(ProceduralShaderLabWindowState::ExternalTextures& e) {
+  e.checkerRes = std::clamp(e.checkerRes, 64, 1024);
+  e.checkerSize = std::clamp(e.checkerSize, 2, std::max(2, e.checkerRes / 4));
+  e.checkerTex.createChecker(e.checkerRes, e.checkerRes, e.checkerSize);
+}
+
+static void rebuildNoise(ProceduralShaderLabWindowState::ExternalTextures& e) {
+  e.noiseRes = std::clamp(e.noiseRes, 64, 1024);
+  const int w = e.noiseRes;
+  const int h = e.noiseRes;
+  e.noiseRGBA.resize((size_t)w * (size_t)h * 4u);
+
+  core::u64 rng = core::hashCombine(e.noiseSeed, core::fnv1a64("shaderLabNoise"));
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const float r = rand01(rng);
+      const float g = rand01(rng);
+      const float b = rand01(rng);
+      const size_t i = ((size_t)y * (size_t)w + (size_t)x) * 4u;
+      e.noiseRGBA[i + 0] = (unsigned char)std::clamp((int)std::lround(r * 255.0f), 0, 255);
+      e.noiseRGBA[i + 1] = (unsigned char)std::clamp((int)std::lround(g * 255.0f), 0, 255);
+      e.noiseRGBA[i + 2] = (unsigned char)std::clamp((int)std::lround(b * 255.0f), 0, 255);
+      e.noiseRGBA[i + 3] = 255;
+    }
+  }
+
+  if (!e.noiseTex.handle() || e.noiseTex.width() != w || e.noiseTex.height() != h) {
+    // Repeatable tiling noise.
+    e.noiseTex.createRGBA(w, h, e.noiseRGBA.data(), /*generateMips=*/true, /*nearest=*/false, /*clampToEdge=*/false);
+  } else {
+    e.noiseTex.updateRGBA(0, 0, w, h, e.noiseRGBA.data());
+  }
+  e.requestRegenNoise = false;
+}
+
+static void seedFluid(stellar::proc::FluidSim2D& sim, core::u64 seed) {
+  sim.clear();
+
+  core::u64 rng = core::hashCombine(seed, core::fnv1a64("shaderLabFluidSeed"));
+  for (int i = 0; i < 10; ++i) {
+    const float x = 0.15f + 0.70f * rand01(rng);
+    const float y = 0.15f + 0.70f * rand01(rng);
+    const float radius = 0.03f + 0.05f * rand01(rng);
+
+    const float ang = 6.2831853f * rand01(rng);
+    const float spd = 30.0f + 80.0f * rand01(rng);
+    const float vx = std::cos(ang) * spd;
+    const float vy = std::sin(ang) * spd;
+
+    const float r = 0.5f + 1.5f * rand01(rng);
+    const float g = 0.5f + 1.5f * rand01(rng);
+    const float b = 0.5f + 1.5f * rand01(rng);
+
+    sim.splat(x, y, radius, vx, vy, r * 12.0f, g * 12.0f, b * 12.0f);
+  }
+}
+
+static void ensureFluid(ProceduralShaderLabWindowState::ExternalTextures& e) {
+  if (e.fluidGrid < 32) e.fluidGrid = 32;
+  if (e.fluidGrid > 512) e.fluidGrid = 512;
+
+  if (e.fluid.gridSize() != e.fluidGrid) {
+    e.fluid.resize(e.fluidGrid);
+
+    // Pleasant defaults for a "living texture".
+    auto& p = e.fluid.params();
+    p.viscosity = 0.00015f;
+    p.diffusion = 0.00005f;
+    p.dyeDissipation = 0.08f;
+    p.velocityDamping = 0.0f;
+    p.vorticityConfinement = 22.0f;
+    p.curlNoiseStrength = 7.0f;
+    p.curlNoiseFrequency = 2.2f;
+    p.curlNoiseTimeScale = 0.20f;
+    p.maxSpeed = 220.0f;
+    p.maxDye = 80.0f;
+
+    seedFluid(e.fluid, e.fluidSeed);
+  }
+
+  e.flowRes = e.fluid.gridSize();
+
+  // Allocate GPU textures on first use (or if resized).
+  const int n = e.fluid.gridSize();
+  if (!e.fluidTex.handle() || e.fluidTex.width() != n || e.fluidTex.height() != n) {
+    e.fluidTex.allocateRGBA(n, n, /*generateMips=*/true, /*nearest=*/false, /*clampToEdge=*/true);
+  }
+  if (!e.flowTex.handle() || e.flowTex.width() != n || e.flowTex.height() != n) {
+    e.flowTex.allocateRGBA(n, n, /*generateMips=*/true, /*nearest=*/false, /*clampToEdge=*/true);
+  }
+}
+
+static inline float saturate(float x) { return std::clamp(x, 0.0f, 1.0f); }
+
+static void updateFluidTextures(ProceduralShaderLabWindowState::ExternalTextures& e) {
+  const int n = e.fluid.gridSize();
+  if (n <= 0) return;
+
+  e.fluidRGBA.resize((size_t)n * (size_t)n * 4u);
+  e.flowRGBA.resize((size_t)n * (size_t)n * 4u);
+
+  const auto& u = e.fluid.u();
+  const auto& v = e.fluid.v();
+  const auto& r = e.fluid.dyeR();
+  const auto& g = e.fluid.dyeG();
+  const auto& b = e.fluid.dyeB();
+  const int stride = e.fluid.paddedStride();
+
+  auto tonemap = [](float x, float exposure) {
+    // Simple filmic-ish curve for pleasant display.
+    return 1.0f - std::exp(-exposure * std::max(0.0f, x));
+  };
+
+  for (int y = 0; y < n; ++y) {
+    for (int x = 0; x < n; ++x) {
+      const int ix = x + 1;
+      const int iy = y + 1;
+      const int id = ix + stride * iy;
+
+      const size_t o = ((size_t)y * (size_t)n + (size_t)x) * 4u;
+
+      // Dye (RGB) -> External2
+      const float rr = tonemap(r[id], e.fluidExposure);
+      const float gg = tonemap(g[id], e.fluidExposure);
+      const float bb = tonemap(b[id], e.fluidExposure);
+      e.fluidRGBA[o + 0] = (unsigned char)std::clamp((int)std::lround(saturate(rr) * 255.0f), 0, 255);
+      e.fluidRGBA[o + 1] = (unsigned char)std::clamp((int)std::lround(saturate(gg) * 255.0f), 0, 255);
+      e.fluidRGBA[o + 2] = (unsigned char)std::clamp((int)std::lround(saturate(bb) * 255.0f), 0, 255);
+      e.fluidRGBA[o + 3] = 255;
+
+      // Flow (velocity) -> External3
+      const float vx = u[id] * e.flowVizScale;
+      const float vy = v[id] * e.flowVizScale;
+      const float sp = std::sqrt(vx * vx + vy * vy);
+
+      const float fr = saturate(0.5f + 0.5f * vx);
+      const float fg = saturate(0.5f + 0.5f * vy);
+      const float fb = saturate(0.25f + 0.75f * sp);
+
+      e.flowRGBA[o + 0] = (unsigned char)std::clamp((int)std::lround(fr * 255.0f), 0, 255);
+      e.flowRGBA[o + 1] = (unsigned char)std::clamp((int)std::lround(fg * 255.0f), 0, 255);
+      e.flowRGBA[o + 2] = (unsigned char)std::clamp((int)std::lround(fb * 255.0f), 0, 255);
+      e.flowRGBA[o + 3] = 255;
+    }
+  }
+
+  e.fluidTex.updateRGBA(0, 0, n, n, e.fluidRGBA.data());
+  e.flowTex.updateRGBA(0, 0, n, n, e.flowRGBA.data());
+}
+
+static void ensureExternalTextures(ProceduralShaderLabWindowState& st) {
+  auto& e = st.ext;
+  if (!e.inited) {
+    rebuildChecker(e);
+    rebuildNoise(e);
+    ensureFluid(e);
+    updateFluidTextures(e);
+    e.inited = true;
+  }
+
+  // Lazy rebuilds.
+  if (e.requestRegenNoise) {
+    rebuildNoise(e);
+  }
+
+  // Keep graph bindings current.
+  st.graph.setExternalTexture(0, &e.checkerTex);
+  st.graph.setExternalTexture(1, &e.noiseTex);
+  st.graph.setExternalTexture(2, e.fluidEnabled ? &e.fluidTex : nullptr);
+  st.graph.setExternalTexture(3, e.fluidEnabled ? &e.flowTex : nullptr);
+}
+
+// -----------------------------
 // Rendering
 // -----------------------------
 
@@ -864,6 +1183,81 @@ static void renderPreview(ProceduralShaderLabWindowState& st, float timeRealSec)
       st.timeOverride += dt;
     }
     t = st.timeOverride;
+  }
+
+  // Update external iChannel textures before running the graph so passes can
+  // reference them this frame.
+  ensureExternalTextures(st);
+  if (st.ext.fluidEnabled) {
+    // Keep fluid buffers sized if the user changed settings.
+    ensureFluid(st.ext);
+
+    // Optional auto-injection to keep the texture alive.
+    if (advance && st.ext.fluidAutoInject && st.ext.fluidInjectEveryNFrames > 0) {
+      if ((st.frame % st.ext.fluidInjectEveryNFrames) == 0) {
+        core::u64 rng = core::hashCombine(st.ext.fluidSeed,
+          core::hashCombine((core::u64)st.frame, core::fnv1a64("shaderLabAutoInject")));
+
+        const float x = 0.10f + 0.80f * rand01(rng);
+        const float y = 0.10f + 0.80f * rand01(rng);
+
+        const float ang = 6.2831853f * rand01(rng);
+        const float spd = st.ext.fluidInjectForce * (0.4f + 0.6f * rand01(rng));
+        const float vx = std::cos(ang) * spd;
+        const float vy = std::sin(ang) * spd;
+
+        const float r = 0.4f + 1.2f * rand01(rng);
+        const float g = 0.4f + 1.2f * rand01(rng);
+        const float b = 0.4f + 1.2f * rand01(rng);
+
+        st.ext.fluid.splat(x, y,
+                           st.ext.fluidInjectRadius,
+                           vx, vy,
+                           r * st.ext.fluidInjectDye,
+                           g * st.ext.fluidInjectDye,
+                           b * st.ext.fluidInjectDye);
+      }
+    }
+
+    // Mouse injection (only when the preview is hovered/clicked).
+    if (st.ext.fluidMouseInject && st.mouseDown) {
+      const float u = st.mouseU;
+      const float v = st.mouseV;
+      float dx = 0.0f;
+      float dy = 0.0f;
+      if (st.ext.fluidWasDown) {
+        dx = (u - st.ext.fluidLastU);
+        dy = (v - st.ext.fluidLastV);
+      }
+      st.ext.fluidLastU = u;
+      st.ext.fluidLastV = v;
+      st.ext.fluidWasDown = true;
+
+      // Map drag delta to a strong local impulse.
+      const float vx = dx * st.ext.fluidInjectForce * 200.0f;
+      const float vy = dy * st.ext.fluidInjectForce * 200.0f;
+
+      // Dye color: warm ramp that reads well under tonemapping.
+      st.ext.fluid.splat(u, v,
+                         st.ext.fluidInjectRadius,
+                         vx, vy,
+                         1.2f * st.ext.fluidInjectDye,
+                         0.6f * st.ext.fluidInjectDye,
+                         0.25f * st.ext.fluidInjectDye);
+    } else {
+      st.ext.fluidWasDown = false;
+    }
+
+    // Advance sim.
+    if (advance && !st.ext.fluidPaused) {
+      const float dts = std::clamp(dt * st.ext.fluidTimeScale, 0.0f, st.ext.fluidMaxDt);
+      if (dts > 0.0f) {
+        st.ext.fluid.step(dts, st.ext.fluidIterations, st.ext.fluidSeed, t);
+      }
+    }
+
+    // Always refresh textures if something could have written to the sim.
+    updateFluidTextures(st.ext);
   }
 
   // Orbit camera around origin.
@@ -1047,6 +1441,149 @@ void drawProceduralShaderLabWindow(ProceduralShaderLabWindowState& st, float tim
       }
       ImGui::SameLine();
       ImGui::Checkbox("Auto-compile preset", &st.autoCompileOnPreset);
+    }
+
+    // External iChannel textures (External0..3)
+    {
+      ImGui::Separator();
+      if (ImGui::CollapsingHeader("External Textures (iChannel)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Ensure textures exist for previews even if the graph is paused.
+        ensureExternalTextures(st);
+
+        ImGui::TextWrapped(
+          "Route these via iChannel0..3 using the channel selectors: "
+          "Checker (Ext0), Noise (Ext1), Fluid (Ext2), Flow (Ext3).  "
+          "Flow encodes velocity in RG with 0.5=center (no motion)."
+        );
+
+        const float thumb = 86.0f;
+
+        // Thumbnails
+        if (ImGui::BeginTable("##ext_tex_thumbs", 2, ImGuiTableFlags_SizingFixedFit)) {
+          auto thumbCell = [&](const char* label, const stellar::render::Texture2D& tex) {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(label);
+            if (tex.handle()) {
+              ImGui::Image((ImTextureID)(intptr_t)tex.handle(), ImVec2(thumb, thumb));
+            } else {
+              ImGui::Dummy(ImVec2(thumb, thumb));
+            }
+          };
+
+          ImGui::TableNextRow();
+          thumbCell("Checker (Ext0)", st.ext.checkerTex);
+          thumbCell("Noise   (Ext1)", st.ext.noiseTex);
+
+          ImGui::TableNextRow();
+          if (st.ext.fluidEnabled) {
+            thumbCell("Fluid   (Ext2)", st.ext.fluidTex);
+            thumbCell("Flow    (Ext3)", st.ext.flowTex);
+          } else {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Fluid   (Ext2)");
+            ImGui::Dummy(ImVec2(thumb, thumb));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Flow    (Ext3)");
+            ImGui::Dummy(ImVec2(thumb, thumb));
+          }
+
+          ImGui::EndTable();
+        }
+
+        ImGui::Spacing();
+
+        // Checker controls
+        {
+          bool changed = false;
+          changed |= ImGui::SliderInt("Checker size", &st.ext.checkerSize, 2, 64);
+          changed |= ImGui::SliderInt("Checker res", &st.ext.checkerRes, 64, 1024);
+          if (changed) {
+            rebuildChecker(st.ext);
+          }
+        }
+
+        // Noise controls
+        {
+          ImGui::SeparatorText("Noise (Ext1)");
+          if (ImGui::SliderInt("Noise res", &st.ext.noiseRes, 64, 1024)) {
+            st.ext.requestRegenNoise = true;
+          }
+
+          // Use a 64-bit seed input via two 32-bit halves for portability.
+          std::uint32_t seedLo = (std::uint32_t)(st.ext.noiseSeed & 0xFFFFFFFFULL);
+          std::uint32_t seedHi = (std::uint32_t)((st.ext.noiseSeed >> 32) & 0xFFFFFFFFULL);
+          bool seedChanged = false;
+          seedChanged |= ImGui::InputScalar("Noise seed (lo)", ImGuiDataType_U32, &seedLo);
+          seedChanged |= ImGui::InputScalar("Noise seed (hi)", ImGuiDataType_U32, &seedHi);
+          if (seedChanged) {
+            st.ext.noiseSeed = ((core::u64)seedHi << 32) | (core::u64)seedLo;
+            st.ext.requestRegenNoise = true;
+          }
+
+          if (ImGui::Button("Regenerate noise")) {
+            st.ext.requestRegenNoise = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Randomize seed")) {
+            core::u64 rng = core::hashCombine(st.ext.noiseSeed, core::hashCombine((core::u64)st.frame, core::fnv1a64("noiseSeedUI")));
+            st.ext.noiseSeed = splitmix64(rng);
+            st.ext.requestRegenNoise = true;
+          }
+
+          if (st.ext.requestRegenNoise) {
+            rebuildNoise(st.ext);
+          }
+        }
+
+        // Fluid controls
+        {
+          ImGui::SeparatorText("Fluid (Ext2) + Flow (Ext3)");
+          ImGui::Checkbox("Enable fluid externals", &st.ext.fluidEnabled);
+          ImGui::SameLine();
+          ImGui::Checkbox("Pause fluid", &st.ext.fluidPaused);
+          ImGui::SameLine();
+          ImGui::Checkbox("Mouse inject", &st.ext.fluidMouseInject);
+
+          if (ImGui::SliderInt("Grid", &st.ext.fluidGrid, 32, 512)) {
+            ensureFluid(st.ext);
+            updateFluidTextures(st.ext);
+          }
+          ImGui::SliderInt("Iterations", &st.ext.fluidIterations, 4, 60);
+          ImGui::SliderFloat("Time scale", &st.ext.fluidTimeScale, 0.0f, 3.0f, "%.2f");
+          ImGui::SliderFloat("Max dt", &st.ext.fluidMaxDt, 1.0f / 240.0f, 1.0f / 10.0f, "%.4f");
+          ImGui::SliderFloat("Exposure", &st.ext.fluidExposure, 0.005f, 0.25f, "%.3f");
+          ImGui::SliderFloat("Flow viz scale", &st.ext.flowVizScale, 0.001f, 0.08f, "%.4f");
+
+          ImGui::Checkbox("Auto inject", &st.ext.fluidAutoInject);
+          ImGui::SameLine();
+          ImGui::SliderInt("Every N frames", &st.ext.fluidInjectEveryNFrames, 1, 240);
+          ImGui::SliderFloat("Inject radius", &st.ext.fluidInjectRadius, 0.005f, 0.20f, "%.3f");
+          ImGui::SliderFloat("Inject dye", &st.ext.fluidInjectDye, 0.0f, 40.0f, "%.1f");
+          ImGui::SliderFloat("Inject force", &st.ext.fluidInjectForce, 0.0f, 200.0f, "%.1f");
+
+          // Seed controls
+          std::uint32_t fSeedLo = (std::uint32_t)(st.ext.fluidSeed & 0xFFFFFFFFULL);
+          std::uint32_t fSeedHi = (std::uint32_t)((st.ext.fluidSeed >> 32) & 0xFFFFFFFFULL);
+          bool fSeedChanged = false;
+          fSeedChanged |= ImGui::InputScalar("Fluid seed (lo)", ImGuiDataType_U32, &fSeedLo);
+          fSeedChanged |= ImGui::InputScalar("Fluid seed (hi)", ImGuiDataType_U32, &fSeedHi);
+          if (fSeedChanged) {
+            st.ext.fluidSeed = ((core::u64)fSeedHi << 32) | (core::u64)fSeedLo;
+          }
+
+          if (ImGui::Button("Reseed fluid")) {
+            ensureFluid(st.ext);
+            seedFluid(st.ext.fluid, st.ext.fluidSeed);
+            updateFluidTextures(st.ext);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Clear")) {
+            ensureFluid(st.ext);
+            st.ext.fluid.clear();
+            updateFluidTextures(st.ext);
+          }
+        }
+      }
     }
 
     // Pass tabs
@@ -1320,7 +1857,16 @@ void drawProceduralShaderLabWindow(ProceduralShaderLabWindowState& st, float tim
 
       // Channels.
       {
-        const char* items = "None\0Buffer A\0Buffer B\0Buffer C\0Buffer D\0";
+        const char* items =
+          "None\0"
+          "Buffer A\0"
+          "Buffer B\0"
+          "Buffer C\0"
+          "Buffer D\0"
+          "Checker (Ext0)\0"
+          "Noise   (Ext1)\0"
+          "Fluid   (Ext2)\0"
+          "Flow    (Ext3)\0";
         for (int c = 0; c < 4; ++c) {
           int idx = 0;
           switch (st.passes[p].channels[c]) {
@@ -1329,14 +1875,26 @@ void drawProceduralShaderLabWindow(ProceduralShaderLabWindowState& st, float tim
             case stellar::render::ShaderToyChannelSource::BufferB: idx = 2; break;
             case stellar::render::ShaderToyChannelSource::BufferC: idx = 3; break;
             case stellar::render::ShaderToyChannelSource::BufferD: idx = 4; break;
+            case stellar::render::ShaderToyChannelSource::External0: idx = 5; break;
+            case stellar::render::ShaderToyChannelSource::External1: idx = 6; break;
+            case stellar::render::ShaderToyChannelSource::External2: idx = 7; break;
+            case stellar::render::ShaderToyChannelSource::External3: idx = 8; break;
           }
 
           char label[32];
           std::snprintf(label, sizeof(label), "iChannel%d", c);
           if (ImGui::Combo(label, &idx, items)) {
             using S = stellar::render::ShaderToyChannelSource;
-            st.passes[p].channels[c] = (idx == 0) ? S::None : (idx == 1) ? S::BufferA : (idx == 2) ? S::BufferB :
-                                       (idx == 3) ? S::BufferC : S::BufferD;
+            st.passes[p].channels[c] =
+              (idx == 0) ? S::None :
+              (idx == 1) ? S::BufferA :
+              (idx == 2) ? S::BufferB :
+              (idx == 3) ? S::BufferC :
+              (idx == 4) ? S::BufferD :
+              (idx == 5) ? S::External0 :
+              (idx == 6) ? S::External1 :
+              (idx == 7) ? S::External2 :
+              S::External3;
           }
         }
       }

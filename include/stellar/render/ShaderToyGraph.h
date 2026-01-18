@@ -37,6 +37,16 @@ enum class ShaderToyChannelSource : int {
   BufferB = 2,
   BufferC = 3,
   BufferD = 4,
+
+  // External textures provided by the application at runtime.
+  // These allow ShaderToy graphs to sample non-feedback inputs similar to
+  // classic ShaderToy "iChannel" textures (noise, images, video, etc.).
+  //
+  // Bind via ShaderToyGraph::setExternalTexture().
+  External0 = 5,
+  External1 = 6,
+  External2 = 7,
+  External3 = 8,
 };
 
 struct ShaderToyGraphPassSettings {
@@ -84,6 +94,15 @@ public:
   // Clears all feedback buffers (both ping/pong) to black.
   void resetBuffers();
 
+  // ---- External textures ----
+  //
+  // The graph supports up to 4 application-provided textures that can be routed
+  // into iChannel0..3 via ShaderToyChannelSource::External0..External3.
+  // This is intentionally lightweight: the graph stores raw pointers only.
+  // The caller owns the textures and may update them between frames.
+  void setExternalTexture(int slot, const Texture2D* tex);
+  const Texture2D* externalTexture(int slot) const;
+
   // Render the full graph for a frame.
   // The Image pass is rendered into outImageTarget.
   void render(const ShaderToyInputs& baseInputs, RenderTarget2D& outImageTarget);
@@ -97,6 +116,7 @@ public:
 private:
   static constexpr int kBufferCount = 4;
   static constexpr int kPassCount = 5;
+  static constexpr int kExternalCount = 4;
 
   static int idx(ShaderToyPass p) { return static_cast<int>(p); }
   static bool isBuffer(ShaderToyPass p) { return idx(p) >= 0 && idx(p) < kBufferCount; }
@@ -123,6 +143,9 @@ private:
 
   int outW_{1};
   int outH_{1};
+
+  // Application-provided textures for External0..External3.
+  const Texture2D* externals_[kExternalCount]{nullptr, nullptr, nullptr, nullptr};
 
 
   void clearRtIfInited_(PassState& p);

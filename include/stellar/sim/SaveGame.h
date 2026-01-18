@@ -6,6 +6,7 @@
 #include "stellar/sim/Celestial.h"
 #include "stellar/sim/Industry.h"
 #include "stellar/sim/Logbook.h"
+#include "stellar/sim/Comms.h"
 #include "stellar/sim/TrafficEscort.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 
@@ -255,7 +256,7 @@ struct Mission {
 };
 
 struct SaveGame {
-  int version{30};
+  int version{31};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -279,6 +280,10 @@ struct SaveGame {
   double explorationDataCr{0.0};
   std::vector<core::u64> scannedKeys{};
   std::vector<LogbookEntry> logbook{};
+
+  // Comms / inbox: diegetic transmissions history.
+  // Stored in the SaveGame so quicksave/quickload preserves narrative and warnings.
+  std::vector<CommsMessage> comms{};
 
   // World state (in-system signals / resource depletion)
   //

@@ -70,6 +70,38 @@ typedef void* (APIENTRYP PFNGLMAPBUFFERRANGEPROC)(GLenum target, GLintptr offset
 typedef GLboolean (APIENTRYP PFNGLUNMAPBUFFERPROC)(GLenum target);
 #endif
 
+// Sync objects (fences) for robust asynchronous GPU readback / transfers.
+// Optional: if unavailable, systems fall back to coarse frame-delay heuristics.
+#ifndef PFNGLFENCESYNCPROC
+typedef GLsync (APIENTRYP PFNGLFENCESYNCPROC)(GLenum condition, GLbitfield flags);
+#endif
+#ifndef PFNGLCLIENTWAITSYNCPROC
+typedef GLenum (APIENTRYP PFNGLCLIENTWAITSYNCPROC)(GLsync sync, GLbitfield flags, GLuint64 timeout);
+#endif
+#ifndef PFNGLDELETESYNCPROC
+typedef void (APIENTRYP PFNGLDELETESYNCPROC)(GLsync sync);
+#endif
+
+// Token fallbacks for sync objects (some header combos omit them).
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
+#endif
+#ifndef GL_ALREADY_SIGNALED
+#define GL_ALREADY_SIGNALED 0x911A
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#define GL_TIMEOUT_EXPIRED 0x911B
+#endif
+#ifndef GL_CONDITION_SATISFIED
+#define GL_CONDITION_SATISFIED 0x911C
+#endif
+#ifndef GL_WAIT_FAILED
+#define GL_WAIT_FAILED 0x911D
+#endif
+
 // KHR_debug (debug message callbacks, groups, labels). Optional but extremely
 // helpful for GPU debugging/profiling tools and for printing driver messages.
 //
@@ -212,6 +244,11 @@ extern PFNGLDELETEBUFFERSPROC DeleteBuffers;
 // Optional buffer mapping functions (nullptr when unsupported).
 extern PFNGLMAPBUFFERRANGEPROC MapBufferRange;
 extern PFNGLUNMAPBUFFERPROC UnmapBuffer;
+
+// Optional sync object functions (nullptr when unsupported).
+extern PFNGLFENCESYNCPROC FenceSync;
+extern PFNGLCLIENTWAITSYNCPROC ClientWaitSync;
+extern PFNGLDELETESYNCPROC DeleteSync;
 
 extern PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray;
 extern PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer;

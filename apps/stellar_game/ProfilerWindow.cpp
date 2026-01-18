@@ -590,6 +590,8 @@ void drawProfilerWindow(ProfilerWindowState& st,
     ImGui::Checkbox("Include frame spans", &st.exportIncludeFrameEvents);
     ImGui::SameLine();
     ImGui::Checkbox("Pretty JSON", &st.exportPretty);
+    ImGui::SameLine();
+    ImGui::Checkbox("Split threads", &st.exportSplitThreads);
 
     if (frameGraph) {
       ImGui::Checkbox("Include GPU FrameGraph counters", &st.exportIncludeGpuCounters);
@@ -601,6 +603,7 @@ void drawProfilerWindow(ProfilerWindowState& st,
     core::ChromeTraceWriteOptions opt;
     opt.includeFrameEvents = st.exportIncludeFrameEvents;
     opt.pretty = st.exportPretty;
+    opt.splitThreads = st.exportSplitThreads;
 
     if (ImGui::Button("Export##trace")) {
       std::string err;

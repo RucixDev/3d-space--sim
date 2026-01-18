@@ -40,6 +40,7 @@ struct ProfilerWindowState {
   bool exportAllFrames{true};
   bool exportIncludeFrameEvents{true};
   bool exportPretty{false};
+  bool exportSplitThreads{true};
 
   // ---- GPU FrameGraph timing view (optional) ----
   bool showGpuFrameGraph{true};

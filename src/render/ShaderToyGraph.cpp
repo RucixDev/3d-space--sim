@@ -20,6 +20,11 @@ static int clampScale(int s) {
 bool ShaderToyGraph::init(std::string* outError) {
   if (inited_) return true;
 
+  // External textures are owned by the caller; we only keep raw pointers.
+  for (int i = 0; i < kExternalCount; ++i) {
+    externals_[i] = nullptr;
+  }
+
   for (int i = 0; i < kPassCount; ++i) {
     passes_[i].valid = false;
     passes_[i].error.clear();
@@ -129,17 +134,41 @@ void ShaderToyGraph::resetBuffers() {
   }
 }
 
+void ShaderToyGraph::setExternalTexture(int slot, const Texture2D* tex) {
+  if (slot < 0 || slot >= kExternalCount) return;
+  externals_[slot] = tex;
+}
+
+const Texture2D* ShaderToyGraph::externalTexture(int slot) const {
+  if (slot < 0 || slot >= kExternalCount) return nullptr;
+  return externals_[slot];
+}
+
 const Texture2D* ShaderToyGraph::resolveChannelTexture_(ShaderToyPass /*currentPass*/, ShaderToyChannelSource src) const {
   if (src == ShaderToyChannelSource::None) return nullptr;
 
-  const int srcIdx = static_cast<int>(src) - 1;
-  if (srcIdx < 0 || srcIdx >= kBufferCount) return nullptr;
+  const int v = static_cast<int>(src);
 
-  const PassState& p = passes_[srcIdx];
-  const int ping = (p.ping < 0 || p.ping > 1) ? 0 : p.ping;
-  if (!p.rtInited[ping]) return nullptr;
+  // Buffers A..D are 1..4.
+  if (v >= (int)ShaderToyChannelSource::BufferA && v <= (int)ShaderToyChannelSource::BufferD) {
+    const int srcIdx = v - (int)ShaderToyChannelSource::BufferA;
+    if (srcIdx < 0 || srcIdx >= kBufferCount) return nullptr;
 
-  return &p.rt[ping].color();
+    const PassState& p = passes_[srcIdx];
+    const int ping = (p.ping < 0 || p.ping > 1) ? 0 : p.ping;
+    if (!p.rtInited[ping]) return nullptr;
+
+    return &p.rt[ping].color();
+  }
+
+  // External0..External3 are 5..8.
+  if (v >= (int)ShaderToyChannelSource::External0 && v <= (int)ShaderToyChannelSource::External3) {
+    const int extIdx = v - (int)ShaderToyChannelSource::External0;
+    if (extIdx < 0 || extIdx >= kExternalCount) return nullptr;
+    return externals_[extIdx];
+  }
+
+  return nullptr;
 }
 
 void ShaderToyGraph::render(const ShaderToyInputs& baseInputs, RenderTarget2D& outImageTarget) {

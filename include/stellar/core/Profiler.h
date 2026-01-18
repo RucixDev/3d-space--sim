@@ -1,8 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 namespace stellar::core {
@@ -22,6 +24,7 @@ struct ProfilerEvent {
   std::uint64_t startNs{0};
   std::uint64_t endNs{0};
   std::uint32_t depth{0};
+  std::uint64_t threadId{0}; // hashed std::thread::id (stable within a run)
 
   std::uint64_t durationNs() const {
     return (endNs >= startNs) ? (endNs - startNs) : 0;
@@ -31,6 +34,7 @@ struct ProfilerEvent {
 struct ProfilerFrame {
   std::uint64_t startNs{0};
   std::uint64_t endNs{0};
+  std::uint64_t mainThreadId{0}; // hashed std::thread::id that called beginFrame()
   std::vector<ProfilerEvent> events;
 
   std::uint64_t durationNs() const {
@@ -43,7 +47,11 @@ class Profiler {
   Profiler() = default;
 
   void setEnabled(bool enabled) { enabled_ = enabled; }
-  bool enabled() const { return enabled_; }
+  bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
+
+  // Returns a stable, hashed identifier for the calling thread.
+  // This is primarily used for trace export (Chrome/Perfetto) and debug UIs.
+  static std::uint64_t threadIdHash();
 
   // Called by the host once per frame.
   void beginFrame();
@@ -66,10 +74,15 @@ class Profiler {
   static std::uint64_t nowNs();
 
  private:
-  bool enabled_{false};
+  std::atomic<bool> enabled_{false};
   std::size_t maxFrames_{240};
   std::size_t reserveEventsPerFrame_{256};
-  bool inFrame_{false};
+  std::atomic<bool> inFrame_{false};
+
+  // Protects current_ + frames_ so record() can be called from multiple threads.
+  // The profiler is designed for low overhead; this mutex is only contended when
+  // profiling spans are emitted from multiple threads.
+  mutable std::mutex mutex_{};
 
   ProfilerFrame current_{};
   std::deque<ProfilerFrame> frames_{};

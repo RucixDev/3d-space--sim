@@ -38,5 +38,34 @@ int test_jobs() {
     CHECK(hits.load(std::memory_order_relaxed) == 10'000);
   }
 
+  // ---- TaskGroup: submit N jobs then wait (no futures) ----
+  {
+    JobSystem js(4);
+    JobSystem::TaskGroup g(js);
+    std::atomic<int> c{0};
+    for (int i = 0; i < 10'000; ++i) {
+      g.run([&]() { c.fetch_add(1, std::memory_order_relaxed); });
+    }
+    g.wait();
+    CHECK(c.load(std::memory_order_relaxed) == 10'000);
+  }
+
+  // ---- nested parallelFor(): safe to call inside jobs (help-while-wait) ----
+  {
+    JobSystem js(4);
+    std::atomic<std::size_t> sum{0};
+
+    auto fut = js.submit([&]() {
+      js.parallelFor(5'000, [&](std::size_t i) {
+        sum.fetch_add(i + 1, std::memory_order_relaxed);
+      });
+    });
+    fut.get();
+
+    const std::size_t n = 5'000;
+    const std::size_t expected = (n * (n + 1)) / 2;
+    CHECK(sum.load(std::memory_order_relaxed) == expected);
+  }
+
   return failures;
 }

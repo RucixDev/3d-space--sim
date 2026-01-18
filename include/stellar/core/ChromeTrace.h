@@ -19,8 +19,9 @@ namespace stellar::core {
 // The exporter is intentionally lightweight:
 //  - We emit Complete ("X") events for all recorded scopes.
 //  - Optional frame-span events can be included.
-//  - All events are written on a single logical thread (tid), but depth is
-//    provided in args for debugging.
+//  - By default, events are split by the profiler's recorded thread ids and
+//    exported on separate tids (so multi-thread work shows up on distinct tracks).
+//    When splitThreads=false, all span events are collapsed onto opt.tid.
 
 struct ChromeTraceWriteOptions {
   // If true, emit a "Frame" span event for each captured profiler frame.
@@ -28,6 +29,10 @@ struct ChromeTraceWriteOptions {
 
   // When true, the JSON is pretty printed (larger files, easier to read).
   bool pretty{false};
+
+  // If true, emit spans on separate tids per ProfilerEvent::threadId.
+  // This allows viewing worker-thread work in Perfetto / chrome://tracing.
+  bool splitThreads{true};
 
   // Process/thread identifiers used by trace viewers.
   int pid{1};

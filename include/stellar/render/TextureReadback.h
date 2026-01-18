@@ -1,10 +1,18 @@
 #pragma once
 
-// Async texture readback helper for debug tooling.
+// Async texture/framebuffer readback helper for debug tooling.
 //
 // This is intentionally small and OpenGL-centric (desktop GL). It uses
-// GL_PIXEL_PACK_BUFFER + glGetTexImage to stage GPU->CPU transfers into a PBO,
-// then maps the buffer a few frames later to retrieve pixels.
+// GL_PIXEL_PACK_BUFFER to stage GPU->CPU transfers into a PBO and, when
+// available, GL sync objects (glFenceSync/glClientWaitSync) to avoid stalling
+// when mapping.
+//
+// Supported sources:
+//  - GL_TEXTURE_2D via glGetTexImage
+//  - framebuffer/backbuffer via glReadPixels
+//
+// Notes:
+//  - The API uses unsigned int for GL object/enums to keep this header light.
 
 #include <cstddef>
 #include <string>
@@ -12,17 +20,36 @@
 
 namespace stellar::render {
 
-// Describes a single texture readback.
+enum class ReadbackSource : unsigned char {
+  Texture2D = 0,
+  Framebuffer = 1,
+};
+
+// Describes a single readback.
 //
 // `format` and `type` correspond to the `format` and `type` parameters you would
-// pass to `glGetTexImage` (or `glReadPixels`).
+// pass to glGetTexImage / glReadPixels.
 struct TextureReadbackDesc {
+  ReadbackSource source{ReadbackSource::Texture2D};
+
+  // --- Texture2D source ---
   unsigned int texture{0};  // GL texture name (assumed GL_TEXTURE_2D)
+  int level{0};             // mip level (usually 0)
+
+  // --- Common ---
   int width{0};
   int height{0};
   unsigned int format{0};   // GLenum, e.g. GL_RGBA / GL_RG
   unsigned int type{0};     // GLenum, e.g. GL_UNSIGNED_BYTE / GL_FLOAT
-  int level{0};             // mip level (usually 0)
+
+  // --- Framebuffer source ---
+  // `framebuffer` is the read framebuffer (0 = default/backbuffer). If
+  // `readBuffer` is 0, it defaults to GL_BACK for the default framebuffer, and
+  // GL_COLOR_ATTACHMENT0 for non-zero FBOs.
+  unsigned int framebuffer{0};
+  unsigned int readBuffer{0};
+  int x{0};
+  int y{0};
 };
 
 // Readback result.
@@ -37,10 +64,10 @@ struct TextureReadbackResult {
 
 // A small, self-contained async readback queue.
 //
-// This is designed for *debug capture* workflows (FrameGraph inspector, etc.).
-// It intentionally trades correctness guarantees for simplicity (no fences):
-// jobs are delayed by N frames before mapping the PBO to reduce the chance of
-// stalling on the GPU.
+// This is designed for debug capture workflows (FrameGraph inspector,
+// screenshots, etc.). When GL sync objects are available, we use a fence per job
+// and poll it with a zero-timeout wait to avoid blocking. When unavailable,
+// jobs are delayed by N frames before mapping the PBO (best-effort).
 class AsyncTextureReadback {
 public:
   AsyncTextureReadback() = default;
@@ -56,12 +83,13 @@ public:
   void shutdown();
 
   bool supported() const { return supported_; }
+  bool fencesSupported() const { return fencesSupported_; }
 
   // Enqueue a readback job. Returns false if unsupported or if params are invalid.
   //
   // `delayFrames` controls how many polls must occur before the job is eligible
-  // to map. Values in the 2-4 range tend to avoid big stalls on most drivers.
-  bool enqueue(const TextureReadbackDesc& desc, std::string tag, int delayFrames = 3);
+  // to map. Values in the 1-3 range tend to avoid stalls on most drivers.
+  bool enqueue(const TextureReadbackDesc& desc, std::string tag, int delayFrames = 2);
 
   // Poll the queue for a completed job.
   // Returns true and fills `out` when a job is available.
@@ -69,7 +97,7 @@ public:
 
   std::size_t pendingJobs() const { return jobs_.size(); }
 
-  // Clear any queued jobs (deleting their PBOs).
+  // Clear any queued jobs (deleting their PBOs and fences).
   void clear();
 
 private:
@@ -79,10 +107,14 @@ private:
     unsigned int pbo{0};
     std::size_t sizeBytes{0};
     int delay{0};
+
+    // GLsync when available (stored as void* to keep the header GL-light).
+    void* fence{nullptr};
   };
 
   std::vector<Job> jobs_{};
   bool supported_{false};
+  bool fencesSupported_{false};
 };
 
 } // namespace stellar::render

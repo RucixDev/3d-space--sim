@@ -103,6 +103,7 @@ set(STELLAR_CORE_SOURCES
   src/core/CVar.cpp
   src/core/Profiler.cpp
   src/core/ChromeTrace.cpp
+  src/core/Base64.cpp
 
   src/ui/Bookmarks.cpp
   src/ui/FuzzySearch.cpp
@@ -111,6 +112,7 @@ set(STELLAR_CORE_SOURCES
   src/ui/HudSettings.cpp
   src/ui/VfxSettings.cpp
   src/ui/ProceduralUi.cpp
+  src/ui/TextFx.cpp
   src/ui/ProceduralShipHud.cpp
   src/ui/AudioSettings.cpp
   src/ui/Livery.cpp
@@ -120,6 +122,8 @@ set(STELLAR_CORE_SOURCES
   src/ui/WindowRegistry.cpp
 
   src/proc/Noise.cpp
+  src/proc/FluidSim2D.cpp
+  src/dsp/AudioAnalyzer.cpp
   src/proc/GalaxyHazards.cpp
   src/proc/GalaxyRegions.cpp
   src/proc/GalaxyClusters.cpp
@@ -215,13 +219,17 @@ set(STELLAR_CORE_SOURCES
   src/sim/TrafficLanes.cpp
   src/sim/TrafficConvoyLayer.cpp
   src/sim/TrafficConvoyEncounter.cpp
+  src/sim/SmugglingScanner.cpp
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
   src/sim/TradeRunPlanner.cpp
   src/sim/MarketAnalysis.cpp
   src/sim/Universe.cpp
   src/sim/NavRoute.cpp
+  src/sim/NavRouteBatch.cpp
   src/sim/MissionAssist.cpp
+  src/sim/MissionBriefing.cpp
+  src/sim/Comms.cpp
   src/sim/MissionLogic.cpp
 
   src/econ/Commodity.cpp
@@ -306,8 +314,10 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/ShipHudOverlay.cpp
     apps/stellar_game/ActionWheel.cpp
     apps/stellar_game/AudioEngine.cpp
+    apps/stellar_game/AudioAnalyzerWindow.cpp
     apps/stellar_game/CommandPalette.cpp
     apps/stellar_game/ControlsWindow.cpp
+    apps/stellar_game/CommsWindow.cpp
     apps/stellar_game/SensorContacts.cpp
     apps/stellar_game/MarketDashboardWindow.cpp
   apps/stellar_game/LogbookWindow.cpp
@@ -323,6 +333,8 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/SystemConditionsWindow.cpp
     apps/stellar_game/PorkchopPlot.cpp
     apps/stellar_game/ProceduralLabWindow.cpp
+    apps/stellar_game/ProceduralFluidLabWindow.cpp
+    apps/stellar_game/TextAnimationLabWindow.cpp
     apps/stellar_game/ProceduralMeshLabWindow.cpp
     apps/stellar_game/ProceduralShaderLabWindow.cpp
     apps/stellar_game/ProceduralGalaxyLabWindow.cpp

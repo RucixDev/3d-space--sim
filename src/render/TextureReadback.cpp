@@ -45,6 +45,13 @@ static std::size_t bytesPerComponent(unsigned int type) {
   }
 }
 
+static void deleteFence(void* fence) {
+  if (!fence) return;
+  if (gl::DeleteSync) {
+    gl::DeleteSync(reinterpret_cast<GLsync>(fence));
+  }
+}
+
 AsyncTextureReadback::~AsyncTextureReadback() {
   shutdown();
 }
@@ -52,6 +59,10 @@ AsyncTextureReadback::~AsyncTextureReadback() {
 bool AsyncTextureReadback::init(std::string* outError) {
   // We require the PBO mapping entry points.
   supported_ = (gl::MapBufferRange != nullptr) && (gl::UnmapBuffer != nullptr);
+
+  // Fences are optional, but when available they allow us to avoid blocking on MapBufferRange.
+  fencesSupported_ = (gl::FenceSync != nullptr) && (gl::ClientWaitSync != nullptr) && (gl::DeleteSync != nullptr);
+
   if (!supported_ && outError) {
     *outError = "Async readback unsupported (missing glMapBufferRange/glUnmapBuffer).";
   }
@@ -61,26 +72,46 @@ bool AsyncTextureReadback::init(std::string* outError) {
 void AsyncTextureReadback::shutdown() {
   clear();
   supported_ = false;
+  fencesSupported_ = false;
 }
 
 void AsyncTextureReadback::clear() {
-  if (!jobs_.empty()) {
-    for (auto& j : jobs_) {
-      if (j.pbo) {
-        unsigned int pbo = j.pbo;
-        gl::DeleteBuffers(1, &pbo);
-        j.pbo = 0;
-      }
+  if (jobs_.empty()) return;
+
+  for (auto& j : jobs_) {
+    if (j.fence) {
+      deleteFence(j.fence);
+      j.fence = nullptr;
     }
-    jobs_.clear();
+    if (j.pbo) {
+      unsigned int pbo = j.pbo;
+      gl::DeleteBuffers(1, &pbo);
+      j.pbo = 0;
+    }
   }
+  jobs_.clear();
 }
 
-bool AsyncTextureReadback::enqueue(const TextureReadbackDesc& desc, std::string tag, int delayFrames) {
+bool AsyncTextureReadback::enqueue(const TextureReadbackDesc& descIn, std::string tag, int delayFrames) {
   if (!supported_) return false;
-  if (desc.texture == 0) return false;
-  if (desc.width <= 0 || desc.height <= 0) return false;
-  if (desc.format == 0 || desc.type == 0) return false;
+  if (descIn.width <= 0 || descIn.height <= 0) return false;
+  if (descIn.format == 0 || descIn.type == 0) return false;
+
+  TextureReadbackDesc desc = descIn;
+
+  switch (desc.source) {
+    case ReadbackSource::Texture2D:
+      if (desc.texture == 0) return false;
+      break;
+    case ReadbackSource::Framebuffer:
+      // framebuffer may be 0 (default framebuffer/backbuffer). readBuffer can be 0 (auto).
+      if (desc.readBuffer == 0) {
+        desc.readBuffer = (desc.framebuffer == 0) ? (unsigned int)GL_BACK : (unsigned int)GL_COLOR_ATTACHMENT0;
+      }
+      break;
+    default:
+      return false;
+  }
 
   delayFrames = std::max(0, delayFrames);
 
@@ -106,6 +137,11 @@ bool AsyncTextureReadback::enqueue(const TextureReadbackDesc& desc, std::string 
   glGetIntegerv(GL_PACK_SKIP_PIXELS, &prevSkipPixels);
 #endif
 
+  GLint prevPackPbo = 0;
+#ifdef GL_PIXEL_PACK_BUFFER_BINDING
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPackPbo);
+#endif
+
   glPixelStorei(GL_PACK_ALIGNMENT, 1);
 #ifdef GL_PACK_ROW_LENGTH
   glPixelStorei(GL_PACK_ROW_LENGTH, 0);
@@ -116,12 +152,56 @@ bool AsyncTextureReadback::enqueue(const TextureReadbackDesc& desc, std::string 
   gl::BindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
   gl::BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)sizeBytes, nullptr, GL_STREAM_READ);
 
-  gl::BindTexture(GL_TEXTURE_2D, desc.texture);
-  glGetTexImage(GL_TEXTURE_2D, desc.level, (GLenum)desc.format, (GLenum)desc.type, (void*)0);
-  gl::BindTexture(GL_TEXTURE_2D, 0);
-  gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  if (desc.source == ReadbackSource::Texture2D) {
+    GLint prevTex = 0;
+#ifdef GL_TEXTURE_BINDING_2D
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+#endif
 
-  // Restore pack state.
+    gl::BindTexture(GL_TEXTURE_2D, desc.texture);
+    glGetTexImage(GL_TEXTURE_2D, desc.level, (GLenum)desc.format, (GLenum)desc.type, (void*)0);
+    gl::BindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+  } else {
+    // Framebuffer readback (default framebuffer/backbuffer or an FBO).
+    GLint prevReadBuf = (GLint)GL_BACK;
+#ifdef GL_READ_BUFFER
+    glGetIntegerv(GL_READ_BUFFER, &prevReadBuf);
+#endif
+
+    GLint prevReadFb = 0;
+#ifdef GL_READ_FRAMEBUFFER_BINDING
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+#elif defined(GL_FRAMEBUFFER_BINDING)
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevReadFb);
+#endif
+
+#ifdef GL_READ_FRAMEBUFFER
+    gl::BindFramebuffer(GL_READ_FRAMEBUFFER, desc.framebuffer);
+#else
+    gl::BindFramebuffer(GL_FRAMEBUFFER, desc.framebuffer);
+#endif
+    glReadBuffer((GLenum)desc.readBuffer);
+    glReadPixels(desc.x, desc.y, desc.width, desc.height,
+                 (GLenum)desc.format, (GLenum)desc.type, (void*)0);
+
+    // Restore framebuffer + read buffer state.
+    glReadBuffer((GLenum)prevReadBuf);
+#ifdef GL_READ_FRAMEBUFFER
+    gl::BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
+#else
+    gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevReadFb);
+#endif
+  }
+
+  void* fence = nullptr;
+  if (fencesSupported_) {
+    GLsync f = gl::FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    fence = reinterpret_cast<void*>(f);
+  }
+
+  // Restore pack buffer binding and pack state.
+  gl::BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPackPbo);
+
   glPixelStorei(GL_PACK_ALIGNMENT, prevAlign);
 #ifdef GL_PACK_ROW_LENGTH
   glPixelStorei(GL_PACK_ROW_LENGTH, prevRowLength);
@@ -135,6 +215,7 @@ bool AsyncTextureReadback::enqueue(const TextureReadbackDesc& desc, std::string 
   j.pbo = pbo;
   j.sizeBytes = sizeBytes;
   j.delay = delayFrames;
+  j.fence = fence;
 
   jobs_.push_back(std::move(j));
   return true;
@@ -144,6 +225,11 @@ bool AsyncTextureReadback::poll(TextureReadbackResult& out) {
   out = {};
   if (!supported_) return false;
   if (jobs_.empty()) return false;
+
+  GLint prevPackPbo = 0;
+#ifdef GL_PIXEL_PACK_BUFFER_BINDING
+  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPackPbo);
+#endif
 
   for (std::size_t i = 0; i < jobs_.size(); ++i) {
     Job& j = jobs_[i];
@@ -155,19 +241,47 @@ bool AsyncTextureReadback::poll(TextureReadbackResult& out) {
 
     if (!j.pbo || j.sizeBytes == 0) {
       // Corrupt job; drop it.
+      if (j.fence) {
+        deleteFence(j.fence);
+        j.fence = nullptr;
+      }
       if (j.pbo) {
         unsigned int pbo = j.pbo;
         gl::DeleteBuffers(1, &pbo);
+        j.pbo = 0;
       }
       jobs_.erase(jobs_.begin() + (std::ptrdiff_t)i);
-      return false;
+      --i;
+      continue;
+    }
+
+    // If we have a fence, only map once the GPU has completed the readback.
+    if (j.fence && gl::ClientWaitSync) {
+      const GLenum r = gl::ClientWaitSync(reinterpret_cast<GLsync>(j.fence),
+                                          GL_SYNC_FLUSH_COMMANDS_BIT,
+                                          0);
+      if (r == GL_TIMEOUT_EXPIRED) {
+        continue; // not ready yet
+      }
+      if (r == GL_WAIT_FAILED) {
+        // Fence is broken; drop the job.
+        deleteFence(j.fence);
+        j.fence = nullptr;
+
+        unsigned int pbo = j.pbo;
+        gl::DeleteBuffers(1, &pbo);
+        jobs_.erase(jobs_.begin() + (std::ptrdiff_t)i);
+        --i;
+        continue;
+      }
+      // GL_ALREADY_SIGNALED or GL_CONDITION_SATISFIED => ready.
     }
 
     gl::BindBuffer(GL_PIXEL_PACK_BUFFER, j.pbo);
     void* ptr = gl::MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)j.sizeBytes, GL_MAP_READ_BIT);
     if (!ptr) {
       // Not ready (or mapping failed). Try again later.
-      gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      gl::BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPackPbo);
       continue;
     }
 
@@ -185,14 +299,21 @@ bool AsyncTextureReadback::poll(TextureReadbackResult& out) {
     }
 
     gl::UnmapBuffer(GL_PIXEL_PACK_BUFFER);
-    gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    gl::BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPackPbo);
+
+    if (j.fence) {
+      deleteFence(j.fence);
+      j.fence = nullptr;
+    }
 
     unsigned int pbo = j.pbo;
     gl::DeleteBuffers(1, &pbo);
+
     jobs_.erase(jobs_.begin() + (std::ptrdiff_t)i);
     return true;
   }
 
+  gl::BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPackPbo);
   return false;
 }
 

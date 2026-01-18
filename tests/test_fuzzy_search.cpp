@@ -27,6 +27,27 @@ int test_fuzzy_search() {
   }
 
   {
+    // Prefer tight consecutive matches over an earlier-but-gappier match.
+    // Greedy subsequence matchers often pick the first 'a'.
+    const auto r = stellar::ui::fuzzyMatch("abc", "a--abc");
+    CHECK(r.score > 0);
+    CHECK(r.positions.size() == 3);
+    CHECK(r.positions[0] == 3);
+    CHECK(r.positions[1] == 4);
+    CHECK(r.positions[2] == 5);
+  }
+
+  {
+    // CamelCase boundaries should be treated as strong match anchors.
+    const auto r = stellar::ui::fuzzyMatch("frw", "FlightRecorderWindow");
+    CHECK(r.score > 0);
+    CHECK(r.positions.size() == 3);
+    CHECK(r.positions[0] == 0);  // F
+    CHECK(r.positions[1] > 0);   // ...R...
+    CHECK(r.positions[2] > r.positions[1]);
+  }
+
+  {
     // Multi-token match should enforce token order.
     const auto r = stellar::ui::fuzzyMatch("dock clear", "Docking Clearance Request");
     CHECK(r.score > 0);

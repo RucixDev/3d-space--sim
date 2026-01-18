@@ -69,6 +69,7 @@
 #include "stellar/sim/LambertPlanner.h"
 #include "stellar/sim/MissionAssist.h"
 #include "stellar/sim/MissionLogic.h"
+#include "stellar/sim/MissionBriefing.h"
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/CargoJettisonPlanner.h"
 #include "stellar/sim/Law.h"
@@ -115,13 +116,16 @@
 #include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/TrafficConvoyEncounter.h"
 #include "stellar/sim/NavRoute.h"
+#include "stellar/sim/NavRouteBatch.h"
 #include "stellar/sim/Universe.h"
 
 #include "ControlsConfig.h"
 #include "ActionWheel.h"
 #include "AudioEngine.h"
+#include "AudioAnalyzerWindow.h"
 #include "CommandPalette.h"
 #include "ControlsWindow.h"
+#include "CommsWindow.h"
 #include "ConsoleWindow.h"
 #include "CVarWindow.h"
 #include "MarketDashboardWindow.h"
@@ -138,6 +142,8 @@
 #include "PhotoModeWindow.h"
 #include "PorkchopPlot.h"
 #include "ProceduralLabWindow.h"
+#include "ProceduralFluidLabWindow.h"
+#include "TextAnimationLabWindow.h"
 #include "ProceduralMeshLabWindow.h"
 #include "ProceduralShaderLabWindow.h"
 #include "ProceduralGalaxyLabWindow.h"
@@ -3010,6 +3016,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::CVarWindowState cvarWindow{};
   game::LogWindowState logWindow{};
   game::ProfilerWindowState profilerWindow{};
+  game::AudioAnalyzerWindowState audioAnalyzerWindow{};
   game::FlightRecorderWindowState flightRecorderWindow{};
   game::CinematicCameraWindowState cinematicCameraWindow{};
   game::OrbitAnalyzerWindowState orbitAnalyzerWindow{};
@@ -3017,6 +3024,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::SystemConditionsWindowState systemConditionsWindow{};
   game::PhotoModeWindowState photoModeWindow{};
   game::ProceduralLabWindowState proceduralLabWindow{};
+  game::ProceduralFluidLabWindowState proceduralFluidLabWindow{};
+  game::TextAnimationLabWindowState textAnimationLabWindow{};
   game::ProceduralMeshLabWindowState proceduralMeshLabWindow{};
   game::ProceduralShaderLabWindowState proceduralShaderLabWindow{};
   game::ProceduralGalaxyLabWindowState proceduralGalaxyLabWindow{};
@@ -3030,6 +3039,12 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   PendingScreenshot shotUi{};
   bool shotRestorePausedPending{false};
   bool shotPrevPaused{false};
+
+  struct PendingScreenshotMeta { bool copyToClipboard{false}; };
+  std::unordered_map<std::string, PendingScreenshotMeta> shotMeta{};
+  render::AsyncTextureReadback shotReadback{};
+  bool shotReadbackOk = false;
+  std::string shotReadbackInitErr{};
 
   // FrameGraph debug capture: schedule per-pass outputs to be written to disk.
   struct PendingFrameGraphCapture {
@@ -3590,6 +3605,16 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   int notificationsSelected = -1;
   char notificationsFilter[128]{};
 
+  // Comms: diegetic message log + incoming transmission overlay.
+  sim::CommsLog commsLog;
+  game::CommsOverlayState commsOverlay;
+  game::CommsWindowState commsWindow;
+
+  auto pushTransmission = [&](sim::CommsMessage msg, bool showOverlay = true) {
+    const core::u64 id = commsLog.push(std::move(msg));
+    if (showOverlay) game::enqueueCommsOverlay(commsOverlay, id);
+  };
+
   // UI: command palette (Ctrl+P by default)
   game::CommandPaletteState commandPalette;
   std::vector<game::PaletteItem> commandPaletteItems;
@@ -3732,6 +3757,10 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.togglePostFx); }});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralLab", "Procedural Lab", "Visual", 70, false, true}, &proceduralLabWindow.open,
                                 {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"ProceduralFluidLab", "Procedural Fluid Lab", "Visual", 70, false, true}, &proceduralFluidLabWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"TextAnimationLab", "Text Animation Lab", "Visual", 70, false, true}, &textAnimationLabWindow.open,
+                                {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralMeshLab", "Procedural Mesh Lab", "Visual", 70, false, true}, &proceduralMeshLabWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ProceduralShaderLab", "Procedural Shader Lab", "Visual", 70, false, true}, &proceduralShaderLabWindow.open,
@@ -3751,6 +3780,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"Bookmarks", "Bookmarks", "UI", 80, false, true}, &showBookmarksWindow,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"Notifications", "Notifications", "UI", 80, false, true}, &showNotifications,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Comms", "Comms / Inbox", "UI", 80, false, true}, &commsWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"PhotoMode", "Photo Mode", "Tools", 55, false, true}, &photoModeWindow.open,
@@ -3786,6 +3817,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"AudioSettings", "Audio", "UI", 55, false, true}, &showAudioSettingsWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"AudioAnalyzer", "Audio Analyzer", "UI", 55, false, true}, &audioAnalyzerWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"HudLayout", "HUD Layout", "HUD", 55, false, true}, &showHudLayoutWindow,
                                 {}, {}, {}});
@@ -5653,6 +5686,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
     core::log(core::LogLevel::Warn, "FrameGraph capture disabled: " + fgReadbackInitErr);
   }
 
+  // Optional: async GPU->CPU readback used by screenshot capture.
+  shotReadbackOk = shotReadback.init(&shotReadbackInitErr);
+  if (!shotReadbackOk && !shotReadbackInitErr.empty()) {
+    core::log(core::LogLevel::Info, "Async screenshots disabled: " + shotReadbackInitErr);
+  }
+
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
 
@@ -5950,6 +5989,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	          s.explorationDataCr = explorationDataCr;
 	          s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
 	          s.logbook = logbook;
+	          s.comms = commsLog.items();
 
 	          // Procedural world persistence (signals / mining depletion)
 	          s.resolvedSignalIds.assign(resolvedSignalIds.begin(), resolvedSignalIds.end());
@@ -6168,6 +6208,13 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	            scannedKeys.clear();
 	            for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
 	            logbook = s.logbook;
+	            commsLog.replace(std::move(s.comms));
+	            commsWindow.selectedId = 0;
+	            commsWindow.selectedOpenedSec = 0.0;
+	            commsOverlay.queue.clear();
+	            commsOverlay.activeId = 0;
+	            commsOverlay.activeStartSec = 0.0;
+	            commsOverlay.activeUntilSec = 0.0;
 
 	            // Procedural world persistence (signals / mining depletion)
 	            resolvedSignalIds.clear();
@@ -9319,6 +9366,14 @@ auto spawnPiratePack = [&](int maxCount) -> int {
           pirateDemand.leaderName + ": jettison cargo worth ~" + std::to_string((int)std::round(pirateDemand.requiredValueCr))
             + " cr within 22s or be destroyed!",
           4.2);
+
+    // Log to Comms + show transmission overlay.
+    pushTransmission(sim::makePirateDemandMessage(timeDays,
+                                                  currentSystem ? currentSystem->stub.id : 0,
+                                                  pirateDemand.groupId,
+                                                  pirateDemand.leaderName,
+                                                  pirateDemand.requiredValueCr,
+                                                  pirateDemand.untilDays));
   }
   return count;
 };
@@ -11246,6 +11301,13 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                     policeDemand.untilDays = timeDays + (18.0 / 86400.0);
                     policeDemand.sourceName = cargoScanSourceName.empty() ? "Authorities" : cargoScanSourceName;
                     toast(toasts, policeDemand.sourceName + ": outstanding bounty detected. Submit (I) or face enforcement.", 3.2);
+
+                    pushTransmission(sim::makePoliceBountyDemandMessage(timeDays,
+                                                                      currentSystem ? currentSystem->stub.id : 0,
+                                                                      policeDemand.factionId,
+                                                                      policeDemand.sourceName,
+                                                                      policeDemand.amountCr,
+                                                                      policeDemand.untilDays));
                   }
                 } else {
                   const sim::LawProfile law = lawForFaction(scanFaction);
@@ -11280,6 +11342,15 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                           bribeOffer.sourceName + ": contraband detected (" + (detail.empty() ? std::string("illegal cargo") : detail)
                             + "). Offer: bribe " + std::to_string((int)std::round(bribeOffer.amountCr)) + " cr (C) to keep cargo, or comply (I).",
                           4.2);
+
+                    pushTransmission(sim::makePoliceBribeOfferMessage(timeDays,
+                                                                    currentSystem ? currentSystem->stub.id : 0,
+                                                                    bribeOffer.factionId,
+                                                                    bribeOffer.sourceName,
+                                                                    bribeOffer.amountCr,
+                                                                    bribeOffer.fineCr,
+                                                                    bribeOffer.detail,
+                                                                    bribeOffer.untilDays));
                   } else {
                     enforceContraband(scanFaction,
                                       cargoScanSourceName.empty() ? "Security" : cargoScanSourceName,
@@ -15355,15 +15426,38 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Screenshot capture (world-only): must happen after the scene is in the backbuffer and before any UI is drawn.
     if (shotWorld.pending) {
-      std::string err;
-      const bool ok = game::captureBackbufferToPng(shotWorld.path, w, h, &err);
-      if (ok) {
-        photoModeWindow.lastSavedPath = shotWorld.path;
-        if (shotWorld.copyToClipboard) SDL_SetClipboardText(shotWorld.path.c_str());
-        toast(toasts, "Saved screenshot: " + shotWorld.path, 2.2);
+      if (shotReadbackOk) {
+        render::TextureReadbackDesc d{};
+        d.source = render::ReadbackSource::Framebuffer;
+        d.framebuffer = 0;
+        d.readBuffer = (unsigned int)GL_BACK;
+        d.x = 0;
+        d.y = 0;
+        d.width = w;
+        d.height = h;
+        d.format = (unsigned int)GL_RGBA;
+        d.type = (unsigned int)GL_UNSIGNED_BYTE;
+
+        const bool ok = shotReadback.enqueue(d, shotWorld.path, /*delayFrames=*/2);
+        if (ok) {
+          shotMeta[shotWorld.path] = PendingScreenshotMeta{shotWorld.copyToClipboard};
+          toast(toasts, "Screenshot queued: " + shotWorld.path, 1.6);
+        } else {
+          toast(toasts, "Screenshot queue failed.", 2.2);
+        }
       } else {
-        toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+        // Fallback: synchronous readback (may stall a frame).
+        std::string err;
+        const bool ok = game::captureBackbufferToPng(shotWorld.path, w, h, &err);
+        if (ok) {
+          photoModeWindow.lastSavedPath = shotWorld.path;
+          if (shotWorld.copyToClipboard) SDL_SetClipboardText(shotWorld.path.c_str());
+          toast(toasts, "Saved screenshot: " + shotWorld.path, 2.2);
+        } else {
+          toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+        }
       }
+
       shotWorld.pending = false;
       shotWorld.path.clear();
       shotWorld.copyToClipboard = false;
@@ -15496,6 +15590,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     }
 
 
+    // Screenshot capture: poll async readbacks and write results to disk.
+    if (shotReadbackOk && shotReadback.pendingJobs() > 0) {
+      render::TextureReadbackResult rb{};
+      int wroteThisFrame = 0;
+      while (shotReadback.poll(rb)) {
+        std::string err;
+        bool ok = false;
+
+        if (!rb.bytes.empty()) {
+          const int comp = 4;
+          const int stride = rb.desc.width * comp;
+          ok = game::writePixelsToPng(rb.tag, rb.desc.width, rb.desc.height, comp,
+                                      rb.bytes.data(), stride, /*flipY=*/true, &err);
+        } else {
+          err = "Empty screenshot buffer.";
+        }
+
+        auto it = shotMeta.find(rb.tag);
+        const bool copyToClipboard = (it != shotMeta.end()) ? it->second.copyToClipboard : false;
+        if (it != shotMeta.end()) shotMeta.erase(it);
+
+        if (ok) {
+          photoModeWindow.lastSavedPath = rb.tag;
+          if (copyToClipboard) SDL_SetClipboardText(rb.tag.c_str());
+          toast(toasts, "Saved screenshot: " + rb.tag, 2.2);
+        } else {
+          toast(toasts, err.empty() ? "Screenshot write failed." : err, 2.2);
+        }
+
+        ++wroteThisFrame;
+        if (wroteThisFrame >= 2) break;
+      }
+    }
+
+
     // Flight telemetry recorder (sample after simulation + render, before UI).
     game::tickFlightRecorder(flightRecorderWindow, dtReal, timeRealSec, timeDays, ship, paused);
 
@@ -15572,6 +15701,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
         ImGui::MenuItem("Notifications", nullptr, &showNotifications);
         ImGui::MenuItem("Audio Settings", nullptr, &showAudioSettingsWindow);
+        ImGui::MenuItem("Audio Analyzer", nullptr, &audioAnalyzerWindow.open);
         if (ImGui::MenuItem("Photo Mode", nullptr, &photoModeWindow.open)) { if (photoModeWindow.open) photoModeWindow.focusDir = true; }
         if (ImGui::MenuItem("Console", nullptr, &consoleWindow.open)) { if (consoleWindow.open) consoleWindow.focusInput = true; }
         if (ImGui::MenuItem("Log", nullptr, &logWindow.open)) { if (logWindow.open) logWindow.focusFilter = true; }
@@ -15644,6 +15774,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
       if (ImGui::BeginMenu("Audio")) {
         ImGui::MenuItem("Audio settings...", nullptr, &showAudioSettingsWindow);
+        ImGui::MenuItem("Audio analyzer...", nullptr, &audioAnalyzerWindow.open);
         ImGui::Separator();
         const char* muteLabel = audioSettings.enabled ? "Mute" : "Unmute";
         if (ImGui::MenuItem(muteLabel)) {
@@ -16350,6 +16481,24 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Console window (log + commands)
     game::drawConsoleWindow(consoleWindow);
 
+    // Comms inbox + transmission overlay
+    {
+      game::CommsWindowContext cctx;
+      cctx.universe = &universe;
+      cctx.currentSystem = currentSystem;
+      cctx.timeDays = timeDays;
+      cctx.timeRealSec = timeRealSec;
+      cctx.log = &commsLog;
+      cctx.toast = [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); };
+      cctx.plotTo = [&](sim::SystemId sysId, sim::StationId stId) {
+        if (sysId == 0) return;
+        if (plotRouteToSystem(sysId, /*showToast=*/true)) {
+          pendingArrivalTargetStationId = stId;
+        }
+      };
+      game::drawCommsWindow(commsWindow, commsOverlay, cctx);
+    }
+
     // Log viewer (ring buffer + filtering + export)
     game::drawLogWindow(logWindow, uiLogBuffer,
                         [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
@@ -16362,11 +16511,21 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
 	                             postFxSettings.enabled ? &postFx.frameGraph() : nullptr);
 
+    // Audio analyzer / oscilloscope (procedural audio tooling)
+    game::drawAudioAnalyzerWindow(audioAnalyzerWindow, audio,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
     // Flight telemetry recorder
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
                                  [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralLabWindow(proceduralLabWindow, (float)timeRealSec,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawProceduralFluidLabWindow(proceduralFluidLabWindow, (float)timeRealSec,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    game::drawTextAnimationLabWindow(textAnimationLabWindow, (float)timeRealSec,
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralMeshLabWindow(proceduralMeshLabWindow, (float)timeRealSec,
@@ -17253,23 +17412,36 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       const float x = 18.0f;
       const ImVec2 pad(8.0f, 4.0f);
 
+      int toastIdx = 0;
       for (const auto& t : toasts) {
         const float denom = (float)std::max(0.001, t.ttlTotal);
         const float a = std::clamp((float)(t.ttl / denom), 0.0f, 1.0f);
 
-        const ImVec2 textSz = ImGui::CalcTextSize(t.text.c_str());
+        const int bgA = (int)std::llround(150.0f * a);
+        const int fgA = (int)std::llround(230.0f * a);
+
+        // TextFx-enabled toasts: you can optionally use markup tags like:
+        //   [wave][color #ff4444]WARNING[/color][/wave]
+        // Unrecognized tags (e.g. "[CONTRABAND]") remain literal.
+        ui::textfx::DrawParams dp;
+        dp.baseColor = hudU32(hudColorText, (float)fgA / 255.0f);
+        dp.seed = core::hashCombine(core::fnv1a64(t.text), (core::u64)toastIdx);
+
+        const ImVec2 textSz = ui::textfx::CalcSize(t.text, dp);
         const ImVec2 p0(x, y);
         const ImVec2 r0(p0.x - pad.x, p0.y - pad.y);
         const ImVec2 r1(p0.x + textSz.x + pad.x, p0.y + textSz.y + pad.y);
 
-        const int bgA = (int)std::llround(150.0f * a);
-        const int fgA = (int)std::llround(230.0f * a);
         draw->AddRectFilled(r0, r1, hudU32(hudColorBackground, (float)bgA / 255.0f), 4.0f);
         draw->AddRect(r0, r1, hudU32(hudColorGrid, (42.0f/255.0f) * a), 4.0f);
-        draw->AddText(p0, hudU32(hudColorText, (float)fgA / 255.0f), t.text.c_str());
+        ui::textfx::Draw(draw, p0, t.text, (float)timeRealSec, dp);
 
         y += textSz.y + pad.y * 2.0f + 4.0f;
+        ++toastIdx;
       }
+
+      // Incoming transmissions (non-interactive overlay)
+      game::tickAndDrawCommsOverlay(commsOverlay, commsLog, timeRealSec);
     }
 
 // --- Shared UI helpers (missions / tracker) ---
@@ -25835,58 +26007,104 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                 missionOfferRoutePreview.clear();
                 missionOfferRoutePreview.resize(missionOffers.size());
 
-                for (std::size_t pi = 0; pi < missionOffers.size(); ++pi) {
-                  const auto& offer = missionOffers[pi];
-                  auto& out = missionOfferRoutePreview[pi];
+                // Batch planner: compute many destination previews with a single-source
+                // shortest-path solve (instead of N x A*).
+                std::vector<sim::SystemId> destPerOffer(missionOffers.size(), 0);
+                std::vector<sim::SystemId> uniqueDests;
+                uniqueDests.reserve(missionOffers.size());
+                std::unordered_map<sim::SystemId, MissionOfferRoutePreview> previewByDest;
+                previewByDest.reserve(missionOffers.size());
 
-                  const bool hasVia = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0
-                                    && (offer.type == sim::MissionType::MultiDelivery || offer.type == sim::MissionType::Passenger));
-                  const sim::SystemId destSys = hasVia ? offer.viaSystem : offer.toSystem;
+                if (currentSystem) {
+                  // Precompute destination set + a conservative initial radius.
+                  double radius = 180.0;
 
-                  if (!currentSystem || destSys == 0) {
-                    out.ok = false;
-                    continue;
+                  for (std::size_t pi = 0; pi < missionOffers.size(); ++pi) {
+                    const auto& offer = missionOffers[pi];
+
+                    const bool hasVia = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0
+                                      && (offer.type == sim::MissionType::MultiDelivery || offer.type == sim::MissionType::Passenger));
+                    const sim::SystemId destSys = hasVia ? offer.viaSystem : offer.toSystem;
+                    destPerOffer[pi] = destSys;
+
+                    if (destSys == 0) continue;
+
+                    if (destSys == currentSystem->stub.id) {
+                      previewByDest[destSys] = MissionOfferRoutePreview{true, 0, 0.0, 0.0};
+                      continue;
+                    }
+
+                    uniqueDests.push_back(destSys);
+
+                    const auto& destStub = universe.getSystem(destSys).stub;
+                    const double directLy = (destStub.posLy - currentSystem->stub.posLy).length();
+                    radius = std::max(radius, std::clamp(directLy * 1.20 + 60.0, 180.0, 1400.0));
                   }
 
-                  if (destSys == currentSystem->stub.id) {
-                    out.ok = true;
-                    out.jumps = 0;
-                    out.distanceLy = 0.0;
-                    out.fuel = 0.0;
-                    continue;
+                  std::sort(uniqueDests.begin(), uniqueDests.end());
+                  uniqueDests.erase(std::unique(uniqueDests.begin(), uniqueDests.end()), uniqueDests.end());
+
+                  // Planner cost model: match player route mode for PATH choice.
+                  double routeCostPerJump = 1.0;
+                  double routeCostPerLy = 0.0;
+                  if (navRouteMode == NavRouteMode::Distance) {
+                    routeCostPerJump = 0.0;
+                    routeCostPerLy = 1.0;
+                  } else if (navRouteMode == NavRouteMode::Fuel) {
+                    routeCostPerJump = kFsdFuelBase;
+                    routeCostPerLy = kFsdFuelPerLy;
                   }
 
-                  if (jrPreviewLy <= 0.0) {
-                    out.ok = false;
-                    continue;
+                  std::size_t remaining = uniqueDests.size();
+
+                  // If we can't jump at all, bail early (local-system offers are already filled).
+                  if (jrPreviewLy > 0.0 && remaining > 0) {
+                    for (int attempt = 0; attempt < 6 && remaining > 0; ++attempt) {
+                      auto nearby = universe.queryNearby(currentSystem->stub.posLy, radius);
+
+                      const sim::NavRouteBatch batch = sim::computeNavRouteBatchCost(nearby,
+                                                                                    currentSystem->stub.id,
+                                                                                    jrPreviewLy,
+                                                                                    routeCostPerJump,
+                                                                                    routeCostPerLy);
+
+                      for (const auto destSys : uniqueDests) {
+                        if (previewByDest.find(destSys) != previewByDest.end()) continue;
+
+                        const auto route = sim::routeFromBatch(nearby, batch, destSys);
+                        if (route.empty()) continue;
+
+                        MissionOfferRoutePreview p{};
+                        p.ok = true;
+                        p.jumps = (int)route.size() - 1;
+                        p.distanceLy = sim::routeDistanceLy(nearby, route);
+                        p.fuel = sim::routeCost(nearby, route, kFsdFuelBase, kFsdFuelPerLy);
+
+                        previewByDest[destSys] = p;
+                        if (remaining > 0) --remaining;
+                        if (remaining == 0) break;
+                      }
+
+                      radius *= 1.35;
+                    }
                   }
 
-                  const auto& destStub = universe.getSystem(destSys).stub;
-                  const double directLy = (destStub.posLy - currentSystem->stub.posLy).length();
-                  double radius = std::clamp(directLy * 1.20 + 60.0, 180.0, 1400.0);
+                  // Copy back per-offer.
+                  for (std::size_t pi = 0; pi < missionOffers.size(); ++pi) {
+                    const sim::SystemId destSys = destPerOffer[pi];
+                    auto& out = missionOfferRoutePreview[pi];
 
-                  for (int attempt = 0; attempt < 6; ++attempt) {
-                    auto nearby = universe.queryNearby(currentSystem->stub.posLy, radius);
-                    sim::RoutePlanStats stats{};
-                    std::vector<sim::SystemId> route;
+                    if (destSys == 0) {
+                      out.ok = false;
+                      continue;
+                    }
 
-                    if (navRouteMode == NavRouteMode::Hops) {
-                      route = sim::plotRouteAStarHops(nearby, currentSystem->stub.id, destSys, jrPreviewLy, &stats);
-                    } else if (navRouteMode == NavRouteMode::Distance) {
-                      route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSys, jrPreviewLy, 0.0, 1.0, &stats);
+                    const auto it = previewByDest.find(destSys);
+                    if (it != previewByDest.end()) {
+                      out = it->second;
                     } else {
-                      route = sim::plotRouteAStarCost(nearby, currentSystem->stub.id, destSys, jrPreviewLy, kFsdFuelBase, kFsdFuelPerLy, &stats);
+                      out.ok = false;
                     }
-
-                    if (!route.empty()) {
-                      out.ok = true;
-                      out.jumps = (int)route.size() - 1;
-                      out.distanceLy = sim::routeDistanceLy(nearby, route);
-                      out.fuel = sim::routeCost(nearby, route, kFsdFuelBase, kFsdFuelPerLy);
-                      break;
-                    }
-
-                    radius *= 1.35;
                   }
                 }
               }
@@ -25927,6 +26145,29 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                   trackedMissionId = missions.back().id;
                 }
                 toast(toasts, "Mission accepted.", 2.0);
+
+                // Log the contract briefing to Comms so players can reference details later.
+                if (!missions.empty() && currentSystem) {
+                  sim::MissionBriefingParams bp;
+                  bp.useMarkup = true;
+                  bp.dynamicsParams = systemSecurityDynParams;
+                  bp.eventParams = systemEventParams;
+                  bp.includeRiskHints = true;
+                  bp.includeReputationCues = true;
+
+                  const auto& mref = missions.back();
+                  const sim::MissionBriefing brief = sim::generateMissionBriefing(
+                      universe, *currentSystem, st, timeDays, rep, mref,
+                      std::span<const sim::SystemSecurityDeltaState>{}, bp);
+
+                  pushTransmission(sim::makeMissionBriefingMessage(timeDays,
+                                                                 mref.toSystem,
+                                                                 mref.toStation,
+                                                                 mref.factionId,
+                                                                 mref.id,
+                                                                 brief,
+                                                                 /*accepted=*/true));
+                }
 
                 if (autoPlot) {
                   const bool hasVia = (chosen.viaSystem != 0 && chosen.viaStation != 0 && chosen.leg == 0);
@@ -26006,8 +26247,138 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
               }();
               const int paxCap = std::max(0, passengerSeats);
 
+              // Briefings/risk model use the same security delta vector as the mission board generator.
+              std::vector<sim::SystemSecurityDeltaState> briefingDeltas;
+              briefingDeltas.reserve(systemSecurityDeltaBySystem.size());
+              for (const auto& kv : systemSecurityDeltaBySystem) {
+                briefingDeltas.push_back(kv.second);
+              }
+              std::sort(briefingDeltas.begin(), briefingDeltas.end(),
+                        [](const sim::SystemSecurityDeltaState& a, const sim::SystemSecurityDeltaState& b) {
+                          return a.systemId < b.systemId;
+                        });
+
+              sim::MissionBriefingParams briefParams{};
+              briefParams.dynamicsParams = systemSecurityDynParams;
+              briefParams.eventParams = systemEventParams;
+              briefParams.applySecurityDeltas = true;
+              briefParams.useMarkup = true;
+
+              std::vector<sim::MissionRisk> offerRisks;
+              offerRisks.resize(missionOffers.size());
               for (std::size_t i = 0; i < missionOffers.size(); ++i) {
+                offerRisks[i] = sim::computeMissionRisk(universe,
+                                                        *currentSystem,
+                                                        st,
+                                                        timeDays,
+                                                        rep,
+                                                        missionOffers[i],
+                                                        briefingDeltas,
+                                                        briefParams);
+              }
+
+              static int offerSortMode = 0;
+              const char* offerSortLabels[] = {
+                "Default",
+                "Reward (high)",
+                "Deadline (soon)",
+                "Risk (safe)",
+                "Distance (near)",
+                "Reward / ly"
+              };
+              ImGui::Combo("Sort offers", &offerSortMode, offerSortLabels, IM_ARRAYSIZE(offerSortLabels));
+              ImGui::SameLine();
+              ImGui::TextDisabled("(Use 'Brief' for procedural contract text + risk)");
+
+              auto canAcceptOffer = [&](const sim::Mission& offer) -> bool {
+                if (missions.size() >= 16) return false;
+
+                // Cargo missions: capacity + inventory + credits.
+                const bool isCargoJob = (offer.type == sim::MissionType::Delivery
+                                      || offer.type == sim::MissionType::MultiDelivery
+                                      || offer.type == sim::MissionType::Smuggle);
+                if (isCargoJob && offer.units > 0.0) {
+                  const econ::CommodityId cid = offer.commodity;
+                  const double massKg = econ::commodityDef(cid).massKg;
+                  const double addKg = (double)offer.units * massKg;
+                  if (cargoMassKg(cargo) + addKg > cargoCapacityKg + 1e-6) return false;
+
+                  // Smuggling cargo is provided by the contact; it doesn't require legal market inventory or credits.
+                  if (offer.type != sim::MissionType::Smuggle) {
+                    if (offer.cargoProvided) {
+                      if (stEcon.inventory[(int)cid] + 1e-6 < (double)offer.units) return false;
+                    } else {
+                      const auto q = econ::quote(stEcon, st.economyModel, cid, 0.10);
+                      const double totalCost = q.ask * (double)offer.units * (1.0 + feeEff);
+                      if (q.inventory + 1e-6 < (double)offer.units) return false;
+                      if (credits + 1e-6 < totalCost) return false;
+                    }
+                  }
+                }
+
+                // Passenger jobs require enough free seats.
+                if (offer.type == sim::MissionType::Passenger) {
+                  const int party = std::max(0, (int)std::llround(offer.units));
+                  if (party <= 0) return false;
+                  if (paxUsed + party > paxCap) return false;
+                }
+
+                return true;
+              };
+
+              std::vector<std::size_t> offerOrder;
+              offerOrder.reserve(missionOffers.size());
+              for (std::size_t i = 0; i < missionOffers.size(); ++i) offerOrder.push_back(i);
+
+              if (offerSortMode != 0) {
+                auto deadlineHrs = [&](const sim::Mission& m) {
+                  if (m.deadlineDay <= 0.0 || !std::isfinite(m.deadlineDay)) return 1e9;
+                  return (m.deadlineDay - timeDays) * 24.0;
+                };
+
+                std::stable_sort(offerOrder.begin(), offerOrder.end(), [&](std::size_t ia, std::size_t ib) {
+                  const auto& A = missionOffers[ia];
+                  const auto& B = missionOffers[ib];
+                  const auto& rA = offerRisks[ia];
+                  const auto& rB = offerRisks[ib];
+
+                  switch (offerSortMode) {
+                    case 1: // Reward (high)
+                      if (A.reward != B.reward) return A.reward > B.reward;
+                      break;
+                    case 2: { // Deadline (soon)
+                      const double da = deadlineHrs(A);
+                      const double db = deadlineHrs(B);
+                      if (da != db) return da < db;
+                      break;
+                    }
+                    case 3: // Risk (safe)
+                      if (rA.overall01 != rB.overall01) return rA.overall01 < rB.overall01;
+                      break;
+                    case 4: // Distance (near)
+                      if (rA.distanceLy != rB.distanceLy) return rA.distanceLy < rB.distanceLy;
+                      break;
+                    case 5: { // Reward / ly
+                      const double a = (rA.distanceLy > 0.01) ? (A.reward / rA.distanceLy) : A.reward;
+                      const double b = (rB.distanceLy > 0.01) ? (B.reward / rB.distanceLy) : B.reward;
+                      if (a != b) return a > b;
+                      break;
+                    }
+                    default:
+                      break;
+                  }
+
+                  // Stable deterministic tie-break.
+                  return A.id < B.id;
+                });
+              }
+
+              static int missionBriefOfferIdx = -1;
+
+              for (std::size_t di = 0; di < offerOrder.size(); ++di) {
+                const std::size_t i = offerOrder[di];
                 const auto offer = missionOffers[i];
+                const auto& risk = offerRisks[i];
                 ImGui::PushID((int)i);
 
                 ImGui::TextWrapped("%s", describeMission(offer).c_str());
@@ -26017,6 +26388,14 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                 } else {
                   ImGui::TextDisabled("Reward %.0f cr", offer.reward);
                 }
+
+                ImGui::TextDisabled("Risk %s (%.2f) | Danger %.2f | Law %.2f | Piracy %.2f | Sec %.2f",
+                                    sim::riskTierName(risk.overall01),
+                                    risk.overall01,
+                                    risk.danger01,
+                                    risk.lawRisk01,
+                                    risk.piracy01,
+                                    risk.security01);
 
                 if (missionOfferRoutePreviewEnabled && i < missionOfferRoutePreview.size()) {
                   const auto& rp = missionOfferRoutePreview[i];
@@ -26031,43 +26410,15 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                   }
                 }
 
-                bool canAccept = (missions.size() < 16);
-
-                // Basic pre-flight validation for cargo missions (so the "Accept" button behaviour matches the toast checks).
-                const bool isCargoJob = (offer.type == sim::MissionType::Delivery
-                                      || offer.type == sim::MissionType::MultiDelivery
-                                      || offer.type == sim::MissionType::Smuggle);
-                if (isCargoJob && offer.units > 0.0) {
-                  const econ::CommodityId cid = offer.commodity;
-                  const double massKg = econ::commodityDef(cid).massKg;
-                  const double addKg = (double)offer.units * massKg;
-                  canAccept = canAccept && (cargoMassKg(cargo) + addKg <= cargoCapacityKg + 1e-6);
-
-                  // Smuggling cargo is provided by the contact; it doesn't require legal market inventory or credits.
-                  if (offer.type != sim::MissionType::Smuggle) {
-                    if (offer.cargoProvided) {
-                      // Cargo-provided offers must be backed by real station inventory.
-                      canAccept = canAccept && (stEcon.inventory[(int)cid] + 1e-6 >= (double)offer.units);
-                    } else {
-                      const auto q = econ::quote(stEcon, st.economyModel, cid, 0.10);
-                      const double totalCost = q.ask * (double)offer.units * (1.0 + feeEff);
-                      canAccept = canAccept && (q.inventory + 1e-6 >= (double)offer.units) && (credits + 1e-6 >= totalCost);
-                    }
-                  }
-                }
-
-                // Passenger jobs require enough free seats.
-                if (offer.type == sim::MissionType::Passenger) {
-                  const int party = std::max(0, (int)std::llround(offer.units));
-                  canAccept = canAccept && (party > 0) && (paxUsed + party <= paxCap);
-                }
-
+                const bool canAccept = canAcceptOffer(offer);
                 const bool acceptDisabled = (!dockedHere) || (!canAccept);
+
                 if (acceptDisabled) ImGui::BeginDisabled();
                 if (ImGui::SmallButton("Accept & Plot")) {
                   acceptedOfferThisFrame = acceptOffer(i, true);
                 }
                 if (acceptDisabled) ImGui::EndDisabled();
+
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Plot")) {
                   const sim::SystemId legSys = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0) ? offer.viaSystem : offer.toSystem;
@@ -26079,11 +26430,123 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                   }
                 }
 
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Brief")) {
+                  missionBriefOfferIdx = (int)i;
+                  ImGui::OpenPopup("Mission Briefing");
+                }
+
                 ImGui::Separator();
                 ImGui::PopID();
               }
 
-              ImGui::EndTabItem();
+              // Briefing popup (procedural narrative + risk bars).
+              if (missionBriefOfferIdx >= 0 && (std::size_t)missionBriefOfferIdx < missionOffers.size()) {
+                const std::size_t i = (std::size_t)missionBriefOfferIdx;
+                if (ImGui::BeginPopupModal("Mission Briefing", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                  const auto& offer = missionOffers[i];
+                  const core::u64 fxSeed = core::hashCombine(core::fnv1a64("mission_brief_ui"), (core::u64)offer.id);
+
+                  const sim::MissionBriefing brief = sim::generateMissionBriefing(universe,
+                                                                                  *currentSystem,
+                                                                                  st,
+                                                                                  timeDays,
+                                                                                  rep,
+                                                                                  offer,
+                                                                                  briefingDeltas,
+                                                                                  briefParams);
+
+                  auto drawFxWrapped = [&](std::string_view markup, core::u64 seed, float fontScale) {
+                    ui::textfx::DrawParams dp;
+                    dp.baseColor = ImGui::GetColorU32(ImGuiCol_Text);
+                    dp.seed = seed;
+                    dp.wrapWidthPx = ImGui::GetContentRegionAvail().x;
+                    dp.fontSizePx = ImGui::GetFontSize() * std::max(0.75f, fontScale);
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 pos = ImGui::GetCursorScreenPos();
+                    const ImVec2 sz = ui::textfx::CalcSize(markup, dp);
+                    ui::textfx::Draw(dl, pos, markup, (float)timeRealSec, dp);
+                    ImGui::Dummy(ImVec2(std::max(1.0f, sz.x), std::max(1.0f, sz.y)));
+                  };
+
+                  drawFxWrapped(brief.titleMarkup, fxSeed, 1.30f);
+                  ImGui::Spacing();
+                  drawFxWrapped(brief.synopsisMarkup, fxSeed + 1, 1.00f);
+
+                  ImGui::Separator();
+
+                  ImGui::TextDisabled("Contract");
+                  ImGui::Text("%s", ui::textfx::stripMarkup(brief.contactName).c_str());
+                  ImGui::SameLine();
+                  ImGui::TextDisabled("(%s)", ui::textfx::stripMarkup(brief.contractCode).c_str());
+
+                  ImGui::TextDisabled("Risk");
+                  ImGui::ProgressBar((float)brief.risk.overall01, ImVec2(-1, 0), sim::riskTierName(brief.risk.overall01));
+                  ImGui::ProgressBar((float)brief.risk.danger01, ImVec2(-1, 0), "Danger");
+                  if (brief.risk.lawRisk01 > 1e-3) {
+                    ImGui::ProgressBar((float)brief.risk.lawRisk01, ImVec2(-1, 0), "Law" );
+                  }
+
+                  ImGui::Separator();
+                  ImGui::TextDisabled("Details");
+
+                  for (std::size_t li = 0; li < brief.bulletsMarkup.size(); ++li) {
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    drawFxWrapped(brief.bulletsMarkup[li], fxSeed + 100 + (core::u64)li, 0.98f);
+                  }
+
+                  ImGui::Separator();
+
+                  if (ImGui::Button("Copy text")) {
+                    std::string plain;
+                    plain.reserve(512);
+                    plain += ui::textfx::stripMarkup(brief.titleMarkup);
+                    plain += "\n";
+                    plain += ui::textfx::stripMarkup(brief.synopsisMarkup);
+                    plain += "\n\n";
+                    for (const auto& line : brief.bulletsMarkup) {
+                      plain += "- ";
+                      plain += ui::textfx::stripMarkup(line);
+                      plain += "\n";
+                    }
+                    ImGui::SetClipboardText(plain.c_str());
+                    toast(toasts, "Briefing copied to clipboard.", 2.0);
+                  }
+
+                  ImGui::SameLine();
+                  ImGui::BeginDisabled(!dockedHere || !canAcceptOffer(offer));
+                  if (ImGui::Button("Accept & Plot")) {
+                    const bool ok = acceptOffer(i, true);
+                    if (ok) {
+                      missionBriefOfferIdx = -1;
+                      ImGui::CloseCurrentPopup();
+                    }
+                  }
+                  ImGui::EndDisabled();
+
+                  ImGui::SameLine();
+                  if (ImGui::Button("Plot")) {
+                    const sim::SystemId legSys = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0) ? offer.viaSystem : offer.toSystem;
+                    const sim::StationId legSt = (offer.viaSystem != 0 && offer.viaStation != 0 && offer.leg == 0) ? offer.viaStation : offer.toStation;
+                    if (plotRouteToSystem(legSys)) {
+                      pendingArrivalTargetStationId = legSt;
+                      if (legSys == currentSystem->stub.id) tryTargetStationById(legSt);
+                      showGalaxy = true;
+                    }
+                  }
+
+                  ImGui::SameLine();
+                  if (ImGui::Button("Close")) {
+                    missionBriefOfferIdx = -1;
+                    ImGui::CloseCurrentPopup();
+                  }
+
+                  ImGui::EndPopup();
+                }
+              }
+ImGui::EndTabItem();
             }
           }
         }
@@ -28355,7 +28818,7 @@ if (showContacts) {
             applyUiScaleNow();
             uiSettingsDirty = true;
           }
-          ImGui::TextDisabled("Effective: %.2fx (DPI %.2fx × User %.2fx)", uiScale, uiScaleDpi, uiScaleUser);
+          ImGui::TextDisabled("Effective: %.2fx (DPI %.2fx x User %.2fx)", uiScale, uiScaleDpi, uiScaleUser);
         }
 
         if (ImGui::CollapsingHeader("Layout profiles", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -29961,15 +30424,38 @@ draw_command_palette:
 
     // Screenshot capture (with UI): after ImGui has drawn, but before window swap.
     if (shotUi.pending) {
-      std::string err;
-      const bool ok = game::captureBackbufferToPng(shotUi.path, w, h, &err);
-      if (ok) {
-        photoModeWindow.lastSavedPath = shotUi.path;
-        if (shotUi.copyToClipboard) SDL_SetClipboardText(shotUi.path.c_str());
-        toast(toasts, "Saved screenshot: " + shotUi.path, 2.2);
+      if (shotReadbackOk) {
+        render::TextureReadbackDesc d{};
+        d.source = render::ReadbackSource::Framebuffer;
+        d.framebuffer = 0;
+        d.readBuffer = (unsigned int)GL_BACK;
+        d.x = 0;
+        d.y = 0;
+        d.width = w;
+        d.height = h;
+        d.format = (unsigned int)GL_RGBA;
+        d.type = (unsigned int)GL_UNSIGNED_BYTE;
+
+        const bool ok = shotReadback.enqueue(d, shotUi.path, /*delayFrames=*/2);
+        if (ok) {
+          shotMeta[shotUi.path] = PendingScreenshotMeta{shotUi.copyToClipboard};
+          toast(toasts, "Screenshot queued: " + shotUi.path, 1.6);
+        } else {
+          toast(toasts, "Screenshot queue failed.", 2.2);
+        }
       } else {
-        toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+        // Fallback: synchronous readback (may stall a frame).
+        std::string err;
+        const bool ok = game::captureBackbufferToPng(shotUi.path, w, h, &err);
+        if (ok) {
+          photoModeWindow.lastSavedPath = shotUi.path;
+          if (shotUi.copyToClipboard) SDL_SetClipboardText(shotUi.path.c_str());
+          toast(toasts, "Saved screenshot: " + shotUi.path, 2.2);
+        } else {
+          toast(toasts, err.empty() ? "Screenshot capture failed." : err, 2.2);
+        }
       }
+
       shotUi.pending = false;
       shotUi.path.clear();
       shotUi.copyToClipboard = false;

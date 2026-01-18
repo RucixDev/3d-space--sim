@@ -1,6 +1,7 @@
 #include "stellar/sim/SaveGame.h"
 
 #include "stellar/core/Clamp.h"
+#include "stellar/core/Base64.h"
 #include "stellar/core/Log.h"
 
 #include <algorithm>
@@ -108,6 +109,29 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << e.discoveredDay << " "
       << e.valueCr << " "
       << (e.sold ? 1 : 0)
+      << "\n";
+  }
+
+  auto b64tok = [](const std::string& s) -> std::string {
+    return s.empty() ? std::string("~") : core::base64Encode(s);
+  };
+
+  // Comms (diegetic inbox)
+  f << "comms " << s.comms.size() << "\n";
+  for (const auto& m : s.comms) {
+    f << "comms_msg "
+      << m.id << " "
+      << m.timeDays << " "
+      << (int)m.channel << " "
+      << m.factionId << " "
+      << m.systemId << " "
+      << m.stationId << " "
+      << m.relatedId << " "
+      << (m.unread ? 1 : 0) << " "
+      << (m.pinned ? 1 : 0) << " "
+      << b64tok(m.from) << " "
+      << b64tok(m.subject) << " "
+      << b64tok(m.body)
       << "\n";
   }
 
@@ -619,6 +643,50 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         e.valueCr = std::max(0.0, e.valueCr);
         e.sold = (sold != 0);
         out.logbook.push_back(e);
+      }
+    } else if (key == "comms") {
+      std::size_t n = 0;
+      f >> n;
+      out.comms.clear();
+      out.comms.reserve(std::min<std::size_t>(n, 4096));
+
+      auto decodeTok = [&](const std::string& tok) -> std::string {
+        if (tok == "~") return {};
+        std::string s;
+        if (!core::base64Decode(tok, &s)) return {};
+        return s;
+      };
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "comms_msg") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        CommsMessage m{};
+        int chan = 0;
+        int unread = 1;
+        int pinned = 0;
+        std::string fromB64;
+        std::string subjectB64;
+        std::string bodyB64;
+
+        if (!(f >> m.id >> m.timeDays >> chan >> m.factionId >> m.systemId >> m.stationId >> m.relatedId >> unread >> pinned >> fromB64 >> subjectB64 >> bodyB64)) {
+          break;
+        }
+
+        m.channel = static_cast<CommsChannel>(core::clampCast<core::u8>(chan, 0, (int)CommsChannel::Custom));
+        m.unread = (unread != 0);
+        m.pinned = (pinned != 0);
+        m.from = decodeTok(fromB64);
+        m.subject = decodeTok(subjectB64);
+        m.body = decodeTok(bodyB64);
+
+        out.comms.push_back(std::move(m));
       }
     } else if (key == "resolved_signals") {
       std::size_t n = 0;

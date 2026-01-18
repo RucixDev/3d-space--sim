@@ -44,6 +44,10 @@ PFNGLDELETEBUFFERSPROC DeleteBuffers = nullptr;
 PFNGLMAPBUFFERRANGEPROC MapBufferRange = nullptr;
 PFNGLUNMAPBUFFERPROC UnmapBuffer = nullptr;
 
+PFNGLFENCESYNCPROC FenceSync = nullptr;
+PFNGLCLIENTWAITSYNCPROC ClientWaitSync = nullptr;
+PFNGLDELETESYNCPROC DeleteSync = nullptr;
+
 PFNGLENABLEVERTEXATTRIBARRAYPROC EnableVertexAttribArray = nullptr;
 PFNGLVERTEXATTRIBPOINTERPROC VertexAttribPointer = nullptr;
 PFNGLVERTEXATTRIBDIVISORPROC VertexAttribDivisor = nullptr;
@@ -133,6 +137,14 @@ bool load() {
   if (!MapBufferRange) MapBufferRange = loadProc<PFNGLMAPBUFFERRANGEPROC>("glMapBufferRangeARB");
   UnmapBuffer = loadProc<PFNGLUNMAPBUFFERPROC>("glUnmapBuffer");
   if (!UnmapBuffer) UnmapBuffer = loadProc<PFNGLUNMAPBUFFERPROC>("glUnmapBufferARB");
+
+  // Optional sync object entry points (fences).
+  FenceSync = loadProc<PFNGLFENCESYNCPROC>("glFenceSync");
+  if (!FenceSync) FenceSync = loadProc<PFNGLFENCESYNCPROC>("glFenceSyncARB");
+  ClientWaitSync = loadProc<PFNGLCLIENTWAITSYNCPROC>("glClientWaitSync");
+  if (!ClientWaitSync) ClientWaitSync = loadProc<PFNGLCLIENTWAITSYNCPROC>("glClientWaitSyncARB");
+  DeleteSync = loadProc<PFNGLDELETESYNCPROC>("glDeleteSync");
+  if (!DeleteSync) DeleteSync = loadProc<PFNGLDELETESYNCPROC>("glDeleteSyncARB");
 
   EnableVertexAttribArray = loadProc<PFNGLENABLEVERTEXATTRIBARRAYPROC>("glEnableVertexAttribArray");
   VertexAttribPointer = loadProc<PFNGLVERTEXATTRIBPOINTERPROC>("glVertexAttribPointer");

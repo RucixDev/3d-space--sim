@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 namespace stellar::core {
 
@@ -22,12 +25,25 @@ std::uint64_t Profiler::nowNs() {
   return (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
-void Profiler::beginFrame() {
-  if (!enabled_) return;
+std::uint64_t Profiler::threadIdHash() {
+  static thread_local std::uint64_t h = 0;
+  if (h == 0) {
+    h = (std::uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
+    if (h == 0) h = 1; // avoid sentinel 0
+  }
+  return h;
+}
 
-  inFrame_ = true;
+void Profiler::beginFrame() {
+  if (!enabled()) return;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!enabled()) return;
+
+  inFrame_.store(true, std::memory_order_release);
   current_.startNs = nowNs();
   current_.endNs = 0;
+  current_.mainThreadId = threadIdHash();
   current_.events.clear();
   if (current_.events.capacity() < reserveEventsPerFrame_) {
     current_.events.reserve(reserveEventsPerFrame_);
@@ -35,12 +51,16 @@ void Profiler::beginFrame() {
 }
 
 void Profiler::endFrame() {
-  if (!enabled_) return;
-  if (!inFrame_) return;
+  if (!enabled()) return;
+  if (!inFrame_.load(std::memory_order_acquire)) return;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!enabled()) return;
+  if (!inFrame_.load(std::memory_order_relaxed)) return;
 
   // Mark as closed first so any scope destructors that happen after endFrame()
   // don't accidentally record into the next frame.
-  inFrame_ = false;
+  inFrame_.store(false, std::memory_order_release);
 
   current_.endNs = nowNs();
 
@@ -56,8 +76,10 @@ void Profiler::endFrame() {
 }
 
 void Profiler::clear() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
   frames_.clear();
-  inFrame_ = false;
+  inFrame_.store(false, std::memory_order_release);
 
   current_ = ProfilerFrame{};
   current_.events.reserve(reserveEventsPerFrame_);
@@ -68,6 +90,7 @@ void Profiler::setMaxFrames(std::size_t maxFrames) {
   if (maxFrames < 1) maxFrames = 1;
   if (maxFrames > 4096) maxFrames = 4096;
 
+  std::lock_guard<std::mutex> lock(mutex_);
   maxFrames_ = maxFrames;
   while (frames_.size() > maxFrames_) {
     frames_.pop_front();
@@ -83,14 +106,21 @@ void Profiler::record(const char* name,
                       std::uint64_t startNs,
                       std::uint64_t endNs,
                       std::uint32_t depth) {
-  if (!enabled_) return;
-  if (!inFrame_) return;
+  if (!enabled()) return;
+  if (!inFrame_.load(std::memory_order_acquire)) return;
+
+  const std::uint64_t tid = threadIdHash();
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!enabled()) return;
+  if (!inFrame_.load(std::memory_order_relaxed)) return;
 
   ProfilerEvent e;
   e.name = name;
   e.startNs = startNs;
   e.endNs = endNs;
   e.depth = depth;
+  e.threadId = tid;
   current_.events.push_back(e);
 }
 

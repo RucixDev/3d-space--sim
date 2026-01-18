@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -58,11 +59,140 @@ public:
 
   std::size_t threadCount() const { return threadCount_; }
 
+  // True if the calling thread is one of this pool's worker threads.
+  // Useful for avoiding oversubscription in nested parallel regions.
+  bool isWorkerThread() const { return tlsCurrent_ == this; }
+
   static std::size_t defaultThreadCount() {
     const unsigned hc = std::thread::hardware_concurrency();
     if (hc > 0) return static_cast<std::size_t>(hc);
     return 4;
   }
+
+  // Schedule a job without creating a future.
+  //
+  // This is a lower-overhead "fire-and-forget" path that is useful for internal
+  // helpers like TaskGroup and parallelFor().
+  //
+  // NOTE: The callable must be safe to execute on any worker thread. If the pool
+  // is stopping, the job is executed inline on the calling thread.
+  template <class F>
+  void enqueue(F&& f) {
+    using FnT = std::decay_t<F>;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (stopping_) {
+        lock.unlock();
+        f();
+        return;
+      }
+
+      if constexpr (std::is_copy_constructible_v<FnT>) {
+        queue_.emplace_back(std::forward<F>(f));
+      } else {
+        // std::function requires copyable callables. For move-only tasks,
+        // store the functor behind a shared_ptr.
+        auto fn = std::make_shared<FnT>(std::forward<F>(f));
+        queue_.emplace_back([fn]() { (*fn)(); });
+      }
+    }
+    cv_.notify_one();
+  }
+
+  // Attempt to run exactly one queued task inline.
+  // Returns true if a task was executed.
+  //
+  // This "help while waiting" primitive is important to avoid nested-parallelism
+  // deadlocks when workers need to wait for other work in the same pool.
+  bool tryRunOne() {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (queue_.empty()) return false;
+      task = std::move(queue_.front());
+      queue_.pop_front();
+      ++active_;
+    }
+
+    task();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      --active_;
+      if (queue_.empty() && active_ == 0) idleCv_.notify_all();
+    }
+
+    return true;
+  }
+
+  // A small helper for "submit N jobs, then wait" patterns without futures.
+  //
+  // TaskGroup is safe to destroy without calling wait(): tasks will still run.
+  // However, waiting is typically what you want for deterministic batching.
+  class TaskGroup {
+  public:
+    explicit TaskGroup(JobSystem& js) : st_(std::make_shared<State>(&js)) {}
+
+    TaskGroup(const TaskGroup&) = default;
+    TaskGroup& operator=(const TaskGroup&) = default;
+
+    // Submit a task into this group.
+    template <class F>
+    void run(F&& f) {
+      auto st = st_;
+      st->remaining.fetch_add(1, std::memory_order_relaxed);
+
+      using FnT = std::decay_t<F>;
+      if constexpr (std::is_copy_constructible_v<FnT>) {
+        st->js->enqueue([st, func = std::forward<F>(f)]() mutable {
+          func();
+          if (st->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            st->cv.notify_all();
+          }
+        });
+      } else {
+        // std::function requires copyable callables; store move-only functors behind a shared_ptr.
+        auto fn = std::make_shared<FnT>(std::forward<F>(f));
+        st->js->enqueue([st, fn]() {
+          (*fn)();
+          if (st->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            st->cv.notify_all();
+          }
+        });
+      }
+    }
+
+    // Wait for all tasks in the group to complete.
+    void wait() {
+      auto st = st_;
+      while (st->remaining.load(std::memory_order_acquire) > 0) {
+        // Help the pool make progress while we're waiting.
+        if (!st->js->tryRunOne()) {
+          std::unique_lock<std::mutex> lock(st->mutex);
+          st->cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+            return st->remaining.load(std::memory_order_acquire) == 0;
+          });
+        }
+      }
+    }
+
+    std::size_t pending() const {
+      return (std::size_t)std::max(0, st_->remaining.load(std::memory_order_relaxed));
+    }
+
+  private:
+    struct State {
+      explicit State(JobSystem* jsIn) : js(jsIn) {}
+      JobSystem* js{nullptr};
+      std::atomic<int> remaining{0};
+      std::mutex mutex{};
+      std::condition_variable cv{};
+    };
+
+    std::shared_ptr<State> st_{};
+  };
 
   // Submit a job and get a future.
   template <class F, class... Args>
@@ -121,35 +251,41 @@ public:
 
     std::atomic<std::size_t> next{0};
 
-    auto workLoop = [&]() {
+    // Keep the user callable by reference (matches old semantics) while still
+    // allowing move-only functors (since we never copy it into tasks).
+    auto* fnPtr = &fn;
+
+    auto workLoop = [&, fnPtr]() {
       for (;;) {
         const std::size_t start = next.fetch_add(grain, std::memory_order_relaxed);
         if (start >= count) break;
         const std::size_t end = (start + grain < count) ? (start + grain) : count;
-        for (std::size_t i = start; i < end; ++i) fn(i);
+        for (std::size_t i = start; i < end; ++i) (*fnPtr)(i);
       }
     };
 
     // Avoid nested-parallelism deadlocks by ensuring the calling thread also works.
     // Launch (workers - 1) helper tasks and run one workLoop inline.
-    std::vector<std::future<void>> futs;
-    futs.reserve(workers - 1);
+    //
+    // Using TaskGroup avoids the allocations/futures overhead of submit().
+    TaskGroup g(*this);
     for (std::size_t i = 0; i + 1 < workers; ++i) {
-      futs.push_back(submit(workLoop));
+      g.run(workLoop);
     }
 
     workLoop();
-    for (auto& f : futs) f.get();
+    g.wait();
   }
 
 private:
   void workerLoop() {
+    tlsCurrent_ = this;
     for (;;) {
       std::function<void()> task;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&]() { return stopping_ || !queue_.empty(); });
-        if (stopping_ && queue_.empty()) return;
+        if (stopping_ && queue_.empty()) break;
 
         task = std::move(queue_.front());
         queue_.pop_front();
@@ -164,6 +300,7 @@ private:
         if (queue_.empty() && active_ == 0) idleCv_.notify_all();
       }
     }
+    tlsCurrent_ = nullptr;
   }
 
   std::size_t threadCount_{1};
@@ -176,6 +313,8 @@ private:
   std::deque<std::function<void()>> queue_{};
   std::size_t active_{0};
   bool stopping_{false};
+
+  inline static thread_local JobSystem* tlsCurrent_{nullptr};
 };
 
 } // namespace stellar::core

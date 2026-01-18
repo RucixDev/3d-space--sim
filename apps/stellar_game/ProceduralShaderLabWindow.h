@@ -1,13 +1,16 @@
 #pragma once
 
 #include "stellar/core/Types.h"
+#include "stellar/proc/FluidSim2D.h"
 #include "stellar/render/RenderTarget.h"
 #include "stellar/render/ShaderToyGraph.h"
 #include "stellar/render/ShaderToyParams.h"
+#include "stellar/render/Texture.h"
 
 #include <array>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace stellar::game {
 
@@ -31,6 +34,63 @@ struct ProceduralShaderLabPassState {
 
 struct ProceduralShaderLabWindowState {
   bool open{false};
+
+  // -----------------------------
+  // External textures for ShaderToy iChannels
+  // -----------------------------
+  // ShaderToyGraph supports 4 application-provided textures (External0..3).
+  // The Procedural Shader Lab binds a small curated set here:
+  //   External0: Checker
+  //   External1: Noise
+  //   External2: Fluid (procedural CPU sim)
+  //   External3: Fluid flow (velocity)
+  struct ExternalTextures {
+    bool inited{false};
+
+    // External0: Checker
+    stellar::render::Texture2D checkerTex{};
+    int checkerRes{256};
+    int checkerSize{16};
+
+    // External1: Noise
+    stellar::render::Texture2D noiseTex{};
+    int noiseRes{256};
+    core::u64 noiseSeed{0x1234ABCDULL};
+    bool requestRegenNoise{true};
+    std::vector<unsigned char> noiseRGBA{};
+
+    // External2: Fluid
+    bool fluidEnabled{true};
+    bool fluidPaused{false};
+    bool fluidMouseInject{true};
+    int fluidGrid{192};
+    int fluidIterations{24};
+    float fluidTimeScale{1.0f};
+    float fluidMaxDt{1.0f / 20.0f};
+    float fluidExposure{0.06f};
+
+    bool fluidAutoInject{true};
+    int fluidInjectEveryNFrames{24};
+    float fluidInjectRadius{0.06f};
+    float fluidInjectDye{18.0f};
+    float fluidInjectForce{70.0f};
+
+    core::u64 fluidSeed{0xC0FFEEULL};
+    stellar::proc::FluidSim2D fluid{};
+    stellar::render::Texture2D fluidTex{};
+    std::vector<unsigned char> fluidRGBA{};
+
+    // Mouse injection tracking (uses the preview mouse coordinates).
+    bool fluidWasDown{false};
+    float fluidLastU{0.0f};
+    float fluidLastV{0.0f};
+
+    // External3: Fluid flow (velocity) encoded into RG (0.5 = 0), and speed into B.
+    stellar::render::Texture2D flowTex{};
+    int flowRes{192};
+    float flowVizScale{0.02f};
+    std::vector<unsigned char> flowRGBA{};
+  } ext;
 
   // Preview
   bool previewInited{false};

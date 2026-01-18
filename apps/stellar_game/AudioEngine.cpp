@@ -37,7 +37,7 @@ static float twoPi() { return 6.28318530718f; }
 
 } // namespace
 
-AudioEngine::AudioEngine() = default;
+AudioEngine::AudioEngine() : capture_(kCaptureSize, 0) {}
 
 AudioEngine::~AudioEngine() {
   shutdown();
@@ -79,6 +79,10 @@ bool AudioEngine::init() {
   noiseState_ = 0x12345678u;
   thrusterNoiseLP_ = 0.0f;
   voiceCount_ = 0;
+
+  // Reset capture ring.
+  capWrite_.store(0, std::memory_order_relaxed);
+  std::fill(capture_.begin(), capture_.end(), (std::int16_t)0);
 
   active_.store(true, std::memory_order_release);
 
@@ -151,6 +155,26 @@ void AudioEngine::setShipParams(float engine01,
 void AudioEngine::play(Sfx sfx, float gain, float pan) {
   if (!enabled_.load(std::memory_order_relaxed)) return;
   (void)enqueue(Event{sfx, gain, pan});
+}
+
+int AudioEngine::copyRecentMono(float* out, int maxSamples) const {
+  if (!out || maxSamples <= 0) return 0;
+  if (capture_.empty()) return 0;
+
+  // Limit reads to <= half the ring so we never overlap the region currently
+  // written by the callback (even in the presence of wrap-around).
+  const int safeMax = (int)kCaptureSize / 2;
+  const int n = std::min(maxSamples, safeMax);
+
+  const std::uint32_t w = capWrite_.load(std::memory_order_acquire);
+  const std::uint32_t start = w - (std::uint32_t)n;
+
+  for (int i = 0; i < n; ++i) {
+    const std::int16_t s = capture_[(std::size_t)((start + (std::uint32_t)i) & kCaptureMask)];
+    out[i] = (float)s / 32768.0f;
+  }
+
+  return n;
 }
 
 bool AudioEngine::enqueue(const Event& e) {
@@ -326,9 +350,22 @@ void AudioEngine::mix(float* outInterleaved, int frames) {
     spawnVoice(e);
   }
 
+  // Capture cursor: we only publish capWrite_ once per callback so readers can
+  // safely snapshot the region *before* capWrite_ without racing the writer.
+  std::uint32_t capW = capWrite_.load(std::memory_order_relaxed);
+
   const bool enabled = enabled_.load(std::memory_order_relaxed);
   if (!enabled) {
     std::memset(outInterleaved, 0, (std::size_t)frames * sizeof(float) * 2);
+
+    // Also advance the capture ring with silence so tools see "flatline".
+    if (!capture_.empty()) {
+      for (int i = 0; i < frames; ++i) {
+        capture_[(std::size_t)(capW & kCaptureMask)] = 0;
+        ++capW;
+      }
+      capWrite_.store(capW, std::memory_order_release);
+    }
     return;
   }
 
@@ -440,9 +477,24 @@ void AudioEngine::mix(float* outInterleaved, int frames) {
     }
 
     // Clamp to avoid NaNs/clipping.
-    outInterleaved[i * 2 + 0] = clamp11(left);
-    outInterleaved[i * 2 + 1] = clamp11(right);
+    const float outL = clamp11(left);
+    const float outR = clamp11(right);
+
+    outInterleaved[i * 2 + 0] = outL;
+    outInterleaved[i * 2 + 1] = outR;
+
+    // Capture mono mix for tools.
+    if (!capture_.empty()) {
+      const float m = 0.5f * (outL + outR);
+      int q = (int)std::lround(clamp11(m) * 32767.0f);
+      q = std::clamp(q, -32767, 32767);
+      capture_[(std::size_t)(capW & kCaptureMask)] = (std::int16_t)q;
+      ++capW;
+    }
   }
+
+  // Publish the written cursor.
+  capWrite_.store(capW, std::memory_order_release);
 }
 
 } // namespace stellar::game

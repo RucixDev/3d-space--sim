@@ -1,4 +1,171 @@
+## Round 84 - Fence-based Async GPU Readback + Hitch-free Screenshots
+
+- Upgraded `render::AsyncTextureReadback` to optionally use OpenGL sync objects (`glFenceSync`/`glClientWaitSync`) for non-blocking readiness checks, avoiding GPU stalls when mapping PBOs (fallback to frame-delay heuristics when unavailable).
+- Extended readbacks to support `ReadbackSource::Framebuffer` using `GL_PIXEL_PACK_BUFFER` + `glReadPixels` (backbuffer/FBO capture, not just textures).
+- Screenshot capture is now queued and written out asynchronously during the readback poll step (reduces frame hitching); clipboard copy and Photo Mode last-path update happen on completion.
+- Added sync-object entry points to the OpenGL loader (`glFenceSync`, `glClientWaitSync`, `glDeleteSync`).
+
+## Round 83 - Multi-thread Profiler + Multi-track Chrome Trace Export
+
+- Made `core::Profiler` thread-safe so `STELLAR_PROFILE_SCOPE` can be used inside worker threads without data races.
+- `ProfilerEvent` now stores a hashed `threadId` and `ProfilerFrame` stores `mainThreadId` (thread that began the frame) for better diagnostics.
+- Chrome trace exporter now supports `splitThreads` (default ON): span events are emitted on separate tids per thread and named via `thread_name` metadata (Perfetto / chrome://tracing).
+- Profiler UI adds a **Split threads** toggle in the Export Trace section.
+- Added `test_profiler_mt` to validate multi-thread capture.
+
+## Round 82 - Mission Board Batch Route Preview (single-source Dijkstra)
+
+- Added `sim::NavRouteBatch` (single-source shortest paths) that computes best routes from one origin to all systems in a nearby set using the same implicit jump-range graph as A*.
+- Mission Board route preview now uses `NavRouteBatch` to compute per-offer (via/to) jumps/distance/fuel with far fewer solves (at most a handful of batch passes vs N x A* per offer).
+- Added `test_nav_route_batch` to validate the batch solver against existing A* expectations for hop/distance/fuel cost modes.
+
+## Round 81 - FluidSim2D Multigrid Projection + Diagnostics
+
+- Added a multigrid V-cycle accelerator for the pressure projection step in `proc::FluidSim2D` (still Stable Fluids-style boundaries). This dramatically improves convergence at higher grid sizes without cranking iteration counts.
+- Added `FluidSim2DStats` (pressure residual + divergence metrics) and surfaced it in the Procedural Fluid Lab UI.
+- Added projection controls to the lab (enable/disable multigrid + smoothing/coarse solve knobs).
+
 # Patch Notes
+
+## Round 80 — JobSystem TaskGroup + help-while-wait parallelFor (lower overhead, safer nesting)
+
+The `core::JobSystem` is used all over the simulation/proc stack (hyperlane routing, scanners, route planning),
+and it already provided a clean `submit()` + `parallelFor()` interface.
+
+However, `parallelFor()` previously used `submit()` + `std::future` internally, which creates extra allocations
+and bookkeeping overhead. More importantly, when `parallelFor()` is invoked from inside a worker job
+(nested parallelism), **blocking waits** can become fragile unless the waiting thread can still help execute
+queued work.
+
+This round improves existing code by adding a lightweight **TaskGroup** + **help-while-wait** primitive and
+rewriting `parallelFor()` to use it.
+
+### What changed
+
+- `JobSystem` gains:
+  - `enqueue()` — fire-and-forget scheduling with no future
+  - `tryRunOne()` — run a queued task inline (used for help-while-wait)
+  - `TaskGroup` — submit N tasks and wait without futures
+  - `isWorkerThread()` — tiny TLS-based helper for future oversubscription heuristics
+- `parallelFor()` now:
+  - keeps the user callable by reference (old semantics) while still supporting move-only functors
+  - schedules helper loops through `TaskGroup` (avoids future allocations)
+  - waits using help-while-wait semantics (safer nested usage)
+- `test_jobs` expanded to cover `TaskGroup` and nested `parallelFor()` inside a job.
+
+### Files changed/added
+
+- `include/stellar/core/JobSystem.h`
+- `tests/test_jobs.cpp`
+- `PATCH_NOTES.md`
+
+## Round 79 — FuzzySearch upgrade (DP matcher, CamelCase acronyms, better highlighting)
+
+The UI uses fuzzy search in a lot of places (command palette, controls, logs, market dashboards, Comms inbox).
+The previous implementation used a greedy subsequence scan per token, which was fast but often produced
+**non-intuitive matches** (especially for CamelCase acronyms) because it didn't search for the *best* alignment.
+
+This round improves existing code by replacing the matcher with a lightweight, deterministic **dynamic-programming**
+scorer/backtracker (in the "fzy" family of fuzzy finders):
+
+- Still **ASCII-only** (as intended for these UI labels), but now prefers:
+  - **CamelCase anchors** (FlightRecorderWindow → `frw`),
+  - **word-boundary anchors** (separators),
+  - **tight consecutive runs** (better highlight + less surprising result ordering).
+- Returns **best-path match positions** for more faithful highlighting.
+
+### Files changed/added
+
+- `src/ui/FuzzySearch.cpp`
+- `tests/test_fuzzy_search.cpp`
+- `PATCH_NOTES.md`
+
+## Round 78 — FluidSim2D BFECC Dye Advection (MacCormack correction) + UI Controls
+
+Semi-Lagrangian advection is extremely stable, but it's also **very diffusive**: dye/smoke loses crispness quickly.
+This round improves existing code by upgrading the FluidSim2D dye transport to an optional
+**BFECC / MacCormack-style corrected advection** pass with a monotonic clamp to avoid ringing/overshoot.
+
+### What changed
+
+- `FluidSim2DParams` gains:
+  - `dyeAdvectionCorrection` (0..1 blend between plain semi-Lagrangian and full BFECC)
+  - `dyeAdvectionClamp` to clamp corrected values to the source stencil min/max
+- `FluidSim2D` adds `advectBFECC(...)` and uses it for dye channels during `step()`
+  - forward advect writes directly to the destination buffer
+  - backward advect uses a single scratch buffer to estimate and compensate truncation error
+- Procedural Fluid Lab now exposes **Advection Quality** controls (BFECC amount + clamp toggle).
+- `test_fluid_sim2d` updated to exercise the BFECC path and assert dye remains bounded.
+
+### Files changed/added
+
+- `include/stellar/proc/FluidSim2D.h`
+- `src/proc/FluidSim2D.cpp`
+- `apps/stellar_game/ProceduralFluidLabWindow.cpp`
+- `tests/test_fluid_sim2d.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## Round 77 — Save/Load Comms Inbox (Base64 tokenization + id-stable import)
+
+This round improves existing code by making the new diegetic Comms system **persist across quicksave/quickload**,
+without destabilizing the line-oriented save format.
+
+### What changed
+
+- Added `stellar::core::base64Encode/base64Decode` (RFC 4648, whitespace-tolerant decode) used for safe string tokens in SaveGame.
+- SaveGame now stores `comms` with `comms_msg` lines (id, time, channel, link ids, unread/pinned, and base64 payloads for from/subject/body).
+  - Uses a `~` sentinel for empty strings to keep parsing token-based.
+- Game quicksave/load now exports/imports the comms log:
+  - Uses new `CommsLog::replace(...)` to restore messages and recompute the internal id allocator.
+  - Clears overlay queue/selection on load to avoid dangling references.
+- Added deterministic tests:
+  - `test_base64` round-trip + spot encodings
+  - `test_savegame_comms` ensures comms messages survive save/load including newlines + markup
+
+### Files changed/added
+
+- `include/stellar/core/Base64.h` *(new)*
+- `src/core/Base64.cpp` *(new)*
+- `include/stellar/sim/SaveGame.h`
+- `src/sim/SaveGame.cpp`
+- `include/stellar/sim/Comms.h`
+- `src/sim/Comms.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_base64.cpp` *(new)*
+- `tests/test_savegame_comms.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+## Round 62 — Smuggling Scanner (black market route suggestions w/ risk + availability modeling)
+
+This round adds a missing gameplay/tooling primitive: a **headless smuggling route scanner**.
+The core sim already had deterministic contraband rules + black market pricing, but there was no reusable module that could answer:
+"What illegal goods should I haul, where, and how risky is it?"
+
+### What changed
+
+- Added a new sim module `stellar::sim::SmugglingScanner`:
+  - Buys legally at the origin station (official ask + origin fee).
+  - Sells at the destination station via the black market (black-market bid, includes fence cut).
+  - Estimates sting probability, fine size, and computes clean/stung/expected profit.
+- Added three black market availability modes so UIs can choose the behavior they want:
+  - **TodayOnly**: only return opportunities where the fence is available today.
+  - **Expected**: scale score by `access01` (useful for "I can wait for a good day").
+  - **Ignore**: treat as always available (useful for tooling/tests).
+- Added a mean/variance option for scoring:
+  - `ExpectedProfit - riskLambda * stdDev` (riskLambda is configurable).
+- Added a deterministic unit test that searches for a valid legal→illegal commodity pair, forces a strongly profitable setup via inventory edits, then validates determinism.
+
+### Files changed/added
+
+- `include/stellar/sim/SmugglingScanner.h`
+- `src/sim/SmugglingScanner.cpp`
+- `tests/test_smuggling_scanner.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
 
 
 ## Round 61 — Deterministic preview LOD sampler (jittered grid + unbiased stub reservoir)
@@ -1530,4 +1697,243 @@ Where betweenness centrality answers “what lanes are *busy*?”, this answers 
 - `tests/test_hyperlane_centrality.cpp` *(rewritten to harness style)*
 - `tests/test_hyperlane_vulnerability.cpp` *(new)*
 - `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 71 — Procedural Fluid Lab (Stable Fluids + Curl Noise Forcing)
+
+This round adds an **interactive procedural fluid simulation** playground aimed at quickly generating
+convincing “space smoke” / nebula textures and experimenting with turbulence controls.
+
+### What changed
+
+- **Core / proc:** added `proc::FluidSim2D` *(new)*:
+  - 2D incompressible solver in the “Stable Fluids” family (semi-Lagrangian advection, implicit diffusion, pressure projection).
+  - **RGB dye** channels for colorful swirls.
+  - Optional **vorticity confinement** to re-inject small-scale rolling motion.
+  - Optional divergence-free **curl-noise forcing** (stream function based) for controllable procedural turbulence.
+  - Safety clamps for extreme brush input (max speed / max dye).
+
+- **Game UI:** added **Procedural Fluid Lab** window *(new)*:
+  - Paint dye + push velocity by dragging directly on the preview.
+  - Live-tweak viscosity/diffusion/dissipation, vorticity, curl-noise parameters, and safety clamps.
+  - **PNG export** of the current simulated texture (useful for baking animated sheets, nebula masks, etc.).
+
+- **Tests:** added a deterministic solver smoke test that checks:
+  - no NaNs/Infs during stepping
+  - divergence stays reasonably small
+
+### Files changed/added
+
+- `include/stellar/proc/FluidSim2D.h` *(new)*
+- `src/proc/FluidSim2D.cpp` *(new)*
+- `apps/stellar_game/ProceduralFluidLabWindow.h` *(new)*
+- `apps/stellar_game/ProceduralFluidLabWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `tests/test_fluid_sim2d.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 72 — Text Animation Modifier (TextFx)
+
+### What’s new
+- Added a lightweight **markup-driven text animation/modifier system** (`stellar::ui::textfx`) that can be used anywhere you draw UI text.
+- New **Text Animation Lab** window to author/preview effects in real time (Visual → Text Animation Lab).
+- **Toast overlay** now supports TextFx markup (existing bracketed gameplay text like `[CONTRABAND]` stays literal; only recognized tags affect rendering).
+
+### Markup examples
+- `[wave amp=6 freq=0.25 speed=2]Hello[/wave]`
+- `[pulse min=0.2 max=1 speed=2][color #ff4444]WARNING[/color][/pulse]`
+- `[grad #ff00aa #00ccff]NEBULA[/grad]`
+- `[scramble amount=0.9 rate=28 set=hex]HACKING...[/scramble]`
+- `[type cps=28 fade=0.06]Incoming transmission...[/type]`
+
+### Notes
+- Unknown tags are preserved literally (important for existing strings that use brackets).
+- The core compiler/evaluator is **ImGui-free**; ImGui rendering wrappers compile only when `STELLAR_ENABLE_IMGUI` is enabled.
+
+### Files changed/added
+
+- `include/stellar/ui/TextFx.h` *(new)*
+- `src/ui/TextFx.cpp` *(new)*
+- `apps/stellar_game/TextAnimationLabWindow.h` *(new)*
+- `apps/stellar_game/TextAnimationLabWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `tests/test_text_fx.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 73 — Shader Lab External iChannel Textures (Checker/Noise + Live Fluid/Flow)
+
+This round upgrades the **Procedural Shader Lab** so your shader graphs can sample **non-feedback textures**
+in iChannel0..3 — similar to how ShaderToy exposes image/noise inputs.
+
+### What changed
+
+**Core / render:**
+- `render::ShaderToyGraph` now supports **External0..External3** channel sources.
+  The app can bind textures via `ShaderToyGraph::setExternalTexture(slot, tex)` and route them per-pass.
+
+**Game UI (Procedural Shader Lab):**
+- Adds an **External Textures (iChannel)** panel with live previews and controls.
+- The lab binds a curated default set:
+  - **External0:** Checker pattern
+  - **External1:** Seeded, tiling RGB noise
+  - **External2:** Live CPU **fluid dye** texture (from `proc::FluidSim2D`)
+  - **External3:** Live **flow/velocity** texture derived from the same fluid sim
+    (velocity encoded into RG, where 0.5 = 0).
+- New **Inkflow (External fluid flow)** preset demonstrates advecting a feedback buffer using the external flow field.
+
+### Files changed/added
+
+- `include/stellar/render/ShaderToyGraph.h`
+- `src/render/ShaderToyGraph.cpp`
+- `apps/stellar_game/ProceduralShaderLabWindow.h`
+- `apps/stellar_game/ProceduralShaderLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 74 — Audio Analyzer / Oscilloscope + FFT Spectrum
+
+This round focuses on the **procedural audio subsystem**, adding tooling to *see* what the synth is producing.
+
+### What’s new
+
+**Core (headless-friendly DSP):**
+- New `stellar::dsp::AudioAnalyzer` module implementing a **radix-2 FFT** analyzer with a **Hann window**, plus log-banded spectrum output.
+- Produces:
+  - time-domain waveform window
+  - linear spectrum magnitude
+  - log-frequency bands with optional smoothing and dB normalization
+
+**Game (UI tooling):**
+- New **Audio Analyzer** window (Menu → Audio → Audio analyzer… or Windows → Audio Analyzer)
+  - oscilloscope waveform
+  - spectrum view (dB or linear)
+  - quick SFX preview buttons
+  - export the most recent capture to a **mono 16-bit WAV**
+
+**Audio engine upgrade:**
+- `AudioEngine` now maintains a lightweight ring-buffer capture of the **mixed output** (mono) for visualizers/tools.
+
+### Files changed/added
+
+- `include/stellar/dsp/AudioAnalyzer.h` *(new)*
+- `src/dsp/AudioAnalyzer.cpp` *(new)*
+- `apps/stellar_game/AudioAnalyzerWindow.h` *(new)*
+- `apps/stellar_game/AudioAnalyzerWindow.cpp` *(new)*
+- `apps/stellar_game/AudioEngine.h`
+- `apps/stellar_game/AudioEngine.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_audio_analyzer.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 75 — Procedural Mission Briefings + Risk-Sorted Mission Board
+
+This round builds out a historically under-developed area: **missions** had solid mechanics, but little contract-style
+presentation and no consistent way to reason about **risk** at a glance.
+
+### What changed
+
+- **Sim (headless / deterministic):** added `stellar::sim::MissionBriefing`:
+  - `computeMissionRisk(...)` estimates **overall / danger / law** risk (0..1) from:
+    - `effectiveSystemSecurityProfile` (security, piracy, traffic, contest)
+    - straight-line **distance (ly)** to the mission's next objective
+    - jurisdiction **law profile** + **black market profile** for smuggling
+  - `generateMissionBriefing(...)` produces a deterministic contract pack:
+    - short **contract code**
+    - procedural **contact handle**
+    - title + synopsis + bullet list (optionally using `ui::textfx` markup)
+
+- **Game (Mission Board UX):**
+  - Added offer **sorting**: reward, deadline, risk, distance, reward/ly.
+  - Added a per-offer **risk summary line** (tier + component breakdown).
+  - Added a **Brief** popup with:
+    - TextFx-rendered contract title/synopsis/bullets
+    - risk progress bars (overall, danger, law)
+    - copy-to-clipboard (strips markup)
+    - accept & plot directly from the contract view
+
+- **Tests:** new deterministic coverage for the briefing generator.
+
+### Files changed/added
+
+- `include/stellar/sim/MissionBriefing.h` *(new)*
+- `src/sim/MissionBriefing.cpp` *(new)*
+- `tests/test_mission_briefing.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 76 — Comms Inbox + Incoming Transmission Overlay
+
+This round focuses on a long-missing piece of *diegetic UX*: the game had great systems (pirates, police scans,
+missions) but **no in-universe comms history**. When something happened, it was easy to miss the toast, and there
+was no way to re-open a contract or recall an ultimatum.
+
+### What’s new
+
+- **Sim:** new lightweight `stellar::sim::CommsLog` + `CommsMessage` module
+  - bounded message log (defaults to 256)
+  - unread + pinned support
+  - small helpers that generate *markup-ready* transmissions for:
+    - pirate ultimatums
+    - authority bounty demands
+    - corrupt-scan bribe offers
+    - mission contract briefings
+
+- **Game:** new **Comms / Inbox** window
+  - filter + channel selection + unread-only
+  - message list + details view (TextFx markup rendering)
+  - convenience actions: mark read/unread, pin, plot route to the message’s linked destination
+
+- **HUD:** new **incoming transmission overlay**
+  - non-interactive, animated preview using TextFx
+  - queues transmissions so you can see what arrived without opening a window
+
+### Files changed/added
+
+- `include/stellar/sim/Comms.h` *(new)*
+- `src/sim/Comms.cpp` *(new)*
+- `apps/stellar_game/CommsWindow.h` *(new)*
+- `apps/stellar_game/CommsWindow.cpp` *(new)*
+- `tests/test_comms.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 77 — TextFx Performance Pass (LRU Cache + Sweep-Line Span Evaluation)
+
+This round focuses on **improving existing code** in one of the most “every-frame” paths: TextFx markup rendering.
+As the Comms inbox + overlay leaned on TextFx more heavily, the previous implementation was doing extra work:
+
+- Recompiling the same markup strings every frame in UI code.
+- Evaluating each glyph by scanning *all spans* (`O(glyphs * spans)`), even when only a few spans were active.
+
+### What’s new
+
+- **TextFx Program now stores `glyphCount`**
+  - computed during compilation (no need to re-scan UTF-8 in hot paths)
+
+- **New `ui::textfx::ProgramCache` (bounded, LRU-ish)**
+  - caches compiled markup Programs
+  - supports heterogeneous lookup (`std::string_view`) to avoid allocations on cache hits
+
+- **TextFx Draw optimized with a sweep-line active span set**
+  - maintains the set of spans that apply to the current glyph as we draw left-to-right
+  - reduces per-frame span scanning overhead significantly for longer marked-up strings
+
+- **Comms UI updated to use TextFx caching throughout**
+  - overlay + inbox no longer recompiles / re-strips markup every frame
+  - “Copy plain” uses cached plain text instead of recompiling
+
+- **Tests**
+  - added coverage for `Program::glyphCount` correctness and basic `ProgramCache` behavior
+
+### Files changed/added
+
+- `include/stellar/ui/TextFx.h`
+- `src/ui/TextFx.cpp`
+- `apps/stellar_game/CommsWindow.cpp`
+- `apps/stellar_game/TextAnimationLabWindow.cpp`
+- `tests/test_text_fx.cpp`
 - `PATCH_NOTES.md`
