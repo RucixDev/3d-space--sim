@@ -10,6 +10,7 @@
 #include "stellar/sim/Mission.h"
 #include "stellar/sim/Universe.h"
 #include "stellar/econ/Commodity.h"
+#include "stellar/ui/Format.h"
 #include "stellar/render/ProceduralRings.h"
 #include "stellar/proc/AsteroidBeltGenerator.h"
 
@@ -981,15 +982,54 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
           s += sim::resourceFieldKindName(f.kind);
           s += " Layout=";
           s += sim::resourceFieldLayoutName(f.layout);
-          s += "\nMajorKm=" + std::to_string(f.majorRadiusKm);
-          s += " MinorKm=" + std::to_string(f.minorRadiusKm);
-          s += " ArcDeg=" + std::to_string(f.arcRad * 57.29577951308232);
+          ui::appendf(s, "\nMajorKm=%.0f", f.majorRadiusKm);
+          ui::appendf(s, " MinorKm=%.0f", f.minorRadiusKm);
+          ui::appendf(s, " ArcDeg=%.2f", f.arcRad * 57.29577951308232);
           s += "\nPrimary=";
           s += econ::commodityDef(f.primary).name;
           s += " Secondary=";
           s += econ::commodityDef(f.secondary).name;
           ImGui::SetClipboardText(s.c_str());
           toast("Copied field.", 1.2);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Copy field JSON")) {
+          std::string js;
+          ui::JsonWriter jw(js);
+          jw.beginObject();
+          jw.member("id", (core::u64)f.id);
+          jw.member("kind", sim::resourceFieldKindName(f.kind));
+          jw.member("layout", sim::resourceFieldLayoutName(f.layout));
+          jw.member("majorRadiusKm", f.majorRadiusKm);
+          jw.member("minorRadiusKm", f.minorRadiusKm);
+          jw.member("arcDeg", f.arcRad * 57.29577951308232);
+          jw.member("primary", econ::commodityDef(f.primary).name);
+          jw.member("secondary", econ::commodityDef(f.secondary).name);
+
+          // Export features that belong to this field.
+          const auto feats = sim::filterFeaturesForField(plan.resourceFields.features, f.id);
+          jw.key("features");
+          jw.beginArray();
+          for (const auto& ft : feats) {
+            jw.beginObject();
+            jw.member("kind", sim::resourceFieldFeatureKindName(ft.kind));
+            jw.member("strength01", ft.strength01);
+            jw.member("width", ft.width);
+            jw.member("param", ft.param);
+            jw.key("localPos");
+            jw.beginArray();
+            jw.value(ft.localPos.x);
+            jw.value(ft.localPos.y);
+            jw.value(ft.localPos.z);
+            jw.endArray();
+            jw.endObject();
+          }
+          jw.endArray();
+          jw.endObject();
+
+          ImGui::SetClipboardText(js.c_str());
+          toast("Copied field JSON.", 1.2);
         }
 
         if (state.showAsteroidScatter) {
@@ -1094,17 +1134,83 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
     std::string s;
     s += "System ";
     s += sys.stub.name;
-    s += "\nId=" + ui::toString(sys.stub.id);
-    s += " Seed=" + ui::toString(sys.stub.seed);
+    s += "\nId=";
+    s += ui::toString(sys.stub.id);
+    s += " Seed=";
+    s += ui::toString(sys.stub.seed);
     s += "\nStar class=";
     s += starClassStr(sys.star.cls);
-    s += " M=" + std::to_string(sys.star.massSol);
-    s += " R=" + std::to_string(sys.star.radiusSol);
-    s += " L=" + std::to_string(sys.star.luminositySol);
-    s += "\nPlanets=" + std::to_string(sys.planets.size());
-    s += " Moons=" + std::to_string(sys.moons.size());
+    ui::appendf(s, " M=%.2f", sys.star.massSol);
+    ui::appendf(s, " R=%.2f", sys.star.radiusSol);
+    ui::appendf(s, " L=%.2f", sys.star.luminositySol);
+    ui::appendf(s, "\nPlanets=%zu", sys.planets.size());
+    ui::appendf(s, " Moons=%zu", sys.moons.size());
     ImGui::SetClipboardText(s.c_str());
     toast("Copied.", 1.2);
+  }
+
+  ImGui::SameLine();
+  if (ImGui::Button("Copy system JSON")) {
+    std::string js;
+    ui::JsonWriter jw(js);
+    jw.beginObject();
+    jw.member("id", (core::u64)sys.stub.id);
+    jw.member("seed", (core::u64)sys.stub.seed);
+    jw.member("name", sys.stub.name);
+
+    jw.key("star");
+    jw.beginObject();
+    jw.member("class", starClassStr(sys.star.cls));
+    jw.member("massSol", sys.star.massSol);
+    jw.member("radiusSol", sys.star.radiusSol);
+    jw.member("luminositySol", sys.star.luminositySol);
+    jw.member("temperatureK", (int)sys.star.temperatureK);
+    jw.endObject();
+
+    jw.key("planets");
+    jw.beginArray();
+    for (const auto& p : sys.planets) {
+      jw.beginObject();
+      jw.member("name", p.name);
+      jw.member("type", planetTypeStr(p.type));
+      jw.member("radiusEarth", p.radiusEarth);
+      jw.member("massEarth", p.massEarth);
+      jw.key("orbit");
+      jw.beginObject();
+      jw.member("semiMajorAxisAU", p.orbit.semiMajorAxisAU);
+      jw.member("eccentricity", p.orbit.eccentricity);
+      jw.member("inclinationRad", p.orbit.inclinationRad);
+      jw.member("periodDays", p.orbit.periodDays);
+      jw.endObject();
+      jw.endObject();
+    }
+    jw.endArray();
+
+    jw.key("moons");
+    jw.beginArray();
+    for (const auto& m : sys.moons) {
+      jw.beginObject();
+      jw.member("id", (core::u64)m.id);
+      jw.member("name", m.name);
+      jw.member("type", planetTypeStr(m.type));
+      jw.member("radiusEarth", m.radiusEarth);
+      jw.member("massEarth", m.massEarth);
+      jw.member("parentPlanetIndex", (core::u32)m.parentPlanetIndex);
+      jw.key("orbit");
+      jw.beginObject();
+      jw.member("semiMajorAxisAU", m.orbit.semiMajorAxisAU);
+      jw.member("eccentricity", m.orbit.eccentricity);
+      jw.member("inclinationRad", m.orbit.inclinationRad);
+      jw.member("periodDays", m.orbit.periodDays);
+      jw.endObject();
+      jw.endObject();
+    }
+    jw.endArray();
+
+    jw.endObject();
+
+    ImGui::SetClipboardText(js.c_str());
+    toast("Copied system JSON.", 1.2);
   }
 
   ImGui::End();

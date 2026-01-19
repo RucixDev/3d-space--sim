@@ -1,40 +1,26 @@
-## Round 94 - Procedural Labs Build Fixes + Mission Briefing "Dial" + ImGui Double Widgets
+## Round 94 - UI Format Utilities + JSON Export for Procedural System Lab
 
-This round targets a painful under-developed area: the **experimental procedural lab windows**.
-They contained a few classic integration hazards (OpenGL extension entry points, missing forward
-declarations, and minor API drift) that prevented the game from compiling on MSVC.
+This round closes a lingering build gap in **ProceduralSystemLabWindow** by adding a small UI formatting layer
+(`ui::toString`, `ui::appendf`) and then leverages it to ship a genuinely useful tool upgrade:
+**structured JSON exports** you can paste into bug reports, tooling, or seed repro scripts.
 
-It also adds a small but high-leverage UX upgrade to the **mission briefing** system: two parameters
-to control how "numeric" / "diegetic" the contract text feels.
+### Fixes
 
-### What’s new / fixed
+- **Fix: missing `ui::toString(...)` + missing `stellar::ui` namespace**
+  - Added `include/stellar/ui/Format.h` defining the missing helpers.
+- **Fix: MSVC ambiguity in some `std::string += ("...")` patterns**
+  - Refactored clipboard string builders to use explicit appends + `ui::appendf`.
 
-- **Fix: MSVC build breaks in Procedural Mesh/Shader/Galaxy labs**
-  - Use the engine's GL loader wrappers (`stellar::render::gl::*`) instead of raw `glUseProgram`/
-    `glBindVertexArray`/
-    `glBindFramebuffer` calls (legacy Windows GL headers do not guarantee these entry points).
-  - Added missing forward declarations for internal LOD-chain helpers in `ProceduralMeshLabWindow.cpp`.
-  - Ensured required hashing utilities are visible by including `stellar/core/Hash.h` where needed.
+### What’s new
 
-- **Fix: Gaussian Surfel Reconstruction lab UI type-safety**
-  - Corrected a `void`-returning texture helper (`createChecker`) being used as a `bool`.
-  - Updated mesher flag name (`computeNormalsFromField`).
-  - Added `ImGui::DragDouble` convenience wrapper and used it for `double` params.
-
-- **New: MissionBriefingParams include toggles**
-  - `includeRiskHints`: enables/disables numeric breakdowns (threat component values, customs %, fine estimates).
-  - `includeReputationCues`: optionally adds a short "standing" line to briefings and a smuggling cue.
+- **Procedural System Lab: JSON export buttons**
+  - **Copy field JSON** exports the currently selected resource field plus its features.
+  - **Copy system JSON** exports star + planets + moons (including orbits) for deterministic repro.
 
 ### Files changed/added
 
-- `apps/stellar_game/ProceduralMeshLabWindow.cpp`
-- `apps/stellar_game/ProceduralShaderLabWindow.cpp`
-- `apps/stellar_game/ProceduralGalaxyLabWindow.cpp`
+- `include/stellar/ui/Format.h` *(new)*
 - `apps/stellar_game/ProceduralSystemLabWindow.cpp`
-- `apps/stellar_game/GaussianSurfelReconstructionLabWindow.cpp`
-- `include/stellar/ui/ImGuiCompat.h`
-- `include/stellar/sim/MissionBriefing.h`
-- `src/sim/MissionBriefing.cpp`
 - `PATCH_NOTES.md`
 
 ## Round 93 - ImGui Build Plumbing + Build Info Window
