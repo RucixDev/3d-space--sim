@@ -92,6 +92,21 @@ if (STELLAR_ENABLE_RENDER)
     target_compile_definitions(imgui_lib PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
     set(IMGUI_TARGET imgui_lib)
   endif()
+
+  # Sanity: if ImGui is enabled but no target was created, try to bind to a user-provided target
+  # (common names) or disable ImGui to avoid confusing missing-header build errors.
+  if (STELLAR_ENABLE_IMGUI AND IMGUI_TARGET STREQUAL "")
+    if (TARGET imgui::imgui)
+      set(IMGUI_TARGET imgui::imgui)
+    elseif (TARGET imgui)
+      set(IMGUI_TARGET imgui)
+    endif()
+  endif()
+
+  if (STELLAR_ENABLE_IMGUI AND IMGUI_TARGET STREQUAL "")
+    message(WARNING "STELLAR_ENABLE_IMGUI=ON but Dear ImGui was not provided. Disabling STELLAR_ENABLE_IMGUI. Set STELLAR_FETCH_IMGUI=ON (recommended) or provide an ImGui target before configuring.")
+    set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
+  endif()
   endif() # OpenGL_FOUND
 endif()
 
@@ -299,6 +314,12 @@ if (STELLAR_ENABLE_RENDER)
     OpenGL::GL
     ${STELLAR_SDL_TARGET}
   )
+
+  if (STELLAR_ENABLE_IMGUI AND NOT IMGUI_TARGET STREQUAL "")
+    # The core library contains small ImGui-backed utilities (e.g. TextFx rendering), so
+    # it must see ImGui include paths when STELLAR_ENABLE_IMGUI is on.
+    target_link_libraries(stellar PUBLIC ${IMGUI_TARGET})
+  endif()
   if (WIN32)
     target_link_libraries(stellar PUBLIC gdi32)
   endif()
@@ -329,6 +350,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/LogWindow.cpp
     apps/stellar_game/CVarWindow.cpp
     apps/stellar_game/ProfilerWindow.cpp
+    apps/stellar_game/BuildInfoWindow.cpp
     apps/stellar_game/FlightRecorderWindow.cpp
     apps/stellar_game/CinematicCameraWindow.cpp
     apps/stellar_game/OrbitAnalyzerWindow.cpp

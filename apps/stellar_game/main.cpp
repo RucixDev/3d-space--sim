@@ -132,6 +132,7 @@
 #include "LogbookWindow.h"
 #include "TradePlannerWindow.h"
 #include "ProfilerWindow.h"
+#include "BuildInfoWindow.h"
 #include "FlightRecorderWindow.h"
 #include "CinematicCameraWindow.h"
 #include "OrbitAnalyzerWindow.h"
@@ -3016,6 +3017,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::CVarWindowState cvarWindow{};
   game::LogWindowState logWindow{};
   game::ProfilerWindowState profilerWindow{};
+  game::BuildInfoWindowState buildInfoWindow{};
   game::AudioAnalyzerWindowState audioAnalyzerWindow{};
   game::FlightRecorderWindowState flightRecorderWindow{};
   game::CinematicCameraWindowState cinematicCameraWindow{};
@@ -3835,6 +3837,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"ImGuiDemo", "ImGui Demo Window", "Debug", 10, false, false}, &showImGuiDemo,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"ImGuiMetrics", "ImGui Metrics Window", "Debug", 10, false, false}, &showImGuiMetrics,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"BuildInfo", "Build Info", "Debug", 15, false, false}, &buildInfoWindow.open,
                                 {}, {}, {}});
   }
 
@@ -15907,6 +15911,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         ImGui::MenuItem("ImGui Demo Window", nullptr, &showImGuiDemo);
         ImGui::MenuItem("ImGui Metrics Window", nullptr, &showImGuiMetrics);
+        ImGui::MenuItem("Build Info", nullptr, &buildInfoWindow.open);
 
         ImGui::Separator();
         if (ImGui::BeginMenu("Theme")) {
@@ -16510,6 +16515,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	    game::drawProfilerWindow(profilerWindow, profiler,
 	                             [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
 	                             postFxSettings.enabled ? &postFx.frameGraph() : nullptr);
+
+    // Build info / dependency snapshot (useful for bug reports)
+    game::drawBuildInfoWindow(buildInfoWindow,
+                              [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     // Audio analyzer / oscilloscope (procedural audio tooling)
     game::drawAudioAnalyzerWindow(audioAnalyzerWindow, audio,

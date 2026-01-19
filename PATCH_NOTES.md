@@ -1,3 +1,29 @@
+## Round 93 - ImGui Build Plumbing + Build Info Window
+
+This round targets a rough edge in the **render+UI build plumbing** (a notably under-developed part of the repo compared to the sim/proc layers):
+fixing the common `imgui.h` include failure when compiling the core library with `STELLAR_ENABLE_IMGUI=ON`.
+
+It also adds a small but high-leverage developer tool: an in-game **Build Info** window with a one-click copy-to-clipboard summary for bug reports.
+
+### What’s new
+
+- **Fix: `imgui.h` include failure in core library builds**
+  - When `STELLAR_ENABLE_IMGUI=ON`, the core `stellar` target now links the ImGui target so the ImGui include paths are available while compiling core sources that have optional ImGui-backed utilities (e.g. `ui/TextFx`).
+  - Added a configure-time sanity guard: if ImGui is enabled but no ImGui target is available, we disable ImGui with a clear warning (instead of failing later with a missing header error).
+
+- **New: Build Info window (UI → Build Info)**
+  - Shows **platform, architecture, compiler, build config**, and key **feature flags**.
+  - Shows dependency versions (**SDL** + **Dear ImGui**) and, optionally, **OpenGL runtime strings** (vendor/renderer/version).
+  - Includes a **Copy summary to clipboard** button for easy sharing in logs/issues.
+
+### Files changed/added
+
+- `CMakeLists.txt`
+- `apps/stellar_game/BuildInfoWindow.h` *(new)*
+- `apps/stellar_game/BuildInfoWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
 ## Round 92 - Resonant Asteroid Belts: Kirkwood Gaps + Trojan Swarms
 
 This round expands **procedural generation** into one of the most under-developed “world building” layers in the sim:
