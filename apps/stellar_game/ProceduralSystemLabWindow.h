@@ -5,6 +5,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <array>
 #include <cstdint>
 
 namespace stellar {
@@ -51,6 +52,24 @@ struct ProceduralSystemLabWindowState {
   bool includeDailyDerelict{false};
   bool includeDistress{false};
   bool includeTrafficConvoys{false};
+
+  // --- Minor bodies / asteroid belts (procedural overlay) ---
+  bool showBelts{false};
+  int selectedBelt{0};
+  int beltPointCount{1024};
+  int beltCandidatesPerPoint{18};
+  int beltRadialPlotRes{160};
+  bool beltShowScatter{true};
+  int beltScatterMaxPoints{1200};
+  bool beltScatterColorByDensity{true};
+  bool beltShowResonanceRings{true};
+
+  // Cached belt visualization.
+  core::u64 beltCacheKey{0};
+  int beltCacheSelected{-1};
+  std::vector<std::array<float, 3>> beltScatterPosAU; // x,y,z in belt plane basis
+  std::vector<float> beltScatterDensity01;
+  std::vector<float> beltRadialMean01;
 
   // Time selection for deterministic daily signals.
   bool useCurrentTime{true};

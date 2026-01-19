@@ -79,6 +79,10 @@ struct ProceduralMeshLabWindowState {
   bool exportWithMaterial{true};
   bool exportTextureFlipY{true};
 
+  // glTF export extras
+  bool exportGltfTangents{true};
+  bool exportGltfPackLodsMsft{false};
+
   // glTF PBR factors (used for export only)
   float exportPbrMetallic{0.0f};
   float exportPbrRoughness{1.0f};

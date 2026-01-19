@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -539,6 +540,68 @@ void drawProfilerWindow(ProfilerWindowState& st,
         ImGui::Checkbox("Table", &st.gpuShowTable);
         ImGui::SameLine();
         ImGui::Checkbox("Sort by last", &st.gpuSortByLast);
+
+        // DOT export (GraphViz) for visualizing the live render graph.
+        if (ImGui::TreeNodeEx("Export graph (GraphViz DOT)", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::InputTextWithHint("DOT path", "framegraph.dot", st.gpuDotExportPath, sizeof(st.gpuDotExportPath));
+
+          ImGui::Checkbox("Include backbuffer", &st.gpuDotIncludeBackbuffer);
+          ImGui::SameLine();
+          ImGui::Checkbox("Include external textures", &st.gpuDotIncludeExternalTextures);
+          ImGui::SameLine();
+          ImGui::Checkbox("Cluster physical textures", &st.gpuDotClusterPhysicalTextures);
+
+          ImGui::Checkbox("Include texture size", &st.gpuDotIncludeTextureSize);
+          ImGui::SameLine();
+          ImGui::Checkbox("Include lifetimes", &st.gpuDotIncludeTextureLifetimes);
+          ImGui::SameLine();
+          ImGui::Checkbox("Include physical ids", &st.gpuDotIncludePhysicalIds);
+
+          ImGui::Checkbox("Enforce schedule order", &st.gpuDotEnforceScheduleOrder);
+
+          auto dotOptions = [&]() {
+            render::FrameGraph::DotExportOptions opt{};
+            opt.includeBackbuffer = st.gpuDotIncludeBackbuffer;
+            opt.includeExternalTextures = st.gpuDotIncludeExternalTextures;
+            opt.clusterPhysicalTextures = st.gpuDotClusterPhysicalTextures;
+            opt.includeTextureSize = st.gpuDotIncludeTextureSize;
+            opt.includeTextureLifetimes = st.gpuDotIncludeTextureLifetimes;
+            opt.includePhysicalIds = st.gpuDotIncludePhysicalIds;
+            opt.enforceScheduleOrder = st.gpuDotEnforceScheduleOrder;
+            return opt;
+          };
+
+          if (ImGui::Button("Copy DOT")) {
+            const std::string dot = frameGraph->toDot(dotOptions());
+            ImGui::SetClipboardText(dot.c_str());
+            if (toast) toast("FrameGraph DOT copied to clipboard", 1.6);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Write DOT file")) {
+            std::string err;
+            const std::string outPath = std::string(st.gpuDotExportPath);
+            if (outPath.empty()) {
+              err = "DOT export path is empty.";
+            } else {
+              const std::string dot = frameGraph->toDot(dotOptions());
+              std::ofstream f(outPath, std::ios::binary);
+              if (!f) {
+                err = "Failed to open: " + outPath;
+              } else {
+                f << dot;
+                if (!f) err = "Failed to write: " + outPath;
+              }
+            }
+
+            if (toast) {
+              toast(err.empty() ? ("Wrote FrameGraph DOT: " + std::string(st.gpuDotExportPath)) : err, 2.0);
+            }
+          }
+
+          ImGui::TextDisabled("Tip: dot -Tpng framegraph.dot -o framegraph.png");
+          ImGui::TreePop();
+        }
+
 
         if (st.gpuShowPlot) {
           drawGpuFrameGraphPlot(st);

@@ -1,3 +1,196 @@
+## Round 92 - Resonant Asteroid Belts: Kirkwood Gaps + Trojan Swarms
+
+This round expands **procedural generation** into one of the most under-developed “world building” layers in the sim:
+**minor bodies**. Systems now get deterministic **asteroid belts / debris discs** that express *dynamical structure*:
+resonance gaps, resonant ridges, and L4/L5 trojan swarms.
+
+### What’s new
+
+- **New `proc::AsteroidBeltGenerator`**
+  - Generates a small **belt plan** per system:
+    - **Main belt** between inner terrestrials and the first gas giant (when possible)
+    - **Outer belt** beyond the outermost planet (Kuiper-ish)
+    - **Trojan swarms** around the dominant planet (two lobes at ±60°)
+    - Fallback **debris disk** for sparse layouts
+  - Adds curated **mean-motion resonance features**:
+    - **Interior “Kirkwood-style” gaps** for the main belt (2:1, 3:1, 5:2, 7:3, ...)
+    - **Exterior resonant ridges** for the outer belt (3:2, 2:1, 5:2, ...)
+  - Everything is deterministic from *(universeSeed + system.stub.seed + belt id)*.
+
+- **Density field + deterministic sampling**
+  - A belt is defined by a **continuous density function** `asteroidBeltDensity01(a, theta)`.
+  - Point clouds are generated with a **Mitchell-style best-candidate sampler** using a low-discrepancy (Halton) candidate stream.
+  - Output reads “blue-noise-ish”, while still respecting gaps/ridges.
+
+- **Procedural System Lab UI: Minor Bodies**
+  - New panel listing generated belts, showing:
+    - span + thickness
+    - controlling planet (if any)
+    - resonance list (gap vs ridge)
+  - Live **radial density plot** (mean over azimuth)
+  - 2D **belt-plane scatter** with optional resonance ring overlay
+
+- **Tests**
+  - Added a CPU-only test to validate determinism + verify resonance dips behave as expected.
+
+### Files changed/added
+
+- `include/stellar/proc/AsteroidBeltGenerator.h` *(new)*
+- `src/proc/AsteroidBeltGenerator.cpp` *(new)*
+- `apps/stellar_game/ProceduralSystemLabWindow.h`
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `tests/test_asteroid_belts.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 91 - Nebula 2.0: Coherent Filaments + Importance-Sampled Puffs
+
+This round focuses on **procedural sky generation** by upgrading the cheap point-sprite nebula layer into something that reads like
+actual gas clouds: **filaments, cavities, and large coherent masses**—still deterministic, still light enough for real-time.
+
+### What’s new
+
+- **Deterministic importance sampling for nebula puffs**
+  - Generates a **low-discrepancy (Halton) candidate pool** on the sphere.
+  - Evaluates a coherent **3D density field** (domain-warped ridged fBm + large blobs + cavity carving).
+  - Keeps the highest-density candidates, producing natural-looking structure without unbounded rejection loops.
+
+- **Density-aware appearance**
+  - Puff **alpha and size** scale with the sampled density so filaments read stronger and voids stay wispy.
+  - Coherent HSV palette fields keep neighboring puffs in related color bands.
+
+- **Smoother, more coherent animation**
+  - Update pass uses animated **3D fBm turbulence** for radial jitter + alpha breakup (instead of 2D-only drift).
+  - Dense regions wobble slightly less, helping the silhouette feel stable.
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
+- **Tests**
+  - Added a CPU-only test verifying determinism (same seed -> same hashed point cloud) and broad sanity bounds.
+
+### Files changed/added
+
+- `include/stellar/render/Nebula.h`
+- `src/render/Nebula.cpp`
+- `tests/test_nebula_field.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 90 - Resonant Moon Systems: Mutual-Hill Spacing + Irregular Moons
+
+This round deepens **procedural system generation** by making moon systems feel less like random scatter and more like *miniature dynamical architectures*.
+
+### What’s new
+
+- **Moon generator upgraded to v2** (does **not** perturb other system procedural streams)
+  - Places moons using a **best-candidate** search in log-orbit space.
+  - Enforces a stability-friendly spacing heuristic using **mutual Hill radius** separation.
+  - Uses a more physics-inspired inner cutoff based on an estimated **Roche limit** + conservative radius buffer.
+
+- **Resonant chains (gentle snapping pass)**
+  - If adjacent moons are already near a simple rational period ratio (e.g., 2:1, 3:2, 4:3), the outer moon is nudged toward that resonance.
+  - Produces more readable “Galilean-style” systems without hard-locking everything into perfect commensurability.
+
+- **Irregular moons for gas giants**
+  - Optional small, **high-inclination / higher-eccentricity** moons placed in the outer Hill-stable band.
+  - Adds variety and “real solar system” flavor (including frequent retrograde captures) without any new simulation complexity.
+
+- **Procedural System Lab UI**
+  - Moon table gains:
+    - **P ratio** (period ratio vs previous moon around the same parent), annotated when close to a resonance.
+    - **dRH** (separation in **mutual Hill radii**) vs the previous moon.
+
+### Files changed/added
+
+- `src/proc/SystemGenerator.cpp`
+- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 89 - Starfield 2.0: Spherical Blue-Noise Relaxation + Kelvin Color Temperature
+
+- **Star placement** got a major quality upgrade.
+  - Added 3 distribution modes:
+    - `UniformRandom` (legacy)
+    - `Fibonacci` (fast quasi-uniform lattice)
+    - `RelaxedFibonacci` (default): runs a deterministic, repulsion-based relaxation pass using a coarse 3D grid to approximate **spherical blue-noise**.
+  - Added `Starfield::Settings` controls for band shaping, random rotation, tangent jitter, and relaxation iterations/strength.
+- **Star appearance** is more physically plausible:
+  - Stars sample an approximate **blackbody temperature** (Kelvin) from a brightness-biased spectral-type mix (M..O).
+  - Temperature is converted to approximate sRGB; a tiny dust-reddening term avoids an overly-clean palette.
+- **Tests**: added `test_starfield` to sanity-check unit-length directions and basic nearest-neighbor uniformity (CPU-only; runs in headless builds).
+
+### Files changed/added
+
+- `include/stellar/render/Starfield.h`
+- `src/render/Starfield.cpp`
+- `tests/test_starfield.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 88 - FrameGraph GraphViz DOT Export + Profiler UI
+
+- Added `render::FrameGraph::toDot(...)`: export the compiled FrameGraph as a GraphViz DOT file for quick visual debugging in tools like GraphViz/xdot.
+  - Optional clustering by transient **physical texture id** to make aliasing behavior visible.
+  - Optional lifetime (firstUse..lastUse) and size annotations.
+  - Optional invisible schedule edges to encourage a stable left-to-right layout.
+- The **Profiler** window GPU FrameGraph panel gains a new **Export graph (GraphViz DOT)** section:
+  - Copy DOT to clipboard
+  - Write a `.dot` file to disk
+  - Toggle what metadata is included (backbuffer/external/lifetimes/etc.)
+- Extended `test_frame_graph` to validate DOT export emits the expected nodes/edges.
+
+### Files changed/added
+
+- `include/stellar/render/FrameGraph.h`
+- `src/render/FrameGraph.cpp`
+- `apps/stellar_game/ProfilerWindow.h`
+- `apps/stellar_game/ProfilerWindow.cpp`
+- `tests/test_frame_graph.cpp`
+- `PATCH_NOTES.md`
+
+## Round 87 - Cinematic Camera: Centripetal Catmull-Rom + Arc-Length Constant Speed
+
+- Added `math::Spline` utilities: uniform + centripetal Catmull-Rom evaluation and a tiny arc-length table (s->u inversion) for constant-speed sampling.
+- **Cinematic Camera** window now supports:
+  - **Centripetal** mode (reduces overshoot/self-intersections around sharp corners)
+  - **Constant speed (arc-length)** mode with an adjustable table resolution
+  - lazy per-segment arc-length caching so per-frame sampling stays cheap
+- Added `test_spline` to validate endpoint invariants and ensure arc-length reparameterization reduces speed variance.
+
+### Files changed/added
+
+- `include/stellar/math/Spline.h` *(new)*
+- `apps/stellar_game/CinematicCameraWindow.h`
+- `apps/stellar_game/CinematicCameraWindow.cpp`
+- `tests/test_spline.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 86 - BeatTracker: Spectral-Flux Onset Detection + BPM UI
+
+- Added `dsp::BeatTracker`: a tiny, dependency-free beat/onset tracker built on spectral flux with an adaptive threshold + peak picking.
+- The **Audio Analyzer** window gains a new **Beat / Onset** section:
+  - live onset + threshold plots for tuning sensitivity
+  - beat pulse (shader-friendly), BPM estimation, and confidence indicator
+  - UI controls for tau/sensitivity/min interval
+- Added `test_beat_tracker` with a deterministic synthetic spectrum stream to validate beat triggering + tempo convergence.
+
+### Files changed/added
+
+- `include/stellar/dsp/BeatTracker.h` *(new)*
+- `src/dsp/BeatTracker.cpp` *(new)*
+- `apps/stellar_game/AudioAnalyzerWindow.h`
+- `apps/stellar_game/AudioAnalyzerWindow.cpp`
+- `tests/test_beat_tracker.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 85 - glTF Export Power-Ups: Tangents + MSFT_lod Packed LOD Chains
+
+- `render::exportMeshToGltf` can now optionally export per-vertex tangents (`TANGENT` / VEC4) for correct normal mapping in standard glTF viewers.
+- Added `render::exportMeshLodsToGltf` which packs a LOD chain into a single `.gltf`/`.bin` using the `MSFT_lod` extension (instead of emitting one file per LOD).
+- Procedural Mesh Lab export UI gains toggles for **Include tangents** and **Pack LODs into one glTF (MSFT_lod)**.
+- Added `test_gltf_export` to validate tangent packing/layout and basic `MSFT_lod` JSON emission.
+
 ## Round 84 - Fence-based Async GPU Readback + Hitch-free Screenshots
 
 - Upgraded `render::AsyncTextureReadback` to optionally use OpenGL sync objects (`glFenceSync`/`glClientWaitSync`) for non-blocking readiness checks, avoiding GPU stalls when mapping PBOs (fallback to frame-delay heuristics when unavailable).
@@ -759,6 +952,10 @@ The previous version proved the concept (procedural layout + basic gauges), but 
   - New scalar: decor alpha.
   - All settings are saved/loaded in `HudSettings`.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Added `test_ship_hud_plan.cpp`: determinism + packing/overlap sanity checks for ship HUD plans.
 
@@ -781,6 +978,10 @@ The old generator produced nice broad bands, but it lacked the *fine structure* 
   - New **Rings** panel shows per-planet predicted ring presence/variant (mirrors the logic in `main.cpp`).
   - Click a planet to preview its ring texture (CPU raster via ImDrawList, no GL texture needed).
   - Includes a radial mean-density plot and a few tweak knobs (chance/opacity, preview resolution, variant).
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - New `test_rings.cpp`: determinism, seam continuity, and basic alpha/color sanity checks.
@@ -824,6 +1025,10 @@ This round revisits the resource-field generator and pushes it into *believable 
   - Added `resourceFieldLayoutName(...)` and `resourceFieldFeatureKindName(...)`.
   - Added `filterFeaturesForField(...)` helper.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - `test_resource_field.cpp` now validates:
     - feature determinism + presence per field
@@ -864,6 +1069,10 @@ a dedicated inspector so you can iterate on the generator quickly.
   - Resource field table (kind/layout/radii/arc/richness/commodities/id).
   - Selected-field details: yield mix + a 2D asteroid scatter preview in field-local coordinates.
   - Clipboard export for quick debugging.
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - `test_resource_field.cpp` now also validates preferred-plane alignment.
@@ -954,6 +1163,10 @@ lab window to inspect the generated architecture.
   - Browse the **current system** or type any system id.
   - Inspect star parameters, planet table, and a dedicated moons table with Hill-radius fractions.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Added `test_system_moons.cpp` to validate determinism and basic orbital sanity.
 
@@ -998,6 +1211,10 @@ This round adds a **streaming-safe macro morphology field** that layers cleanly 
   - New color mode: **Color: morph** (visualizes bar+ring influence).
   - Tooltips show per-system morphology diagnostics (`bar01`, `ring01`, `warpZLy`, thickness, multiplier).
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Added `test_galaxy_morphology.cpp` to validate determinism and sane ranges for masks/warp/flare.
 
@@ -1040,6 +1257,10 @@ generation so the lane network can naturally form safer corridors and avoid turb
   - Selection panel shows hazard kind + scalar values when hazards are enabled.
   - Top trade corridors list now includes per-edge hazard estimates.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Added `test_galaxy_hazards.cpp` to validate determinism, ranges, time drift, and segment sampling.
 
@@ -1081,6 +1302,10 @@ by routing pairwise (or sampled) trade potentials along shortest paths.
     - the selected system’s traffic value
     - top traffic hubs
     - top trade corridors (with bandwidth/risk/distance info)
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - New unit test validates that a toy flow routes through the cheapest hyperlane path and produces expected
@@ -1128,6 +1353,10 @@ This round **connects the hyperlane layer to the procedural trade system** so ma
   - Added lane travel-cost controls (risk weight, bandwidth bias, min bandwidth factor).
   - Route bullets now show cost/lane/direct/hops/bottleneck when hyperlane routing is enabled.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Added a unit test that validates hyperlane connectivity can change the best route (unreachable systems are excluded).
 
@@ -1168,6 +1397,10 @@ It’s a foundational procedural system you can later plug into: economy, securi
   - Hover tooltip shows region name/kind/edge.
   - Region cell-size slider for quickly exploring scale.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - New unit test for determinism + basic spatial coherence.
 
@@ -1199,6 +1432,10 @@ Contraband used to be mostly a punishment (scan → confiscation → fine). Now 
 - **`stellar_sandbox` upgraded**
   - New `--blackMarket` mode prints the fence profile + sample illegal-commodity quotes.
   - `--law` output now correctly prints the **station-local** illegal list (not just faction-wide).
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - New unit test validates determinism, bounds, and basic sell vs sting behavior.
@@ -1232,6 +1469,10 @@ produces plausible per-system price surfaces and rough profit estimates for sugg
   - Adds optional macro economics display (spread, fees, cargo capacity knobs).
   - Shows estimated per-route profit and the best round-trip loops found in the current route set.
 
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
+
 - **Tests**
   - Adds a focused unit test covering multiplier behavior, determinism, and basic loop profitability.
 
@@ -1261,6 +1502,10 @@ without touching live station inventories/prices.
 - **Procedural Trade Systems lab window upgraded**
   - Click any system row to inspect its top exports/imports and **macro trade routes**.
   - Adds basic tuning knobs (max routes, distance exponent, optional max distance).
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - Adds a focused unit test validating basic ordering/selection logic and max-route truncation.
@@ -1925,6 +2170,10 @@ As the Comms inbox + overlay leaned on TextFx more heavily, the previous impleme
 - **Comms UI updated to use TextFx caching throughout**
   - overlay + inbox no longer recompiles / re-strips markup every frame
   - “Copy plain” uses cached plain text instead of recompiling
+
+- **Build / headless support**
+  - Moved **Starfield** + **Nebula** generators into the CPU/core build so procedural sky code can compile and be tested
+    in environments without OpenGL (better CI coverage).
 
 - **Tests**
   - added coverage for `Program::glyphCount` correctness and basic `ProgramCache` behavior

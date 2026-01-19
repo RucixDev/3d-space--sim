@@ -121,6 +121,51 @@ int test_frame_graph() {
     }
   }
 
+
+
+  // ---------------------------------------------------------------------------
+  // DOT export: emits a GraphViz graph with stable pass/texture nodes and edges.
+  // ---------------------------------------------------------------------------
+  {
+    FrameGraph fg;
+    fg.setViewport(320, 200);
+
+    FrameGraph::TextureDesc d;
+    d.scale = 1.0f;
+    d.internalFormat = 1;
+    d.format = 1;
+    d.type = 1;
+
+    const auto a = fg.createTexture("A", d);
+    const auto b = fg.createTexture("B", d);
+
+    fg.addPass("P0", {}, a, [](const FrameGraph::PassContext&) {});
+    fg.addPass("P1", {a}, b, [](const FrameGraph::PassContext&) {});
+    fg.addPass("P2", {b}, FrameGraph::Backbuffer(), [](const FrameGraph::PassContext&) {});
+
+    std::string err;
+    const bool ok = fg.compile(&err);
+    if (!ok) {
+      std::cerr << "[test_frame_graph] compile failed in DOT export test: " << err << "\n";
+      ++failures;
+    } else {
+      const std::string dot = fg.toDot();
+
+      CHECK(dot.find("digraph FrameGraph") != std::string::npos);
+      CHECK(dot.find("p0") != std::string::npos);
+      CHECK(dot.find("p1") != std::string::npos);
+      CHECK(dot.find("t0") != std::string::npos);
+      CHECK(dot.find("t1") != std::string::npos);
+
+      // Read/write edges.
+      CHECK(dot.find("t0 -> p1") != std::string::npos);
+      CHECK(dot.find("p1 -> t1") != std::string::npos);
+
+      // Backbuffer write.
+      CHECK(dot.find("backbuffer") != std::string::npos);
+      CHECK(dot.find("p2 -> backbuffer") != std::string::npos);
+    }
+  }
   if (failures == 0) {
     std::cout << "[test_frame_graph] PASS\n";
   }

@@ -224,11 +224,18 @@ static void appendMoonsForPlanet(std::vector<sim::Moon>& out,
                                  const sim::Planet& host,
                                  std::size_t hostIndex) {
   // Separate stream per host planet.
-  const core::u64 stream = core::seedFromText("proc.moons.v1");
+  //
+  // NOTE: This stream is intentionally versioned so future moon generator tweaks
+  // do not perturb other procedural content (stations/economy/etc.).
+  const core::u64 stream = core::seedFromText("proc.moons.v2");
   core::SplitMix64 rng(core::hashCombine(stub.seed, core::hashCombine(stream, (core::u64)hostIndex)));
 
   // Quick gate: tiny bodies rarely hold moons.
   if (host.massEarth < 0.12 || host.radiusEarth < 0.25) return;
+
+  const std::size_t baseCount = out.size();
+  const std::size_t hardCap = 32; // total moons per system cap (safety)
+  if (baseCount >= hardCap) return;
 
   // Stable satellite band.
   const double hill = hillRadiusAU(host, star);
@@ -237,64 +244,261 @@ static void appendMoonsForPlanet(std::vector<sim::Moon>& out,
   // Prograde stable region is ~0.5 R_H; we stay comfortably inside.
   const double aMaxAU = hill * 0.45;
 
-  // Inner cutoff: a few tens of host radii (above Roche + atmosphere).
+  // --- Physics-inspired inner cutoff (Roche + size buffer) -----------------
+  auto densityRelPlanet = [&](const sim::Planet& p) {
+    const double r = std::max(0.05, p.radiusEarth);
+    const double m = std::max(1.0e-6, p.massEarth);
+    return std::clamp(m / (r * r * r), 0.05, 10.0);
+  };
+
+  auto densityRelMoon = [&](sim::PlanetType t) {
+    switch (t) {
+      case sim::PlanetType::Ice:   return 0.65;
+      case sim::PlanetType::Ocean: return 0.80;
+      case sim::PlanetType::Desert:return 0.95;
+      case sim::PlanetType::Rocky:
+      default:                     return 1.05;
+    }
+  };
+
+  auto rocheLimitAU = [&](sim::PlanetType moonType) {
+    // Fluid Roche limit approximation: 2.44 R_p * (rho_p / rho_s)^(1/3)
+    const double rhoP = densityRelPlanet(host);
+    const double rhoS = std::max(0.25, densityRelMoon(moonType));
+    const double k = 2.44 * std::cbrt(rhoP / rhoS);
+    return planetRadiusAU(host) * k;
+  };
+
+  // Inner cutoff: stay outside Roche and also a conservative multiple of
+  // the host radius (covers atmosphere + “close orbit” clutter).
+  // NOTE: tests assume aAU > 4*R_host.
   const double hostRAU = planetRadiusAU(host);
-  const double aMinAU = std::max(hostRAU * rng.range(10.0, 22.0), 1.0e-6);
+  const double aHardMinAU = std::max(hostRAU * 4.0, 1.0e-6);
 
-  if (!(aMaxAU > aMinAU * 1.35)) return;
+  // We don't know moon type yet, so estimate with a typical density.
+  const double aRocheEst = std::max(rocheLimitAU(sim::PlanetType::Rocky), rocheLimitAU(sim::PlanetType::Ice));
+  const double aMinAU = std::max(aHardMinAU, aRocheEst * 1.15);
 
-  // Target moon count by host type. Placement may produce fewer due to spacing.
-  int target = 0;
+  if (!(aMaxAU > aMinAU * 1.25)) return;
+
+  // --- Target moon counts --------------------------------------------------
+  int targetRegular = 0;
   switch (host.type) {
     case sim::PlanetType::GasGiant:
-      target = rng.range(2, 8);
+      targetRegular = rng.range(3, 9);
       break;
     case sim::PlanetType::Ice:
-      target = rng.chance(0.65) ? rng.range(1, 4) : rng.range(0, 2);
+      targetRegular = rng.chance(0.70) ? rng.range(1, 4) : rng.range(0, 2);
       break;
     case sim::PlanetType::Ocean:
-      target = rng.chance(0.25) ? rng.range(1, 2) : 0;
+      targetRegular = rng.chance(0.28) ? rng.range(1, 2) : 0;
       break;
     case sim::PlanetType::Desert:
     case sim::PlanetType::Rocky:
     default:
-      target = (host.massEarth > 0.8 && rng.chance(0.30)) ? rng.range(1, 2) : 0;
+      targetRegular = (host.massEarth > 0.8 && rng.chance(0.34)) ? rng.range(1, 2) : 0;
       break;
   }
 
   // If the host is a gas giant and has room for satellites, guarantee at least one.
-  if (host.type == sim::PlanetType::GasGiant) target = std::max(1, target);
+  if (host.type == sim::PlanetType::GasGiant) targetRegular = std::max(1, targetRegular);
 
-  const std::size_t baseCount = out.size();
-  const std::size_t hardCap = 32; // total moons per system cap (safety)
+  // Room check against hard cap.
+  targetRegular = std::min<int>(targetRegular, (int)(hardCap - baseCount));
+  if (targetRegular <= 0) return;
 
-  double aAU = rng.range(aMinAU * 1.20, aMinAU * 3.00);
-  for (int i = 0; i < target; ++i) {
-    if (out.size() >= hardCap) break;
+  // --- Utility: mutual Hill separation -------------------------------------
+  auto mutualHillAU = [&](double a1, double a2, double m1Earth, double m2Earth) {
+    const double M = std::max(1.0e-6, host.massEarth);
+    const double mu = std::max(1.0e-12, (m1Earth + m2Earth) / (3.0 * M));
+    const double aBar = 0.5 * (a1 + a2);
+    return std::cbrt(mu) * std::max(1.0e-12, aBar);
+  };
 
-    if (i == 0) {
-      aAU = rng.range(aMinAU * 1.20, aMinAU * 3.00);
-    } else {
-      aAU *= rng.range(1.40, 2.25);
+  struct Placed {
+    double aAU{0.0};
+    double mEarth{0.0};
+    std::size_t idx{0};
+  };
+
+  auto minSepInMutualHill = [&](double aAU, double mEarth, const std::vector<Placed>& placed) {
+    double best = 1.0e9;
+    for (const auto& p : placed) {
+      const double rH = mutualHillAU(aAU, p.aAU, mEarth, p.mEarth);
+      const double sep = std::abs(aAU - p.aAU) / std::max(1.0e-12, rH);
+      best = std::min(best, sep);
     }
+    return best;
+  };
 
-    if (aAU > aMaxAU) break;
+  auto sampleLogUniform = [&](double lo, double hi, double biasPow) {
+    lo = std::max(lo, 1.0e-12);
+    hi = std::max(hi, lo * 1.000001);
+    const double l0 = std::log(lo);
+    const double l1 = std::log(hi);
+    double t = rng.nextDouble();
+    // biasPow > 1 => bias toward inner orbits (lo)
+    if (biasPow > 1.0) t = std::pow(t, biasPow);
+    return std::exp(math::lerp(l0, l1, t));
+  };
+
+  auto pickBestA = [&](double lo, double hi, double mEarth, const std::vector<Placed>& placed,
+                       int candidates, double biasPow, double sepMin, double& outA) {
+    double bestScore = -1.0;
+    double bestA = lo;
+    for (int c = 0; c < candidates; ++c) {
+      const double a = sampleLogUniform(lo, hi, biasPow);
+      const double score = placed.empty() ? 1.0e9 : minSepInMutualHill(a, mEarth, placed);
+      if (score > bestScore) {
+        bestScore = score;
+        bestA = a;
+      }
+    }
+    if (!placed.empty() && bestScore < sepMin) return false;
+    outA = bestA;
+    return true;
+  };
+
+  // --- Generate regular moons (low-i, mostly prograde) ----------------------
+  std::vector<sim::Moon> moons;
+  moons.reserve((std::size_t)targetRegular + 4);
+
+  for (int i = 0; i < targetRegular; ++i) {
+    if (baseCount + moons.size() >= hardCap) break;
 
     sim::Moon m{};
     m.parentPlanetIndex = static_cast<core::u32>(hostIndex);
     m.id = core::hashCombine(stub.id, core::hashCombine((core::u64)hostIndex, (core::u64)i));
     m.name = host.name + " " + moonSuffix((std::size_t)i);
+
     m.type = pickMoonType(host, host.orbit.semiMajorAxisAU, star, rng);
     setMoonMassRadius(m, rng);
 
-    // Orbit: align roughly with the host's orbital plane.
-    m.orbit.semiMajorAxisAU = aAU;
-    m.orbit.eccentricity = rng.range(0.0, 0.06);
+    moons.push_back(std::move(m));
+  }
+
+  if (moons.empty()) return;
+
+  // Place larger moons first (more restrictive) for higher success rate.
+  std::vector<std::size_t> order(moons.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    if (moons[a].massEarth != moons[b].massEarth) return moons[a].massEarth > moons[b].massEarth;
+    return moons[a].id < moons[b].id;
+  });
+
+  // Regular satellite disk occupies a small inner band (gas giants) to create a
+  // visually familiar "Galilean-style" structure, while leaving room for
+  // irregular moons further out.
+  double aRegMaxAU = aMaxAU;
+  if (host.type == sim::PlanetType::GasGiant) {
+    aRegMaxAU = std::min(aMaxAU, std::max(aMinAU * 4.0, hill * rng.range(0.06, 0.11)));
+  }
+
+  const int candidates = (host.type == sim::PlanetType::GasGiant) ? 96 : 64;
+  const double biasPow = (host.type == sim::PlanetType::GasGiant) ? 2.2 : 1.4;
+  const double sepMin = (host.type == sim::PlanetType::GasGiant) ? 4.5 : 5.0;
+
+  std::vector<Placed> placed;
+  placed.reserve(moons.size());
+
+  for (std::size_t oi = 0; oi < order.size(); ++oi) {
+    const std::size_t mi = order[oi];
+    double aAU = 0.0;
+
+    if (!pickBestA(aMinAU, aRegMaxAU, moons[mi].massEarth, placed, candidates, biasPow, sepMin, aAU)) {
+      // If we can't place the smallest moons, just stop.
+      continue;
+    }
+
+    moons[mi].orbit.semiMajorAxisAU = aAU;
+    placed.push_back(Placed{aAU, moons[mi].massEarth, mi});
+  }
+
+  // Remove any moons we failed to place.
+  moons.erase(std::remove_if(moons.begin(), moons.end(), [](const sim::Moon& m) {
+               return !(m.orbit.semiMajorAxisAU > 0.0);
+             }),
+             moons.end());
+
+  if (moons.empty()) return;
+
+  // Resonance snapping pass (gentle): if two neighbors are already close to a
+  // simple rational period ratio, nudge the outer one toward that resonance.
+  // This creates more interesting, less "random" satellite systems.
+  struct Res {
+    int num;
+    int den;
+    double r; // period ratio
+  };
+  const std::array<Res, 6> kRes = {Res{4,3,4.0/3.0}, Res{3,2,1.5}, Res{5,3,5.0/3.0},
+                                  Res{2,1,2.0}, Res{5,2,2.5}, Res{3,1,3.0}};
+
+  auto nearestResonance = [&](double periodRatio) {
+    Res best = kRes[0];
+    double bestErr = 1.0e9;
+    for (const auto& rr : kRes) {
+      const double err = std::abs(periodRatio - rr.r) / rr.r;
+      if (err < bestErr) {
+        bestErr = err;
+        best = rr;
+      }
+    }
+    return std::pair<Res, double>(best, bestErr);
+  };
+
+  std::sort(moons.begin(), moons.end(), [](const sim::Moon& a, const sim::Moon& b) {
+    return a.orbit.semiMajorAxisAU < b.orbit.semiMajorAxisAU;
+  });
+
+  const double snapTol = (host.type == sim::PlanetType::GasGiant) ? 0.030 : 0.022;
+  const double snapProb = (host.type == sim::PlanetType::GasGiant) ? 0.78 : 0.40;
+
+  for (std::size_t i = 1; i < moons.size(); ++i) {
+    if (!rng.chance(snapProb)) continue;
+
+    const double a0 = moons[i - 1].orbit.semiMajorAxisAU;
+    const double a1 = moons[i].orbit.semiMajorAxisAU;
+    if (!(a1 > a0 * 1.05)) continue;
+
+    const double pr = std::pow(a1 / a0, 1.5);
+    const auto [res, relErr] = nearestResonance(pr);
+    if (relErr > snapTol) continue;
+
+    const double aRes = a0 * std::pow(res.r, 2.0 / 3.0);
+    const double jitter = 1.0 + rng.range(-0.0025, 0.0025);
+    const double aNew = aRes * jitter;
+
+    if (!(aNew > aMinAU && aNew < aRegMaxAU)) continue;
+
+    // Check mutual Hill spacing vs immediate neighbors only.
+    bool ok = true;
+    {
+      const double sepPrev = std::abs(aNew - a0) / std::max(1.0e-12, mutualHillAU(aNew, a0, moons[i].massEarth, moons[i - 1].massEarth));
+      if (sepPrev < sepMin) ok = false;
+    }
+    if (ok && i + 1 < moons.size()) {
+      const double a2 = moons[i + 1].orbit.semiMajorAxisAU;
+      const double sepNext = std::abs(a2 - aNew) / std::max(1.0e-12, mutualHillAU(a2, aNew, moons[i + 1].massEarth, moons[i].massEarth));
+      if (sepNext < sepMin) ok = false;
+    }
+
+    if (ok) moons[i].orbit.semiMajorAxisAU = aNew;
+  }
+
+  // Fill orbital elements for regular moons (low eccentricity, near-host plane).
+  for (auto& m : moons) {
+    const double aAU = m.orbit.semiMajorAxisAU;
+    const double rel = std::clamp((aAU - aMinAU) / std::max(1.0e-9, (aRegMaxAU - aMinAU)), 0.0, 1.0);
+
+    // Eccentricities: close-in moons tend to be more circular.
+    const double eMax = math::lerp(0.015, 0.060, rel);
+    m.orbit.eccentricity = rng.range(0.0, eMax);
 
     // Small mutual inclination offsets (degrees).
-    const double dInc = math::degToRad(rng.range(-2.0, 2.0));
+    const double dInc = math::degToRad(rng.range(-1.2, 1.2));
     m.orbit.inclinationRad = host.orbit.inclinationRad + dInc;
-    m.orbit.ascendingNodeRad = host.orbit.ascendingNodeRad + rng.range(-0.35, 0.35);
+    m.orbit.ascendingNodeRad = host.orbit.ascendingNodeRad + rng.range(-0.25, 0.25);
     m.orbit.argPeriapsisRad = rng.range(0.0, math::kPi * 2.0);
     m.orbit.meanAnomalyAtEpochRad = rng.range(0.0, math::kPi * 2.0);
     m.orbit.epochDays = 0.0;
@@ -303,7 +507,89 @@ static void appendMoonsForPlanet(std::vector<sim::Moon>& out,
     const double mHostSol = std::max(1e-12, planetMassSol(host));
     const double years = std::sqrt((aAU * aAU * aAU) / mHostSol);
     m.orbit.periodDays = years * 365.25;
+  }
 
+  // --- Optional irregular moons for gas giants --------------------------------
+  // These are high-inclination, more eccentric satellites near the edge of the
+  // Hill stability band. They add flavor and variety without needing any new
+  // simulation systems.
+  if (host.type == sim::PlanetType::GasGiant && (baseCount + moons.size()) < hardCap) {
+    const int maxIr = std::min<int>(3, (int)(hardCap - (baseCount + moons.size())));
+    const int irregularTarget = rng.chance(0.55) ? rng.range(0, maxIr) : 0;
+
+    if (irregularTarget > 0) {
+      // Define an outer band separated from the regular disk.
+      const double aIrMinAU = std::max(aRegMaxAU * rng.range(1.35, 2.10), hill * rng.range(0.18, 0.28));
+      const double aIrMaxAU = aMaxAU;
+
+      if (aIrMaxAU > aIrMinAU * 1.10) {
+        // Build a combined placed-list for spacing checks.
+        std::vector<Placed> placedAll;
+        placedAll.reserve(moons.size() + (std::size_t)irregularTarget);
+        for (std::size_t i = 0; i < moons.size(); ++i) {
+          placedAll.push_back(Placed{moons[i].orbit.semiMajorAxisAU, moons[i].massEarth, i});
+        }
+
+        const int irCandidates = 72;
+        const double irBiasPow = 0.75; // bias toward outer edge
+        const double irSepMin = 3.5;
+
+        for (int j = 0; j < irregularTarget; ++j) {
+          const int idx = targetRegular + j;
+
+          sim::Moon m{};
+          m.parentPlanetIndex = static_cast<core::u32>(hostIndex);
+          m.id = core::hashCombine(stub.id, core::hashCombine((core::u64)hostIndex, (core::u64)idx));
+          m.name = host.name + " " + moonSuffix((std::size_t)idx);
+
+          // Irregulars are usually small; bias toward icy/rocky.
+          const double r = rng.nextDouble();
+          m.type = (r < 0.70) ? sim::PlanetType::Ice : sim::PlanetType::Rocky;
+          setMoonMassRadius(m, rng);
+          // Make them smaller on average.
+          m.radiusEarth *= rng.range(0.35, 0.75);
+          m.massEarth = std::clamp(m.massEarth * rng.range(0.15, 0.55), 1e-6, 0.02);
+
+          double aAU = 0.0;
+          if (!pickBestA(aIrMinAU, aIrMaxAU, m.massEarth, placedAll, irCandidates, irBiasPow, irSepMin, aAU)) {
+            continue;
+          }
+
+          // Eccentric, high inclination, often retrograde.
+          double e = rng.range(0.08, 0.35);
+          // Avoid plunging into the regular satellite disk.
+          const double q = aAU * (1.0 - e);
+          if (q < aRegMaxAU * 1.10) {
+            e = std::max(0.05, 1.0 - (aRegMaxAU * 1.10) / std::max(1.0e-9, aAU));
+            e = std::clamp(e, 0.05, 0.35);
+          }
+
+          const bool retro = rng.chance(0.62);
+          const double incDeg = retro ? rng.range(110.0, 170.0) : rng.range(30.0, 85.0);
+
+          m.orbit.semiMajorAxisAU = aAU;
+          m.orbit.eccentricity = e;
+          m.orbit.inclinationRad = std::clamp(host.orbit.inclinationRad + math::degToRad(incDeg), 0.0, math::kPi);
+          m.orbit.ascendingNodeRad = rng.range(0.0, math::kPi * 2.0);
+          m.orbit.argPeriapsisRad = rng.range(0.0, math::kPi * 2.0);
+          m.orbit.meanAnomalyAtEpochRad = rng.range(0.0, math::kPi * 2.0);
+          m.orbit.epochDays = 0.0;
+
+          const double mHostSol = std::max(1e-12, planetMassSol(host));
+          const double years = std::sqrt((aAU * aAU * aAU) / mHostSol);
+          m.orbit.periodDays = years * 365.25;
+
+          // Accept.
+          placedAll.push_back(Placed{aAU, m.massEarth, moons.size()});
+          moons.push_back(std::move(m));
+        }
+      }
+    }
+  }
+
+  // Append to output.
+  for (auto& m : moons) {
+    if (out.size() >= hardCap) break;
     out.push_back(std::move(m));
   }
 

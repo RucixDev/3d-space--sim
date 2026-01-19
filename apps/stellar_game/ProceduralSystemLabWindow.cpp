@@ -3,6 +3,7 @@
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
+#include "stellar/math/Math.h"
 #include "stellar/sim/System.h"
 #include "stellar/sim/Signals.h"
 #include "stellar/sim/ResourceField.h"
@@ -11,6 +12,7 @@
 #include "stellar/econ/Commodity.h"
 #include "stellar/ui/Format.h"
 #include "stellar/render/ProceduralRings.h"
+#include "stellar/proc/AsteroidBeltGenerator.h"
 
 #include <algorithm>
 #include <array>
@@ -127,6 +129,8 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
   ImGui::Checkbox("Signals", &state.showSignals);
   ImGui::SameLine();
   ImGui::Checkbox("Rings", &state.showRings);
+  ImGui::SameLine();
+  ImGui::Checkbox("Belts", &state.showBelts);
 
   // Precompute moon counts per planet
   std::vector<int> moonCount(sys.planets.size(), 0);
@@ -185,6 +189,243 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
       }
 
       ImGui::EndTable();
+    }
+  }
+
+  if (state.showBelts) {
+    ImGui::SeparatorText("Minor Bodies");
+
+    ImGui::TextDisabled("Procedural asteroid belts / debris disks with resonance gaps + trojan swarms.");
+
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputInt("Points", &state.beltPointCount);
+    state.beltPointCount = std::clamp(state.beltPointCount, 0, 60000);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputInt("Candidates/pt", &state.beltCandidatesPerPoint);
+    state.beltCandidatesPerPoint = std::clamp(state.beltCandidatesPerPoint, 1, 64);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputInt("Plot res", &state.beltRadialPlotRes);
+    state.beltRadialPlotRes = std::clamp(state.beltRadialPlotRes, 32, 512);
+
+    ImGui::Checkbox("Scatter", &state.beltShowScatter);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputInt("Max scatter pts", &state.beltScatterMaxPoints);
+    state.beltScatterMaxPoints = std::clamp(state.beltScatterMaxPoints, 0, 20000);
+    ImGui::SameLine();
+    ImGui::Checkbox("Color by density", &state.beltScatterColorByDensity);
+    ImGui::SameLine();
+    ImGui::Checkbox("Resonance rings", &state.beltShowResonanceRings);
+
+    const auto beltPlan = proc::generateAsteroidBelts(universe.seed(), sys);
+
+    if (beltPlan.belts.empty()) {
+      ImGui::TextDisabled("(no belts)");
+    } else {
+      state.selectedBelt = std::clamp(state.selectedBelt, 0, (int)beltPlan.belts.size() - 1);
+
+      // Belt list with selection.
+      if (ImGui::BeginTable("##belt_table", 7,
+                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable,
+                            ImVec2(0.0f, 140.0f))) {
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 108.0f);
+        ImGui::TableSetupColumn("Inner (AU)", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+        ImGui::TableSetupColumn("Outer (AU)", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+        ImGui::TableSetupColumn("Thickness", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Res", ImGuiTableColumnFlags_WidthFixed, 42.0f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < (int)beltPlan.belts.size(); ++i) {
+          const auto& b = beltPlan.belts[(std::size_t)i];
+          ImGui::TableNextRow();
+
+          ImGui::TableSetColumnIndex(0);
+          const bool sel = (i == state.selectedBelt);
+          char buf[16];
+          std::snprintf(buf, sizeof(buf), "%d", i);
+          if (ImGui::Selectable(buf, sel, ImGuiSelectableFlags_SpanAllColumns)) {
+            state.selectedBelt = i;
+            state.beltCacheKey = 0; // invalidate
+          }
+
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(proc::asteroidBeltKindName(b.kind));
+
+          ImGui::TableSetColumnIndex(2);
+          ImGui::Text("%.2f", b.aInnerAU);
+
+          ImGui::TableSetColumnIndex(3);
+          ImGui::Text("%.2f", b.aOuterAU);
+
+          ImGui::TableSetColumnIndex(4);
+          ImGui::Text("%.3f", b.thicknessAU);
+
+          ImGui::TableSetColumnIndex(5);
+          if (b.controllingPlanetIndex >= 0 && b.controllingPlanetIndex < (int)sys.planets.size()) {
+            ImGui::Text("%s", sys.planets[(std::size_t)b.controllingPlanetIndex].name.c_str());
+          } else {
+            ImGui::TextDisabled("-");
+          }
+
+          ImGui::TableSetColumnIndex(6);
+          ImGui::Text("%d", (int)b.resonances.size());
+        }
+
+        ImGui::EndTable();
+      }
+
+      const auto& b = beltPlan.belts[(std::size_t)state.selectedBelt];
+
+      // Cache key includes the selected belt + sampling knobs.
+      core::u64 key = 0;
+      key = core::hashCombine(key, sys.stub.id);
+      key = core::hashCombine(key, sys.stub.seed);
+      key = core::hashCombine(key, b.id);
+      key = core::hashCombine(key, (core::u64)state.selectedBelt);
+      key = core::hashCombine(key, (core::u64)state.beltPointCount);
+      key = core::hashCombine(key, (core::u64)state.beltCandidatesPerPoint);
+      key = core::hashCombine(key, (core::u64)state.beltRadialPlotRes);
+      key = core::hashCombine(key, (core::u64)state.beltScatterMaxPoints);
+
+      if (key != state.beltCacheKey || state.beltCacheSelected != state.selectedBelt) {
+        state.beltCacheKey = key;
+        state.beltCacheSelected = state.selectedBelt;
+
+        // --- Radial mean density plot ---
+        state.beltRadialMean01.assign((std::size_t)state.beltRadialPlotRes, 0.0f);
+        const int nTheta = 24;
+        for (int i = 0; i < state.beltRadialPlotRes; ++i) {
+          const double u = (state.beltRadialPlotRes <= 1) ? 0.0 : (double)i / (double)(state.beltRadialPlotRes - 1);
+          const double aAU = b.aInnerAU + (b.aOuterAU - b.aInnerAU) * u;
+
+          double sum = 0.0;
+          for (int t = 0; t < nTheta; ++t) {
+            const double th = (double)t / (double)nTheta * (2.0 * stellar::math::kPi);
+            sum += proc::asteroidBeltDensity01(b, aAU, th);
+          }
+          const double mean = sum / (double)nTheta;
+          state.beltRadialMean01[(std::size_t)i] = (float)std::clamp(mean, 0.0, 1.0);
+        }
+
+        // --- Scatter points ---
+        state.beltScatterPosAU.clear();
+        state.beltScatterDensity01.clear();
+        const int nPts = std::min(state.beltPointCount, state.beltScatterMaxPoints);
+        if (state.beltShowScatter && nPts > 0) {
+          const auto pts = proc::sampleAsteroidBeltPoints(universe.seed(), sys, b, nPts, state.beltCandidatesPerPoint);
+          state.beltScatterPosAU.reserve(pts.size());
+          state.beltScatterDensity01.reserve(pts.size());
+
+          for (const auto& p : pts) {
+            // Store belt-local coordinates (x along basisX, y along basisY, z along basisZ).
+            const float x = (float)math::dot(p.posAU, b.basisX);
+            const float y = (float)math::dot(p.posAU, b.basisY);
+            const float z = (float)math::dot(p.posAU, b.basisZ);
+            state.beltScatterPosAU.push_back({x, y, z});
+            state.beltScatterDensity01.push_back((float)p.density01);
+          }
+        }
+      }
+
+      // Summary line.
+      ImGui::Text("Selected: %s  span [%.2f, %.2f] AU  control=%s",
+                  proc::asteroidBeltKindName(b.kind),
+                  b.aInnerAU,
+                  b.aOuterAU,
+                  (b.controllingPlanetIndex >= 0 && b.controllingPlanetIndex < (int)sys.planets.size())
+                      ? sys.planets[(std::size_t)b.controllingPlanetIndex].name.c_str()
+                      : "-"
+      );
+
+      if (!state.beltRadialMean01.empty()) {
+        ImGui::PlotLines("Radial mean density",
+                         state.beltRadialMean01.data(),
+                         (int)state.beltRadialMean01.size(),
+                         0,
+                         nullptr,
+                         0.0f,
+                         1.0f,
+                         ImVec2(0.0f, 78.0f));
+      }
+
+      if (!b.resonances.empty()) {
+        ImGui::TextDisabled("Resonances:");
+        for (const auto& f : b.resonances) {
+          const bool ridge = (f.strength01 < 0.0);
+          if (ridge) {
+            ImGui::BulletText("%d:%d @ %.2f AU  ridge  width %.3f AU  amp %.2f",
+                              f.m, f.n, f.aAU, f.halfWidthAU, std::abs(f.strength01));
+          } else {
+            ImGui::BulletText("%d:%d @ %.2f AU  gap    width %.3f AU  depth %.2f",
+                              f.m, f.n, f.aAU, f.halfWidthAU, f.strength01);
+          }
+        }
+      }
+
+      if (state.beltShowScatter && !state.beltScatterPosAU.empty()) {
+        ImGui::SeparatorText("Belt Scatter");
+
+        // 2D plot in belt plane (x,z). y is thickness.
+        const ImVec2 plotSize = ImVec2(0.0f, 240.0f);
+        ImGui::BeginChild("##belt_scatter", plotSize, true, ImGuiWindowFlags_NoScrollbar);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float wpx = std::max(10.0f, avail.x);
+        const float hpx = std::max(10.0f, avail.y);
+        const ImVec2 p1 = ImVec2(p0.x + wpx, p0.y + hpx);
+
+        // Background
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(0.05f, 0.05f, 0.07f, 1.0f)));
+        dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_Border));
+
+        const float rAU = (float)std::max(0.1, b.aOuterAU) * 1.05f;
+        auto toScreen = [&](float xAU, float zAU) -> ImVec2 {
+          const float nx = (xAU / rAU) * 0.5f + 0.5f;
+          const float ny = (zAU / rAU) * 0.5f + 0.5f;
+          // Flip Y so +Z is up.
+          return ImVec2(p0.x + nx * wpx, p1.y - ny * hpx);
+        };
+
+        // Resonance rings (gaps/ridges).
+        if (state.beltShowResonanceRings && !b.resonances.empty()) {
+          for (const auto& f : b.resonances) {
+            const float rr = (float)f.aAU;
+            const float radPx = (rr / rAU) * 0.5f * std::min(wpx, hpx);
+            const bool ridge = (f.strength01 < 0.0);
+            const ImU32 col = ridge ? ImGui::GetColorU32(ImVec4(0.30f, 0.75f, 0.40f, 0.60f))
+                                    : ImGui::GetColorU32(ImVec4(0.85f, 0.35f, 0.25f, 0.55f));
+            dl->AddCircle(ImVec2(p0.x + wpx * 0.5f, p0.y + hpx * 0.5f), radPx, col, 72, 1.0f);
+          }
+        }
+
+        // Draw points.
+        const float baseSize = 1.45f;
+        for (std::size_t i = 0; i < state.beltScatterPosAU.size(); ++i) {
+          const auto& v = state.beltScatterPosAU[i];
+          const float x = v[0];
+          const float z = v[2];
+          const float dens = (i < state.beltScatterDensity01.size()) ? state.beltScatterDensity01[i] : 1.0f;
+
+          ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+          if (state.beltScatterColorByDensity) {
+            const float d = std::clamp(dens, 0.0f, 1.0f);
+            col = ImGui::GetColorU32(ImVec4(0.20f + 0.80f * d, 0.25f + 0.75f * d, 0.35f + 0.65f * d, 1.0f));
+          }
+
+          const ImVec2 sp = toScreen(x, z);
+          dl->AddCircleFilled(sp, baseSize, col, 6);
+        }
+
+        // Keep cursor/child size stable.
+        ImGui::Dummy(avail);
+        ImGui::EndChild();
+      }
     }
   }
 
@@ -398,12 +639,14 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
     } else {
       const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                     ImGuiTableFlags_ScrollY;
-      if (ImGui::BeginTable("##moon_table", 10, flags, ImVec2(0.0f, 0.0f))) {
+      if (ImGui::BeginTable("##moon_table", 12, flags, ImVec2(0.0f, 0.0f))) {
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Parent", ImGuiTableColumnFlags_WidthFixed, 150.0f);
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 86.0f);
         ImGui::TableSetupColumn("a (AU)", ImGuiTableColumnFlags_WidthFixed, 74.0f);
         ImGui::TableSetupColumn("Period (d)", ImGuiTableColumnFlags_WidthFixed, 84.0f);
+        ImGui::TableSetupColumn("P ratio", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+        ImGui::TableSetupColumn("dRH", ImGuiTableColumnFlags_WidthFixed, 56.0f);
         ImGui::TableSetupColumn("e", ImGuiTableColumnFlags_WidthFixed, 44.0f);
         ImGui::TableSetupColumn("i (deg)", ImGuiTableColumnFlags_WidthFixed, 64.0f);
         ImGui::TableSetupColumn("R (Re)", ImGuiTableColumnFlags_WidthFixed, 64.0f);
@@ -411,7 +654,24 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
         ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 110.0f);
         ImGui::TableHeadersRow();
 
-        for (const auto& m : sys.moons) {
+        struct Res { int num; int den; double r; };
+        const std::array<Res, 6> kRes = {Res{4,3,4.0/3.0}, Res{3,2,1.5}, Res{5,3,5.0/3.0},
+                                        Res{2,1,2.0}, Res{5,2,2.5}, Res{3,1,3.0}};
+
+        auto mutualHillAU = [&](double a1, double a2, double m1, double m2, double hostMassEarth) {
+          const double M = std::max(1.0e-6, hostMassEarth);
+          const double mu = std::max(1.0e-12, (m1 + m2) / (3.0 * M));
+          const double aBar = 0.5 * (a1 + a2);
+          return std::cbrt(mu) * std::max(1.0e-12, aBar);
+        };
+
+        for (std::size_t mi = 0; mi < sys.moons.size(); ++mi) {
+          const auto& m = sys.moons[mi];
+          const sim::Moon* prev = nullptr;
+          if (mi > 0 && sys.moons[mi - 1].parentPlanetIndex == m.parentPlanetIndex) {
+            prev = &sys.moons[mi - 1];
+          }
+
           const sim::Planet* parent = nullptr;
           if (m.parentPlanetIndex < sys.planets.size()) {
             parent = &sys.planets[m.parentPlanetIndex];
@@ -441,18 +701,48 @@ void drawProceduralSystemLabWindow(ProceduralSystemLabWindowState& state,
           ImGui::Text("%.2f", m.orbit.periodDays);
 
           ImGui::TableSetColumnIndex(5);
-          ImGui::Text("%.2f", m.orbit.eccentricity);
+          if (prev) {
+            const double pr = m.orbit.periodDays / std::max(1.0e-9, prev->orbit.periodDays);
+            Res best = kRes[0];
+            double bestErr = 1.0e9;
+            for (const auto& rr : kRes) {
+              const double err = std::abs(pr - rr.r) / rr.r;
+              if (err < bestErr) {
+                bestErr = err;
+                best = rr;
+              }
+            }
+            if (bestErr < 0.03) {
+              ImGui::Text("%.2f (%d:%d)", pr, best.num, best.den);
+            } else {
+              ImGui::Text("%.2f", pr);
+            }
+          } else {
+            ImGui::TextDisabled("-");
+          }
 
           ImGui::TableSetColumnIndex(6);
-          ImGui::Text("%.1f", m.orbit.inclinationRad * 57.29577951308232);
+          if (prev && parent) {
+            const double rH = mutualHillAU(prev->orbit.semiMajorAxisAU, m.orbit.semiMajorAxisAU, prev->massEarth, m.massEarth, parent->massEarth);
+            const double sep = (m.orbit.semiMajorAxisAU - prev->orbit.semiMajorAxisAU) / std::max(1.0e-12, rH);
+            ImGui::Text("%.1f", sep);
+          } else {
+            ImGui::TextDisabled("-");
+          }
 
           ImGui::TableSetColumnIndex(7);
-          ImGui::Text("%.2f", m.radiusEarth);
+          ImGui::Text("%.2f", m.orbit.eccentricity);
 
           ImGui::TableSetColumnIndex(8);
-          ImGui::Text("%.0f%%", frac * 100.0);
+          ImGui::Text("%.1f", m.orbit.inclinationRad * 57.29577951308232);
 
           ImGui::TableSetColumnIndex(9);
+          ImGui::Text("%.2f", m.radiusEarth);
+
+          ImGui::TableSetColumnIndex(10);
+          ImGui::Text("%.0f%%", frac * 100.0);
+
+          ImGui::TableSetColumnIndex(11);
           ImGui::Text("%s", ui::toString(m.id).c_str());
         }
 

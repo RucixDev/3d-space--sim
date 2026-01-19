@@ -2,6 +2,7 @@
 
 #include "AudioEngine.h"
 #include "stellar/dsp/AudioAnalyzer.h"
+#include "stellar/dsp/BeatTracker.h"
 
 #include <functional>
 #include <string>
@@ -32,6 +33,20 @@ struct AudioAnalyzerWindowState {
   // Analyzer parameters exposed to UI.
   dsp::AudioAnalyzerParams params{};
   dsp::AudioAnalyzer analyzer{params};
+
+  // Beat / onset tracking (spectral flux).
+  bool beatEnabled{true};
+  bool beatPrevEnabled{true};
+  dsp::BeatTrackerParams beatParams{};
+  dsp::BeatTracker beat{beatParams};
+
+  bool beatShowPlot{true};
+  bool beatShowDebug{false};
+
+  // Onset plot history.
+  int onsetHistoryMax{420};
+  std::vector<float> onsetHistory{};
+  std::vector<float> thresholdHistory{};
 
   // Display options
   bool spectrumUseDb{true};

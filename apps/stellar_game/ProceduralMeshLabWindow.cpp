@@ -1895,10 +1895,21 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
     ImGui::SameLine();
     ImGui::Checkbox("Flip PNG Y", &st.exportTextureFlipY);
 
+    ImGui::Checkbox("Include tangents (glTF TANGENT)", &st.exportGltfTangents);
+    ImGui::SameLine();
+    {
+      ImGui::BeginDisabled(!st.exportAllLods);
+      ImGui::Checkbox("Pack LODs into one glTF (MSFT_lod)", &st.exportGltfPackLodsMsft);
+      ImGui::EndDisabled();
+      if (!st.exportAllLods) {
+        ImGui::TextDisabled("(Enable 'Export all LODs' to use MSFT_lod packaging)");
+      }
+    }
+
     ImGui::SliderFloat("PBR metallic", &st.exportPbrMetallic, 0.0f, 1.0f);
     ImGui::SliderFloat("PBR roughness", &st.exportPbrRoughness, 0.0f, 1.0f);
 
-    ImGui::TextDisabled("glTF export writes .gltf + .bin (and optional PNG). glTF UV origin is upper-left; exporter flips V by default.");
+    ImGui::TextDisabled("glTF export writes .gltf + .bin (and optional PNG). glTF UV origin is upper-left; exporter flips V by default.\nOptionally exports TANGENT and can package LODs via MSFT_lod.");
 
     const bool clickedObj = ImGui::Button("Export OBJ");
     ImGui::SameLine();
@@ -2085,7 +2096,7 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
         }
       }
 
-      auto exportOne = [&](const fs::path& outGltf, const render::SdfMeshData& m) {
+      auto buildOpt = [&]() {
         render::GltfExportOptions opt;
         opt.meshName = "procedural_mesh";
         opt.materialName = "mat0";
@@ -2094,11 +2105,16 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
         opt.baseColorTextureUri = withTex ? sharedTexUri : std::string{};
         opt.metallicFactor = std::clamp(st.exportPbrMetallic, 0.0f, 1.0f);
         opt.roughnessFactor = std::clamp(st.exportPbrRoughness, 0.0f, 1.0f);
+        opt.exportTangents = st.exportGltfTangents;
 
         // Our engine's UVs are authored in OpenGL-style (origin bottom-left). glTF's UV origin is upper-left.
         // Flip V so the asset looks correct in standard glTF viewers.
         opt.flipTexcoordV = true;
+        return opt;
+      };
 
+      auto exportOne = [&](const fs::path& outGltf, const render::SdfMeshData& m) {
+        const render::GltfExportOptions opt = buildOpt();
         std::string gltfErr;
         if (!render::exportMeshToGltf(outGltf.string(), m, opt, &gltfErr)) {
           err = gltfErr;
@@ -2107,17 +2123,26 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
 
       if (err.empty()) {
         if (st.exportAllLods && maxLod > 0) {
-          // Batch export: foo.gltf -> foo_lod0.gltf, foo_lod1.gltf, ...
-          for (int li = 0; li <= maxLod && err.empty(); ++li) {
-            const render::SdfMeshData& m = (li == 0)
-              ? st.cpuMesh
-              : st.lodMeshes[(std::size_t)(li - 1)];
+          if (st.exportGltfPackLodsMsft) {
+            const render::GltfExportOptions opt = buildOpt();
+            std::string gltfErr;
+            const std::span<const render::SdfMeshData> extra(st.lodMeshes.data(), st.lodMeshes.size());
+            if (!render::exportMeshLodsToGltf(rootPath.string(), st.cpuMesh, extra, opt, &gltfErr)) {
+              err = gltfErr;
+            }
+          } else {
+            // Batch export: foo.gltf -> foo_lod0.gltf, foo_lod1.gltf, ...
+            for (int li = 0; li <= maxLod && err.empty(); ++li) {
+              const render::SdfMeshData& m = (li == 0)
+                ? st.cpuMesh
+                : st.lodMeshes[(std::size_t)(li - 1)];
 
-            fs::path out = rootPath;
-            const std::string ext = out.extension().string();
-            const std::string base = out.stem().string();
-            out = out.parent_path() / (base + "_lod" + std::to_string(li) + ext);
-            exportOne(out, m);
+              fs::path out = rootPath;
+              const std::string ext = out.extension().string();
+              const std::string base = out.stem().string();
+              out = out.parent_path() / (base + "_lod" + std::to_string(li) + ext);
+              exportOne(out, m);
+            }
           }
         } else {
           exportOne(rootPath, *exportMesh);

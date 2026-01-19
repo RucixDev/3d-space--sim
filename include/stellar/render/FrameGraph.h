@@ -146,6 +146,37 @@ public:
   const std::vector<PassInfo>& passes() const { return passes_; }
   const std::vector<int>& schedule() const { return schedule_; }
 
+  // ---------------------------------------------------------------------------
+  // Debug export: GraphViz DOT
+  // ---------------------------------------------------------------------------
+  struct DotExportOptions {
+    // Emit a dedicated Backbuffer node and connect passes that write to it.
+    bool includeBackbuffer{true};
+
+    // Include imported (external) textures as nodes.
+    bool includeExternalTextures{true};
+
+    // Group transient textures into clusters by physical allocation id (aliasing).
+    bool clusterPhysicalTextures{true};
+
+    // Include resolved width/height in the texture node label (requires setViewport/compile).
+    bool includeTextureSize{true};
+
+    // Include firstUse/lastUse lifetime ranges in the texture node label (requires compile).
+    bool includeTextureLifetimes{true};
+
+    // Include the physicalId in the texture node label (requires compile).
+    bool includePhysicalIds{true};
+
+    // Add invisible edges between passes in scheduled order to encourage a left-to-right layout.
+    bool enforceScheduleOrder{true};
+  };
+
+  // Returns a GraphViz DOT representation of the current graph.
+  //
+  // Note: For best results (lifetimes/aliasing/schedule), call compile() first.
+  std::string toDot(const DotExportOptions& opt = DotExportOptions{}) const;
+
   // Number of physical transient allocations required for the last compile.
   int physicalTextureCount() const { return physRequired_; }
 

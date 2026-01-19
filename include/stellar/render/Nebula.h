@@ -36,6 +36,11 @@ public:
   NebulaField() = default;
 
   // Regenerate the puff field.
+  //
+  // Implementation note: this uses a deterministic low-discrepancy candidate set
+  // and importance-samples a coherent 3D density field (filaments + voids),
+  // producing more "nebula-like" structure than purely random puffs.
+  //
   // bandPower > 1 squeezes puffs toward y=0 (galactic plane band).
   void regenerate(core::u64 seed, int puffCount, float bandPower = 1.8f);
 
@@ -52,6 +57,7 @@ private:
     float alpha{1.0f};
     float size01{0.5f};   // random in [0,1]
     float depth01{0.5f};  // random in [0,1] (maps to inner/outer radius)
+    float density01{0.5f}; // local structure weight in [0,1]
     float twinkleSpeed{1.0f};
     float phase{0.0f};
   };

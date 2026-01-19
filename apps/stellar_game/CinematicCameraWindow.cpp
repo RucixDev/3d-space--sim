@@ -1,5 +1,7 @@
 #include "CinematicCameraWindow.h"
 
+#include "stellar/core/Hash.h"
+
 #include <imgui.h>
 
 #include <algorithm>
@@ -25,15 +27,76 @@ static void sortKeys(std::vector<CinematicCameraKeyframe>& keys) {
   std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.tSec < b.tSec; });
 }
 
-static math::Vec3d lerp(const math::Vec3d& a, const math::Vec3d& b, double t) {
-  return a * (1.0 - t) + b * t;
+static core::u64 buildArcCacheKey(const CinematicCameraWindowState& st) {
+  // Arbitrary salt.
+  core::u64 h = 0xC1C1C1C1C1C1C1C1ULL ^ 0x9E3779B97F4A7C15ULL;
+
+  auto mix = [&](const auto& v) {
+    h = core::hashCombine(h, core::hashBytes(&v, sizeof(v)));
+  };
+
+  const int keyCount = (int)st.keys.size();
+  mix(keyCount);
+  mix(st.catmullRom);
+  mix(st.centripetal);
+  mix(st.constantSpeed);
+  mix(st.arcSamples);
+
+  for (const auto& k : st.keys) {
+    mix(k.tSec);
+    mix(k.offsetLocalU.x);
+    mix(k.offsetLocalU.y);
+    mix(k.offsetLocalU.z);
+    mix(k.fovDeg);
+  }
+
+  return h;
 }
 
-// Uniform Catmull-Rom spline (t in [0,1]).
-static math::Vec3d catmullRom(const math::Vec3d& p0, const math::Vec3d& p1, const math::Vec3d& p2, const math::Vec3d& p3, double t) {
-  const double t2 = t * t;
-  const double t3 = t2 * t;
-  return (p1 * 2.0 + (p2 - p0) * t + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2 + (-p0 + p1 * 3.0 - p2 * 3.0 + p3) * t3) * 0.5;
+static math::Vec3d evalSegment(const CinematicCameraWindowState& st,
+                              int seg,
+                              double u) {
+  const auto& k1 = st.keys[seg];
+  const auto& k2 = st.keys[seg + 1];
+
+  const math::Vec3d p0 = (seg - 1 >= 0) ? st.keys[seg - 1].offsetLocalU : k1.offsetLocalU;
+  const math::Vec3d p1 = k1.offsetLocalU;
+  const math::Vec3d p2 = k2.offsetLocalU;
+  const math::Vec3d p3 = (seg + 2 < (int)st.keys.size()) ? st.keys[seg + 2].offsetLocalU : k2.offsetLocalU;
+
+  return st.centripetal ? math::catmullRomCentripetal(p0, p1, p2, p3, u) : math::catmullRomUniform(p0, p1, p2, p3, u);
+}
+
+static void ensureArcTables(const CinematicCameraWindowState& st) {
+  if (!(st.catmullRom && st.constantSpeed)) {
+    if (!st.arcTables.empty()) {
+      st.arcTables.clear();
+      st.arcCacheKey = 0;
+    }
+    return;
+  }
+
+  if (st.keys.size() < 2) {
+    st.arcTables.clear();
+    st.arcCacheKey = 0;
+    return;
+  }
+
+  const core::u64 key = buildArcCacheKey(st);
+  const std::size_t segCount = st.keys.size() - 1;
+  if (key == st.arcCacheKey && st.arcTables.size() == segCount) {
+    return;
+  }
+
+  st.arcCacheKey = key;
+  st.arcTables.clear();
+  st.arcTables.reserve(segCount);
+
+  for (std::size_t seg = 0; seg < segCount; ++seg) {
+    const int s = (int)seg;
+    auto eval = [&](double u) { return evalSegment(st, s, u); };
+    st.arcTables.emplace_back(math::buildArcLengthTable(eval, st.arcSamples));
+  }
 }
 
 static bool parseCsvLine(const std::string& line, double* out5) {
@@ -133,23 +196,26 @@ CinematicCameraSample sampleCinematicCamera(const CinematicCameraWindowState& st
   const auto& k1 = st.keys[seg];
   const auto& k2 = st.keys[seg + 1];
   const double denom = std::max(1e-9, k2.tSec - k1.tSec);
-  const double u = std::clamp((t - k1.tSec) / denom, 0.0, 1.0);
+  double u = std::clamp((t - k1.tSec) / denom, 0.0, 1.0);
 
   // FOV: linear.
   sample.fovDeg = k1.fovDeg * (1.0 - u) + k2.fovDeg * u;
 
   // Offset: Catmull-Rom or linear.
   if (!st.catmullRom) {
-    sample.offsetLocalU = lerp(k1.offsetLocalU, k2.offsetLocalU, u);
+    sample.offsetLocalU = math::lerp(k1.offsetLocalU, k2.offsetLocalU, u);
     return sample;
   }
 
-  const math::Vec3d p0 = (seg - 1 >= 0) ? st.keys[seg - 1].offsetLocalU : k1.offsetLocalU;
-  const math::Vec3d p1 = k1.offsetLocalU;
-  const math::Vec3d p2 = k2.offsetLocalU;
-  const math::Vec3d p3 = (seg + 2 < static_cast<int>(st.keys.size())) ? st.keys[seg + 2].offsetLocalU : k2.offsetLocalU;
+  // Optional constant-speed reparameterization.
+  if (st.constantSpeed) {
+    ensureArcTables(st);
+    if (seg >= 0 && seg < (int)st.arcTables.size()) {
+      u = math::reparamByArcLength(st.arcTables[(std::size_t)seg], u);
+    }
+  }
 
-  sample.offsetLocalU = catmullRom(p0, p1, p2, p3, u);
+  sample.offsetLocalU = evalSegment(st, seg, u);
   return sample;
 }
 
@@ -173,6 +239,20 @@ void drawCinematicCameraWindow(CinematicCameraWindowState& st, const ToastFn& to
   ImGui::Checkbox("Catmull-Rom (smooth)", &st.catmullRom);
   ImGui::SameLine();
   ImGui::Checkbox("Loop", &st.loop);
+
+  if (st.catmullRom) {
+    ImGui::Checkbox("Centripetal (less overshoot)", &st.centripetal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Constant speed (arc-length)", &st.constantSpeed);
+
+    if (st.constantSpeed) {
+      ImGui::PushItemWidth(180.0f);
+      if (ImGui::SliderInt("Arc samples", &st.arcSamples, 8, 128)) {
+        st.arcSamples = std::clamp(st.arcSamples, 2, 512);
+      }
+      ImGui::PopItemWidth();
+    }
+  }
 
   ImGui::Checkbox("Advance using simulation dt", &st.playUsesSimTime);
   ImGui::SameLine();

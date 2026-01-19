@@ -304,6 +304,193 @@ unsigned int FrameGraph::glTexture(TextureHandle h) const {
   return phys_[(std::size_t)pid].tex;
 }
 
+
+
+namespace {
+
+std::string dotEscape(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (const char c : s) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+} // namespace
+
+std::string FrameGraph::toDot(const DotExportOptions& opt) const {
+  std::ostringstream ss;
+
+  ss << "digraph FrameGraph {\n";
+  ss << "  rankdir=LR;\n";
+  ss << "  graph [fontsize=10, labelloc=\"t\"];\n";
+  ss << "  node  [fontsize=10];\n";
+  ss << "  edge  [fontsize=9];\n\n";
+
+  const int passCount = (int)passes_.size();
+  const int texCount = (int)textures_.size();
+
+  // Pass schedule order: passId -> schedule index.
+  std::vector<int> passOrder;
+  passOrder.assign((std::size_t)passCount, -1);
+  for (int si = 0; si < (int)schedule_.size(); ++si) {
+    const int p = schedule_[(std::size_t)si];
+    if (p >= 0 && p < passCount) passOrder[(std::size_t)p] = si;
+  }
+
+  // Optional backbuffer node.
+  if (opt.includeBackbuffer) {
+    ss << "  backbuffer [shape=doubleoctagon, label=\"Backbuffer\"];\n\n";
+  }
+
+  // Pass nodes.
+  ss << "  // Passes\n";
+  for (int p = 0; p < passCount; ++p) {
+    const auto& pass = passes_[(std::size_t)p];
+    std::string label;
+    if (passOrder[(std::size_t)p] >= 0) {
+      label = "#" + std::to_string(passOrder[(std::size_t)p]) + "\\n";
+    }
+    label += pass.name;
+    ss << "  p" << p << " [shape=box, label=\"" << dotEscape(label) << "\"];\n";
+  }
+  ss << "\n";
+
+  auto emitTextureNode = [&](int tId) {
+    if (tId < 0 || tId >= texCount) return;
+    const auto& t = textures_[(std::size_t)tId];
+    if (t.external && !opt.includeExternalTextures) return;
+
+    std::string label = t.name;
+    label += "\\n(id " + std::to_string(tId) + ")";
+
+    if (opt.includeTextureSize && t.resolvedW > 0 && t.resolvedH > 0) {
+      label += "\\n" + std::to_string(t.resolvedW) + "x" + std::to_string(t.resolvedH);
+    }
+
+    if (opt.includePhysicalIds && !t.external && t.physicalId >= 0) {
+      label += "\\nphys " + std::to_string(t.physicalId);
+    }
+
+    if (opt.includeTextureLifetimes && t.firstUse >= 0 && t.lastUse >= 0) {
+      label += "\\nlife " + std::to_string(t.firstUse) + ".." + std::to_string(t.lastUse);
+    }
+
+    if (t.external) {
+      label += "\\nexternal";
+    }
+
+    ss << "  t" << tId << " [shape=ellipse, label=\"" << dotEscape(label) << "\"";
+    if (t.external) {
+      ss << ", style=dashed";
+    }
+    ss << "];\n";
+  };
+
+  // Texture nodes.
+  ss << "  // Textures\n";
+
+  // Group by physical allocation id (optional).
+  if (opt.clusterPhysicalTextures) {
+    // physId -> list of texture ids
+    std::vector<std::vector<int>> physGroups;
+    int maxPhys = -1;
+    for (int tId = 0; tId < texCount; ++tId) {
+      const auto& t = textures_[(std::size_t)tId];
+      if (t.external) continue;
+      if (t.physicalId < 0) continue;
+      maxPhys = std::max(maxPhys, t.physicalId);
+    }
+    if (maxPhys >= 0) physGroups.resize((std::size_t)maxPhys + 1);
+
+    for (int tId = 0; tId < texCount; ++tId) {
+      const auto& t = textures_[(std::size_t)tId];
+      if (t.external) continue;
+      if (t.physicalId < 0) continue;
+      physGroups[(std::size_t)t.physicalId].push_back(tId);
+    }
+
+    for (int pid = 0; pid < (int)physGroups.size(); ++pid) {
+      if (physGroups[(std::size_t)pid].empty()) continue;
+      ss << "  subgraph cluster_phys" << pid << " {\n";
+      ss << "    label=\"Phys " << pid << "\";\n";
+      ss << "    style=dashed;\n";
+      for (int tId : physGroups[(std::size_t)pid]) {
+        emitTextureNode(tId);
+      }
+      ss << "  }\n";
+    }
+
+    // Any remaining textures not in a phys group (external or uncompiled) are emitted outside.
+    for (int tId = 0; tId < texCount; ++tId) {
+      const auto& t = textures_[(std::size_t)tId];
+      const bool inGroup = (!t.external && t.physicalId >= 0 && t.physicalId <= maxPhys);
+      if (inGroup) continue;
+      emitTextureNode(tId);
+    }
+
+  } else {
+    for (int tId = 0; tId < texCount; ++tId) {
+      emitTextureNode(tId);
+    }
+  }
+
+  ss << "\n";
+
+  // Edges.
+  ss << "  // Reads (texture -> pass) and writes (pass -> texture)\n";
+  for (int p = 0; p < passCount; ++p) {
+    const auto& pass = passes_[(std::size_t)p];
+
+    for (const auto& r : pass.reads) {
+      if (!r.valid()) continue;
+      if (r.id < 0 || r.id >= texCount) continue;
+      const auto& t = textures_[(std::size_t)r.id];
+      if (t.external && !opt.includeExternalTextures) continue;
+      ss << "  t" << r.id << " -> p" << p << ";\n";
+    }
+
+    if (pass.write.isBackbuffer()) {
+      if (opt.includeBackbuffer) {
+        ss << "  p" << p << " -> backbuffer;\n";
+      }
+    } else if (pass.write.valid()) {
+      if (pass.write.id >= 0 && pass.write.id < texCount) {
+        const auto& t = textures_[(std::size_t)pass.write.id];
+        if (!(t.external && !opt.includeExternalTextures)) {
+          ss << "  p" << p << " -> t" << pass.write.id << ";\n";
+        }
+      }
+    }
+  }
+
+  // Optional invisible schedule edges to encourage a stable left-to-right layout.
+  if (opt.enforceScheduleOrder) {
+    const bool hasSchedule = ((int)schedule_.size() == passCount);
+    if (hasSchedule) {
+      ss << "\n  // Schedule order hint (invisible)\n";
+      for (int i = 1; i < (int)schedule_.size(); ++i) {
+        const int a = schedule_[(std::size_t)i - 1];
+        const int b = schedule_[(std::size_t)i];
+        if (a >= 0 && b >= 0) {
+          ss << "  p" << a << " -> p" << b << " [style=invis, weight=10];\n";
+        }
+      }
+    }
+  }
+
+  ss << "}\n";
+  return ss.str();
+}
+
 unsigned int FrameGraph::PassContext::texture(TextureHandle h) const {
   return fg.glTexture(h);
 }

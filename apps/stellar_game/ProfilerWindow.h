@@ -54,6 +54,16 @@ struct ProfilerWindowState {
   // Simple substring filter applied to GPU pass rows.
   char gpuFilter[96]{};
 
+  // ---- GPU FrameGraph DOT export (GraphViz) ----
+  char gpuDotExportPath[256]{"framegraph.dot"};
+  bool gpuDotIncludeBackbuffer{true};
+  bool gpuDotIncludeExternalTextures{true};
+  bool gpuDotClusterPhysicalTextures{true};
+  bool gpuDotIncludeTextureSize{true};
+  bool gpuDotIncludeTextureLifetimes{true};
+  bool gpuDotIncludePhysicalIds{true};
+  bool gpuDotEnforceScheduleOrder{true};
+
   // Internal: GPU timing history aligned to CPU profiler frames.
   // Each row = { totalGpuMs, pass0Ms, pass1Ms, ... }.
   std::vector<std::string> gpuCounterKeys{};

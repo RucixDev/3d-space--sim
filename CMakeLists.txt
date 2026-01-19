@@ -124,6 +124,7 @@ set(STELLAR_CORE_SOURCES
   src/proc/Noise.cpp
   src/proc/FluidSim2D.cpp
   src/dsp/AudioAnalyzer.cpp
+  src/dsp/BeatTracker.cpp
   src/proc/GalaxyHazards.cpp
   src/proc/GalaxyRegions.cpp
   src/proc/GalaxyClusters.cpp
@@ -146,10 +147,14 @@ set(STELLAR_CORE_SOURCES
   src/render/ProceduralCompositor.cpp
   src/render/AutoExposure.cpp
   src/render/ShaderToyParams.cpp
+  # Procedural sky layers (CPU-side; safe for headless builds).
+  src/render/Starfield.cpp
+  src/render/Nebula.cpp
   src/proc/NameGenerator.cpp
   src/proc/GalaxyGenerator.cpp
   src/proc/GalaxyMorphology.cpp
   src/proc/SystemGenerator.cpp
+  src/proc/AsteroidBeltGenerator.cpp
   src/proc/TradeProfile.cpp
   src/proc/TradeEconomy.cpp
   src/proc/TradeRoutes.cpp
@@ -259,8 +264,6 @@ set(STELLAR_RENDER_SOURCES
   src/render/VolumetricAtmosphereRenderer.cpp
   src/render/ProceduralSky.cpp
   src/render/StarCoronaRenderer.cpp
-  src/render/Starfield.cpp
-  src/render/Nebula.cpp
   src/render/ParticleSystem.cpp
   src/render/PostFX.cpp
   src/render/RenderTarget.cpp

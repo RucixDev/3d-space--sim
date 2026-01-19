@@ -2,6 +2,7 @@
 
 #include "stellar/render/SdfMesher.h" // SdfMeshData
 
+#include <span>
 #include <string>
 
 namespace stellar::render {
@@ -14,8 +15,8 @@ namespace stellar::render {
 //  - Optionally references a baseColorTexture (PNG) for PBR metallic-roughness.
 //
 // NOTE:
-//  - If you want normal mapping in glTF, you need tangents (TANGENT). We do not
-//    export them yet; many viewers can generate tangents at import time.
+//  - If you want normal mapping in glTF, you need tangents (TANGENT). Tangents
+//    are optional and can be exported by enabling GltfExportOptions::exportTangents.
 
 struct GltfExportOptions {
   // Optional. When non-empty, an image/texture is emitted and the material's
@@ -39,6 +40,14 @@ struct GltfExportOptions {
   // uses OpenGL-style UVs but the texture is written with a top-left origin.
   bool flipTexcoordV{false};
 
+  // If true, exports per-vertex tangents as TANGENT (VEC4 float) using a
+  // standard UV-based tangent frame build.
+  //
+  // - This is recommended if you plan to use normal maps in downstream tools.
+  // - When UVs are degenerate, the exporter falls back to an arbitrary stable
+  //   tangent frame derived from the vertex normal.
+  bool exportTangents{false};
+
   std::string meshName{"mesh0"};
   std::string materialName{"mat0"};
   std::string nodeName{"node0"};
@@ -58,5 +67,20 @@ bool exportMeshToGltf(const std::string& gltfPath,
                       const SdfMeshData& mesh,
                       const GltfExportOptions& options,
                       std::string* outError = nullptr);
+
+// Export a mesh LOD chain as a single glTF asset.
+//
+// This uses the `MSFT_lod` extension so glTF viewers that support it can pick
+// an appropriate LOD automatically.
+//
+// - lod0 is required.
+// - lods contains LOD1..LOD(N) (may be empty).
+// - The exporter writes <gltfPath> and <gltfPath stem>.bin (same folder).
+// - The same material is used for all LOD meshes.
+bool exportMeshLodsToGltf(const std::string& gltfPath,
+                          const SdfMeshData& lod0,
+                          std::span<const SdfMeshData> lods,
+                          const GltfExportOptions& options,
+                          std::string* outError = nullptr);
 
 } // namespace stellar::render

@@ -161,6 +161,9 @@ void drawAudioAnalyzerWindow(AudioAnalyzerWindowState& st,
   // Apply parameter changes.
   st.analyzer.setParams(st.params);
 
+  // Beat tracker params are independent from the FFT/banding params.
+  st.beat.setParams(st.beatParams);
+
   // Pull capture + analyze.
   if (!st.pause) {
     st.capture.resize((std::size_t)st.captureSamples);
@@ -174,12 +177,49 @@ void drawAudioAnalyzerWindow(AudioAnalyzerWindowState& st,
     }
   }
 
+  // Reset beat tracker when toggled so it doesn't "remember" stale spectra.
+  if (st.beatEnabled != st.beatPrevEnabled) {
+    st.beat.reset();
+    st.onsetHistory.clear();
+    st.thresholdHistory.clear();
+    st.beatPrevEnabled = st.beatEnabled;
+  }
+
+  // Beat/onset analysis runs on the most recent spectrum (even when paused).
+  // This makes the beat pulse decay feel responsive in the UI.
+  const float dtSec = ImGui::GetIO().DeltaTime;
+  const auto& spec = st.analyzer.spectrumMag();
+  const dsp::BeatTrackerOutput beatOut = (st.beatEnabled && !spec.empty())
+    ? st.beat.processSpectrum(spec.data(), (int)spec.size(), dtSec)
+    : st.beat.processSpectrum(nullptr, 0, dtSec);
+
+  // Maintain a small onset history for plotting.
+  st.onsetHistoryMax = std::clamp(st.onsetHistoryMax, 60, 4096);
+  if (st.beatEnabled) {
+    st.onsetHistory.push_back(beatOut.onset);
+    st.thresholdHistory.push_back(beatOut.threshold);
+    while ((int)st.onsetHistory.size() > st.onsetHistoryMax) st.onsetHistory.erase(st.onsetHistory.begin());
+    while ((int)st.thresholdHistory.size() > st.onsetHistoryMax) st.thresholdHistory.erase(st.thresholdHistory.begin());
+  }
+
   ImGui::Separator();
 
   // ---- Stats ----
   ImGui::Text("RMS: %.4f", st.analyzer.rms());
   ImGui::SameLine();
   ImGui::Text("Peak: %.3f", st.analyzer.peak());
+
+  if (st.beatEnabled) {
+    ImGui::SameLine();
+    ImGui::Text("| BPM: %s%.1f", (beatOut.bpmConfidence01 >= 0.35f) ? "" : "(~)", beatOut.bpm);
+
+    ImGui::SameLine();
+    if (beatOut.beat) {
+      ImGui::TextColored(ImVec4(0.95f, 0.90f, 0.20f, 1.0f), "BEAT");
+    } else {
+      ImGui::TextDisabled("beatPulse=%.2f", beatOut.beatPulse01);
+    }
+  }
 
   // ---- Plots ----
   if (st.showWaveform) {
@@ -204,6 +244,64 @@ void drawAudioAnalyzerWindow(AudioAnalyzerWindowState& st,
     }
 
     ImGui::TextDisabled("Tip: A Hann window + FFT reduces leakage vs raw DFT; smoothing stabilizes UI.");
+  }
+
+  // ---- Beat / Onset ----
+  if (ImGui::CollapsingHeader("Beat / Onset", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enable", &st.beatEnabled);
+    ImGui::SameLine();
+    ImGui::Checkbox("Plot", &st.beatShowPlot);
+    ImGui::SameLine();
+    ImGui::Checkbox("Debug", &st.beatShowDebug);
+
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Sensitivity", &st.beatParams.sensitivity, 0.0f, 4.0f, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Min beat interval", &st.beatParams.minBeatIntervalSec, 0.05f, 1.0f, "%.2f s");
+
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Mean tau", &st.beatParams.meanTauSec, 0.02f, 2.0f, "%.2f s");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Dev tau", &st.beatParams.devTauSec, 0.02f, 2.0f, "%.2f s");
+
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::SliderFloat("Pulse decay", &st.beatParams.beatPulseDecaySec, 0.05f, 1.5f, "%.2f s");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragInt("History", &st.beatParams.bpmHistory, 1.0f, 4, 48);
+
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat("BPM min", &st.beatParams.bpmMin, 1.0f, 20.0f, 240.0f, "%.0f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat("BPM max", &st.beatParams.bpmMax, 1.0f, st.beatParams.bpmMin + 1.0f, 420.0f, "%.0f");
+
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragInt("Plot samples", &st.onsetHistoryMax, 2.0f, 64, 2048);
+
+    if (!st.beatEnabled) {
+      ImGui::TextDisabled("Beat tracking is disabled.");
+    } else {
+      ImGui::Text("Onset: %.4f | Thr: %.4f | mean: %.4f | dev: %.4f",
+                  beatOut.onset, beatOut.threshold, beatOut.mean, beatOut.deviation);
+      ImGui::Text("BPM: %.1f (conf %.2f)", beatOut.bpm, beatOut.bpmConfidence01);
+    }
+
+    if (st.beatEnabled && st.beatShowPlot && !st.onsetHistory.empty() && st.onsetHistory.size() == st.thresholdHistory.size()) {
+      // Plot onset and threshold as two stacked plots so you can tune sensitivity.
+      const float onsetMax = *std::max_element(st.onsetHistory.begin(), st.onsetHistory.end());
+      const float thrMax = *std::max_element(st.thresholdHistory.begin(), st.thresholdHistory.end());
+      const float yMax = std::max(1.0e-5f, std::max(onsetMax, thrMax) * 1.10f);
+      ImGui::PlotLines("Onset", st.onsetHistory.data(), (int)st.onsetHistory.size(), 0, nullptr, 0.0f, yMax, ImVec2(0, 90));
+      ImGui::PlotLines("Threshold", st.thresholdHistory.data(), (int)st.thresholdHistory.size(), 0, nullptr, 0.0f, yMax, ImVec2(0, 70));
+    }
+
+    if (st.beatEnabled && st.beatShowDebug) {
+      ImGui::TextDisabled("Notes: This is a tiny spectral-flux onset tracker with adaptive threshold and peak-picking.");
+      ImGui::TextDisabled("If you see double-triggers, increase Min beat interval; if you see misses, lower Sensitivity.");
+    }
   }
 
   ImGui::Separator();

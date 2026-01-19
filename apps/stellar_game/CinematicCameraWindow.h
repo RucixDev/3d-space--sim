@@ -1,7 +1,9 @@
 #pragma once
 
+#include "stellar/math/Spline.h"
 #include "stellar/math/Vec3.h"
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -44,6 +46,17 @@ struct CinematicCameraWindowState {
   // Interpolation for offsets between keyframes.
   bool catmullRom{true};
 
+  // Catmull-Rom variant (only relevant when catmullRom == true).
+  // Centripetal parameterization tends to reduce overshoot around sharp corners.
+  bool centripetal{false};
+
+  // If enabled, reparameterize the spline by arc-length so camera speed within a
+  // segment stays approximately constant over time.
+  bool constantSpeed{false};
+
+  // Arc-length table resolution (higher = more accurate, more CPU when building).
+  int arcSamples{32};
+
   // Playback state
   double playheadSec{0.0};
   double playbackRate{1.0}; // 1.0 = realtime, 2.0 = double speed, etc.
@@ -59,6 +72,11 @@ struct CinematicCameraWindowState {
 
   // Keyframes
   std::vector<CinematicCameraKeyframe> keys;
+
+  // Internal caches (built lazily during sampling; safe because they do not affect
+  // functional behavior and are only used for visualization/tooling smoothness).
+  mutable std::uint64_t arcCacheKey{0};
+  mutable std::vector<math::ArcLengthTable> arcTables; // one per segment (keys-1)
 };
 
 using ToastFn = std::function<void(const std::string& msg, double ttlSec)>;
