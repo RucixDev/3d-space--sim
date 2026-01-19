@@ -10,7 +10,6 @@
 #include "stellar/sim/Mission.h"
 #include "stellar/sim/Universe.h"
 #include "stellar/econ/Commodity.h"
-#include "stellar/ui/Format.h"
 #include "stellar/render/ProceduralRings.h"
 #include "stellar/proc/AsteroidBeltGenerator.h"
 

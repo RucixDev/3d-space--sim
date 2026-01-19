@@ -5,6 +5,7 @@
 
 #include <imgui.h>
 
+#include <cmath>
 #include <string_view>
 
 #ifndef IM_PI
@@ -25,6 +26,21 @@ inline ImVec2 GetMouseDelta() {
 // Uses the (text, text_end) overload, which does not require null-termination.
 inline void TextUnformatted(std::string_view sv) {
   TextUnformatted(sv.data(), sv.data() + sv.size());
+}
+
+// Type-safe wrapper for editing doubles without forcing callsites to reach for
+// DragScalar(... ImGuiDataType_Double ...).
+inline bool DragDouble(const char* label,
+                       double* v,
+                       float v_speed = 1.0f,
+                       double v_min = 0.0,
+                       double v_max = 0.0,
+                       const char* format = "%.3f",
+                       ImGuiSliderFlags flags = 0) {
+  const bool has_range = std::isfinite(v_min) && std::isfinite(v_max) && (v_min < v_max);
+  const void* p_min = has_range ? (const void*)&v_min : nullptr;
+  const void* p_max = has_range ? (const void*)&v_max : nullptr;
+  return DragScalar(label, ImGuiDataType_Double, v, v_speed, p_min, p_max, format, flags);
 }
 
 } // namespace ImGui

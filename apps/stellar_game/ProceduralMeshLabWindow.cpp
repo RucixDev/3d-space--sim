@@ -1,9 +1,11 @@
 #include "ProceduralMeshLabWindow.h"
 
+#include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
 #include "stellar/math/Math.h"
 #include "stellar/math/Mat4.h"
 #include "stellar/math/Vec3.h"
+#include "stellar/render/Gl.h"
 #include "stellar/render/GltfExport.h"
 
 #include "Screenshot.h"
@@ -24,6 +26,11 @@ namespace stellar::game {
 namespace {
 
 using namespace stellar;
+
+// Forward declarations for helpers used before their definitions.
+static void uploadPreviewMeshForCurrentLod(ProceduralMeshLabWindowState& st);
+static void resetLodChainToBaseMesh(ProceduralMeshLabWindowState& st);
+static void requestBuildLods(ProceduralMeshLabWindowState& st);
 
 static const char* meshOpHelp(render::SdfNodeOp op) {
   switch (op) {
@@ -453,9 +460,13 @@ static void renderPreview(ProceduralMeshLabWindowState& st, float timeSec) {
   if (!prevCull) glDisable(GL_CULL_FACE);
   if (prevBlend) glEnable(GL_BLEND);
 
-  glUseProgram((GLuint)prevProg);
-  glBindVertexArray((GLuint)prevVao);
-  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+  // Restore core GL object bindings.
+  // NOTE: We intentionally use the engine's tiny GL loader wrappers here
+  // instead of calling glUseProgram/glBindVertexArray/glBindFramebuffer
+  // directly (those entry points are not exported from legacy Windows gl.h).
+  if (render::gl::UseProgram) render::gl::UseProgram((GLuint)prevProg);
+  if (render::gl::BindVertexArray) render::gl::BindVertexArray((GLuint)prevVao);
+  if (render::gl::BindFramebuffer) render::gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
   glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
   // Restore polygon mode (OpenGL returns front/back packed on some drivers).

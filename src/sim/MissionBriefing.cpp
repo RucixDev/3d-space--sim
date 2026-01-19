@@ -162,6 +162,32 @@ static std::string riskTierMarkup(double risk01, bool useMarkup) {
   return std::string("[color #7cffb2]") + tier + "[/color]";
 }
 
+static const char* repTierName(double rep) {
+  double r = rep;
+  if (!std::isfinite(r)) r = 0.0;
+  r = std::clamp(r, -1.0, 1.0);
+  if (r < -0.60) return "HOSTILE";
+  if (r < -0.20) return "UNFRIENDLY";
+  if (r < 0.20) return "NEUTRAL";
+  if (r < 0.60) return "FRIENDLY";
+  return "ALLIED";
+}
+
+static std::string repTierMarkup(double rep, bool useMarkup) {
+  const char* tier = repTierName(rep);
+  if (!useMarkup) return tier;
+
+  double r = rep;
+  if (!std::isfinite(r)) r = 0.0;
+  r = std::clamp(r, -1.0, 1.0);
+
+  if (r < -0.60) return std::string("[color #ff4a4a]") + tier + "[/color]";
+  if (r < -0.20) return std::string("[color #ff9a4a]") + tier + "[/color]";
+  if (r < 0.20) return std::string("[color #ffd36a]") + tier + "[/color]";
+  if (r < 0.60) return std::string("[color #7cffb2]") + tier + "[/color]";
+  return std::string("[grad #7cffb2 #5ad1ff]") + tier + "[/grad]";
+}
+
 static std::string titleForType(MissionType t, bool useMarkup) {
   const char* plain = "Contract";
   const char* gradA = "#ffffff";
@@ -407,6 +433,17 @@ MissionBriefing generateMissionBriefing(Universe& universe,
     lines.push_back(std::string("Contract ID: ") + b.contractCode);
     lines.push_back(std::string("Contact: ") + b.contactName + "  (" + issuerFaction + ")");
 
+    if (params.includeReputationCues && mission.factionId != 0) {
+      const double rep = std::clamp(playerRepWithIssuerFaction, -1.0, 1.0);
+
+      std::ostringstream oss;
+      oss.setf(std::ios::fixed);
+      oss.precision(2);
+      oss << "Standing: " << repTierMarkup(rep, params.useMarkup)
+          << "  (rep " << (rep >= 0.0 ? "+" : "") << rep << ")";
+      lines.push_back(oss.str());
+    }
+
     {
       std::ostringstream oss;
       oss.setf(std::ios::fixed);
@@ -502,31 +539,41 @@ MissionBriefing generateMissionBriefing(Universe& universe,
       std::ostringstream oss;
       oss.setf(std::ios::fixed);
       oss.precision(2);
-      oss << "Threat: " << riskTierMarkup(b.risk.overall01, params.useMarkup)
-          << "  (danger " << b.risk.danger01
-          << ", law " << b.risk.lawRisk01
-          << ", piracy " << b.risk.piracy01
-          << ", security " << b.risk.security01 << ")";
+
+      oss << "Threat: " << riskTierMarkup(b.risk.overall01, params.useMarkup);
+      if (params.includeRiskHints) {
+        oss << "  (danger " << b.risk.danger01
+            << ", law " << b.risk.lawRisk01
+            << ", piracy " << b.risk.piracy01
+            << ", security " << b.risk.security01 << ")";
+      }
       lines.push_back(oss.str());
     }
 
     if (mission.type == MissionType::Smuggle) {
-      std::ostringstream oss;
-      oss.setf(std::ios::fixed);
-      oss.precision(0);
-
       const bool illegal = b.risk.contrabandIllegalAtDestination;
-      oss << "Customs: " << (illegal ? "illegal" : "legal")
-          << " | black market access " << (int)std::llround(b.risk.blackMarketAccess01 * 100.0) << "%"
-          << " | sting chance " << (int)std::llround(b.risk.stingChance01 * 100.0) << "%";
-      lines.push_back(oss.str());
 
-      if (b.risk.expectedFineCr > 1.0) {
-        std::ostringstream fine;
-        fine.setf(std::ios::fixed);
-        fine.precision(0);
-        fine << "If scanned: expected fine ~" << b.risk.expectedFineCr << " cr (before rep penalties).";
-        lines.push_back(fine.str());
+      if (params.includeRiskHints) {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(0);
+        oss << "Customs: " << (illegal ? "illegal" : "legal")
+            << " | black market access " << (int)std::llround(b.risk.blackMarketAccess01 * 100.0) << "%"
+            << " | sting chance " << (int)std::llround(b.risk.stingChance01 * 100.0) << "%";
+        lines.push_back(oss.str());
+
+        if (b.risk.expectedFineCr > 1.0) {
+          std::ostringstream fine;
+          fine.setf(std::ios::fixed);
+          fine.precision(0);
+          fine << "If scanned: expected fine ~" << b.risk.expectedFineCr << " cr (before rep penalties).";
+          lines.push_back(fine.str());
+        }
+      } else {
+        lines.push_back(std::string("Customs: ") + (illegal ? "illegal" : "legal"));
+        if (params.includeReputationCues) {
+          lines.push_back("Cue: standing influences backroom access and the odds of a sting.");
+        }
       }
 
       lines.push_back("Recommendation: approach cold, avoid loitering in comms range." );

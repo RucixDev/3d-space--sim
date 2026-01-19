@@ -4,6 +4,7 @@
 #include "stellar/core/Random.h"
 #include "stellar/core/JobSystem.h"
 #include "stellar/proc/GalaxyClusters.h"
+#include "stellar/proc/GalaxyMorphology.h"
 #include "stellar/proc/GalaxyVoids.h"
 #include "stellar/proc/HyperlaneCentrality.h"
 
@@ -27,6 +28,9 @@
 namespace stellar::game {
 
 using Clock = std::chrono::high_resolution_clock;
+
+// Small float helper used in a few UI color ramps.
+static inline float lerpF(float a, float b, float t) { return a + (b - a) * t; }
 
 
 // -----------------------------
@@ -1076,9 +1080,12 @@ static void renderGalaxyHeatmap(ProceduralGalaxyLabWindowState& st, int canvasW,
       if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
       if (prevSciss) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
 
-      glUseProgram((GLuint)prevProg);
-      glBindVertexArray((GLuint)prevVao);
-      glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+      // Restore core bindings using the engine's GL loader wrappers.
+      // This avoids relying on legacy Windows OpenGL headers exporting these
+      // entry points directly.
+      if (stellar::render::gl::UseProgram) stellar::render::gl::UseProgram((GLuint)prevProg);
+      if (stellar::render::gl::BindVertexArray) stellar::render::gl::BindVertexArray((GLuint)prevVao);
+      if (stellar::render::gl::BindFramebuffer) stellar::render::gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
       glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
       glClearColor(prevClearColor[0], prevClearColor[1], prevClearColor[2], prevClearColor[3]);
     }
@@ -1139,9 +1146,9 @@ static ImU32 colorForFaction(core::u32 id, const std::vector<sim::Faction>& fact
   if (id == 0) return rgba(0.75f, 0.75f, 0.75f);
   for (const auto& f : factions) {
     if (f.id == id) {
-      return rgba(static_cast<float>(f.colorRgb.x),
-                  static_cast<float>(f.colorRgb.y),
-                  static_cast<float>(f.colorRgb.z));
+      return rgba(static_cast<float>(f.color.x),
+                  static_cast<float>(f.color.y),
+                  static_cast<float>(f.color.z));
     }
   }
   return rgba(0.75f, 0.75f, 0.75f);
@@ -3050,9 +3057,6 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
           const float t = std::clamp((x - a) / denom, 0.0f, 1.0f);
           return t * t * (3.0f - 2.0f * t);
         };
-
-        const auto lerpF = [](float a, float b, float t) -> float { return a + (b - a) * t; };
-
         const auto laneColor = [&](float bw01, float risk01, float traffic01, float critical01, float alpha) -> ImU32 {
           float r = 0.20f, g = 0.85f, b = 1.00f;
           const int mode = st.hyperlaneColorMode;
@@ -3710,7 +3714,12 @@ void drawProceduralGalaxyLabWindow(ProceduralGalaxyLabWindowState& st, float tim
       } else {
         for (const auto& f : st.factions) {
           ImGui::PushID((int)f.id);
-          ImGui::ColorButton("##f", ImVec4(static_cast<float>(f.colorRgb.x), static_cast<float>(f.colorRgb.y), static_cast<float>(f.colorRgb.z), 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
+          ImGui::ColorButton("##f", ImVec4(static_cast<float>(f.color.x),
+                                            static_cast<float>(f.color.y),
+                                            static_cast<float>(f.color.z),
+                                            1.0f),
+                             ImGuiColorEditFlags_NoTooltip,
+                             ImVec2(16, 16));
           ImGui::PopID();
           ImGui::SameLine();
           ImGui::Text("%u %s", f.id, f.name.c_str());

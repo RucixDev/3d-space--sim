@@ -5,6 +5,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/math/Math.h"
 #include "stellar/math/Vec3.h"
+#include "stellar/render/Gl.h"
 
 #include <SDL_opengl.h>
 
@@ -1340,9 +1341,10 @@ static void renderPreview(ProceduralShaderLabWindowState& st, float timeRealSec)
   if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
   if (prevSciss) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
 
-  glUseProgram((GLuint)prevProg);
-  glBindVertexArray((GLuint)prevVao);
-  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+  // Restore core GL bindings using the engine's extension-safe loader wrappers.
+  if (stellar::render::gl::UseProgram) stellar::render::gl::UseProgram((GLuint)prevProg);
+  if (stellar::render::gl::BindVertexArray) stellar::render::gl::BindVertexArray((GLuint)prevVao);
+  if (stellar::render::gl::BindFramebuffer) stellar::render::gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
   glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 }
 

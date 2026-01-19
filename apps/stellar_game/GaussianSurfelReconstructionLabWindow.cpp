@@ -3,7 +3,7 @@
 #include "stellar/core/Log.h"
 #include "stellar/math/Mat4.h"
 
-#include "imgui.h"
+#include "stellar/ui/ImGuiCompat.h"
 
 #include <SDL_opengl.h>
 
@@ -140,11 +140,9 @@ void ensurePreviewInit(GaussianSurfelReconstructionLabWindowState& s) {
     return;
   }
 
-  if (!s.checker.createChecker(256, 256, 16)) {
-    s.previewError = "Failed to create checker texture";
-    s.previewReady = false;
-    return;
-  }
+  // Texture2D::createChecker is a convenience helper and does not currently
+  // surface failure through a return value.
+  s.checker.createChecker(256, 256, 16);
 
   if (!s.meshRenderer.init(&s.previewError)) {
     s.previewReady = false;
@@ -478,7 +476,7 @@ void drawGaussianSurfelReconstructionLabWindow(GaussianSurfelReconstructionLabWi
     mesherChanged |= ImGui::DragInt("Resolution", &s.mesher.resolution, 1.0f, 8, 256);
     mesherChanged |= ImGui::DragFloat("Bounds", &s.mesher.bounds, 0.05f, 0.25f, 10.0f);
     mesherChanged |= ImGui::DragFloat("Iso", &s.mesher.iso, 0.005f, -1.0f, 1.0f);
-    mesherChanged |= ImGui::Checkbox("Compute normals", &s.mesher.computeNormals);
+    mesherChanged |= ImGui::Checkbox("Compute normals", &s.mesher.computeNormalsFromField);
     if (mesherChanged) s.meshDirty = true;
 
     if (ImGui::Button("Rebuild Mesh")) {
@@ -535,8 +533,8 @@ void drawGaussianSurfelReconstructionLabWindow(GaussianSurfelReconstructionLabWi
     plannerChanged |= ImGui::DragInt("Horizon", &s.planner.horizon, 1.0f, 1, 8);
     plannerChanged |= ImGui::DragInt("Beam width", &s.planner.beamWidth, 1.0f, 1, 32);
     plannerChanged |= ImGui::DragInt("Branching", &s.planner.localBranching, 1.0f, 1, 32);
-    plannerChanged |= ImGui::DragFloat("Move cost", &s.planner.moveCostWeight, 0.01f, 0.0f, 2.0f);
-    plannerChanged |= ImGui::DragFloat("Revisit penalty", &s.planner.revisitPenalty, 0.01f, 0.0f, 5.0f);
+    plannerChanged |= ImGui::DragDouble("Move cost", &s.planner.moveCostWeight, 0.01f, 0.0, 2.0, "%.3f");
+    plannerChanged |= ImGui::DragDouble("Revisit penalty", &s.planner.revisitPenalty, 0.01f, 0.0, 5.0, "%.3f");
     if (plannerChanged && s.autoPlan && s.candidatesReady) {
       replan(s);
     }
