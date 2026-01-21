@@ -111,5 +111,72 @@ int test_missile_defense() {
     }
   }
 
+
+  // Evasion plan: offset pass -> should push away from the predicted closest-approach point.
+  {
+    sim::Missile m{};
+    m.posKm = {0, 0, 0};
+    m.velKmS = {0, 0, 1};
+
+    const math::Vec3d tgtPos{1, 0, 10};
+    const math::Vec3d tgtVel{0, 0, 0};
+    const auto plan = sim::planMissileEvasion(m, tgtPos, tgtVel, /*seed=*/42);
+    if (!plan.valid) {
+      std::cerr << "FAIL: expected valid evasion plan (offset case)\n";
+      fails++;
+    } else {
+      if (!approx(plan.tClosestSec, 10.0, 1e-6)) {
+        std::cerr << "FAIL: tClosestSec mismatch. got=" << plan.tClosestSec << " expected=10\n";
+        fails++;
+      }
+      if (!approx(plan.missDistanceKm, 1.0, 1e-6)) {
+        std::cerr << "FAIL: missDistanceKm mismatch. got=" << plan.missDistanceKm << " expected=1\n";
+        fails++;
+      }
+
+      const math::Vec3d los = (m.posKm - tgtPos).normalized();
+      const double lateralDot = std::fabs(math::dot(plan.dirWorld, los));
+      if (lateralDot > 1e-6) {
+        std::cerr << "FAIL: expected dirWorld lateral to LOS. |dot|=" << lateralDot << "\n";
+        fails++;
+      }
+
+      // In this setup the missile passes on the target's -X side, so +X is a good escape direction.
+      if (plan.dirWorld.x < 0.5) {
+        std::cerr << "FAIL: expected dirWorld.x positive (move away). got=" << plan.dirWorld.x << "\n";
+        fails++;
+      }
+    }
+  }
+
+  // Evasion plan: head-on -> seeded perpendicular direction.
+  {
+    sim::Missile m{};
+    m.posKm = {0, 0, 0};
+    m.velKmS = {0, 0, 1};
+
+    const math::Vec3d tgtPos{0, 0, 10};
+    const math::Vec3d tgtVel{0, 0, 0};
+    const auto p1 = sim::planMissileEvasion(m, tgtPos, tgtVel, /*seed=*/123);
+    const auto p2 = sim::planMissileEvasion(m, tgtPos, tgtVel, /*seed=*/123);
+    if (!p1.valid) {
+      std::cerr << "FAIL: expected valid evasion plan (head-on)\n";
+      fails++;
+    } else {
+      const double axisDot = std::fabs(math::dot(p1.dirWorld, math::Vec3d{0, 0, 1}));
+      if (axisDot > 1e-6) {
+        std::cerr << "FAIL: expected dirWorld ⟂ approach axis. |dot|=" << axisDot << "\n";
+        fails++;
+      }
+    }
+
+    // Deterministic for identical seeds.
+    if (!approx(p1.dirWorld.x, p2.dirWorld.x, 1e-12) ||
+        !approx(p1.dirWorld.y, p2.dirWorld.y, 1e-12) ||
+        !approx(p1.dirWorld.z, p2.dirWorld.z, 1e-12)) {
+      std::cerr << "FAIL: expected deterministic dirWorld for identical seed\n";
+      fails++;
+    }
+  }
   return fails;
 }

@@ -42,6 +42,50 @@ struct MissileThreatSummary {
   bool fromPlayer{false};
 };
 
+// Recommended evasion direction for an inbound missile (deterministic).
+//
+// The goal is to provide a *direction only*; the game can decide how strongly
+// to apply thrust based on pilot skill, ship performance, and time-to-impact.
+struct MissileEvasionPlan {
+  bool valid{false};
+
+  // Unit vector (world space) pointing in a good direction for applying
+  // lateral thrust to increase the predicted miss distance.
+  math::Vec3d dirWorld{0, 0, 0};
+
+  // Time of closest approach under constant relative velocity (seconds).
+  double tClosestSec{0.0};
+
+  // Predicted miss distance at closest approach if the target does nothing (km).
+  double missDistanceKm{0.0};
+
+  // Relative closing speed along the line of sight (km/s). Positive means inbound.
+  double closingKmS{0.0};
+};
+
+struct MissileEvasionParams {
+  // Ignore cases where relative speed is extremely low (fallback direction is used).
+  double minRelSpeedKmS{0.02};
+
+  // Treat the closest-approach offset as degenerate below this threshold (km).
+  double minMissVecKm{1e-3};
+
+  // If true, project the output onto the plane perpendicular to the current
+  // line-of-sight (produces a more "lateral jink" that tends to increase LOS rate).
+  bool enforceLateralToLos{true};
+};
+
+// Compute a suggested evasion direction against a specific missile/target pair.
+//
+// seed:
+//   Any stable seed (hash(universeSeed, npcId, timePhase, etc.)). Only used to break
+//   ties in degenerate head-on cases.
+MissileEvasionPlan planMissileEvasion(const Missile& missile,
+                                     const math::Vec3d& targetPosKm,
+                                     const math::Vec3d& targetVelKmS,
+                                     core::u64 seed,
+                                     const MissileEvasionParams& params = {});
+
 // Find the nearest (minimum time-to-impact) inbound missile tracking the given
 // target, according to a simple relative kinematic estimate.
 MissileThreatSummary nearestInboundMissile(const Missile* missiles,

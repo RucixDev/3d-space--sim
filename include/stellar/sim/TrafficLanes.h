@@ -57,6 +57,26 @@ struct TrafficLaneParams {
   // window (with state evaluated at timeDays). If false, only active convoys
   // are returned.
   bool includeInactive{false};
+
+  // ---------------------------------------------------------------------------
+  // Lane corridor modeling
+  // ---------------------------------------------------------------------------
+  // If true, lane geometry is derived primarily from the unordered station pair
+  // (systemId, min(from,to), max(from,to)). This makes multiple convoys between
+  // the same endpoints share a stable "corridor".
+  //
+  // If false, lane geometry is derived from the convoy id (legacy behavior), so
+  // each convoy can have a distinct arc plane/offset.
+  bool bundleByStationPair{true};
+
+  // If true, opposite-direction travel between the same station pair uses a
+  // mirrored arc ("dual carriageway") by flipping the arc side sign.
+  bool dualCarriageway{true};
+
+  // Optional per-convoy arc magnitude jitter (fraction of base arc magnitude).
+  // This keeps multiple same-route convoys from perfectly overlapping while
+  // still forming a coherent corridor. 0 disables.
+  double arcJitterFrac{0.0};
 };
 
 // A deterministic shipment traveling between two stations.
@@ -91,6 +111,53 @@ struct TrafficConvoyState {
   math::Vec3d dir{0, 0, 1};
 };
 
+// Precomputed lane/corridor geometry for a specific convoy schedule.
+//
+// This is a purely geometric helper: it does not own simulation state.
+// It exists to:
+//  - make lane evaluation/sample cheaper (compute once, evaluate many)
+//  - expose stable "lane keys" so UI/tools can group convoys into corridors
+struct TrafficLaneGeometry {
+  // Stable key used to group lanes into corridors.
+  //
+  // When TrafficLaneParams::bundleByStationPair==true, this is derived from the
+  // unordered station pair (systemId, min(from,to), max(from,to)).
+  // When false, this may be derived from the convoy id (legacy behavior).
+  core::u64 laneKey{0};
+
+  SystemId systemId{0};
+  StationId fromStation{0};
+  StationId toStation{0};
+
+  // +1 or -1 for dual-carriageway lanes (sign applied to `side`).
+  int directionSign{1};
+
+  // Schedule snapshot.
+  double departDay{0.0};
+  double arriveDay{0.0};
+
+  // Endpoints (km) evaluated at (departDay/arriveDay).
+  math::Vec3d p0Km{0, 0, 0};
+  math::Vec3d p1Km{0, 0, 0};
+
+  // Orthonormal frame:
+  //  - dir: along the chord from p0->p1
+  //  - side: perpendicular direction used for lane arc offsets
+  //  - up: completes the basis (useful for lane "ribbon" jitter)
+  math::Vec3d dir{0, 0, 1};
+  math::Vec3d side{1, 0, 0};
+  math::Vec3d up{0, 1, 0};
+
+  double distKm{0.0};
+  double durSec{0.0};
+
+  // Base arc amplitude (km). Applied as sin^2(pi*t) so endpoints are zero.
+  double arcMagKm{0.0};
+
+  // Jitter applied to arcMagKm for this specific convoy (km). Typically 0.
+  double arcJitterKm{0.0};
+};
+
 struct TrafficConvoyView {
   TrafficConvoy convoy{};
   TrafficConvoyState state{};
@@ -105,6 +172,14 @@ std::vector<TrafficConvoy> generateTrafficConvoysForDay(core::u64 universeSeed,
                                                         int dayStamp,
                                                         const TrafficLaneParams& params = {});
 
+// Compute the lane geometry used for a convoy.
+//
+// This is deterministic from (systemId, station ids, convoy schedule) and the
+// lane parameters.
+TrafficLaneGeometry computeTrafficLaneGeometry(const TrafficConvoy& convoy,
+                                               const StarSystem& system,
+                                               const TrafficLaneParams& params = {});
+
 // Evaluate a convoy's position/velocity at a time. The returned state is safe
 // to compute even when timeDays is outside [departDay, arriveDay] (progress is
 // clamped and active=false).
@@ -112,6 +187,18 @@ TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
                                          const StarSystem& system,
                                          double timeDays,
                                          const TrafficLaneParams& params = {});
+
+// Evaluate using a precomputed lane geometry (faster when sampling many times).
+TrafficConvoyState evaluateTrafficConvoy(const TrafficLaneGeometry& lane,
+                                         double timeDays,
+                                         const TrafficLaneParams& params = {});
+
+// Sample a lane path as positions in km.
+//
+// Returns `segments + 1` points (including both endpoints) when segments >= 1.
+std::vector<math::Vec3d> sampleTrafficLanePathKm(const TrafficLaneGeometry& lane,
+                                                 int segments,
+                                                 const TrafficLaneParams& params = {});
 
 // Convenience: generate convoys around timeDays (dayStamp +/- genWindowDays)
 // and return each convoy with evaluated state.
