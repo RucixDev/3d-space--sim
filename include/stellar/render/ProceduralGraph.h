@@ -196,7 +196,6 @@ private:
   bool generateMips_{true};
   float ditherStrength_{1.0f};
   bool packHeightInAlpha_{false};
-  bool packHeightInAlpha_{false};
 
   // Packed uniform data (fixed max sizes).
   std::array<float, kProcGraphMaxNodes * 4> packedParams_{};

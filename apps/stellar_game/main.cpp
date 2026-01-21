@@ -3089,6 +3089,9 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::SpectralMieLabWindowState spectralMieLabWindow{};
   game::GaussianSurfelReconstructionLabWindowState gaussianSurfelReconLabWindow{};
 
+  // Alias to the Integration Hub action queue (cross-system glue).
+  game::GameActionQueue& gameActions = integrationHubWindow.actions;
+
   // Cross-system trace correlation: mirror Integration Hub events into the Flight Recorder
   // as discrete markers so telemetry can be inspected alongside gameplay/devtools events.
   integrationHubWindow.onEvent = [&](const game::GameEvent& ev) {
@@ -5895,8 +5898,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
       // (Mouse handled here for all events; keyboard handled below in the KEYDOWN branch so rebind can intercept.)
       if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEWHEEL) {
         game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
-                                   [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                   [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
       }
 
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
@@ -6111,7 +6113,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               as.u64bConst = a.u64bConst;
               as.i32Const = a.i32Const;
               as.bConst = a.bConst;
-              as.delaySec = std::max(0.0, a.delaySec);
+              as.delaySec = std::max(0.0, (double)a.delaySec);
               as.msgTemplate = std::string(a.msgTemplate);
               rs.actions.push_back(std::move(as));
             }
@@ -15747,7 +15749,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       const float camForward[3] = {(float)f.x, (float)f.y, (float)f.z};
       const float camPosU[3] = {(float)cp.x, (float)cp.y, (float)cp.z};
 
-      const float tanHalfFovY = (float)std::tan(math::degToRad(camFovDeg) * 0.5);
+      const float tanHalfFovY = (float)std::tan(math::degToRad(rig.fovDeg) * 0.5);
       proceduralSky.draw(sceneW, sceneH,
                          vfxProceduralSky,
                          camRight, camUp, camForward,
@@ -17112,8 +17114,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     game::tickRuntimeValidation(runtimeValidationWindow, ship, &flightRecorderWindow, timeRealSec, timeDays, paused,
                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
                                 [&](const game::GameEvent& e) { game::hubPushEvent(integrationHubWindow, e); },
-                                [&](const game::GameAction& a) { game::hubPushAction(integrationHubWindow, a); },
-                                &integrationHubWindow.events);
+                                [&](const game::GameAction& a) { game::hubPushAction(integrationHubWindow, a); });
 
     // ---- UI ----
     // Rebuild fonts *before* starting a new ImGui frame.
@@ -18063,57 +18064,44 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Audio analyzer / oscilloscope (procedural audio tooling)
     game::drawAudioAnalyzerWindow(audioAnalyzerWindow, audio,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     // Flight telemetry recorder
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralLabWindow(proceduralLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralFluidLabWindow(proceduralFluidLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawTextAnimationLabWindow(textAnimationLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralMeshLabWindow(proceduralMeshLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralShaderLabWindow(proceduralShaderLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralSystemLabWindow(proceduralSystemLabWindow, universe, currentSystem ? currentSystem->stub.id : 0, timeDays, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawProceduralTradeSystemsLabWindow(proceduralTradeSystemsLabWindow, universe, currentSystem, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawSpectralMieLabWindow(spectralMieLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
     game::drawGaussianSurfelReconstructionLabWindow(gaussianSurfelReconLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
 
     game::drawCinematicCameraWindow(cinematicCameraWindow,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
-                                &integrationHubWindow.events);
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     game::drawCameraRigWindow(cameraRigWindow, ship, currentSystem, timeDays, gravityParams,
                               [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
