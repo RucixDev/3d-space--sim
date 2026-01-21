@@ -16,8 +16,12 @@ namespace stellar::sim {
 static constexpr double kPi = std::numbers::pi_v<double>;
 
 // Stable tags for behavior continuity across versions.
-static constexpr std::string_view kConvoyTag = "traffic_convoy_v1";
-static constexpr std::string_view kLaneTag   = "traffic_lane_v1";
+static constexpr std::string_view kConvoyTag     = "traffic_convoy_v1";
+static constexpr std::string_view kLaneTagV1     = "traffic_lane_v1";
+static constexpr std::string_view kLaneTagV2     = "traffic_lane_corridor_v2";
+static constexpr std::string_view kLaneDirTag    = "traffic_lane_dir_v1";
+static constexpr std::string_view kLaneArcTag    = "traffic_lane_arc_v1";
+static constexpr std::string_view kLaneJitterTag = "traffic_lane_arcjitter_v1";
 
 static const Station* findStation(const StarSystem& sys, StationId id) {
   for (const auto& st : sys.stations) {
@@ -52,19 +56,20 @@ static int chooseWeightedStations(core::SplitMix64& rng, const std::vector<doubl
   return (int)w.size() - 1;
 }
 
+// Deterministic unit-vector sampler with fixed RNG consumption.
+//
+// This avoids rejection sampling so arc magnitude draws remain stable even if
+// code changes the number of samples taken in the direction generator.
 static math::Vec3d randomUnitVec(core::SplitMix64& rng) {
-  // Rejection sampling in a cube; sufficient for a prototype.
-  for (int tries = 0; tries < 8; ++tries) {
-    const double x = rng.range(-1.0, 1.0);
-    const double y = rng.range(-1.0, 1.0);
-    const double z = rng.range(-1.0, 1.0);
-    const double len2 = x * x + y * y + z * z;
-    if (len2 > 1e-8 && len2 <= 1.0) {
-      const double inv = 1.0 / std::sqrt(len2);
-      return {x * inv, y * inv, z * inv};
-    }
-  }
-  return {0, 1, 0};
+  // z in [-1,1], phi in [0,2pi)
+  const double z = rng.range(-1.0, 1.0);
+  const double phi = rng.range(0.0, 2.0 * kPi);
+
+  const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+  const double x = r * std::cos(phi);
+  const double y = z;
+  const double zz = r * std::sin(phi);
+  return {x, y, zz};
 }
 
 static core::u64 convoySeed(core::u64 universeSeed, SystemId systemId, int dayStamp) {
@@ -73,6 +78,26 @@ static core::u64 convoySeed(core::u64 universeSeed, SystemId systemId, int daySt
   s = core::hashCombine(s, (core::u64)systemId);
   s = core::hashCombine(s, (core::u64)(core::u32)dayStamp);
   return s;
+}
+
+static core::u64 corridorLaneKey(SystemId systemId, StationId a, StationId b) {
+  const StationId lo = std::min(a, b);
+  const StationId hi = std::max(a, b);
+
+  // Note: StationId/SystemId are already deterministic world ids derived from
+  // the universe seed, so hashing them is sufficient to disambiguate lanes
+  // across different universes.
+  const core::u64 tag = core::seedFromText(kLaneTagV2);
+  const core::u64 h = core::hashCombine((core::u64)systemId,
+                                       core::hashCombine((core::u64)lo, (core::u64)hi));
+  return makeDeterministicWorldId(tag, h);
+}
+
+static core::u64 legacyLaneKey(const TrafficConvoy& convoy, const StarSystem& system) {
+  // Legacy: lane seed derived from convoy id.
+  const core::u64 tag = core::seedFromText(kLaneTagV1);
+  const core::u64 h = core::hashCombine((core::u64)system.stub.id, convoy.id);
+  return makeDeterministicWorldId(tag, h);
 }
 
 std::vector<TrafficConvoy> generateTrafficConvoysForDay(core::u64 universeSeed,
@@ -229,50 +254,62 @@ std::vector<TrafficConvoy> generateTrafficConvoysForDay(core::u64 universeSeed,
   return out;
 }
 
-TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
-                                         const StarSystem& system,
-                                         double timeDays,
-                                         const TrafficLaneParams& params) {
-  TrafficConvoyState st;
+TrafficLaneGeometry computeTrafficLaneGeometry(const TrafficConvoy& convoy,
+                                               const StarSystem& system,
+                                               const TrafficLaneParams& params) {
+  TrafficLaneGeometry lane{};
+
+  lane.systemId = convoy.systemId;
+  lane.fromStation = convoy.fromStation;
+  lane.toStation = convoy.toStation;
+  lane.departDay = convoy.departDay;
+  lane.arriveDay = convoy.arriveDay;
 
   const Station* from = findStation(system, convoy.fromStation);
   const Station* to = findStation(system, convoy.toStation);
-  if (!from || !to) return st;
+  if (!from || !to) return lane;
 
+  // Endpoints.
   const double depart = convoy.departDay;
   const double arrive = convoy.arriveDay;
   const double durDays = std::max(1e-9, arrive - depart);
   const double durSec = durDays * kSecondsPerDay;
 
-  double t = 0.0;
-  if (durDays > 0.0) t = (timeDays - depart) / durDays;
-  st.active = (timeDays >= depart && timeDays <= arrive);
-  st.progress01 = std::clamp(t, 0.0, 1.0);
+  lane.p0Km = stationPosKm(*from, depart);
+  lane.p1Km = stationPosKm(*to, arrive);
+  const math::Vec3d delta = lane.p1Km - lane.p0Km;
+  lane.distKm = delta.length();
+  lane.durSec = durSec;
 
-  const math::Vec3d p0 = stationPosKm(*from, depart);
-  const math::Vec3d p1 = stationPosKm(*to, arrive);
-  const math::Vec3d delta = p1 - p0;
-  st.distKm = delta.length();
-  st.speedKmS = (durSec > 0.0) ? (st.distKm / durSec) : 0.0;
-
-  // Direction.
-  if (st.distKm > 1e-6) {
-    st.dir = delta * (1.0 / st.distKm);
+  if (lane.distKm > 1e-6) {
+    lane.dir = delta * (1.0 / lane.distKm);
   } else {
-    st.dir = {0, 0, 1};
+    lane.dir = {0, 0, 1};
   }
 
-  // Base linear interpolation along the chord.
-  const math::Vec3d basePos = p0 + delta * st.progress01;
-  const math::Vec3d baseVel = (durSec > 0.0) ? (delta * (1.0 / durSec)) : math::Vec3d{0, 0, 0};
+  // Direction sign for dual-carriageway lanes.
+  lane.directionSign = 1;
+  if (params.dualCarriageway && convoy.fromStation != convoy.toStation) {
+    lane.directionSign = (convoy.fromStation < convoy.toStation) ? 1 : -1;
+  }
 
-  // Lane arc derived from convoy id (no extra saved state required).
-  core::SplitMix64 r(core::hashCombine(convoy.id ^ core::seedFromText(kLaneTag), (core::u64)system.stub.id));
-  const math::Vec3d rv = randomUnitVec(r);
-  math::Vec3d side = math::cross(st.dir, rv);
+  // Stable key used for corridor grouping and sub-stream RNG.
+  if (params.bundleByStationPair) {
+    lane.laneKey = corridorLaneKey(system.stub.id, convoy.fromStation, convoy.toStation);
+  } else {
+    lane.laneKey = legacyLaneKey(convoy, system);
+  }
+
+  // Side direction.
+  // Use independent sub-streams so future tweaks to the direction sampler don't
+  // perturb arc magnitudes.
+  core::SplitMix64 rngDir(core::hashCombine(lane.laneKey, core::seedFromText(kLaneDirTag)));
+  const math::Vec3d rv = randomUnitVec(rngDir);
+
+  math::Vec3d side = math::cross(lane.dir, rv);
   double sideLen = side.length();
   if (sideLen < 1e-6) {
-    side = math::cross(st.dir, {0, 1, 0});
+    side = math::cross(lane.dir, {0, 1, 0});
     sideLen = side.length();
   }
   if (sideLen < 1e-6) {
@@ -280,14 +317,63 @@ TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
     sideLen = 1.0;
   }
   side = side * (1.0 / sideLen);
+  side = side * (double)lane.directionSign;
+  lane.side = side;
 
-  const double arcCapByDist = std::max(0.0, params.arcMaxFracOfDistance) * st.distKm;
+  // Up axis completes the frame. (Useful for optional future lane ribbon jitter.)
+  math::Vec3d up = math::cross(lane.side, lane.dir);
+  const double upLen = up.length();
+  if (upLen > 1e-6) up = up * (1.0 / upLen);
+  lane.up = up;
+
+  // Arc magnitude: clamp by distance so short hops don't produce huge arcs.
+  const double arcCapByDist = std::max(0.0, params.arcMaxFracOfDistance) * lane.distKm;
   const double arcCap = std::max(0.0, std::min(params.arcMaxKm, arcCapByDist));
 
   // arcMinKm is a "preferred" minimum, but we never exceed the cap.
   const double arcMin = std::clamp(params.arcMinKm, 0.0, arcCap);
   const double arcMax = std::max(arcMin, arcCap);
-  const double arcMag = (arcCap > 0.0) ? r.range(arcMin, arcMax) : 0.0;
+
+  core::SplitMix64 rngArc(core::hashCombine(lane.laneKey, core::seedFromText(kLaneArcTag)));
+  lane.arcMagKm = (arcCap > 0.0) ? rngArc.range(arcMin, arcMax) : 0.0;
+
+  // Optional per-convoy arc jitter (keeps overlapping convoys distinct).
+  lane.arcJitterKm = 0.0;
+  if (lane.arcMagKm > 0.0 && params.arcJitterFrac > 0.0) {
+    const double jf = std::max(0.0, params.arcJitterFrac);
+    core::SplitMix64 rngJ(core::hashCombine(convoy.id ^ core::seedFromText(kLaneJitterTag), lane.laneKey));
+    const double s = (rngJ.nextUnit() * 2.0 - 1.0); // [-1,1]
+    lane.arcJitterKm = lane.arcMagKm * (s * jf);
+  }
+
+  return lane;
+}
+
+TrafficConvoyState evaluateTrafficConvoy(const TrafficLaneGeometry& lane,
+                                         double timeDays,
+                                         const TrafficLaneParams&) {
+  TrafficConvoyState st;
+
+  const double depart = lane.departDay;
+  const double arrive = lane.arriveDay;
+  const double durDays = std::max(1e-9, arrive - depart);
+  const double durSec = durDays * kSecondsPerDay;
+
+  double t = 0.0;
+  if (durDays > 0.0) t = (timeDays - depart) / durDays;
+
+  st.active = (timeDays >= depart && timeDays <= arrive);
+  st.progress01 = std::clamp(t, 0.0, 1.0);
+
+  const math::Vec3d delta = lane.p1Km - lane.p0Km;
+  st.distKm = lane.distKm;
+  st.speedKmS = (durSec > 0.0) ? (st.distKm / durSec) : 0.0;
+
+  st.dir = lane.dir;
+
+  // Base linear interpolation along the chord.
+  const math::Vec3d basePos = lane.p0Km + delta * st.progress01;
+  const math::Vec3d baseVel = (durSec > 0.0) ? (delta * (1.0 / durSec)) : math::Vec3d{0, 0, 0};
 
   // Use an ease-in/out arc that has *zero* lateral velocity at the endpoints.
   // offset(phase) = sin^2(pi*phase) * arcMag
@@ -296,11 +382,12 @@ TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
   const double cp = std::cos(kPi * phase);
   const double s2 = sp * sp;
 
-  const math::Vec3d arcOffset = side * (s2 * arcMag);
+  const double arcMag = std::max(0.0, lane.arcMagKm + lane.arcJitterKm);
+  const math::Vec3d arcOffset = lane.side * (s2 * arcMag);
 
   // d/dt[sin^2(pi*phase)] = 2*sin(pi*phase)*cos(pi*phase) * pi / durSec
   const double ds2_dt = (durSec > 0.0) ? (2.0 * sp * cp * kPi / durSec) : 0.0;
-  const math::Vec3d arcVel = side * (ds2_dt * arcMag);
+  const math::Vec3d arcVel = lane.side * (ds2_dt * arcMag);
 
   st.posKm = basePos + arcOffset;
   st.velKmS = baseVel + arcVel;
@@ -312,6 +399,34 @@ TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
   }
 
   return st;
+}
+
+TrafficConvoyState evaluateTrafficConvoy(const TrafficConvoy& convoy,
+                                         const StarSystem& system,
+                                         double timeDays,
+                                         const TrafficLaneParams& params) {
+  const TrafficLaneGeometry lane = computeTrafficLaneGeometry(convoy, system, params);
+  return evaluateTrafficConvoy(lane, timeDays, params);
+}
+
+std::vector<math::Vec3d> sampleTrafficLanePathKm(const TrafficLaneGeometry& lane,
+                                                 int segments,
+                                                 const TrafficLaneParams& params) {
+  std::vector<math::Vec3d> pts;
+  if (segments < 1) return pts;
+
+  const double depart = lane.departDay;
+  const double arrive = lane.arriveDay;
+  const double dur = std::max(1e-12, arrive - depart);
+
+  pts.reserve((std::size_t)segments + 1);
+  for (int i = 0; i <= segments; ++i) {
+    const double u = (double)i / (double)segments;
+    const double t = depart + u * dur;
+    const auto st = evaluateTrafficConvoy(lane, t, params);
+    pts.push_back(st.posKm);
+  }
+  return pts;
 }
 
 std::vector<TrafficConvoyView> generateTrafficConvoys(core::u64 universeSeed,

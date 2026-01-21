@@ -73,21 +73,12 @@ std::vector<math::Vec3d> sampleTrafficConvoyPathKm(const TrafficConvoy& convoy,
                                                    const StarSystem& system,
                                                    int segments,
                                                    const TrafficLaneParams& laneParams) {
-  std::vector<math::Vec3d> pts;
-  if (segments < 1) return pts;
+  if (segments < 1) return {};
 
-  const double depart = convoy.departDay;
-  const double arrive = convoy.arriveDay;
-  const double dur = std::max(1e-12, arrive - depart);
-
-  pts.reserve((std::size_t)segments + 1);
-  for (int i = 0; i <= segments; ++i) {
-    const double u = (double)i / (double)segments;
-    const double t = depart + u * dur;
-    const auto st = evaluateTrafficConvoy(convoy, system, t, laneParams);
-    pts.push_back(st.posKm);
-  }
-  return pts;
+  // Compute lane geometry once, then sample. This avoids re-computing station
+  // endpoint positions and lane basis for every segment.
+  const auto lane = computeTrafficLaneGeometry(convoy, system, laneParams);
+  return sampleTrafficLanePathKm(lane, segments, laneParams);
 }
 
 } // namespace stellar::sim
