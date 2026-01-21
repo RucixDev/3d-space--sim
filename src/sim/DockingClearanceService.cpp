@@ -1,3 +1,5 @@
+#include "stellar/sim/DockingPads.h"
+
 #include "stellar/sim/DockingClearanceService.h"
 
 #include "stellar/core/Hash.h"
@@ -111,6 +113,9 @@ DockingClearanceDecision requestDockingClearance(core::u64 universeSeed,
     ioState.expiresDays = timeDays + params.grantDurationSec / 86400.0;
     ioState.cooldownUntilDays = timeDays;
 
+    const int padCount = stationDockingPadCount(st);
+    ioState.assignedPad = (core::u16)rng.range(1, std::max(1, padCount));
+
     out.status = DockingClearanceStatus::Granted;
     out.hasClearance = true;
     return out;
@@ -118,6 +123,7 @@ DockingClearanceDecision requestDockingClearance(core::u64 universeSeed,
 
   // Denied: apply cooldown and revoke.
   ioState.granted = false;
+  ioState.assignedPad = 0;
   ioState.expiresDays = 0.0;
   ioState.cooldownUntilDays = timeDays + params.denyCooldownSec / 86400.0;
 

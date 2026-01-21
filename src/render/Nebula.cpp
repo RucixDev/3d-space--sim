@@ -351,6 +351,29 @@ void NebulaField::regenerate(core::u64 seed, int puffCount, float bandPower) {
 
   points_.clear();
   points_.reserve(puffs_.size());
+
+  // Initialize the cached turbulence noise term.
+  //
+  // NOTE: We intentionally do this once during regeneration; update() will
+  // refresh a small batch per frame.
+  cachedNoise01_.clear();
+  cachedNoise01_.reserve(puffs_.size());
+  noiseCursor_ = 0;
+
+  if (!puffs_.empty()) {
+    const core::u64 noiseSeed = core::hashCombine(seed_, core::fnv1a64("nebula_update_v2"));
+    const double nNorm = fbmSumAmp(3, 0.55);
+    constexpr double tf = 4.1;
+    constexpr double t0 = 0.0;
+
+    for (const Puff& p : puffs_) {
+      const double nx = p.dir.x * tf + t0 * 0.030;
+      const double ny = p.dir.y * tf - t0 * 0.022;
+      const double nz = p.dir.z * tf + t0 * 0.027;
+      const double n = proc::fbmPerlin3D(noiseSeed, nx, ny, nz, 3, 2.1, 0.55) / nNorm;
+      cachedNoise01_.push_back((float)n);
+    }
+  }
 }
 
 void NebulaField::update(const math::Vec3d& cameraPosU, double timeSeconds, const Settings& s) {
@@ -375,18 +398,52 @@ void NebulaField::update(const math::Vec3d& cameraPosU, double timeSeconds, cons
   const core::u64 noiseSeed = core::hashCombine(seed_, core::fnv1a64("nebula_update_v2"));
   const double nNorm = fbmSumAmp(3, 0.55);
 
-  for (const Puff& p : puffs_) {
+  // Refresh a subset of the cached noise values each frame.
+  //
+  // This trades a tiny amount of temporal lag for much lower CPU cost vs
+  // evaluating fBm noise for every puff every frame.
+  if (cachedNoise01_.size() != puffs_.size()) {
+    cachedNoise01_.assign(puffs_.size(), 0.5f);
+    noiseCursor_ = 0;
+  }
+
+  const std::size_t nPuffs = puffs_.size();
+  if (nPuffs > 0) {
+    // Aim to refresh the whole field over ~24 frames (tunable).
+    const int slices = 24;
+    const int minBatch = 8;
+    const int maxBatch = 256;
+    int batch = (int)(nPuffs / (std::size_t)slices);
+    batch = std::clamp(batch, minBatch, maxBatch);
+    batch = std::min<int>(batch, (int)nPuffs);
+
+    constexpr double tf = 4.1;
+    const double t = timeSeconds;
+    const float smooth = 0.18f; // exponential smoothing toward new samples
+
+    for (int i = 0; i < batch; ++i) {
+      const std::size_t idx = (noiseCursor_ + (std::size_t)i) % nPuffs;
+      const Puff& p = puffs_[idx];
+
+      const double nx = p.dir.x * tf + t * 0.030;
+      const double ny = p.dir.y * tf - t * 0.022;
+      const double nz = p.dir.z * tf + t * 0.027;
+      const double ns = proc::fbmPerlin3D(noiseSeed, nx, ny, nz, 3, 2.1, 0.55) / nNorm;
+
+      const float prev = cachedNoise01_[idx];
+      const float target = (float)ns;
+      cachedNoise01_[idx] = prev + (target - prev) * smooth;
+    }
+
+    noiseCursor_ = (noiseCursor_ + (std::size_t)batch) % nPuffs;
+  }
+
+  for (std::size_t i = 0; i < puffs_.size(); ++i) {
+    const Puff& p = puffs_[i];
     const double r0 = inner + (outer - inner) * (double)p.depth01;
 
     // 3D turbulence noise sampled on the sphere, animated by drifting coords over time.
-    const double tf = 4.1;
-    const double t = timeSeconds;
-
-    const double nx = p.dir.x * tf + t * 0.030;
-    const double ny = p.dir.y * tf - t * 0.022;
-    const double nz = p.dir.z * tf + t * 0.027;
-
-    const double n = proc::fbmPerlin3D(noiseSeed, nx, ny, nz, 3, 2.1, 0.55) / nNorm;
+    const double n = (i < cachedNoise01_.size()) ? (double)cachedNoise01_[i] : 0.5;
 
     // Mild per-puff radial variation. Denser puffs jitter slightly less.
     const double jitter = (0.82 + 0.34 * n) * (0.96 - 0.08 * (double)p.density01);

@@ -386,6 +386,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Toggle Autopilot", a.toggleAutopilot);
   addAction("Nav Assist: Approach", a.navAssistApproach);
   addAction("Nav Assist: Match Velocity", a.navAssistMatchVelocity);
+  addAction("Nav Assist: Follow (formation)", a.navAssistFollow);
   addAction("Toggle Mouse steer", a.toggleMouseSteer);
   addAction("Supercruise", a.supercruise);
   addAction("FSD Jump", a.fsdJump);
@@ -773,6 +774,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Toggle Autopilot", controls.actions.toggleAutopilot, ad.toggleAutopilot);
     add("Nav Assist: Approach", controls.actions.navAssistApproach, ad.navAssistApproach);
     add("Nav Assist: Match Velocity", controls.actions.navAssistMatchVelocity, ad.navAssistMatchVelocity);
+    add("Nav Assist: Follow (formation)", controls.actions.navAssistFollow, ad.navAssistFollow);
     add("Mouse steer", controls.actions.toggleMouseSteer, ad.toggleMouseSteer);
     add("Supercruise", controls.actions.supercruise, ad.supercruise);
     add("FSD Jump", controls.actions.fsdJump, ad.fsdJump);

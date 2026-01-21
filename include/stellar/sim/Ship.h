@@ -81,10 +81,19 @@ public:
   // Update physics
   void step(double dtSeconds, const ShipInput& input);
 
-  // Update physics with a constant external acceleration in world space.
+  // Update physics with constant external accelerations.
   //
-  // Intended for lightweight environmental effects (e.g., Newtonian gravity)
-  // without forcing callers to manually integrate velocity/position.
+  // - externalAccelWorldKmS2: world-space linear acceleration (km/s^2)
+  // - externalAngAccelLocalRadS2: ship-local angular acceleration (rad/s^2)
+  //
+  // This is intended for lightweight environmental effects (gravity, aerodynamics,
+  // docking fields, etc.) while keeping Ship integration deterministic.
+  void stepWithExternalForces(double dtSeconds,
+                             const ShipInput& input,
+                             const math::Vec3d& externalAccelWorldKmS2,
+                             const math::Vec3d& externalAngAccelLocalRadS2);
+
+  // Convenience: external linear acceleration only (no external torque).
   void stepWithExternalAccel(double dtSeconds,
                              const ShipInput& input,
                              const math::Vec3d& externalAccelWorldKmS2);

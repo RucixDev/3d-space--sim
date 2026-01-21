@@ -475,4 +475,23 @@ void Starfield::update(const math::Vec3d& cameraPosU, double timeSeconds) {
   }
 }
 
+void Starfield::exportGpuStars(std::vector<GpuStar>& out) const {
+  out.clear();
+  out.reserve(stars_.size());
+  for (const auto& s : stars_) {
+    GpuStar g;
+    g.dx = (float)s.dir.x;
+    g.dy = (float)s.dir.y;
+    g.dz = (float)s.dir.z;
+    g.r = s.r;
+    g.g = s.g;
+    g.b = s.b;
+    g.baseAlpha = s.baseAlpha;
+    g.sizePx = s.sizePx;
+    g.twinkleSpeed = s.twinkleSpeed;
+    g.phase = s.phase;
+    out.push_back(g);
+  }
+}
+
 } // namespace stellar::render

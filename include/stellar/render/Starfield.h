@@ -56,6 +56,25 @@ public:
     double relaxStrength{0.20};
   };
 
+  // GPU-friendly packed star attributes.
+  //
+  // When rendering via StarfieldGpuRenderer, we upload these once after
+  // regenerate() and then compute the final world position + twinkle on the GPU
+  // (vertex shader) each frame. This avoids per-frame CPU expansion of stars
+  // around the camera and dramatically reduces streaming bandwidth.
+  struct GpuStar {
+    // Unit direction vector on the sky sphere.
+    float dx{0.0f}, dy{0.0f}, dz{1.0f};
+
+    // Base color.
+    float r{1.0f}, g{1.0f}, b{1.0f};
+
+    float baseAlpha{1.0f};
+    float sizePx{1.0f};
+    float twinkleSpeed{1.0f};
+    float phase{0.0f};
+  };
+
   void setRadius(double radiusU) { radiusU_ = radiusU; }
   double radius() const { return radiusU_; }
 
@@ -73,6 +92,10 @@ public:
 
   const std::vector<PointVertex>& points() const { return points_; }
   std::size_t starCount() const { return stars_.size(); }
+
+  // Export GPU-friendly packed star attributes.
+  // Intended for use with StarfieldGpuRenderer.
+  void exportGpuStars(std::vector<GpuStar>& out) const;
 
 private:
   struct Star {

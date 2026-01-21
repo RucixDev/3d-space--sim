@@ -1,11 +1,9 @@
 #include "ProceduralMeshLabWindow.h"
 
-#include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
 #include "stellar/math/Math.h"
 #include "stellar/math/Mat4.h"
 #include "stellar/math/Vec3.h"
-#include "stellar/render/Gl.h"
 #include "stellar/render/GltfExport.h"
 
 #include "Screenshot.h"
@@ -26,11 +24,6 @@ namespace stellar::game {
 namespace {
 
 using namespace stellar;
-
-// Forward declarations for helpers used before their definitions.
-static void uploadPreviewMeshForCurrentLod(ProceduralMeshLabWindowState& st);
-static void resetLodChainToBaseMesh(ProceduralMeshLabWindowState& st);
-static void requestBuildLods(ProceduralMeshLabWindowState& st);
 
 static const char* meshOpHelp(render::SdfNodeOp op) {
   switch (op) {
@@ -460,13 +453,9 @@ static void renderPreview(ProceduralMeshLabWindowState& st, float timeSec) {
   if (!prevCull) glDisable(GL_CULL_FACE);
   if (prevBlend) glEnable(GL_BLEND);
 
-  // Restore core GL object bindings.
-  // NOTE: We intentionally use the engine's tiny GL loader wrappers here
-  // instead of calling glUseProgram/glBindVertexArray/glBindFramebuffer
-  // directly (those entry points are not exported from legacy Windows gl.h).
-  if (render::gl::UseProgram) render::gl::UseProgram((GLuint)prevProg);
-  if (render::gl::BindVertexArray) render::gl::BindVertexArray((GLuint)prevVao);
-  if (render::gl::BindFramebuffer) render::gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+  glUseProgram((GLuint)prevProg);
+  glBindVertexArray((GLuint)prevVao);
+  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
   glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
   // Restore polygon mode (OpenGL returns front/back packed on some drivers).
@@ -1639,6 +1628,23 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
         st.texDirty = true;
       }
 
+      if (ImGui::Checkbox("Generate mips##texMips", &st.texGenerateMips)) {
+        st.texDirty = true;
+      }
+      if (ImGui::SliderFloat("Dither##texDither", &st.texDitherStrength, 0.0f, 2.0f, "%.2f")) {
+        st.texDirty = true;
+      }
+
+      if (ImGui::Checkbox("Pack height in alpha##texHeightA", &st.texPackHeightInAlpha)) {
+        // Requires a re-bake to take effect.
+        st.texDirty = true;
+      }
+
+      // Apply quality options to the texture baker (affects the next bake).
+      st.texBaker.setGenerateMips(st.texGenerateMips);
+      st.texBaker.setDitherStrength(st.texDitherStrength);
+      st.texBaker.setPackHeightInAlpha(st.texPackHeightInAlpha);
+
       ImGui::Checkbox("Auto-bake##tex", &st.texAutoBake);
       ImGui::SameLine();
       const bool wantBake = ImGui::Button("Bake texture") || (st.texAutoBake && st.texDirty);
@@ -1659,7 +1665,12 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
 
       if (st.texBaker.isReady()) {
         ImGui::SameLine();
-        ImGui::TextDisabled("(shader %.2f ms, draw %.2f ms)", st.texBaker.stats().shaderBuildMs, st.texBaker.stats().drawMs);
+        const auto& s = st.texBaker.stats();
+        if (st.texGenerateMips) {
+          ImGui::TextDisabled("(shader %.2f ms, draw %.2f ms, mips %.2f ms)", s.shaderBuildMs, s.drawMs, s.mipsGenerated ? s.mipGenMs : 0.0);
+        } else {
+          ImGui::TextDisabled("(shader %.2f ms, draw %.2f ms)", s.shaderBuildMs, s.drawMs);
+        }
         ImGui::Image((ImTextureID)(intptr_t)st.texBaker.texture().handle(), ImVec2(128, 128), ImVec2(0, 1), ImVec2(1, 0));
       }
 
@@ -1667,6 +1678,19 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
       ImGui::DragFloat("RM UV scale", &st.raymarchMat.uvScale, 0.01f, 0.05f, 20.0f);
       ImGui::DragFloat("RM UV rotate", &st.raymarchMat.uvRotateDeg, 0.5f, -360.0f, 360.0f);
       ImGui::DragFloat2("RM UV offset", st.raymarchMat.uvOffset, 0.01f, -10.0f, 10.0f);
+
+      ImGui::SeparatorText("Raymarch Mapping");
+      ImGui::Checkbox("RM Triplanar blend##rmTri", &st.raymarchMat.triplanarBlend);
+      ImGui::SliderFloat("RM Tri sharpness##rmTriSharp", &st.raymarchMat.triplanarSharpness, 1.0f, 16.0f, "%.1f");
+
+      ImGui::SeparatorText("Raymarch Micro Normals");
+      ImGui::Checkbox("RM Height from alpha##rmHeightA", &st.raymarchMat.heightFromAlpha);
+      ImGui::SliderFloat("RM Micro normal strength##rmMicroN", &st.raymarchMat.microNormalStrength, 0.0f, 4.0f, "%.2f");
+      ImGui::SliderFloat("RM Micro normal step (texels)##rmMicroStep", &st.raymarchMat.microNormalStepTexels, 0.25f, 4.0f, "%.2f");
+
+      if (st.raymarchMat.microNormalStrength > 0.0f && (!st.texPackHeightInAlpha || !st.raymarchMat.heightFromAlpha)) {
+        ImGui::TextDisabled("Tip: enable 'Pack height in alpha' and 'RM Height from alpha' for best results.");
+      }
 
       // Graph save/load (texture graph)
       ImGui::InputText("Tex graph file", st.texGraphPath, sizeof(st.texGraphPath));

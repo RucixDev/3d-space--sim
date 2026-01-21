@@ -65,6 +65,18 @@ private:
   core::u64 seed_{0};
   float bandPower_{1.8f};
 
+  // Cache of the expensive turbulence noise term used by update().
+  //
+  // The original implementation evaluated fBm Perlin noise for every puff
+  // every frame. On integrated GPUs / slower CPUs this can become a dominant
+  // per-frame cost and tank FPS when nebula counts are high.
+  //
+  // We instead maintain a cached noise value per puff and refresh a small
+  // batch each frame using exponential smoothing. This preserves the visual
+  // feel (slowly drifting breakup) while reducing noise evaluations by ~N/slices.
+  std::vector<float> cachedNoise01_;
+  std::size_t noiseCursor_{0};
+
   std::vector<Puff> puffs_;
   std::vector<PointVertex> points_;
 };

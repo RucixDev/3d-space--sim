@@ -107,6 +107,7 @@ bool saveVfxSettingsToFile(const VfxSettings& s, const std::string& path) {
 
   f << "starfieldEnabled " << (s.starfieldEnabled ? 1 : 0) << "\n";
   f << "starfieldTextured " << (s.starfieldTextured ? 1 : 0) << "\n";
+  f << "starfieldGpuEnabled " << (s.starfieldGpuEnabled ? 1 : 0) << "\n";
   f << "starCount " << s.starCount << "\n";
   f << "starRadiusU " << s.starRadiusU << "\n";
 
@@ -223,8 +224,9 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
     }
   }
 
+  // Start from defaults (current version) and overlay any keys from disk.
+  // This keeps newly added fields working even when loading older files.
   VfxSettings s = makeDefaultVfxSettings();
-  s.version = version;
 
   std::string line;
   while (std::getline(f, line)) {
@@ -263,6 +265,10 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
     }
     if (key == "starfieldTextured") {
       std::string v; ss >> v; bool b = s.starfieldTextured; if (parseBool(v, &b)) s.starfieldTextured = b;
+      continue;
+    }
+    if (key == "starfieldGpuEnabled") {
+      std::string v; ss >> v; bool b = s.starfieldGpuEnabled; if (parseBool(v, &b)) s.starfieldGpuEnabled = b;
       continue;
     }
 

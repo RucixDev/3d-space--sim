@@ -73,6 +73,26 @@ struct SdfRaymarchMaterial {
   float uvScale{1.0f};
   float uvRotateDeg{0.0f};
   float uvOffset[2]{0.0f, 0.0f};
+
+  // Projection / filtering.
+  //
+  // The old preview path selected a single dominant axis which can create visible
+  // seams where the normal transitions between axes. Enabling triplanar blending
+  // samples all three planar projections and blends them based on abs(normal).
+  bool triplanarBlend{true};
+
+  // Exponent applied to the abs(normal) weights before normalization.
+  // Higher values reduce "layering" artifacts and make transitions tighter.
+  float triplanarSharpness{8.0f};
+
+  // Optional micro-normal perturbation derived from a height channel in the albedo
+  // texture.
+  //
+  // This is intended for tooling / previews. It is *not* physically correct normal
+  // mapping, but it adds convincing high-frequency detail when prototyping.
+  bool heightFromAlpha{true};
+  float microNormalStrength{0.0f};
+  float microNormalStepTexels{1.0f};
 };
 
 struct SdfRaymarchStats {

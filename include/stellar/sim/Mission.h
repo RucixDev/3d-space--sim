@@ -1,8 +1,25 @@
 #pragma once
 
-// Mission data is currently defined in SaveGame.h so that the early gameplay
-// loop (missions + progression) can be persisted easily.
-//
-// This header exists as a stable include point for mission-related code.
-
 #include "stellar/sim/SaveGame.h"
+
+namespace stellar::sim {
+
+// Small helper utilities for UI/logging.
+// (Keep this header light and inline-only.)
+
+inline const char* missionTypeName(MissionType t) {
+  switch (t) {
+    case MissionType::Courier: return "Courier";
+    case MissionType::Delivery: return "Delivery";
+    case MissionType::MultiDelivery: return "MultiDelivery";
+    case MissionType::Escort: return "Escort";
+    case MissionType::Salvage: return "Salvage";
+    case MissionType::Passenger: return "Passenger";
+    case MissionType::Smuggle: return "Smuggle";
+    case MissionType::BountyScan: return "BountyScan";
+    case MissionType::BountyKill: return "BountyKill";
+    default: return "Unknown";
+  }
+}
+
+} // namespace stellar::sim

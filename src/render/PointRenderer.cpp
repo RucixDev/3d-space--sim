@@ -4,12 +4,27 @@
 
 #include <cstring>
 
+// Some platform/header combinations (notably Windows) ship legacy OpenGL
+// headers that omit these tokens even though MapBufferRange is available.
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#endif
+#ifndef GL_MAP_INVALIDATE_RANGE_BIT
+#define GL_MAP_INVALIDATE_RANGE_BIT 0x0004
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
+#endif
+
 namespace stellar::render {
 
 PointRenderer::~PointRenderer() {
-  if (vbo_) gl::DeleteBuffers(1, &vbo_);
-  if (vao_) gl::DeleteVertexArrays(1, &vao_);
-  vbo_ = vao_ = 0;
+  for (int i = 0; i < kBufferRing; ++i) {
+    if (vbo_[i]) gl::DeleteBuffers(1, &vbo_[i]);
+    if (vao_[i]) gl::DeleteVertexArrays(1, &vao_[i]);
+    vbo_[i] = vao_[i] = 0;
+    vboCapacityBytes_[i] = 0;
+  }
 }
 
 static const char* kVS = R"GLSL(
@@ -63,23 +78,30 @@ void main() {
 bool PointRenderer::init(std::string* outError) {
   if (!shader_.build(kVS, kFS, outError)) return false;
 
-  gl::GenVertexArrays(1, &vao_);
-  gl::GenBuffers(1, &vbo_);
+  // Create a small VAO/VBO ring so updates never stomp the buffer currently
+  // in-flight on the GPU. This reduces implicit synchronization stalls on
+  // some drivers when streaming many point sprites.
+  for (int i = 0; i < kBufferRing; ++i) {
+    gl::GenVertexArrays(1, &vao_[i]);
+    gl::GenBuffers(1, &vbo_[i]);
 
-  gl::BindVertexArray(vao_);
-  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
-  gl::BufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    gl::BindVertexArray(vao_[i]);
+    gl::BindBuffer(GL_ARRAY_BUFFER, vbo_[i]);
+    gl::BufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STREAM_DRAW);
+    vboCapacityBytes_[i] = 0;
 
-  gl::EnableVertexAttribArray(0);
-  gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, px));
-  gl::EnableVertexAttribArray(1);
-  gl::VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, cr));
-  gl::EnableVertexAttribArray(2);
-  gl::VertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, a));
-  gl::EnableVertexAttribArray(3);
-  gl::VertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, size));
+    gl::EnableVertexAttribArray(0);
+    gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, px));
+    gl::EnableVertexAttribArray(1);
+    gl::VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, cr));
+    gl::EnableVertexAttribArray(2);
+    gl::VertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, a));
+    gl::EnableVertexAttribArray(3);
+    gl::VertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PointVertex), (void*)offsetof(PointVertex, size));
+  }
 
   gl::BindVertexArray(0);
+  ringIndex_ = 0;
 
   for (int i = 0; i < 16; ++i) {
     view_[i] = (i % 5 == 0) ? 1.0f : 0.0f;
@@ -115,12 +137,39 @@ void PointRenderer::drawPoints(const std::vector<PointVertex>& points, PointBlen
   shader_.setUniformMat4("uProj", proj_);
   shader_.setUniform1i("uUseTex", 0);
 
-  gl::BindVertexArray(vao_);
-  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
-  gl::BufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(points.size() * sizeof(PointVertex)),
-                 points.data(),
-                 GL_DYNAMIC_DRAW);
+  ringIndex_ = (ringIndex_ + 1) % kBufferRing;
+  gl::BindVertexArray(vao_[ringIndex_]);
+  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_[ringIndex_]);
+
+  const std::size_t bytes = points.size() * sizeof(PointVertex);
+  if (bytes > vboCapacityBytes_[ringIndex_]) {
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
+    vboCapacityBytes_[ringIndex_] = bytes;
+  }
+
+  // Update buffer contents with a streaming-friendly path.
+  // Prefer MapBufferRange (with invalidation) to avoid implicit reallocation.
+  bool wrote = false;
+  if (gl::MapBufferRange) {
+    void* dst = gl::MapBufferRange(GL_ARRAY_BUFFER,
+                                  0,
+                                  static_cast<GLsizeiptr>(bytes),
+                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (dst) {
+      std::memcpy(dst, points.data(), bytes);
+      if (gl::UnmapBuffer) {
+        (void)gl::UnmapBuffer(GL_ARRAY_BUFFER);
+      }
+      wrote = true;
+    }
+  }
+
+  if (!wrote) {
+    gl::BufferSubData(GL_ARRAY_BUFFER,
+                      0,
+                      static_cast<GLsizeiptr>(bytes),
+                      points.data());
+  }
 
   glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(points.size()));
 
@@ -148,12 +197,37 @@ void PointRenderer::drawPointsSprite(const std::vector<PointVertex>& points,
 
   sprite.bind(0);
 
-  gl::BindVertexArray(vao_);
-  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
-  gl::BufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(points.size() * sizeof(PointVertex)),
-                 points.data(),
-                 GL_DYNAMIC_DRAW);
+  ringIndex_ = (ringIndex_ + 1) % kBufferRing;
+  gl::BindVertexArray(vao_[ringIndex_]);
+  gl::BindBuffer(GL_ARRAY_BUFFER, vbo_[ringIndex_]);
+
+  const std::size_t bytes = points.size() * sizeof(PointVertex);
+  if (bytes > vboCapacityBytes_[ringIndex_]) {
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
+    vboCapacityBytes_[ringIndex_] = bytes;
+  }
+
+  bool wrote = false;
+  if (gl::MapBufferRange) {
+    void* dst = gl::MapBufferRange(GL_ARRAY_BUFFER,
+                                  0,
+                                  static_cast<GLsizeiptr>(bytes),
+                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (dst) {
+      std::memcpy(dst, points.data(), bytes);
+      if (gl::UnmapBuffer) {
+        (void)gl::UnmapBuffer(GL_ARRAY_BUFFER);
+      }
+      wrote = true;
+    }
+  }
+
+  if (!wrote) {
+    gl::BufferSubData(GL_ARRAY_BUFFER,
+                      0,
+                      static_cast<GLsizeiptr>(bytes),
+                      points.data());
+  }
 
   glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(points.size()));
 

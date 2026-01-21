@@ -43,7 +43,7 @@ SdfRaymarcher::~SdfRaymarcher() {
 core::u64 SdfRaymarcher::structureKey(const SdfGraph& g) {
   // Shader structure key: depends only on topology (op + connections).
   // Parameters and seeds are uploaded via uniforms and do NOT require a recompile.
-  core::u64 h = core::fnv1a64("SdfRaymarchShaderV1");
+  core::u64 h = core::fnv1a64("SdfRaymarchShaderV2");
   const int nodeCount = clampNodeCount((int)g.nodes.size());
   h = core::hashCombine(h, (core::u64)nodeCount);
   for (int i = 0; i < nodeCount; ++i) {
@@ -104,6 +104,12 @@ std::string SdfRaymarcher::buildFragmentShader(const SdfGraph& g) {
   ss << "uniform float uTexScale;\n";
   ss << "uniform float uTexRotateDeg;\n";
   ss << "uniform vec2  uTexOffset;\n";
+  ss << "uniform int   uTriplanarBlend;\n";
+  ss << "uniform float uTriSharpness;\n";
+  ss << "uniform vec2  uTexInvSize;\n";
+  ss << "uniform int   uHeightFromAlpha;\n";
+  ss << "uniform float uMicroNormalStrength;\n";
+  ss << "uniform float uMicroNormalStepTexels;\n";
   ss << "uniform vec3  uBgColor;\n";
   ss << "uniform float uAmbient;\n";
   ss << "uniform float uDiffuse;\n";
@@ -617,20 +623,9 @@ float ambientOcclusion(vec3 p, vec3 n) {
   return clamp(1.0 - uAoStrength * occ, 0.0, 1.0);
 }
 
-vec2 texUvFromPoint(vec3 p, vec3 n) {
-  // Simple triplanar-like: choose projection based on normal.
-  vec3 an = abs(n);
-  vec2 uv;
-  if (an.x > an.y && an.x > an.z) {
-    uv = p.yz;
-  } else if (an.y > an.z) {
-    uv = p.xz;
-  } else {
-    uv = p.xy;
-  }
-
+vec2 uvTransform(vec2 baseUv) {
   // Scale + rotate + offset.
-  uv *= uTexScale;
+  vec2 uv = baseUv * uTexScale;
   float a = radians(uTexRotateDeg);
   float c = cos(a), s = sin(a);
   uv = vec2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
@@ -638,10 +633,118 @@ vec2 texUvFromPoint(vec3 p, vec3 n) {
   return uv;
 }
 
+vec3 texSampleRgb(vec2 baseUv) {
+  return texture(uAlbedoTex, uvTransform(baseUv)).rgb;
+}
+
+float texSampleHeight(vec2 baseUv) {
+  vec4 t = texture(uAlbedoTex, uvTransform(baseUv));
+  if (uHeightFromAlpha != 0) {
+    return t.a;
+  }
+  // Luma as a reasonable fallback.
+  return dot(t.rgb, vec3(0.299, 0.587, 0.114));
+}
+
+vec3 triplanarWeights(vec3 n) {
+  vec3 w = abs(n);
+  float p = max(1.0, uTriSharpness);
+  w = pow(w, vec3(p));
+  return w / (w.x + w.y + w.z + 1e-6);
+}
+
 vec3 sampleAlbedo(vec3 p, vec3 n) {
   if (uUseAlbedoTex == 0) return uBaseColor;
-  vec2 uv = texUvFromPoint(p, n);
-  return texture(uAlbedoTex, uv).rgb;
+
+  if (uTriplanarBlend == 0) {
+    // Legacy: choose a single dominant axis.
+    vec3 an = abs(n);
+    vec2 baseUv;
+    if (an.x > an.y && an.x > an.z) {
+      baseUv = p.yz;
+    } else if (an.y > an.z) {
+      baseUv = p.xz;
+    } else {
+      baseUv = p.xy;
+    }
+    return texSampleRgb(baseUv);
+  }
+
+  // Full triplanar blend (weighted by abs(normal), sharpened by a power).
+  vec3 w = triplanarWeights(n);
+  vec3 col = vec3(0.0);
+  // Micro-optimization: with sharpened weights, many regions contribute ~0.
+  if (w.x > 0.001) col += texSampleRgb(p.yz) * w.x;
+  if (w.y > 0.001) col += texSampleRgb(p.xz) * w.y;
+  if (w.z > 0.001) col += texSampleRgb(p.xy) * w.z;
+  return col;
+}
+
+vec2 microStepBaseUv() {
+  // Convert a texel-sized step into base-UV units so the finite-difference kernel
+  // stays stable under uTexScale.
+  float s = max(abs(uTexScale), 1e-4);
+  vec2 stepBase = (uMicroNormalStepTexels * uTexInvSize) / s;
+  return max(stepBase, vec2(1e-6));
+}
+
+vec2 heightGradient2D(vec2 baseUv) {
+  vec2 st = microStepBaseUv();
+
+  float hL = texSampleHeight(baseUv - vec2(st.x, 0.0));
+  float hR = texSampleHeight(baseUv + vec2(st.x, 0.0));
+  float hD = texSampleHeight(baseUv - vec2(0.0, st.y));
+  float hU = texSampleHeight(baseUv + vec2(0.0, st.y));
+
+  float dHdu = (hR - hL) / max(2.0 * st.x, 1e-8);
+  float dHdv = (hU - hD) / max(2.0 * st.y, 1e-8);
+  return vec2(dHdu, dHdv);
+}
+
+vec3 microHeightGradient(vec3 p, vec3 n) {
+  if (uTriplanarBlend == 0) {
+    // Dominant axis gradient.
+    vec3 an = abs(n);
+    if (an.x > an.y && an.x > an.z) {
+      vec2 g = heightGradient2D(p.yz);
+      return vec3(0.0, g.x, g.y);
+    } else if (an.y > an.z) {
+      vec2 g = heightGradient2D(p.xz);
+      return vec3(g.x, 0.0, g.y);
+    } else {
+      vec2 g = heightGradient2D(p.xy);
+      return vec3(g.x, g.y, 0.0);
+    }
+  }
+
+  // Triplanar: blend gradients using the same weights as the albedo.
+  vec3 w = triplanarWeights(n);
+  vec3 g = vec3(0.0);
+  if (w.x > 0.001) {
+    vec2 gx = heightGradient2D(p.yz);
+    g += vec3(0.0, gx.x, gx.y) * w.x;
+  }
+  if (w.y > 0.001) {
+    vec2 gy = heightGradient2D(p.xz);
+    g += vec3(gy.x, 0.0, gy.y) * w.y;
+  }
+  if (w.z > 0.001) {
+    vec2 gz = heightGradient2D(p.xy);
+    g += vec3(gz.x, gz.y, 0.0) * w.z;
+  }
+  return g;
+}
+
+vec3 applyMicroNormal(vec3 p, vec3 nGeom) {
+  if (uUseAlbedoTex == 0) return nGeom;
+  if (uMicroNormalStrength <= 0.0) return nGeom;
+
+  vec3 g = microHeightGradient(p, nGeom);
+  // Project gradient onto the tangent plane so we don't change the normal's
+  // component along itself (stability on steep features).
+  g -= nGeom * dot(g, nGeom);
+
+  return normalize(nGeom - uMicroNormalStrength * g);
 }
 
 void main() {
@@ -703,10 +806,14 @@ void main() {
     return;
   }
 
-  vec3 ld = normalize(uLightDir);
-  float ndl = max(dot(n, ld), 0.0);
+  vec3 nGeom = n;
+  vec3 nShade = applyMicroNormal(p, nGeom);
 
-  vec3 albedo = sampleAlbedo(p, n);
+  vec3 ld = normalize(uLightDir);
+  float ndl = max(dot(nShade, ld), 0.0);
+
+  // Keep albedo projection stable (use the geometry normal for triplanar weights).
+  vec3 albedo = sampleAlbedo(p, nGeom);
 
   vec3 col = vec3(0.0);
   col += albedo * uAmbient;
@@ -714,18 +821,18 @@ void main() {
 
   // Specular.
   vec3 h = normalize(ld - rd);
-  float ndh = max(dot(n, h), 0.0);
+  float ndh = max(dot(nShade, h), 0.0);
   col += pow(ndh, uShininess) * uSpecular;
 
   // Shadows.
   if (uSoftShadow != 0 && uShadowSteps > 0) {
-    float sh = softShadow(p + n * (uEps * 2.0), ld, 0.02, uShadowMaxDist, uShadowK);
+    float sh = softShadow(p + nGeom * (uEps * 2.0), ld, 0.02, uShadowMaxDist, uShadowK);
     col *= mix(1.0, sh, 0.9);
   }
 
   // AO.
   if (uAO != 0 && uAoSteps > 0) {
-    float ao = ambientOcclusion(p, n);
+    float ao = ambientOcclusion(p, nGeom);
     col *= ao;
   }
 
@@ -880,6 +987,22 @@ bool SdfRaymarcher::render(const SdfGraph& g,
   shader_.setUniform2f("uTexOffset",
                        useAlbedo ? mat->uvOffset[0] : 0.0f,
                        useAlbedo ? mat->uvOffset[1] : 0.0f);
+
+  shader_.setUniform1i("uTriplanarBlend", (useAlbedo && mat->triplanarBlend) ? 1 : 0);
+  shader_.setUniform1f("uTriSharpness", useAlbedo ? std::max(1.0f, mat->triplanarSharpness) : 1.0f);
+
+  float invW = 1.0f, invH = 1.0f;
+  if (useAlbedo) {
+    const int tw = std::max(1, mat->albedoTex->width());
+    const int th = std::max(1, mat->albedoTex->height());
+    invW = 1.0f / (float)tw;
+    invH = 1.0f / (float)th;
+  }
+  shader_.setUniform2f("uTexInvSize", invW, invH);
+
+  shader_.setUniform1i("uHeightFromAlpha", (useAlbedo && mat->heightFromAlpha) ? 1 : 0);
+  shader_.setUniform1f("uMicroNormalStrength", useAlbedo ? std::max(0.0f, mat->microNormalStrength) : 0.0f);
+  shader_.setUniform1f("uMicroNormalStepTexels", useAlbedo ? std::max(0.25f, mat->microNormalStepTexels) : 1.0f);
   if (useAlbedo) {
     mat->albedoTex->bind(0);
   } else {

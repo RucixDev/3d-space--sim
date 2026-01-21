@@ -216,12 +216,12 @@ CraterSample craterLayer(vec3 p, uint seed, float freq, float amp, bool withRays
     }
   }
 
-  CraterSample out;
-  out.h = (-amp * depthScale * bowl) + (amp * 0.45 * rim) + (amp * 0.10 * ejectaRing);
-  out.bowl = bowl;
-  out.rim = rim;
-  out.ejecta = ejecta;
-  return out;
+  CraterSample cs;
+  cs.h = (-amp * depthScale * bowl) + (amp * 0.45 * rim) + (amp * 0.10 * ejectaRing);
+  cs.bowl = bowl;
+  cs.rim = rim;
+  cs.ejecta = ejecta;
+  return cs;
 }
 
 CraterSample craterField(vec3 p, uint seed) {
@@ -229,12 +229,12 @@ CraterSample craterField(vec3 p, uint seed) {
   CraterSample b = craterLayer(p, seed ^ 0xF00Du,  7.5, 0.05, false);
   CraterSample c = craterLayer(p, seed ^ 0xB16D0u, 16.0, 0.02, false);
 
-  CraterSample out;
-  out.h = a.h + b.h + c.h;
-  out.bowl = max(a.bowl, max(b.bowl * 0.75, c.bowl * 0.50));
-  out.rim = max(a.rim, max(b.rim * 0.75, c.rim * 0.50));
-  out.ejecta = max(a.ejecta, max(b.ejecta * 0.65, c.ejecta * 0.45));
-  return out;
+  CraterSample cs;
+  cs.h = a.h + b.h + c.h;
+  cs.bowl = max(a.bowl, max(b.bowl * 0.75, c.bowl * 0.50));
+  cs.rim = max(a.rim, max(b.rim * 0.75, c.rim * 0.50));
+  cs.ejecta = max(a.ejecta, max(b.ejecta * 0.65, c.ejecta * 0.45));
+  return cs;
 }
 
 

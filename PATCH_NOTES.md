@@ -1,26 +1,598 @@
-## Round 94 - UI Format Utilities + JSON Export for Procedural System Lab
+## Round 123 - Dynamic resolution render scale (FPS boost)
 
-This round closes a lingering build gap in **ProceduralSystemLabWindow** by adding a small UI formatting layer
-(`ui::toString`, `ui::appendf`) and then leverages it to ship a genuinely useful tool upgrade:
-**structured JSON exports** you can paste into bug reports, tooling, or seed repro scripts.
+This round introduces a **render-scale / dynamic resolution** path that can noticeably improve FPS by rendering the 3D scene + post-processing at a lower internal resolution and upscaling in the final compositor.
 
-### Fixes
+### Highlights
 
-- **Fix: missing `ui::toString(...)` + missing `stellar::ui` namespace**
-  - Added `include/stellar/ui/Format.h` defining the missing helpers.
-- **Fix: MSVC ambiguity in some `std::string += ("...")` patterns**
-  - Refactored clipboard string builders to use explicit appends + `ui::appendf`.
+- **PostFX: render scale + DRS controls**
+  - Manual **Render scale** (0.25..1.0)
+  - Optional **Dynamic resolution** that nudges the render scale toward a target FPS using a smoothed CPU frame-time signal.
+  - Rate-limited scale changes to avoid resize thrash.
 
-### What’s new
+- **Bloom now respects render scale**
+  - Bloom’s half-res chain is sized relative to the **scene** resolution (not the window), avoiding accidental upsampling work.
 
-- **Procedural System Lab: JSON export buttons**
-  - **Copy field JSON** exports the currently selected resource field plus its features.
-  - **Copy system JSON** exports star + planets + moons (including orbits) for deterministic repro.
+- **Retro compositor fixed for scaled scene textures**
+  - Retro mode used `texelFetch` under the assumption the scene texture matched window resolution.
+  - It now maps output pixels → scene texels correctly when renderScale < 1.
+
+- **Optional upscale sharpening**
+  - Cheap unsharp-mask style filter (default off) to offset the blur from upscaling.
 
 ### Files changed/added
 
-- `include/stellar/ui/Format.h` *(new)*
-- `apps/stellar_game/ProceduralSystemLabWindow.cpp`
+- `include/stellar/render/PostFX.h`
+- `src/render/PostFX.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 121 - FPS Boost: Fast Nebula Updates + Streaming Point Buffers
+
+This round focuses on **real, measurable frame-rate improvements** in the most per-frame expensive procedural background layers (nebula + point sprites).
+
+### Highlights
+
+- **NebulaField: cached turbulence noise (time-sliced refresh)**
+  - Previously, the nebula evaluated **fBm Perlin noise for every puff every frame**.
+  - Now, each puff stores a cached noise value, and we **refresh only a small batch per frame** using exponential smoothing.
+  - Result: similar drifting/breakup look with dramatically lower CPU cost at typical puff counts.
+
+- **PointRenderer: VBO capacity caching + MapBufferRange streaming uploads**
+  - Avoids reallocating the point VBO each draw call.
+  - Grows the buffer only when needed, then streams updates through `glMapBufferRange` (fallback to `glBufferSubData`).
+  - Benefits all point-heavy layers: **starfield**, **nebula**, and **CPU particles**.
+
+### Files changed
+
+- `include/stellar/render/Nebula.h`
+- `src/render/Nebula.cpp`
+- `include/stellar/render/PointRenderer.h`
+- `src/render/PointRenderer.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 119 - Integration Hub Automation Persistence (SaveGame v32)
+
+This round upgrades the **Integration Hub** from a session-only devtool into a persistent **player workflow / macro** system by saving and restoring automation rules through **SaveGame** (quicksave/quickload).
+
+### Highlights
+
+- **SaveGame v32: Integration Hub automation serialization**
+  - New keys in the save format:
+    - `hubAutomationsEnabled` (bool)
+    - `hubRules` (count)
+    - `hub_rule` and `hub_action` records (strings base64-encoded like comms)
+  - Strings (rule names, tag text, message templates) use the existing base64 token strategy so the save file stays whitespace-safe.
+
+- **Stable enum IDs for persisted automation payloads**
+  - `GameEventKind` and `GameActionKind` now have **explicit numeric values** and a "do not reorder" comment.
+  - This prevents future enum edits from silently breaking saved automation rules.
+
+- **Quicksave/quickload now preserves Integration Hub rules (v32+)**
+  - Quicksave captures the current automation rule-set.
+  - Quickload clears runtime queues (events/actions/scheduled actions) and restores automations for saves with `version >= 32`.
+
+- **New test: SaveGame Integration Hub roundtrip**
+  - Adds `tests/test_savegame_hub_automations.cpp` to validate that hub rules survive a save/load cycle.
+
+### Files changed
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/main.cpp`
+- `include/stellar/sim/SaveGame.h`
+- `src/sim/SaveGame.cpp`
+- `tests/test_savegame_hub_automations.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 118 - NavAssist Follow Mode (Escort-Friendly Autopilot)
+
+This round adds a **Follow** mode to the Navigation Assist computer and wires it into the **Traffic Escort** HUD so escort contracts can auto-engage a stable formation-follow behavior.
+
+### Highlights
+
+- **NavAssistComputer: new `Follow` mode**
+  - Maintains a configurable distance behind a target ship using a smooth pursuit/offset intercept.
+  - Uses the existing flight controller pipeline (heading/velocity) to keep behavior consistent with other assist modes.
+
+- **Traffic Escort HUD integration**
+  - Adds a one-click **Target + Follow** action for convoy ships.
+
+### Files changed
+
+- `include/stellar/sim/NavAssistComputer.h`
+- `src/sim/NavAssistComputer.cpp`
+- `apps/stellar_game/main.cpp`
+
+---
+
+## Round 117 - Diagnostics Capture Bundle (Cross-System Debugging Glue)
+
+This round adds a **one-click diagnostics bundle** that cross-integrates the game’s existing systems: the **Integration Hub**, **Flight Recorder**, **Runtime Validation Repro Pack**, and the **Screenshot pipeline**.
+
+The goal is simple: when something looks wrong, you can capture *everything needed* to reproduce or share the issue in one folder — with stable filenames and a manifest.
+
+### Highlights
+
+- **New GameAction: `CaptureBundle`**
+  - Creates a unique folder under an output root (default `captures/`) using a sanitized label + timestamp.
+  - Writes a `manifest.json` describing the capture.
+  - Optionally captures:
+    - World screenshot (`world.png`)
+    - UI screenshot (`ui.png`)
+    - Flight Recorder trace (`flight_trace.json`)
+    - Integration Hub trace (`integration_trace.json`)
+    - Runtime Validation repro pack snapshot (`repro_pack.json`)
+  - Optionally **stops** the Flight Recorder before exports and **copies the bundle path** to clipboard.
+
+- **Integration Hub: new automation action + quick capture button**
+  - `CaptureBundle` is available as an automation action kind, with checkboxes for bundle contents and behavior.
+  - Event inspector adds a **Bundle** button next to the screenshot buttons for fast “capture everything” moments.
+  - Starter rule updated: **Validation Watchdog → Capture bundle** (disabled by default).
+
+- **Runtime Validation: export helper + capture button**
+  - Adds `exportReproPackJsonToPath(...)` so other systems can request a repro pack at a specific file path.
+  - The Runtime Validation window now includes a **Capture bundle** button next to **Dump now**.
+
+### Files changed
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/RuntimeValidationWindow.h`
+- `apps/stellar_game/RuntimeValidationWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 116 - Time Trial Ghost Racing (Cross-System Gameplay + Telemetry)
+
+This round cross-integrates **Time Trials**, the existing **Flight Recorder sample format**, and the in-world **ghost rendering pass** to add a proper **best-run “ghost”** you can race against.
+
+### Highlights
+
+- **Best-run ghost replay (per course)**
+  - While a run is active, the game records a lightweight telemetry strip of the player ship (position/orientation/velocity).
+  - If you set a **new personal best**, that run becomes the stored **best ghost** for that course.
+
+- **In-world rendering (ship + trail)**
+  - The best-run ghost is rendered as a translucent ship (teal) using the same instance path as the Flight Recorder ghost.
+  - A decimated trail is also drawn in-world for easy line-of-flight comparison.
+
+- **Objective HUD “ghost split”**
+  - The Objective HUD now shows a simple **ahead/behind** split versus the ghost by comparing distance to the **next objective**:
+    - next gate during the run, or
+    - the anchor station during docking finishes.
+
+- **Time Trials UI controls**
+  - New **Ghost (best run)** section:
+    - enable/disable, ship/trail toggles
+    - record rate (Hz) + lead/lag
+    - reset best time + ghost for the current course
+
+### Files changed
+
+- `apps/stellar_game/TimeTrialWindow.h`
+- `apps/stellar_game/TimeTrialWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 115 - Delayed Automations + Nav Auto-run Phase Events (Cross-System Orchestration)
+
+This round focuses on the *glue code* that makes disparate systems feel like one coherent game:
+
+- the **Integration Hub automation engine** can now **sequence actions over time** (not just instantly), and
+- the existing **Nav Auto-run** state machine now emits structured **Integration Hub events** for its key phases.
+
+Together, this enables truly hands-free workflows (travel → supercruise → docking) that are **traceable**, **automatable**, and **recordable** in the Flight Recorder.
+
+### Highlights
+
+- **New concept: scheduled actions (delayed execution)**
+  - The Integration Hub now maintains a small **scheduled queue** for actions whose `tRealSec` is in the future.
+  - Each frame, due actions are moved into the pending queue and executed normally.
+  - Actions tab now shows a **Scheduled** section (with countdown), plus clear/copy utilities.
+
+- **Automation actions now support `delaySec`**
+  - Every automation action template can optionally set a **Delay (sec)**.
+  - This allows reliable sequencing like:
+    - `StopFlightRecorder` → *(+0.15s)* `ExportFlightRecorderTrace`
+    - `RequestScreenshot` → *(+0.25s)* `ExportIntegrationTrace`
+
+- **Integration trace export upgraded**
+  - Trace JSON schema bumped to **version 4**.
+  - Adds optional `scheduledActions` export.
+  - Adds `delaySec` field to exported automation actions.
+
+- **Nav Auto-run emits phase events (cross-integrates navigation → automation → camera/comms)**
+  - The Nav Auto-run loop now pushes `GameEventKind::NavAssist` events for key transitions:
+    - `AutoRunSupercruise`
+    - `AutoRunDockingComputer`
+    - `AutoRunReplot`
+    - `AutoRunStopRange`
+    - `AutoRunStopFuel`
+    - `AutoRunComplete`
+  - These events appear in the Integration Hub timeline and can drive automations.
+
+- **New starter automations (disabled by default)**
+  - `AutoRunSupercruise` → `SetCameraRigPreset(Travel)`
+  - `AutoRunDockingComputer` → `SetCameraRigPreset(Docking)`
+  - `AutoRunStop*` → `TransmitComms` (overlay)
+
+### Files touched
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 114 - Mission Deep Links + Objective Quick Actions (Cross-System Integration)
+
+This round cross-integrates **Missions**, **Comms**, the **Objective HUD**, and the **Integration Hub** action pipeline so gameplay intent ("track this mission", "route there", "auto-run", "capture the run") can flow through *one* observability-friendly command path.
+
+### Highlights
+
+- **New Integration Hub action: `SetTrackedMissionId`**
+  - Allows UI surfaces and automations to set the currently tracked mission (Objective HUD / Ship-Status mission summary).
+  - Payload:
+    - `u64a`: mission id (0 clears)
+
+- **Comms mission deep-links**
+  - Mission briefings (Comms channel: Mission) now surface actionable buttons when `CommsMessage::relatedId` is present:
+    - **Track mission**
+    - **Plot mission** (Sync nav to mission’s next stop)
+    - **Auto-run mission** (arms the existing nav auto-run pipeline)
+
+- **Objective HUD: one-click mission operations**
+  - Added a new **Quick actions** strip:
+    - **Plot mission**
+    - **Auto-run mission** (also switches camera preset to *Travel*)
+    - **Capture + Auto-run** (clears Integration Hub log + starts Flight Recorder + auto-runs)
+  - This creates a tight end-to-end loop: *Objective HUD → Integration Hub → Nav Auto-run / Camera Rig / Flight Recorder*.
+
+- **Mission & logistics UI now routes through the Integration Hub**
+  - Mission list "Plot route" and "Track" go through the same command pipeline (better traceability + automation).
+  - Cargo sourcing helpers now provide **Plot source** + **Auto-run source** via the Integration Hub (cross-integrates economy → navigation → camera).
+
+- **New starter automation rule (disabled by default)**
+  - `MissionAccepted` → `SetTrackedMissionId` (tracks newly accepted missions automatically, through the same pipeline).
+
+### Files touched
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/CommsWindow.h`
+- `apps/stellar_game/CommsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 112 - Actionable Comms + GoToStation Travel Action (Cross-System Gameplay Integration)
+
+This round focuses on **cross integrating existing systems into a tighter gameplay loop** by making
+in-universe **Comms** messages *actionable*.
+
+### Highlights
+
+- **New Integration Hub action: `GoToStation`**
+  - A high-level travel command that cross-integrates:
+    - route planning (system hops)
+    - station targeting (on arrival, or immediately if already in-system)
+    - optional **Nav Auto-run** (hands off the trip to the existing auto-run + docking computer flow)
+  - Payload:
+    - `u64b`: system id
+    - `u64a`: station id
+    - `b`: arm auto-run
+
+- **Comms → Navigation → Docking (one-click)**
+  - If a comms message includes a location, the UI now shows:
+    - **Target** (if already in the system) / **Plot route** (if not)
+    - **Go & Dock** (arms auto-run so you travel and dock hands-free)
+  - This makes mission briefings and transmissions a first-class navigation entry point.
+
+- **Integration Hub automation upgraded: 2× u64 fields**
+  - Automation action templates can now drive both `u64a` **and** `u64b` via independent sources
+    (constant, event u64a, event u64b).
+  - Enables automations for multi-id actions like `GoToStation` without hacks.
+  - **Integration trace JSON version bumped to 3** to reflect the new schema.
+
+### Files touched
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/CommsWindow.h`
+- `apps/stellar_game/CommsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 111 - Runtime Validation → Integration Hub → Screenshot Capture (Cross-System Debug Workflow)
+
+This round strengthens the **debug / QA workflow** by cross-integrating three existing systems:
+
+- **Runtime Validation** (NaN/Inf watchdog + smoke checks)
+- **Integration Hub** (event/action timeline + automations)
+- **Photo Mode / Screenshot pipeline** (world/UI capture)
+
+### Highlights
+
+- **New Integration Hub action: `RequestScreenshot`**
+  - Bridges automations and tools into the existing screenshot capture path.
+  - Supports UI vs world capture, timestamped filenames, optional pause-for-capture, and copy-path-to-clipboard.
+
+- **Integration Hub: event detail quick actions**
+  - Timeline entries now have one-click buttons to request a screenshot (UI/world) with a safe, event-derived basename.
+
+- **Runtime Validation emits through the Integration Hub event stream**
+  - Watchdog failures and repro-pack results now flow through `hubPushEvent`, so:
+    - automations can react to validation events
+    - Flight Recorder marker capture can correlate telemetry with validation spikes
+
+- **Runtime Validation: optional screenshot-on-failure**
+  - Configurable “On watchdog failure → request screenshot(s)” controls:
+    - UI and/or world capture
+    - pause-for-capture
+    - timestamp/copy-path
+    - out dir + base name
+
+- **Starter automation rule (disabled by default)**
+  - `Validation:Watchdog` → RequestScreenshot (UI) + export traces (Integration/Flight)
+
+### Files touched
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/RuntimeValidationWindow.h`
+- `apps/stellar_game/RuntimeValidationWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 110 - Integration Hub → Flight Recorder Marker Track (Cross-System Correlation)
+
+This round cross-integrates the **Integration Hub** event stream with the **Flight Recorder**, enabling
+rapid correlation between *telemetry* (position, velocity, orientation) and *discrete gameplay/devtools*
+events (docking clearance, time trials, validation alerts, mission sync, etc.).
+
+### Highlights
+- **Event mirroring hook**
+  - `IntegrationHubWindowState` now exposes an optional `onEvent` sink called before an event is moved into
+    the hub log. This keeps the Integration Hub dependency-light while still allowing external systems to
+    subscribe.
+- **Flight Recorder markers**
+  - Added a marker ring buffer that captures Integration Hub events during recording (filterable / size limited).
+  - New UI section lists markers and lets you click to scrub the replay playhead directly to that moment.
+- **Trace export upgrade**
+  - Flight recorder trace export can now include markers as **instant events** on a dedicated "Markers" track
+    in the Chrome/Perfetto trace JSON (toggleable via "Trace: include markers").
+
+### Files touched
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/FlightRecorderWindow.h`
+- `apps/stellar_game/FlightRecorderWindow.cpp`
+- `apps/stellar_game/main.cpp`
+
+---
+
+## Round 109 - Mission Nav Sync (Cross-System Integration)
+
+This round cross-integrates the **Mission Tracker**, the **route planner**, and the existing **Nav Auto-run + Docking Computer** pipeline.
+
+### Highlights
+- **New Integration Hub action: `SyncNavToMission`**
+  - Given a `MissionId`, it plots the route to the mission’s *next stop* (via leg for passenger/multi-delivery, otherwise final destination).
+  - Arms `pendingArrivalTargetStationId` (auto-target on jump completion) and immediately targets the station if you’re already in-system.
+  - Optional “arm auto-run” flag to hand the trip off to the existing auto-run flow.
+- **Unified codepath** for mission route plotting
+  - Mission Board “auto plot on accept” and Mission Tracker “Plot Route” now go through the same action pipeline (less duplication, better observability in Integration Hub).
+- **Mission Tracker one-click convenience**
+  - Added **Auto-run** button next to Plot Route to arm auto-run for the tracked mission.
+- **Starter automation rule (disabled by default)**
+  - `MissionAccepted -> SyncNavToMission` for users who want the game to auto-sync nav when accepting missions.
+
+### Files touched
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/main.cpp`
+
+---
+
+## Round 107 - Cross Integration: Integration Hub ↔ Comms
+
+This round focuses on **cross integrating existing code and systems** by connecting the Integration Hub action/event layer to the in-universe **Comms** system.
+
+You can now treat Comms as a first-class automation target:
+
+- New `TransmitComms` **GameAction** (subject/body via `subject|body`) that routes actions into the Comms log and optionally pops the incoming overlay.
+- New *starter* automation rules (disabled by default) that demonstrate end-to-end integration:
+  - **Docking Clearance → Comms** (ATC-style clearance response)
+  - **Mission Complete → Comms** (wraps completion events as a transmission)
+  - **TimeTrial Finish → Comms** (race control summary)
+
+### Files changed/added
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 98 - Reliability: CI + Sanitizers + Repro Packs
+
+This round continues the push to **make sure existing code is working as intended** by adding:
+
+- A modern **GitHub Actions CI** pipeline (CMake + CTest) that builds headless on Ubuntu/Windows, plus a Clang **ASan+UBSan** job.
+- Optional CMake sanitizer toggles (`STELLAR_ENABLE_ASAN`, `STELLAR_ENABLE_UBSAN`) so local dev builds can match CI.
+- A **Repro Pack** exporter in the Runtime Validation window that writes a small JSON bundle (ship state + optional Flight Recorder telemetry) when the watchdog trips.
+
+### What’s new
+
+- **CI: CMake + CTest workflows**
+  - Headless build + tests on **Ubuntu + Windows**
+  - Clang **AddressSanitizer + UndefinedBehaviorSanitizer** build that runs the full test suite
+  - Optional Windows render build to catch UI/render integration issues at compile-time
+
+- **Runtime Validation: Repro Pack JSON**
+  - Toggle “Dump on watchdog failure” and specify an output filename
+  - Optional “Unique name per hit” and “Include Flight Recorder telemetry”
+  - Manual “Dump now” button for bug reports
+
+### Files changed/added
+
+- `.github/workflows/c-cpp.yml`
+- `CMakeLists.txt`
+- `apps/stellar_game/RuntimeValidationWindow.h`
+- `apps/stellar_game/RuntimeValidationWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 97 - Reliability: Runtime Validation + Regression Tests
+
+This round focuses on **making sure existing code is working as intended** by adding:
+
+- An in-game **Runtime Validation** dashboard (watchdog + smoke checks) to catch common sim corruption early.
+- New **unit tests** for the most recent under-tested systems (Aerodynamics + Time Trials) so regressions get caught immediately.
+
+### What’s new
+
+- **New: Runtime Validation (UI → Runtime Validation)**
+  - Continuous **NaN/Inf watchdog** for ship state (pos/vel/orient/angVel) with optional auto-pause.
+  - Optional **magnitude watchdog** to detect runaway values without modifying the simulation.
+  - **Deterministic smoke checks** you can run and copy as a report:
+    - TimeTrial gate pass logic and generator determinism/invariants
+    - Aerodynamics sign/invariant sanity checks
+
+- **Tests: regression coverage**
+  - Added `stellar_tests` coverage for:
+    - `sim::computeAerodynamics(...)`
+    - `sim::timeTrialGatePassed(...)` and deterministic course generation
+
+### Files changed/added
+
+- `apps/stellar_game/RuntimeValidationWindow.h` *(new)*
+- `apps/stellar_game/RuntimeValidationWindow.cpp` *(new)*
+- `tests/test_aerodynamics.cpp` *(new)*
+- `tests/test_time_trial.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 96 - 3D Gameplay: Time Trials (Gate Courses)
+
+This round focuses on **moment-to-moment 3D gameplay**: a lightweight, deterministic **gate course** system you can run as a time trial.
+Courses are generated from a stable seed (system + station + user seed), then rendered as HUD gate markers and tracked as an objective.
+
+### What’s new
+
+- **New: Time Trials (Windows → Time Trials)**
+  - Generate a deterministic station slalom course:
+    - gate count, gate radius, course radius, height, jitter, loops
+    - stable seed option (system + station) plus a user seed for shareable variants
+  - Run phases: **Ready → Running → Finished**, with best time tracking per-course.
+  - Quality-of-life controls:
+    - Copy shareable **Course Code** to clipboard
+    - Reset best time for current course
+
+- **HUD integration**
+  - 3D gate markers rendered in the forward HUD (with offscreen clamping).
+  - Objective HUD switches to a compact time-trial status panel while a course is active.
+
+### Files changed/added
+
+- `include/stellar/sim/TimeTrial.h` *(new)*
+- `src/sim/TimeTrial.cpp` *(new)*
+- `apps/stellar_game/TimeTrialWindow.h` *(new)*
+- `apps/stellar_game/TimeTrialWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 95 - 3D Camera Rig: Orbit Controls + Horizon Lock + Body Avoidance
+
+This round focuses on the **3D camera**—a notably under-developed gameplay layer compared to the sim/proc systems.
+It replaces the hardcoded chase camera with a small but powerful **camera rig** that supports
+**orbit controls**, **gravity-aware horizon stabilization**, and **large-body collision avoidance**.
+
+### What’s new
+
+- **New: 3D Camera Rig (Tools → 3D Camera Rig)**
+  - **Orbit camera** with `Alt + LMB` orbit, `Alt + MMB` pan, `Alt + wheel` zoom.
+  - **Horizon lock** driven by a reference “up” vector:
+    - near planets: align to **gravity up**
+    - in deep space: fall back to **orbital angular momentum** normal when available
+  - **Springy smoothing** for position/orientation/FOV using half-life parameters.
+
+- **Safety: Avoid dominant gravity body**
+  - Camera is kept outside the rendered radius of the currently dominant gravity body
+    (star/planet) with a small padding, preventing “inside the planet” clips.
+
+- **Better depth precision**
+  - Dynamic **near plane** derived from camera distance to the ship improves z precision
+    (reduces flicker) without requiring engine-level reverse-Z changes.
+
+- **Cinematic camera compatibility**
+  - When the Cinematic Camera tool is enabled, the rig can optionally consume its
+    offset/FOV samples (still benefits from smoothing + body avoidance).
+
+### Files changed/added
+
+- `apps/stellar_game/CameraRigWindow.h` *(new)*
+- `apps/stellar_game/CameraRigWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 94 - 3D Flight Model: Aerodynamic Lift + Stability (Atmospheric)
+
+This round deepens the **flight model** once you leave vacuum: ships now experience **aerodynamic lift**,
+**induced drag**, and optional **stability / control-surface moments** when flying through an atmosphere.
+The result is a controllable “bank-to-turn” feel—while keeping the sim deterministic and headless-friendly.
+
+### What’s new
+
+- **New `sim::Aerodynamics` module (CPU / deterministic)**
+  - Computes lift using the classic relation `L = q · S · CL` and adds induced + stall drag.
+  - Provides simple stability:
+    - rotational damping proportional to dynamic pressure
+    - optional “weathervane” alignment to the velocity vector
+    - optional control-surface authority (maps pilot torque input to aero angular accel)
+
+- **Integrated into ship physics**
+  - `Ship::stepWithExternalForces(...)` now supports external *angular* acceleration (in addition to linear),
+    enabling aerodynamic moments (and future effects like wind gusts).
+
+- **UI: Physics (experimental)**
+  - Toggle **Aerodynamic lift + stability** and tune wing area, lift slope, stall angle, induced drag, etc.
+  - Optional **Affect NPC ships** toggle.
+
+- **UI: Ship → Status → Gravity / Orbit**
+  - Atmosphere section now shows AoA/sideslip, CL, stall %, lift g-load, and extra drag when aero is enabled.
+
+### Files changed/added
+
+- `include/stellar/sim/Aerodynamics.h` *(new)*
+- `src/sim/Aerodynamics.cpp` *(new)*
+- `include/stellar/sim/Ship.h`
+- `src/sim/Ship.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
 - `PATCH_NOTES.md`
 
 ## Round 93 - ImGui Build Plumbing + Build Info Window
@@ -2236,4 +2808,399 @@ As the Comms inbox + overlay leaned on TextFx more heavily, the previous impleme
 - `apps/stellar_game/CommsWindow.cpp`
 - `apps/stellar_game/TextAnimationLabWindow.cpp`
 - `tests/test_text_fx.cpp`
+- `PATCH_NOTES.md`
+
+## Round 99 — Station Docking Pads (Procedural Layout + Clearance Pad Assignment)
+
+This round expands the *station docking* loop beyond the single “center hangar point” by introducing a
+**procedural docking pad layout** per station and wiring it into the docking clearance + docking flow.
+
+### What’s new
+
+- **Procedural docking pad layout (deterministic)**
+  - New `sim::DockingPads` module generates a stable set of pad poses in station-local space.
+  - Uses a farthest-point sampling pass ("blue-noise-ish") so pads spread nicely without obvious grid artifacts.
+
+- **Clearance now assigns a pad number**
+  - `DockingClearanceState` stores `assignedPad` (1-based).
+  - When clearance is granted, the station returns an assigned pad number (stable for that clearance).
+
+- **Docked ship snaps to assigned pad**
+  - While docked, the ship is attached to the station at the assigned pad pose (instead of a fixed center point).
+  - The pad is recovered automatically on load by selecting the nearest pad to the saved docked ship position.
+
+- **Undock orientation fix**
+  - Undocking now orients the ship to face away from the station along the slot axis.
+
+### Files changed/added
+
+- `include/stellar/sim/DockingPads.h` *(new)*
+- `src/sim/DockingPads.cpp` *(new)*
+- `include/stellar/sim/DockingClearanceService.h`
+- `src/sim/DockingClearanceService.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_docking_clearance.cpp`
+- `tests/test_docking_pads.cpp` *(new)*
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## Round 100 — 3D Distance & FOV Toolkit (Dolly Zoom Lock + Physical Lens Readout)
+
+This round focuses on **distance + FOV**: getting the camera to behave predictably as you change distance,
+while also exposing the key projection numbers you usually end up re-deriving by hand.
+
+### What’s new
+
+- **New `math::fov` utilities** (header-only)
+  - Vertical↔horizontal FOV conversion for any aspect ratio.
+  - Dolly-zoom FOV math (keep framing constant while distance changes).
+  - Angular diameter (exact via `asin(r/d)`), view-height-at-distance, and units-per-pixel helpers.
+  - Simple physical camera equivalence: focal length ↔ FOV given a sensor size.
+
+- **Camera rig: distance-aware FOV tools**
+  - **Telemetry**: viewport aspect, vertical/horizontal FOV, camera distance, view height at depth, and scale (U/px).
+  - **Dolly zoom lock**: keeps the subject’s framing stable while you orbit-zoom.
+    - Supports auto-capture and manual capture of the reference framing.
+  - **Physical lens readout** (sensor + focal length → FOV) with a one-click “apply to base FOV”.
+  - **Dominant body framing helper**: compute angular diameter as seen from the camera and set base FOV to frame it.
+
+### Fixes
+
+- Fixed a couple build-breaking issues inside the camera rig module (`kPi` constant + cinematic FOV gating).
+
+### Files changed/added
+
+- `include/stellar/math/Fov.h` *(new)*
+- `apps/stellar_game/CameraRigWindow.h`
+- `apps/stellar_game/CameraRigWindow.cpp`
+- `tests/test_fov_math.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## Round 101 - Procedural generation rendering
+
+### Rendering upgrades
+
+- **GPU surface cache crater shader fixed**: renamed GLSL variable `out` to avoid a reserved keyword collision, re-enabling the GPU surface cache when the shader previously failed to compile.
+- **Star corona shader fixed**: removed an `n` redefinition by renaming the scalar noise term, restoring the renderer when it was disabled due to fragment compilation errors.
+- **RenderTarget2D: new descriptor**
+  - Optional depth attachment (depthless targets for fullscreen procedural baking).
+  - Optional mipmap allocation + `generateMips()` helper for post-bake refresh.
+- **ProceduralGraphBaker quality pipeline**
+  - Optional mip generation for baked textures (better minification / fewer moire artifacts).
+  - Optional lightweight dithering to reduce 8-bit banding.
+  - Now uses a depthless render target when baking 2D procedural graphs.
+
+### UI
+
+- Procedural Lab: added toggles for mip generation and dithering.
+- Procedural Mesh Lab: same controls for baked 2D surface textures; stats now include mip generation time.
+
+### Files changed/added
+
+- `include/stellar/render/RenderTarget.h`
+- `src/render/RenderTarget.cpp`
+- `include/stellar/render/ProceduralGraph.h`
+- `src/render/ProceduralGraph.cpp`
+- `src/render/GpuSurfaceCache.cpp`
+- `src/render/StarCoronaRenderer.cpp`
+- `apps/stellar_game/ProceduralLabWindow.h`
+- `apps/stellar_game/ProceduralLabWindow.cpp`
+- `apps/stellar_game/ProceduralMeshLabWindow.h`
+- `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 102 - Seamless Triplanar + Micro-Detail Normals for Procedural Materials
+
+### Procedural graph baking
+
+- **ProceduralGraphBaker**: added an optional *"Pack height in alpha"* mode that writes the scalar graph output `t` into the baked texture's alpha channel. This keeps the existing RGB albedo workflow intact while enabling downstream uses like height-based micro normals.
+
+### Raymarch preview shading
+
+- **SdfRaymarcher**: upgraded the albedo projection from a single dominant-axis selection to an optional full **triplanar blend** (with sharpenable weights).
+- Added an optional **micro-normal** perturbation path that derives a surface-gradient from a height channel (alpha or luminance), then projects that gradient onto the geometric normal's tangent plane for stable detail shading.
+
+### UI
+
+- **Procedural Lab**: new bake-quality toggle: *Pack height in alpha*.
+- **Procedural Mesh Lab**:
+  - new bake-quality toggle: *Pack height in alpha*.
+  - new raymarch controls: *Triplanar blend*, *Tri sharpness*, *Height from alpha*, *Micro normal strength*, and *Micro normal step*.
+
+### Files changed/added
+
+- `include/stellar/render/ProceduralGraph.h`
+- `src/render/ProceduralGraph.cpp`
+- `include/stellar/render/SdfRaymarcher.h`
+- `src/render/SdfRaymarcher.cpp`
+- `apps/stellar_game/ProceduralLabWindow.h`
+- `apps/stellar_game/ProceduralLabWindow.cpp`
+- `apps/stellar_game/ProceduralMeshLabWindow.h`
+- `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+## Round 104
+
+### Cross-system Integration Hub (Actions + Events)
+
+This round adds a new **Integration Hub** debug window that acts as a lightweight bridge between otherwise loosely-coupled systems:
+
+- **GameActionQueue**: systems (e.g., Time Trial) can request cross-system actions (target station, engage docking computer, set camera mode) without reaching into `main.cpp` state directly.
+- **GameEventLog**: systems can emit structured events for debugging and for attaching to repro packs.
+- **JSON trace export**: write a compact `stellar_integration_trace` JSON to disk for bug reports.
+
+### Time Trial cross-integration refactor
+
+- Time Trial now emits **actions/events** (via sinks) instead of relying on one-off request booleans.
+- The central game loop drains and executes actions in order, recording an execution event.
+
+### Runtime Validation + Repro Packs
+
+- Runtime repro packs can optionally embed a recent slice of Integration Hub events (time window + cap).
+- Watchdog hits and repro-pack writes emit Validation events into the Integration Hub log.
+
+
+## Round 105
+
+### Run Capture: Time Trial ↔ Flight Recorder ↔ Integration Trace
+
+This round deepens **cross-system integration** by wiring together gameplay + devtools so a time-trial run can produce a shareable, reproducible trace bundle.
+
+- **Time Trial → Flight Recorder automation**
+  - New toggles in the Time Trial window:
+    - Clear Integration Hub log on arm (clean run trace)
+    - Auto start Flight Recorder on first gate pass
+    - Auto stop Flight Recorder on finish
+    - Auto export traces on finish
+  - When enabled, Time Trials now auto-drive the Flight Recorder and trace exporters via the Integration Hub action queue.
+
+- **Integration Hub: expanded action vocabulary**
+  - Added actions for:
+    - Start/Stop Flight Recorder
+    - Export Flight Recorder trace
+    - Export Integration trace
+    - Clear Integration Hub log
+
+- **Main loop: action executor upgrades**
+  - Action executor now performs the new trace/recording actions and emits structured events for them.
+  - `EngageDockingComputer` now honors the `engage=false` action form (disengage).
+
+- **Fix**
+  - Fixed a bad reference in the docking-clearance request event path (was referencing a non-existent `dockingClearanceSvc`).
+
+### Files changed/added
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/TimeTrialWindow.h`
+- `apps/stellar_game/TimeTrialWindow.cpp`
+- `apps/stellar_game/FlightRecorderWindow.h`
+- `apps/stellar_game/FlightRecorderWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+## Round 106
+
+### Integration Hub Automations: Event → Action Rules (IFTTT-style)
+
+This round turns the Integration Hub into a real *cross-system glue layer* by adding a small **automation/rule engine**:
+
+- New **Automation** tab in the Integration Hub window.
+- Define rules that match incoming **GameEvents** (by kind + tag match mode) and automatically enqueue **GameActions**.
+- Includes safety rails:
+  - Per-rule cooldown
+  - Per-frame max action budget to avoid accidental action spam / loops
+- Supports simple template expansion for action strings (e.g. export paths):
+  - `{kind}`, `{tag}`, `{u64a}`, `{u64b}`, `{tRealSec}`, `{tRealMs}`, `{tSimDays}`, `{rule}`
+- Ships with a few **starter preset rules** (disabled by default) so you can enable and tweak quickly.
+
+### Missions emit Integration Hub gameplay events
+
+To make automations useful for gameplay, core mission milestones now emit structured events:
+
+- `MissionAccepted`
+- `MissionComplete`
+- `MissionFailed`
+- `MissionLegComplete`
+
+These include IDs in `u64a/u64b` plus a human-readable message.
+
+### Mission Briefing: optional risk hints & reputation cues
+
+`MissionBriefingParams` now includes:
+
+- `includeRiskHints`
+- `includeReputationCues`
+
+When enabled, the generated briefing appends short, context-sensitive hints derived from the computed risk model.
+
+### Fixes / cleanup
+
+- Added missing `GameEventKind::Debug` (was referenced by the main loop).
+- Moved `timeRealSec` into the main time block so lambdas can consistently timestamp emitted events.
+
+### Files changed/added
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/IntegrationHubWindow.h`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `include/stellar/sim/Mission.h`
+- `include/stellar/sim/MissionBriefing.h`
+- `src/sim/MissionBriefing.cpp`
+- `PATCH_NOTES.md`
+
+## Round 118 - Nav Assist Follow (formation) + Escort HUD integration
+
+Adds a new **Nav Assist** mode designed for the *most annoying part of escort gameplay*: staying comfortably in formation with a moving convoy.
+
+- **Nav Assist: Follow**
+  - Chases a *moving follow point behind the target* based on its travel direction.
+  - Uses exponential smoothing on the follow direction to avoid jitter when target velocity is noisy.
+  - Can optionally keep the ship **facing the target** while translating (default), which makes convoy escorting feel much more natural.
+- New default keybind: **Home** (`NavAssistFollow`).
+- **Traffic Escort HUD** gets a one-click **Target + Follow** button to immediately lock onto the convoy and engage Follow mode (stays safely inside contract max range).
+
+### Files changed/added
+
+- `apps/stellar_game/ControlsConfig.h`
+- `apps/stellar_game/ControlsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `include/stellar/sim/NavAssistComputer.h`
+- `src/sim/NavAssistComputer.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 122 - Star corona perf pass (GPU + CPU)
+
+This round targets a real-world perf hotspot: **procedural star corona shading** (lots of fragment work + per-frame instance uploads).
+
+### What changed
+
+- **Shader early-out**: fragments with negligible rim contribution now return immediately, skipping the expensive 3D FBM noise path.
+- **Quality knob**: `noiseOctaves` (1..8) lets you trade detail for speed.
+- **Streaming instance uploads**: instance VBO updates now prefer `glMapBufferRange` with invalidation and fall back to an orphan + `glBufferSubData` path.
+- **VAO state caching**: instanced attribute pointers are configured once per mesh VAO (instead of every draw) to reduce GL driver overhead.
+
+### New UI controls
+
+In **World visuals → Star corona**:
+
+- `Corona noise octaves` *(perf)*
+- `Corona rim early-out` *(perf)*
+
+### Files changed/added
+
+- `include/stellar/render/StarCoronaRenderer.h`
+- `src/render/StarCoronaRenderer.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+## Round 124 - Fast HDR buffers (R11G11B10F) to improve FPS
+
+This round targets a common bottleneck on integrated GPUs: **memory bandwidth**.
+The HDR scene buffer and bloom targets previously used **RGBA16F** (64 bpp). We
+now support a packed HDR format, **R11G11B10F** (32 bpp), which can significantly
+reduce bandwidth and improve frame rate.
+
+### What changed
+
+- **New PostFX setting:** HDR buffer format
+  - `RGBA16F (quality)`
+  - `R11G11B10F (fast)`
+- **Automatic fallback:** if the driver doesn't support `R11G11B10F` as an FBO
+  color attachment, PostFX automatically falls back to `RGBA16F` at runtime.
+- **Bloom transient textures** now match the active HDR format so the whole
+  post pipeline benefits from the reduced bandwidth.
+- Added a UI control under **PostFX → Performance / Render Scale** and shows the
+  **active** runtime format.
+
+### Files changed/added
+
+- `include/stellar/render/Gl.h`
+- `include/stellar/render/PostFX.h`
+- `src/render/PostFX.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+## Round 125 - Async auto exposure (PBO) + bloom bandwidth cuts
+
+This round targets two **frame-time spikes** that can show up on mid-range and integrated GPUs:
+
+1) **Auto exposure GPU readback stalls**: the previous implementation used a synchronous `glGetTexImage` each frame (even though it reads only a 1×1 texture). On many drivers this forces a CPU↔GPU sync point.
+2) **Redundant bloom clears**: bloom passes rendered full-screen, but also cleared the color buffer beforehand—doubling the memory bandwidth for no visual gain.
+
+### What changed
+
+- **Async auto exposure readback** (optional, enabled by default):
+  - Uses a tiny **pixel-pack-buffer (PBO) ring** + **fence sync**.
+  - Consumes the newest ready sample **without stalling**.
+  - Adds a small **~1–2 frame latency** to exposure adaptation (visually fine, vastly smoother).
+- **Removed redundant `glClear` calls** in bloom bright-pass and blur passes.
+
+### New UI control
+
+In **PostFX → Tonemap / Output → Auto exposure**:
+
+- `Async readback (no stalls)` *(recommended)*
+
+### Files changed/added
+
+- `include/stellar/render/PostFX.h`
+- `src/render/PostFX.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 126 - CPU-side render caches + streamed line/mesh buffers
+
+This round focuses on **CPU-side per-frame work** and **driver stalls** that show up as FPS drops on integrated GPUs:
+
+- **Orbit line sampling** (planets + stations) was being re-generated every frame.
+- **Asteroid spin parameters** were being re-derived from RNG every frame.
+- **LineRenderer / MeshRenderer** were using upload paths that can trigger buffer reallocations and implicit sync.
+
+### What changed
+
+- **Orbit line cache**: planet + station orbit line vertices are now built **once per system** and reused each frame.
+- **Asteroid spin cache**: deterministic spin axis/phase/rate is now computed **once per asteroid id** and cached.
+- **LineRenderer streaming VBO**: grows on demand, then uses `glMapBufferRange` (with invalidate) for low-stall updates.
+- **MeshRenderer streaming instance VBO**: same growth + mapping approach to reduce per-draw driver overhead.
+
+### Files changed/added
+
+- `include/stellar/render/LineRenderer.h`
+- `src/render/LineRenderer.cpp`
+- `include/stellar/render/MeshRenderer.h`
+- `src/render/MeshRenderer.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 127 - Fewer GL driver calls + point streaming ring buffers (FPS)
+
+This round targets two common sources of frame time spikes in OpenGL apps:
+
+1) **GL driver overhead** from repeatedly rebinding per-instance attribute layouts.
+2) **Implicit sync/stalls** when streaming dynamic point-sprite data into a buffer
+   the GPU is still consuming.
+
+### What changed
+
+- **MeshRenderer instance attribute layout is now bound once per mesh**.
+  The instance attribute pointers (locations 3..6) are VAO state. Re-specifying
+  them every draw call costs CPU time on some drivers. We now bind them lazily
+  once per mesh and reuse the state.
+
+- **PointRenderer now uses a small VAO/VBO ring (triple-buffer) for streaming**.
+  Each draw rotates to the next buffer so the CPU never overwrites the buffer
+  potentially still in-flight on the GPU. This reduces driver synchronization
+  stalls when drawing large starfields/nebula/particle sprites.
+
+### Files changed/added
+
+- `include/stellar/render/PointRenderer.h`
+- `src/render/PointRenderer.cpp`
+- `include/stellar/render/MeshRenderer.h`
+- `src/render/MeshRenderer.cpp`
 - `PATCH_NOTES.md`

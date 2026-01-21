@@ -17,8 +17,18 @@ if (NOT STELLAR_BUILD_GAME)
   set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
 endif()
 
+# ImGui cannot be enabled without the render path.
+if (NOT STELLAR_ENABLE_RENDER)
+  set(STELLAR_ENABLE_IMGUI OFF CACHE BOOL "" FORCE)
+endif()
+
+
 option(STELLAR_FETCH_SDL2 "Fetch SDL2 if not found via find_package (render builds only)" ON)
 option(STELLAR_FETCH_IMGUI "Fetch Dear ImGui (render+imgui builds only)" ON)
+
+# Tooling / correctness options
+option(STELLAR_ENABLE_ASAN "Enable AddressSanitizer (Clang/GCC only)" OFF)
+option(STELLAR_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer (Clang/GCC only)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -184,6 +194,8 @@ set(STELLAR_CORE_SOURCES
   src/sim/Orbit.cpp
   src/sim/Gravity.cpp
   src/sim/Atmosphere.cpp
+  src/sim/Aerodynamics.cpp
+  src/sim/TimeTrial.cpp
   src/sim/OrbitalMechanics.cpp
   src/sim/TrajectoryPredictor.cpp
   src/sim/TrajectoryAnalysis.cpp
@@ -206,6 +218,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SystemSecurityDynamics.cpp
   src/sim/SystemEvents.cpp
   src/sim/SystemConditions.cpp
+  src/sim/DockingPads.cpp
   src/sim/Docking.cpp
   src/sim/DockingComputer.cpp
   src/sim/DockingClearanceService.cpp
@@ -279,6 +292,7 @@ set(STELLAR_RENDER_SOURCES
   src/render/VolumetricAtmosphereRenderer.cpp
   src/render/ProceduralSky.cpp
   src/render/StarCoronaRenderer.cpp
+  src/render/StarfieldGpuRenderer.cpp
   src/render/ParticleSystem.cpp
   src/render/PostFX.cpp
   src/render/RenderTarget.cpp
@@ -307,6 +321,35 @@ target_compile_definitions(stellar PUBLIC
   STELLAR_ENABLE_RENDER=$<BOOL:${STELLAR_ENABLE_RENDER}>
   STELLAR_ENABLE_IMGUI=$<BOOL:${STELLAR_ENABLE_IMGUI}>
 )
+
+# ---- Tooling: sanitizers (optional) ----
+# These flags help catch memory errors and undefined behavior early when running tests.
+add_library(stellar_sanitizers INTERFACE)
+
+if ((STELLAR_ENABLE_ASAN OR STELLAR_ENABLE_UBSAN) AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"))
+  set(_san_list "")
+  if (STELLAR_ENABLE_ASAN)
+    list(APPEND _san_list address)
+  endif()
+  if (STELLAR_ENABLE_UBSAN)
+    list(APPEND _san_list undefined)
+  endif()
+  list(JOIN _san_list "," _san_csv)
+
+  target_compile_options(stellar_sanitizers INTERFACE
+    -fsanitize=${_san_csv}
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=all
+  )
+  target_link_options(stellar_sanitizers INTERFACE
+    -fsanitize=${_san_csv}
+  )
+elseif (STELLAR_ENABLE_ASAN OR STELLAR_ENABLE_UBSAN)
+  message(WARNING "Sanitizers requested but compiler '${CMAKE_CXX_COMPILER_ID}' does not support -fsanitize flags here. Ignoring STELLAR_ENABLE_ASAN/UBSAN.")
+endif()
+
+# Propagate sanitizer flags from the core library to dependents (tests/apps).
+target_link_libraries(stellar PUBLIC stellar_sanitizers)
 
 
 if (STELLAR_ENABLE_RENDER)
@@ -351,8 +394,12 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/CVarWindow.cpp
     apps/stellar_game/ProfilerWindow.cpp
     apps/stellar_game/BuildInfoWindow.cpp
+    apps/stellar_game/RuntimeValidationWindow.cpp
+  apps/stellar_game/IntegrationHubWindow.cpp
     apps/stellar_game/FlightRecorderWindow.cpp
     apps/stellar_game/CinematicCameraWindow.cpp
+    apps/stellar_game/CameraRigWindow.cpp
+    apps/stellar_game/TimeTrialWindow.cpp
     apps/stellar_game/OrbitAnalyzerWindow.cpp
     apps/stellar_game/TrafficLanesWindow.cpp
     apps/stellar_game/SystemConditionsWindow.cpp

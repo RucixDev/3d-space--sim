@@ -66,8 +66,14 @@ int test_docking_clearance() {
       ++fails;
     }
 
+    if (cs.assignedPad == 0) {
+      std::cerr << "[test_docking_clearance] expected assignedPad set on grant\n";
+      ++fails;
+    }
+
     // Calling again while valid should be a no-op unless allowRefresh=true.
     const core::u32 rc = cs.requestCount;
+    const core::u16 pad = cs.assignedPad;
     const auto d2 = sim::requestDockingClearance(seed, st, t + 0.00001, 500.0, cs, 0.0, params);
     if (d2.status != sim::DockingClearanceStatus::Granted || !d2.hasClearance) {
       std::cerr << "[test_docking_clearance] expected Granted (pre-existing clearance)\n";
@@ -76,6 +82,11 @@ int test_docking_clearance() {
     if (cs.requestCount != rc) {
       std::cerr << "[test_docking_clearance] expected requestCount unchanged when already granted. got="
                 << cs.requestCount << " expected=" << rc << "\n";
+      ++fails;
+    }
+
+    if (cs.assignedPad != pad) {
+      std::cerr << "[test_docking_clearance] expected assignedPad unchanged when already granted\n";
       ++fails;
     }
   }
@@ -93,6 +104,11 @@ int test_docking_clearance() {
     if (d.status != sim::DockingClearanceStatus::Denied || d.hasClearance) {
       std::cerr << "[test_docking_clearance] expected Denied. got status="
                 << (int)d.status << " hasClearance=" << (int)d.hasClearance << "\n";
+      ++fails;
+    }
+
+    if (cs.assignedPad != 0) {
+      std::cerr << "[test_docking_clearance] expected assignedPad cleared on denial\n";
       ++fails;
     }
     if (cs.cooldownUntilDays <= t) {
@@ -132,7 +148,7 @@ int test_docking_clearance() {
     const auto da = sim::requestDockingClearance(seed, st, t, 500.0, a, traffic, params);
     const auto db = sim::requestDockingClearance(seed, st, t, 500.0, b, traffic, params);
 
-    if (da.status != db.status || a.granted != b.granted || !approxEq(da.pGrant, db.pGrant, 1e-12)) {
+    if (da.status != db.status || a.granted != b.granted || a.assignedPad != b.assignedPad || !approxEq(da.pGrant, db.pGrant, 1e-12)) {
       std::cerr << "[test_docking_clearance] expected deterministic decisions. aStatus="
                 << (int)da.status << " bStatus=" << (int)db.status << " aGranted="
                 << (int)a.granted << " bGranted=" << (int)b.granted << "\n";

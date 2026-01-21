@@ -168,7 +168,6 @@ struct EscortConvoyState {
   double nextAmbushDays{0.0};
 };
 
-
 // Mission-critical bounty targets (for bounty scan/kill missions) are persisted so they don't
 // reset when the player saves/loads or leaves/returns to the system.
 struct BountyTargetState {
@@ -188,7 +187,6 @@ struct BountyTargetState {
   double hullFrac{1.0};
   double shieldFrac{1.0};
 };
-
 
 // Lightweight "gameplay" mission representation.
 // Stored in the save file so early progression loops (cargo delivery/courier/bounties)
@@ -255,8 +253,59 @@ struct Mission {
   bool cargoProvided{true};
 };
 
+// -----------------------------------------------------------------------------
+// Integration Hub automation persistence
+// -----------------------------------------------------------------------------
+//
+// The Integration Hub (stellar_game) provides cross-system automation rules.
+// These rules are extremely useful for player workflows (travel macros,
+// capture bundles on validation watchdogs, etc.) so we persist them in the
+// SaveGame for quicksave/quickload.
+//
+// NOTE: We intentionally store the *numeric* values of GameEventKind and
+// GameActionKind rather than depending on the app-layer types here.
+// Those enums are now assigned explicit stable IDs (see apps/stellar_game/GameSignals.h).
+
+struct IntegrationHubAutomationActionState {
+  // Numeric value of stellar::game::GameActionKind.
+  core::u8 kind{0};
+
+  // Numeric value of stellar::game::AutomationValueSource.
+  core::u8 u64aSource{0};
+  core::u64 u64aConst{0};
+
+  core::u8 u64bSource{0};
+  core::u64 u64bConst{0};
+
+  int i32Const{0};
+  bool bConst{false};
+
+  double delaySec{0.0};
+
+  // Stored as a normal string; the file format base64-encodes it into a single token.
+  std::string msgTemplate{};
+};
+
+struct IntegrationHubAutomationRuleState {
+  bool enabled{false};
+
+  // Human-friendly name.
+  std::string name{"Rule"};
+
+  // Numeric value of stellar::game::GameEventKind.
+  core::u8 eventKind{0};
+
+  // Numeric value of stellar::game::AutomationTagMatch.
+  core::u8 tagMatch{0};
+  std::string tagText{};
+
+  double cooldownSec{0.25};
+
+  std::vector<IntegrationHubAutomationActionState> actions{};
+};
+
 struct SaveGame {
-  int version{31};
+  int version{32};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -284,6 +333,11 @@ struct SaveGame {
   // Comms / inbox: diegetic transmissions history.
   // Stored in the SaveGame so quicksave/quickload preserves narrative and warnings.
   std::vector<CommsMessage> comms{};
+
+  // Integration Hub (stellar_game) automation rules + toggles.
+  // Persisted so your cross-system "glue" survives quicksave/quickload.
+  bool hubAutomationsEnabled{true};
+  std::vector<IntegrationHubAutomationRuleState> hubAutomationRules{};
 
   // World state (in-system signals / resource depletion)
   //
@@ -332,7 +386,6 @@ struct SaveGame {
   core::u8 navRouteMode{0};
   bool navConstrainToCurrentFuelRange{true};
   StationId pendingArrivalStation{0};
-
 
   // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).
   // These are *not* physics-critical; they tune HUD/combat feel and basic progression loops.

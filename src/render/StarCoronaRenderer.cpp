@@ -6,6 +6,18 @@
 #include <cmath>
 #include <cstring>
 
+// Some platform/header combinations (notably Windows) ship legacy OpenGL
+// headers that omit these tokens even though MapBufferRange is available.
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#endif
+#ifndef GL_MAP_INVALIDATE_RANGE_BIT
+#define GL_MAP_INVALIDATE_RANGE_BIT 0x0004
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
+#endif
+
 namespace stellar::render {
 
 StarCoronaRenderer::~StarCoronaRenderer() {
@@ -67,6 +79,9 @@ uniform float uRimPower;
 uniform float uNoiseFreq;
 uniform float uNoiseStrength;
 uniform float uFlowSpeed;
+
+uniform int   uNoiseOctaves;
+uniform float uRimEarlyOut;
 
 uniform float uStreamerStrength;
 uniform float uStreamerSharpness;
@@ -138,11 +153,14 @@ float smoothNoise3D(vec3 x, uint seed) {
   return mix(y0v, y1v, w);
 }
 
-float fbm3D(vec3 p, uint seed) {
+float fbm3D(vec3 p, uint seed, int octaves) {
   float amp = 0.5;
   float freq = 1.0;
   float sum = 0.0;
-  for (int i = 0; i < 6; ++i) {
+
+  int oct = clamp(octaves, 1, 8);
+  for (int i = 0; i < 8; ++i) {
+    if (i >= oct) break;
     sum += amp * smoothNoise3D(p * freq, seed + uint(i) * 1013u);
     freq *= 2.07;
     amp *= 0.52;
@@ -165,6 +183,13 @@ void main() {
   // Rim/limb factor. Corona should mostly appear at grazing angles.
   float rim = pow(1.0 - ndotv, max(0.25, uRimPower));
 
+  // If the corona contribution is essentially zero for this pixel, skip the expensive
+  // procedural noise work entirely.
+  if (uIntensity <= 1e-5 || rim <= max(0.0, uRimEarlyOut)) {
+    FragColor = vec4(0.0);
+    return;
+  }
+
   // Direction from star center (seam-free domain).
   vec3 dir = normalize(vWorldPos - vInstPos);
 
@@ -182,17 +207,18 @@ void main() {
   float t = uTime * max(uFlowSpeed, 0.0);
 
   float freq = max(0.001, uNoiseFreq);
-  float n0 = fbm3D(dir * freq + flowDir * t, s ^ 0x51A7u);
-  float n1 = fbm3D(dir * (freq * 1.9) + flowDir * (t * 1.35), s ^ 0x70ADu);
-  float n = clamp01(0.65 * n0 + 0.35 * n1);
+  int oct = clamp(uNoiseOctaves, 1, 8);
+  float n0 = fbm3D(dir * freq + flowDir * t, s ^ 0x51A7u, oct);
+  float n1 = fbm3D(dir * (freq * 1.9) + flowDir * (t * 1.35), s ^ 0x70ADu, oct);
+  float noise = clamp01(0.65 * n0 + 0.35 * n1);
 
   // Edge fray/filaments.
-  float edge = 1.0 + (n - 0.5) * 2.0 * clamp(uNoiseStrength, 0.0, 3.0);
+  float edge = 1.0 + (noise - 0.5) * 2.0 * clamp(uNoiseStrength, 0.0, 3.0);
   edge = max(edge, 0.0);
 
   // Streamers: azimuthal rays modulated by an equatorial band.
   float eq = pow(clamp01(1.0 - abs(lat)), 1.25);
-  float rays = 0.5 + 0.5 * cos(float(max(uPromCount, 1)) * az + phase + (n - 0.5) * 2.2);
+  float rays = 0.5 + 0.5 * cos(float(max(uPromCount, 1)) * az + phase + (noise - 0.5) * 2.2);
   rays = pow(clamp01(rays), max(0.5, uStreamerSharpness));
   float streamer = rays * eq;
 
@@ -244,6 +270,8 @@ void StarCoronaRenderer::drawInstances(const std::vector<InstanceData>& instance
   glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 
   const int seed = std::max(settings_.seed, 1);
+  const int octaves = std::clamp(settings_.noiseOctaves, 1, 8);
+  const float rimEarlyOut = std::max(0.0f, settings_.rimEarlyOut);
 
   shader_.bind();
   shader_.setUniformMat4("uView", view_);
@@ -257,6 +285,9 @@ void StarCoronaRenderer::drawInstances(const std::vector<InstanceData>& instance
   shader_.setUniform1f("uNoiseFreq", settings_.noiseFrequency);
   shader_.setUniform1f("uNoiseStrength", settings_.noiseStrength);
   shader_.setUniform1f("uFlowSpeed", settings_.flowSpeed);
+  shader_.setUniform1i("uNoiseOctaves", octaves);
+  shader_.setUniform1f("uRimEarlyOut", rimEarlyOut);
+
   shader_.setUniform1f("uStreamerStrength", settings_.streamerStrength);
   shader_.setUniform1f("uStreamerSharpness", settings_.streamerSharpness);
   shader_.setUniform1f("uPromStrength", settings_.prominenceStrength);
@@ -267,30 +298,64 @@ void StarCoronaRenderer::drawInstances(const std::vector<InstanceData>& instance
   mesh_->bind();
 
   gl::BindBuffer(GL_ARRAY_BUFFER, instanceVbo_);
-  gl::BufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(instances.size() * sizeof(InstanceData)),
-                 instances.data(),
-                 GL_DYNAMIC_DRAW);
 
-  // location 3: vec3 position
-  gl::EnableVertexAttribArray(3);
-  gl::VertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, px));
-  gl::VertexAttribDivisor(3, 1);
+  const std::size_t bytes = instances.size() * sizeof(InstanceData);
+  if (bytes > instanceVboCapacityBytes_) {
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
+    instanceVboCapacityBytes_ = bytes;
+  }
 
-  // location 4: vec3 scale
-  gl::EnableVertexAttribArray(4);
-  gl::VertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, sx));
-  gl::VertexAttribDivisor(4, 1);
+  // Update buffer contents with a streaming-friendly path.
+  // Prefer MapBufferRange (with invalidation) to avoid implicit reallocation/stalls.
+  bool wrote = false;
+  if (gl::MapBufferRange) {
+    void* dst = gl::MapBufferRange(GL_ARRAY_BUFFER,
+                                   0,
+                                   static_cast<GLsizeiptr>(bytes),
+                                   GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (dst) {
+      std::memcpy(dst, instances.data(), bytes);
+      if (gl::UnmapBuffer) {
+        (void)gl::UnmapBuffer(GL_ARRAY_BUFFER);
+      }
+      wrote = true;
+    }
+  }
 
-  // location 5: vec4 quaternion
-  gl::EnableVertexAttribArray(5);
-  gl::VertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, qx));
-  gl::VertexAttribDivisor(5, 1);
+  if (!wrote) {
+    // Orphaning hint: we don't care about previous contents, avoid synchronization.
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(instanceVboCapacityBytes_), nullptr, GL_STREAM_DRAW);
+    gl::BufferSubData(GL_ARRAY_BUFFER,
+                      0,
+                      static_cast<GLsizeiptr>(bytes),
+                      instances.data());
+  }
 
-  // location 6: vec3 color
-  gl::EnableVertexAttribArray(6);
-  gl::VertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, cr));
-  gl::VertexAttribDivisor(6, 1);
+  // The instanced attribute pointers live in the mesh VAO. Set them once per mesh.
+  if (!instanceAttribsReady_ || instanceAttribsMesh_ != mesh_) {
+    // location 3: vec3 position
+    gl::EnableVertexAttribArray(3);
+    gl::VertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, px));
+    gl::VertexAttribDivisor(3, 1);
+
+    // location 4: vec3 scale
+    gl::EnableVertexAttribArray(4);
+    gl::VertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, sx));
+    gl::VertexAttribDivisor(4, 1);
+
+    // location 5: vec4 quaternion
+    gl::EnableVertexAttribArray(5);
+    gl::VertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, qx));
+    gl::VertexAttribDivisor(5, 1);
+
+    // location 6: vec3 color
+    gl::EnableVertexAttribArray(6);
+    gl::VertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(InstanceData), (void*)offsetof(InstanceData, cr));
+    gl::VertexAttribDivisor(6, 1);
+
+    instanceAttribsMesh_ = mesh_;
+    instanceAttribsReady_ = true;
+  }
 
   mesh_->drawInstanced(static_cast<std::uint32_t>(instances.size()));
 }

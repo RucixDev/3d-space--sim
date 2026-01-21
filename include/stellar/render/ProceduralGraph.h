@@ -128,6 +128,9 @@ struct ProcBakeStats {
   bool shaderRebuilt{false};
   double shaderBuildMs{0.0};
   double drawMs{0.0};
+
+  bool mipsGenerated{false};
+  double mipGenMs{0.0};
 };
 
 class ProceduralGraphBaker {
@@ -137,6 +140,32 @@ public:
 
   ProceduralGraphBaker(const ProceduralGraphBaker&) = delete;
   ProceduralGraphBaker& operator=(const ProceduralGraphBaker&) = delete;
+
+  // Quality knobs.
+  //
+  // - generateMips: allocates a mip chain for the baked texture, and generates it after each bake.
+  //   This reduces aliasing when the baked texture is applied to 3D previews.
+  // - ditherStrength: small ordered noise (in 8-bit space) applied before writing to RGBA8.
+  //   Helps reduce color banding in smooth procedural gradients.
+  void setGenerateMips(bool v) { generateMips_ = v; }
+  bool generateMips() const { return generateMips_; }
+
+  void setDitherStrength(float v) {
+    // Keep within a sane range; values above ~2.0 start to look intentionally noisy.
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    ditherStrength_ = v;
+  }
+  float ditherStrength() const { return ditherStrength_; }
+
+  // When enabled, the scalar graph output `t` (clamped to [0,1]) is also written to
+  // the alpha channel of the baked RGBA8 texture.
+  //
+  // This is intentionally optional because alpha is commonly used for transparency
+  // in downstream pipelines. In tooling (raymarch preview, material prototyping)
+  // the packed height is useful for deriving micro-normals.
+  void setPackHeightInAlpha(bool v) { packHeightInAlpha_ = v; }
+  bool packHeightInAlpha() const { return packHeightInAlpha_; }
 
   // Bake graph into an offscreen texture.
   // Returns false on shader compilation failure or FBO init failure; outError describes the problem.
@@ -154,13 +183,20 @@ private:
 
   bool ensureShader(const ProcGraph& g, std::string* outError);
 
+  // Bake target (no depth needed; optional mip chain).
   RenderTarget2D target_{};
+
   ShaderProgram shader_{};
   core::u64 shaderKey_{0};
   unsigned int vao_{0};
 
   ProcBakeStats stats_{};
   std::string lastFragSrc_{};
+
+  bool generateMips_{true};
+  float ditherStrength_{1.0f};
+  bool packHeightInAlpha_{false};
+  bool packHeightInAlpha_{false};
 
   // Packed uniform data (fixed max sizes).
   std::array<float, kProcGraphMaxNodes * 4> packedParams_{};

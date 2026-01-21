@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -91,6 +92,67 @@ struct TradePlannerWindowState {
   std::vector<stellar::sim::TradeLoop> loops;
   std::vector<stellar::sim::IndustryTradeOpportunity> industryOps;
 
+  // ---------------------------------------------------------------------------
+  // Trade Route Runner (cross-integrates TradePlanner -> Nav/Docking/Comms)
+  // ---------------------------------------------------------------------------
+  //
+  // A lightweight, UI-owned plan that can be executed by the main game loop
+  // (auto-run to the next stop, auto-dock when in range). This intentionally
+  // stores only IDs + UI-friendly labels + the precomputed manifest.
+  //
+  // Notes:
+  //  - We copy legs when arming a route so the runner stays stable even if the
+  //    user re-scans trade ideas.
+  //  - Persistence is intentionally left to the save system; the runner is
+  //    designed to be safe to drop on load.
+
+  struct TradeRouteLeg {
+    stellar::sim::SystemId fromSystem{0};
+    stellar::sim::StationId fromStation{0};
+    stellar::sim::SystemId toSystem{0};
+    stellar::sim::StationId toStation{0};
+
+    std::string fromSystemName;
+    std::string fromStationName;
+    std::string toSystemName;
+    std::string toStationName;
+
+    // Geometry / scoring hints.
+    double distanceLy{0.0};
+    int hops{0};
+
+    // Per-leg economics (net-of-fees).
+    double netProfitCr{0.0};
+    stellar::econ::CargoManifestPlan manifest{};
+  };
+
+  struct TradeRouteRunner {
+    bool active{false};
+
+    // Route type: loops can optionally repeat.
+    bool isLoop{false};
+    bool repeat{false};
+
+    // If true, the runner will arm nav auto-run on each leg transition.
+    bool armAutoRun{true};
+
+    // Index of the current leg we are traveling *towards* (destination).
+    int legIndex{0};
+
+    // Integration markers.
+    bool startEventEmitted{false};
+    bool endEventPending{false};
+    enum class EndReason : int { None = 0, Cancelled = 1 };
+    EndReason endReason{EndReason::None};
+
+    double startedAtDays{0.0};
+    double lastAdvanceAtDays{0.0};
+
+    std::vector<TradeRouteLeg> legs;
+  };
+
+  TradeRouteRunner route{};
+
   std::unique_ptr<stellar::core::JobSystem> jobs;
   std::size_t jobsThreadCount{0};
 };
@@ -116,6 +178,9 @@ struct TradePlannerContext {
 
   // UI callbacks.
   std::function<void(stellar::sim::SystemId, stellar::sim::StationId)> routeToStation;
+  // Like routeToStation, but can also arm nav auto-run + auto-docking.
+  // If unset, the UI will gracefully fall back to routeToStation.
+  std::function<void(stellar::sim::SystemId, stellar::sim::StationId, bool armAutoRun)> goToStation;
   std::function<void(std::string_view, double)> toast;
 };
 

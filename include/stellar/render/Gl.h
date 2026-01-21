@@ -102,6 +102,16 @@ typedef void (APIENTRYP PFNGLDELETESYNCPROC)(GLsync sync);
 #define GL_WAIT_FAILED 0x911D
 #endif
 
+// Packed HDR formats (core since OpenGL 3.0). Some legacy Windows OpenGL
+// headers may omit these enums even if the driver supports them.
+#ifndef GL_R11F_G11F_B10F
+#define GL_R11F_G11F_B10F 0x8C3A
+#endif
+
+#ifndef GL_UNSIGNED_INT_10F_11F_11F_REV
+#define GL_UNSIGNED_INT_10F_11F_11F_REV 0x8C3B
+#endif
+
 // KHR_debug (debug message callbacks, groups, labels). Optional but extremely
 // helpful for GPU debugging/profiling tools and for printing driver messages.
 //

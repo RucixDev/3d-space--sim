@@ -93,6 +93,7 @@ struct ActionBinds {
   KeyChord toggleAutopilot;
   KeyChord navAssistApproach;
   KeyChord navAssistMatchVelocity;
+  KeyChord navAssistFollow;
   KeyChord toggleMouseSteer;
   KeyChord supercruise;
   KeyChord fsdJump;
@@ -305,6 +306,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.toggleAutopilot = {SDL_SCANCODE_P, KMOD_NONE};
   c.actions.navAssistApproach = {SDL_SCANCODE_PAGEUP, KMOD_NONE};
   c.actions.navAssistMatchVelocity = {SDL_SCANCODE_PAGEDOWN, KMOD_NONE};
+  c.actions.navAssistFollow = {SDL_SCANCODE_HOME, KMOD_NONE};
   c.actions.toggleMouseSteer = {SDL_SCANCODE_M, KMOD_NONE};
   c.actions.supercruise = {SDL_SCANCODE_H, KMOD_NONE};
   c.actions.fsdJump = {SDL_SCANCODE_J, KMOD_NONE};
@@ -403,6 +405,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "ToggleAutopilot", a.toggleAutopilot);
   saveKeyChord(f, "NavAssistApproach", a.navAssistApproach);
   saveKeyChord(f, "NavAssistMatchVelocity", a.navAssistMatchVelocity);
+  saveKeyChord(f, "NavAssistFollow", a.navAssistFollow);
   saveKeyChord(f, "ToggleMouseSteer", a.toggleMouseSteer);
   saveKeyChord(f, "Supercruise", a.supercruise);
   saveKeyChord(f, "FsdJump", a.fsdJump);
@@ -475,6 +478,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("ToggleAutopilot", &a.toggleAutopilot);
     addB("NavAssistApproach", &a.navAssistApproach);
     addB("NavAssistMatchVelocity", &a.navAssistMatchVelocity);
+    addB("NavAssistFollow", &a.navAssistFollow);
     addB("ToggleMouseSteer", &a.toggleMouseSteer);
     addB("Supercruise", &a.supercruise);
     addB("FsdJump", &a.fsdJump);

@@ -50,6 +50,17 @@ struct StarCoronaSettings {
 
   // Global brightness pulsation.
   float pulseStrength{0.08f};
+
+  // --- Performance / quality ---
+  // Number of FBM octaves used for the 3D noise field.
+  // Higher = richer detail, lower = faster.
+  // Clamped to [1,8] in the shader.
+  int noiseOctaves{6};
+
+  // Early-out threshold for the rim factor. Pixels with rim below this value
+  // skip the expensive noise path and output black.
+  // Lower = more accurate but slower; higher = faster but can thin the halo.
+  float rimEarlyOut{0.0015f};
 };
 
 class StarCoronaRenderer {
@@ -81,6 +92,12 @@ private:
   const Mesh* mesh_{nullptr};
   ShaderProgram shader_{};
   unsigned int instanceVbo_{0};
+  std::size_t instanceVboCapacityBytes_{0};
+
+  // Instanced attribute pointers are stored in the Mesh VAO. Configure them
+  // once per mesh to avoid redundant state churn each frame.
+  const Mesh* instanceAttribsMesh_{nullptr};
+  bool instanceAttribsReady_{false};
 
   float view_[16]{};
   float proj_[16]{};

@@ -3,6 +3,7 @@
 #include "stellar/render/Shader.h"
 
 #include <vector>
+#include <cstddef>
 
 namespace stellar::render {
 
@@ -28,6 +29,10 @@ private:
   ShaderProgram shader_{};
   unsigned int vao_{0};
   unsigned int vbo_{0};
+
+  // Capacity of the VBO allocation (bytes). Used to avoid reallocating the
+  // data store every frame.
+  std::size_t vboCapacityBytes_{0};
 
   float view_[16]{};
   float proj_[16]{};

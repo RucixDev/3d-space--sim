@@ -39,6 +39,9 @@ struct DockingClearanceState {
   double cooldownUntilDays{0.0};
   double lastRequestDays{0.0};
 
+  // Assigned hangar pad number (1-based). 0 means "none" (no valid clearance).
+  core::u16 assignedPad{0};
+
   // Counts actual request attempts (in range, not throttled/cooldown).
   // Used to derive a stable per-request RNG seed.
   core::u32 requestCount{0};

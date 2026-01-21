@@ -5,6 +5,7 @@
 #include "stellar/render/Texture.h"
 
 #include <vector>
+#include <cstddef>
 
 namespace stellar::render {
 
@@ -34,7 +35,14 @@ public:
 
   bool init(std::string* outError = nullptr);
 
-  void setMesh(const Mesh* mesh) { mesh_ = mesh; }
+  void setMesh(const Mesh* mesh) {
+    if (mesh_ != mesh) {
+      mesh_ = mesh;
+      // Instance attributes live on the mesh VAO. If the mesh changes we must
+      // re-bind our instance attribute layout once.
+      instanceLayoutBoundForMesh_ = nullptr;
+    }
+  }
   void setTexture(const Texture2D* tex) { tex_ = tex; }
   // Optional tangent-space normal map (RGBA8 normal, encoded in RGB).
   // When null, normal mapping is disabled.
@@ -92,6 +100,8 @@ public:
   void drawInstances(const std::vector<InstanceData>& instances);
 
 private:
+  void ensureInstanceAttribLayoutBound_();
+
   const Mesh* mesh_{nullptr};
   const Texture2D* tex_{nullptr};
   const Texture2D* normalTex_{nullptr};
@@ -115,6 +125,15 @@ private:
   ShaderProgram shader_{};
 
   unsigned int instanceVbo_{0};
+
+  // The instance attribute pointers are stored on the mesh VAO. Re-binding
+  // them every draw call is surprisingly expensive on some drivers. We
+  // therefore bind the layout once per mesh.
+  const Mesh* instanceLayoutBoundForMesh_{nullptr};
+
+  // Capacity of the instance buffer allocation (bytes). Avoids reallocating
+  // the data store every draw call.
+  std::size_t instanceVboCapacityBytes_{0};
 
   float view_[16]{};
   float proj_[16]{};

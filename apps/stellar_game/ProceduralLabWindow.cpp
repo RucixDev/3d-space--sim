@@ -376,6 +376,15 @@ void drawProceduralLabWindow(ProceduralLabWindowState& st, float timeSec, const 
 
     if (ImGui::SliderInt("Resolution", &st.resolution, 64, 2048)) st.dirty = true;
 
+    if (ImGui::Checkbox("Generate mips", &st.bakeGenerateMips)) st.dirty = true;
+    if (ImGui::SliderFloat("Dither", &st.bakeDitherStrength, 0.0f, 2.0f, "%.2f")) st.dirty = true;
+    if (ImGui::Checkbox("Pack height in alpha", &st.bakePackHeightInAlpha)) st.dirty = true;
+
+    // Apply quality options to the baker (affects the next bake).
+    st.baker.setGenerateMips(st.bakeGenerateMips);
+    st.baker.setDitherStrength(st.bakeDitherStrength);
+    st.baker.setPackHeightInAlpha(st.bakePackHeightInAlpha);
+
     ImGui::Checkbox("Auto-bake", &st.autoBake);
     ImGui::SameLine();
     const bool wantBake = ImGui::Button("Bake now") || (st.autoBake && st.dirty);
@@ -399,10 +408,18 @@ void drawProceduralLabWindow(ProceduralLabWindowState& st, float timeSec, const 
     ImGui::Image((ImTextureID)(intptr_t)st.baker.texture().handle(), ImVec2(preview, preview), ImVec2(0, 1), ImVec2(1, 0));
 
     const auto& stats = st.baker.stats();
-    ImGui::Text("Shader: %s (build %.2f ms) | Bake draw %.2f ms",
-                stats.shaderRebuilt ? "rebuilt" : "cached",
-                stats.shaderBuildMs,
-                stats.drawMs);
+    if (st.bakeGenerateMips) {
+      ImGui::Text("Shader: %s (build %.2f ms) | Draw %.2f ms | Mips %.2f ms",
+                  stats.shaderRebuilt ? "rebuilt" : "cached",
+                  stats.shaderBuildMs,
+                  stats.drawMs,
+                  stats.mipsGenerated ? stats.mipGenMs : 0.0);
+    } else {
+      ImGui::Text("Shader: %s (build %.2f ms) | Draw %.2f ms | Mips: off",
+                  stats.shaderRebuilt ? "rebuilt" : "cached",
+                  stats.shaderBuildMs,
+                  stats.drawMs);
+    }
   } else {
     ImGui::TextUnformatted("(No baked texture yet)");
   }

@@ -135,6 +135,36 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  // Integration Hub automations (stellar_game)
+  //
+  // Persisted so Integration Hub (IFTTT-style) rules survive quicksave/quickload.
+  f << "hubAutomationsEnabled " << (s.hubAutomationsEnabled ? 1 : 0) << "\n";
+  f << "hubRules " << s.hubAutomationRules.size() << "\n";
+  for (const auto& r : s.hubAutomationRules) {
+    f << "hub_rule "
+      << (r.enabled ? 1 : 0) << " "
+      << (int)r.eventKind << " "
+      << (int)r.tagMatch << " "
+      << r.cooldownSec << " "
+      << b64tok(r.name) << " "
+      << b64tok(r.tagText) << " "
+      << r.actions.size()
+      << "\n";
+
+    for (const auto& a : r.actions) {
+      f << "hub_action "
+        << (int)a.kind << " "
+        << (int)a.u64aSource << " "
+        << a.u64aConst << " "
+        << (int)a.u64bSource << " "
+        << a.u64bConst << " "
+        << a.i32Const << " "
+        << (a.bConst ? 1 : 0) << " "
+        << a.delaySec << " "
+        << b64tok(a.msgTemplate)
+        << "\n";
+    }
+  }
   // World state (signals / mining depletion)
   f << "resolved_signals " << s.resolvedSignalIds.size() << "\n";
   for (core::u64 id : s.resolvedSignalIds) {
@@ -687,6 +717,88 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         m.body = decodeTok(bodyB64);
 
         out.comms.push_back(std::move(m));
+      }
+    } else if (key == "hubAutomationsEnabled") {
+      int v = 1;
+      f >> v;
+      out.hubAutomationsEnabled = (v != 0);
+    } else if (key == "hubRules") {
+      std::size_t n = 0;
+      f >> n;
+      out.hubAutomationRules.clear();
+      out.hubAutomationRules.reserve(std::min<std::size_t>(n, 256));
+
+      auto decodeTok = [&](const std::string& tok) -> std::string {
+        if (tok == "~") return {};
+        std::string s;
+        if (!core::base64Decode(tok, &s)) return {};
+        return s;
+      };
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "hub_rule") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        IntegrationHubAutomationRuleState r{};
+        int enabled = 0;
+        int eventKind = 0;
+        int tagMatch = 0;
+        double cooldownSec = 0.0;
+        std::string nameB64;
+        std::string tagTextB64;
+        std::size_t actionCount = 0;
+
+        if (!(f >> enabled >> eventKind >> tagMatch >> cooldownSec >> nameB64 >> tagTextB64 >> actionCount)) {
+          break;
+        }
+
+        r.enabled = (enabled != 0);
+        r.eventKind = core::clampCast<core::u8>(eventKind, 0, 255);
+        r.tagMatch = core::clampCast<core::u8>(tagMatch, 0, 255);
+        r.cooldownSec = std::max(0.0, cooldownSec);
+        r.name = decodeTok(nameB64);
+        r.tagText = decodeTok(tagTextB64);
+
+        r.actions.clear();
+        r.actions.reserve(std::min<std::size_t>(actionCount, 64));
+        for (std::size_t j = 0; j < actionCount; ++j) {
+          const std::streampos pos2 = f.tellg();
+          std::string atag;
+          if (!(f >> atag)) break;
+          if (atag != "hub_action") {
+            f.clear();
+            f.seekg(pos2);
+            break;
+          }
+
+          IntegrationHubAutomationActionState a{};
+          int kind = 0;
+          int u64aSource = 0;
+          int u64bSource = 0;
+          int bConst = 0;
+          std::string msgB64;
+
+          if (!(f >> kind >> u64aSource >> a.u64aConst >> u64bSource >> a.u64bConst >> a.i32Const >> bConst >> a.delaySec >> msgB64)) {
+            break;
+          }
+
+          a.kind = core::clampCast<core::u8>(kind, 0, 255);
+          a.u64aSource = core::clampCast<core::u8>(u64aSource, 0, 255);
+          a.u64bSource = core::clampCast<core::u8>(u64bSource, 0, 255);
+          a.bConst = (bConst != 0);
+          a.delaySec = std::max(0.0, a.delaySec);
+          a.msgTemplate = decodeTok(msgB64);
+
+          r.actions.push_back(std::move(a));
+        }
+
+        out.hubAutomationRules.push_back(std::move(r));
       }
     } else if (key == "resolved_signals") {
       std::size_t n = 0;

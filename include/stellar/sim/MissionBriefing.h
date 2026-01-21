@@ -40,13 +40,11 @@ struct MissionBriefingParams {
   // If true, embed optional ui::textfx markup tags in generated text.
   bool useMarkup{true};
 
-  // If true, include detailed risk breakdowns (component values, customs/fine
-  // estimates, etc.). If false, the briefing stays more "in-universe" and less
-  // numeric.
-  bool includeRiskHints{true};
+  // If true, append short, human-friendly guidance derived from the risk model.
+  // (Useful for compact logbook entries / comms messages.)
+  bool includeRiskHints{false};
 
-  // If true, include a lightweight cue about the player's standing with the
-  // issuing faction (useful for smuggling/black-market flavored missions).
+  // If true, add a brief reputation cue based on playerRepWithIssuerFaction.
   bool includeReputationCues{false};
 };
 

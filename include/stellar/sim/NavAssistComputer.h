@@ -23,6 +23,9 @@ enum class NavAssistMode : core::u8 {
   Off = 0,
   Approach = 1,
   MatchVelocity = 2,
+  // Formation-like guidance: keep an offset behind the target based on its
+  // current travel direction while matching velocity.
+  Follow = 3,
 };
 
 // Tunables for NavAssistComputer.
@@ -42,6 +45,25 @@ struct NavAssistParams {
   double matchSlowDownRangeKm{2500.0};
   double matchVelGain{2.2};
   bool matchAllowBoost{false};
+
+  // --- Follow mode (formation) ---
+  // Keep a point behind the target (based on target velocity direction) at a
+  // configurable distance while matching velocity.
+  double followMaxSpeedKmS{0.55};
+  double followSlowDownRangeKm{5000.0};
+  double followVelGain{2.0};
+  bool followAllowBoost{false};
+
+  // When the target isn't moving much, fall back to the line-of-sight direction.
+  double followMinTargetSpeedKmS{0.02};
+
+  // Smoothing for the travel direction used to compute the follow point.
+  // Higher values = smoother but more lag.
+  double followDirBlendTauSec{0.75};
+
+  // If true, keep facing the *target* while translating toward the follow point.
+  // If false, face the target's travel direction.
+  bool followFaceTarget{true};
 
   // --- Common ---
   double accelScale{1.0};
@@ -105,6 +127,15 @@ public:
                            const math::Vec3d& targetPosKm,
                            double desiredDistOverrideKm = -1.0);
 
+  // Engage "follow" mode: hold behind the target based on its travel direction.
+  //
+  // desiredDistOverrideKm can be set to a non-negative value to force a specific
+  // follow distance.
+  void engageFollow(const Ship& ship,
+                    const math::Vec3d& targetPosKm,
+                    const math::Vec3d& targetVelKmS,
+                    double desiredDistOverrideKm = -1.0);
+
   // Compute assisted inputs for this frame.
   //
   // dtSimSec is currently only used for future-proofing and is safe to pass 0.
@@ -122,6 +153,10 @@ private:
   NavAssistParams params_{};
   NavAssistMode mode_{NavAssistMode::Off};
   double desiredDistKm_{0.0};
+
+  // Internal state for Follow mode.
+  math::Vec3d followDirUnit_{0, 0, 1};
+  bool followDirInit_{false};
 };
 
 } // namespace stellar::sim

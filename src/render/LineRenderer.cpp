@@ -2,9 +2,19 @@
 
 #include "stellar/render/Gl.h"
 
+#include <cstddef>
 #include <cstring>
 
 namespace stellar::render {
+
+// Some Windows OpenGL headers omit these tokens even though glMapBufferRange is
+// available via extension loading.
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#endif
+#ifndef GL_MAP_INVALIDATE_RANGE_BIT
+#define GL_MAP_INVALIDATE_RANGE_BIT 0x0004
+#endif
 
 LineRenderer::~LineRenderer() {
   if (vbo_) gl::DeleteBuffers(1, &vbo_);
@@ -45,7 +55,8 @@ bool LineRenderer::init(std::string* outError) {
 
   gl::BindVertexArray(vao_);
   gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
-  gl::BufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+  gl::BufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_STREAM_DRAW);
+  vboCapacityBytes_ = 0;
 
   gl::EnableVertexAttribArray(0);
   gl::VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex), (void*)offsetof(LineVertex, px));
@@ -76,13 +87,32 @@ void LineRenderer::drawLines(const std::vector<LineVertex>& vertices) {
 
   gl::BindVertexArray(vao_);
   gl::BindBuffer(GL_ARRAY_BUFFER, vbo_);
-  gl::BufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(vertices.size() * sizeof(LineVertex)),
-                 vertices.data(),
-                 GL_DYNAMIC_DRAW);
+
+  const std::size_t bytes = vertices.size() * sizeof(LineVertex);
+  if (bytes > vboCapacityBytes_) {
+    // Grow once, then stream into the existing store to avoid per-frame
+    // reallocations / driver stalls.
+    gl::BufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
+    vboCapacityBytes_ = bytes;
+  }
+
+  bool wrote = false;
+  if (gl::MapBufferRange) {
+    void* dst = gl::MapBufferRange(GL_ARRAY_BUFFER,
+                                  0,
+                                  static_cast<GLsizeiptr>(bytes),
+                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+    if (dst) {
+      std::memcpy(dst, vertices.data(), bytes);
+      gl::UnmapBuffer(GL_ARRAY_BUFFER);
+      wrote = true;
+    }
+  }
+  if (!wrote) {
+    gl::BufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(bytes), vertices.data());
+  }
 
   glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size()));
-
   gl::BindVertexArray(0);
 }
 

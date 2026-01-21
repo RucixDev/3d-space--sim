@@ -248,6 +248,9 @@ uniform float uTime;
 // Viewport size in pixels.
 uniform vec2 uResolution;
 
+// Optional upscale sharpening (0 disables). Intended for use with renderScale < 1.
+uniform float uSharpen;
+
 // Retro / CRT compositor mode.
 uniform int   uRetroEnabled;
 uniform int   uRetroPixelSize;
@@ -428,18 +431,24 @@ void main() {
     uv = clamp(uv, 0.0, 1.0);
 
     // Pixelation grid and exact sampling (texelFetch bypasses bilinear filtering).
-    vec2 resF = max(uResolution, vec2(1.0));
-    ivec2 res = ivec2(resF);
+    // uResolution is the *output* resolution, but the scene texture may be
+    // smaller when renderScale < 1.0. Map output-space grid texels into the
+    // scene texture to avoid out-of-range texelFetch.
+    ivec2 outRes = ivec2(max(uResolution, vec2(1.0)));
+    ivec2 sceneRes = max(textureSize(uScene, 0), ivec2(1));
+    vec2 sceneScale = vec2(sceneRes) / vec2(outRes);
 
     int px = max(1, uRetroPixelSize);
-    ivec2 grid = ivec2(max(1, res.x / px), max(1, res.y / px));
+    ivec2 grid = ivec2(max(1, outRes.x / px), max(1, outRes.y / px));
     vec2 g = vec2(grid);
     ivec2 ip = ivec2(clamp(floor(uv * g), vec2(0.0), g - 1.0));
 
-    ivec2 tex = ip * px + ivec2(px / 2);
-    tex = clamp(tex, ivec2(0), res - 1);
+    ivec2 texOut = ip * px + ivec2(px / 2);
+    texOut = clamp(texOut, ivec2(0), outRes - 1);
 
-    vec2 uvS = (vec2(tex) + 0.5) / vec2(res);
+    // Convert to scene texel space.
+    ivec2 tex = ivec2(clamp(floor(vec2(texOut) * sceneScale), vec2(0.0), vec2(sceneRes - 1)));
+    vec2 uvS = (vec2(tex) + 0.5) / vec2(sceneRes);
 
     vec3 scene = texelFetch(uScene, tex, 0).rgb;
     vec3 bloom = (uBloomEnabled != 0) ? texture(uBloom, uvS).rgb : vec3(0.0);
@@ -569,6 +578,21 @@ void main() {
     }
     streak /= float(N);
     scene = scene + streak * 0.65;
+  }
+
+  // Optional unsharp-mask style sharpening to make upscaling less blurry.
+  // (Kept very cheap so the default path stays fast.)
+  float sh = clamp(uSharpen, 0.0, 1.0);
+  if (sh > 0.001) {
+    ivec2 ts = max(textureSize(uScene, 0), ivec2(1));
+    vec2 texel = 1.0 / vec2(ts);
+
+    vec3 n = texture(uScene, clamp(uv + vec2(texel.x, 0.0), 0.0, 1.0)).rgb;
+    vec3 s2 = texture(uScene, clamp(uv - vec2(texel.x, 0.0), 0.0, 1.0)).rgb;
+    vec3 e = texture(uScene, clamp(uv + vec2(0.0, texel.y), 0.0, 1.0)).rgb;
+    vec3 w2 = texture(uScene, clamp(uv - vec2(0.0, texel.y), 0.0, 1.0)).rgb;
+    vec3 blur = (n + s2 + e + w2) * 0.25;
+    scene = scene + (scene - blur) * sh;
   }
 
   vec3 bloom = (uBloomEnabled != 0) ? texture(uBloom, uv).rgb : vec3(0.0);
@@ -787,14 +811,127 @@ void PostFX::destroy() {
     gl::DeleteFramebuffers(1, &sceneFbo_);
     sceneFbo_ = 0;
   }
+  // Async auto exposure readback resources.
+  if (aeReadbackInited_) {
+    // Delete any pending sync objects.
+    if (gl::DeleteSync) {
+      for (int i = 0; i < kAeReadbackFrames; ++i) {
+        void* f = aeReadbackFences_[(std::size_t)i];
+        if (f) {
+          gl::DeleteSync(reinterpret_cast<GLsync>(f));
+          aeReadbackFences_[(std::size_t)i] = nullptr;
+        }
+      }
+    } else {
+      for (int i = 0; i < kAeReadbackFrames; ++i) {
+        aeReadbackFences_[(std::size_t)i] = nullptr;
+      }
+    }
+
+    // Delete PBO ring.
+    if (gl::DeleteBuffers) {
+      gl::DeleteBuffers((GLsizei)kAeReadbackFrames, aeReadbackPbos_.data());
+    }
+
+    for (int i = 0; i < kAeReadbackFrames; ++i) {
+      aeReadbackPbos_[(std::size_t)i] = 0u;
+      aeReadbackTags_[(std::size_t)i] = 0;
+    }
+
+    aeReadbackWrite_ = 0;
+    aeReadbackTagCounter_ = 1;
+    aeReadbackInited_ = false;
+    aeReadbackSupported_ = false;
+  }
 
   w_ = h_ = 0;
+
+  // Reset render-scale state.
+  renderScaleUsed_ = 1.0f;
+  dynamicScale_ = 1.0f;
+  lastUserScale_ = 1.0f;
+  smoothedFrameMs_ = 16.67f;
+  drsCooldownSec_ = 0.0f;
+  drsWasEnabled_ = false;
+
+  // Reset HDR format state.
+  hdrBufferFormatRequested_ = HdrBufferFormat::R11G11B10f;
+  hdrBufferFormatActive_ = HdrBufferFormat::Rgba16f;
+  forceRecreate_ = false;
+  hdrInternalFormat_ = 0;
+  hdrUploadFormat_ = 0;
+  hdrUploadType_ = 0;
+}
+
+namespace {
+
+static float clampScale(float s) {
+  return std::clamp(s, 0.25f, 1.0f);
+}
+
+static float quantize(float v, float step) {
+  if (step <= 0.0f) return v;
+  const float inv = 1.0f / step;
+  return std::round(v * inv) / inv;
+}
+
+} // namespace
+
+void PostFX::configure(const PostFXSettings& s) {
+  // HDR buffer format can change at runtime from the UI. If it changes, we need
+  // to recreate the scene target even if the resolution is unchanged.
+  if (s.hdrBufferFormat != hdrBufferFormatRequested_) {
+    hdrBufferFormatRequested_ = s.hdrBufferFormat;
+    forceRecreate_ = true;
+  }
+
+  const float userScale = clampScale(s.renderScale);
+
+  // Manual / fixed scale.
+  if (!s.dynamicResolutionEnabled) {
+    renderScaleUsed_ = userScale;
+    dynamicScale_ = userScale;
+    lastUserScale_ = userScale;
+    drsCooldownSec_ = 0.0f;
+    drsWasEnabled_ = false;
+    return;
+  }
+
+  // Dynamic resolution enabled.
+  const float minS = std::clamp(clampScale(s.dynamicResolutionMinScale), 0.25f, 1.0f);
+  const float maxS = std::clamp(clampScale(s.dynamicResolutionMaxScale), minS, 1.0f);
+
+  // First frame / toggle-on: seed from the user-provided scale.
+  if (!drsWasEnabled_) {
+    dynamicScale_ = std::clamp(userScale, minS, maxS);
+    lastUserScale_ = userScale;
+    drsCooldownSec_ = 0.0f;
+    drsWasEnabled_ = true;
+  } else {
+    // If the user touched the slider while DRS is enabled, treat it as a reset.
+    if (std::abs(userScale - lastUserScale_) > 0.0005f) {
+      dynamicScale_ = std::clamp(userScale, minS, maxS);
+    }
+    lastUserScale_ = userScale;
+  }
+
+  // Quantize to reduce realloc churn.
+  const float step = std::clamp(s.dynamicResolutionStep, 0.0f, 0.25f);
+  dynamicScale_ = std::clamp(quantize(dynamicScale_, step), minS, maxS);
+  renderScaleUsed_ = dynamicScale_;
 }
 
 void PostFX::ensureSize(int w, int h) {
   if (w <= 0 || h <= 0) return;
-  if (w == w_ && h == h_) return;
-  createOrResize(w, h);
+
+  // `w`,`h` are the window/backbuffer dimensions. The scene target dimensions
+  // are scaled by renderScaleUsed_.
+  const float sc = clampScale(renderScaleUsed_);
+  const int sw = std::max(1, (int)std::lround((float)w * sc));
+  const int sh = std::max(1, (int)std::lround((float)h * sc));
+  if (sw == w_ && sh == h_ && !forceRecreate_) return;
+  createOrResize(sw, sh);
+  forceRecreate_ = false;
 }
 
 void PostFX::createOrResize(int w, int h) {
@@ -807,8 +944,22 @@ void PostFX::createOrResize(int w, int h) {
   w_ = w;
   h_ = h;
 
-  // HDR scene texture + depth
-  sceneTex_ = makeTex2D(w_, h_, GL_RGBA16F, GL_RGBA, GL_FLOAT);
+  // Choose the HDR color buffer format.
+  auto getHdrFormat = [](HdrBufferFormat fmt, int& outInternal, unsigned int& outFormat, unsigned int& outType) {
+    switch (fmt) {
+      case HdrBufferFormat::R11G11B10f:
+        outInternal = GL_R11F_G11F_B10F;
+        outFormat = GL_RGB;
+        outType = GL_UNSIGNED_INT_10F_11F_11F_REV;
+        break;
+      case HdrBufferFormat::Rgba16f:
+      default:
+        outInternal = GL_RGBA16F;
+        outFormat = GL_RGBA;
+        outType = GL_FLOAT;
+        break;
+    }
+  };
 
   gl::GenRenderbuffers(1, &depthRbo_);
   gl::BindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
@@ -816,13 +967,38 @@ void PostFX::createOrResize(int w, int h) {
   gl::BindRenderbuffer(GL_RENDERBUFFER, 0);
 
   gl::BindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
-  gl::FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneTex_, 0);
   gl::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRbo_);
-  glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-  if (gl::CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-    // If incomplete, keep going but the scene will render black; better than crash.
+  auto tryAllocColor = [&](HdrBufferFormat fmt) -> bool {
+    int internal = 0;
+    unsigned int format = 0;
+    unsigned int type = 0;
+    getHdrFormat(fmt, internal, format, type);
+
+    if (sceneTex_) { gl::DeleteTextures(1, &sceneTex_); sceneTex_ = 0; }
+    sceneTex_ = makeTex2D(w_, h_, internal, format, type);
+    gl::FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneTex_, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    const bool ok = (gl::CheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    if (ok) {
+      hdrBufferFormatActive_ = fmt;
+      hdrInternalFormat_ = internal;
+      hdrUploadFormat_ = format;
+      hdrUploadType_ = type;
+      return true;
+    }
+
+    // Clean up and let caller try a fallback.
+    if (sceneTex_) { gl::DeleteTextures(1, &sceneTex_); sceneTex_ = 0; }
+    return false;
+  };
+
+  // Try the requested format, then fall back to RGBA16F if unsupported.
+  if (!tryAllocColor(hdrBufferFormatRequested_)) {
+    (void)tryAllocColor(HdrBufferFormat::Rgba16f);
   }
+
   gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -830,6 +1006,9 @@ void PostFX::beginScene(int w, int h) const {
   (void)w;
   (void)h;
   gl::BindFramebuffer(GL_FRAMEBUFFER, sceneFbo_);
+  if (w_ > 0 && h_ > 0) {
+    glViewport(0, 0, w_, h_);
+  }
 }
 
 void PostFX::drawFullscreen() const {
@@ -955,10 +1134,14 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
 
   // Half-res HDR transient textures.
   FrameGraph::TextureDesc half{};
-  half.scale = 0.5f;
-  half.internalFormat = GL_RGBA16F;
-  half.format = GL_RGBA;
-  half.type = GL_FLOAT;
+  // Bloom runs relative to the *scene* resolution. When rendering at a scaled
+  // resolution, incorporate the renderScale so we don't accidentally upsample
+  // and pay more than necessary.
+  half.scale = 0.5f * clampScale(renderScaleUsed_);
+  // Use the active HDR buffer format for post-FX to reduce bandwidth.
+  half.internalFormat = (hdrInternalFormat_ != 0) ? hdrInternalFormat_ : GL_RGBA16F;
+  half.format = (hdrUploadFormat_ != 0) ? hdrUploadFormat_ : GL_RGBA;
+  half.type = (hdrUploadType_ != 0) ? hdrUploadType_ : GL_FLOAT;
   half.linearFilter = true;
   half.clampToEdge = true;
 
@@ -971,9 +1154,6 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
       brightOut,
       [&](const FrameGraph::PassContext& ctx) {
         (void)ctx;
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
-
         bright_.bind();
         gl::ActiveTexture(GL_TEXTURE0);
         gl::BindTexture(GL_TEXTURE_2D, ctx.texture(scene));
@@ -999,9 +1179,6 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
         out,
         [&, hdir, prev, out](const FrameGraph::PassContext& ctx) {
           (void)out;
-          glClearColor(0, 0, 0, 1);
-          glClear(GL_COLOR_BUFFER_BIT);
-
           blur_.bind();
           blur_.setUniform1i("uTex", 0);
 
@@ -1050,6 +1227,7 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
       composite_.setUniform1f("uTime", timeSeconds);
 
       composite_.setUniform2f("uResolution", (float)w, (float)h);
+      composite_.setUniform1f("uSharpen", s.upsampleSharpen);
 
       // Retro compositor
       composite_.setUniform1i("uRetroEnabled", s.retroEnabled ? 1 : 0);
@@ -1095,6 +1273,7 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
     composite_.setUniform1f("uWarp", s.warp);
     composite_.setUniform1f("uTime", timeSeconds);
     composite_.setUniform2f("uResolution", (float)w, (float)h);
+    composite_.setUniform1f("uSharpen", s.upsampleSharpen);
     composite_.setUniform1i("uRetroEnabled", s.retroEnabled ? 1 : 0);
     composite_.setUniform1i("uRetroPixelSize", s.retroPixelSize);
     composite_.setUniform1i("uRetroSteps", s.retroColorSteps);
@@ -1113,27 +1292,180 @@ void PostFX::present(int w, int h, const PostFXSettings& s, float timeSeconds) {
   }
 
   // --- Auto exposure update (read back 1x1 log-luminance) -------------------
+  //
+  // NOTE: A synchronous glGetTexImage on a GPU-produced texture can stall the CPU/GPU
+  // pipeline. When enabled and supported, we use an async pixel-pack-buffer (PBO)
+  // + fence sync path that reads back with a small (1-2 frame) latency but avoids
+  // stutters and improves overall FPS on bandwidth/latency-limited systems.
   if (s.autoExposureEnabled && lumFinal.valid() && !lumFinal.isBackbuffer()) {
     const unsigned int lt = frameGraph_.glTexture(lumFinal);
     if (lt) {
-      float rg[2] = {0.0f, 1.0f};
-      gl::BindTexture(GL_TEXTURE_2D, lt);
-      glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_FLOAT, rg);
-      gl::BindTexture(GL_TEXTURE_2D, 0);
+      auto applySample = [&](float r, float g) {
+        const float wAvg = g;
+        const float avgLogLum = (wAvg > 1e-6f) ? (r / wAvg) : r;
+        if (std::isfinite(avgLogLum)) {
+          const float avgLum = std::exp(avgLogLum);
+          AutoExposureConfig cfg{};
+          cfg.key = s.autoExposureKey;
+          cfg.minExposure = s.autoExposureMin;
+          cfg.maxExposure = s.autoExposureMax;
+          cfg.speedUp = s.autoExposureSpeedUp;
+          cfg.speedDown = s.autoExposureSpeedDown;
+          stepAutoExposure(autoExposure_, avgLum, avgLogLum, dt, cfg);
+        }
+      };
 
-      const float wAvg = rg[1];
-      const float avgLogLum = (wAvg > 1e-6f) ? (rg[0] / wAvg) : rg[0];
-      if (std::isfinite(avgLogLum)) {
-        const float avgLum = std::exp(avgLogLum);
-        AutoExposureConfig cfg{};
-        cfg.key = s.autoExposureKey;
-        cfg.minExposure = s.autoExposureMin;
-        cfg.maxExposure = s.autoExposureMax;
-        cfg.speedUp = s.autoExposureSpeedUp;
-        cfg.speedDown = s.autoExposureSpeedDown;
-        stepAutoExposure(autoExposure_, avgLum, avgLogLum, dt, cfg);
+      const bool wantAsync = s.autoExposureAsyncReadback;
+
+      const bool asyncSupported =
+          wantAsync &&
+          gl::GenBuffers && gl::DeleteBuffers && gl::BindBuffer && gl::BufferData &&
+          gl::MapBufferRange && gl::UnmapBuffer &&
+          gl::FenceSync && gl::ClientWaitSync && gl::DeleteSync;
+
+      if (asyncSupported) {
+        // Lazy init PBO ring.
+        if (!aeReadbackInited_) {
+          // Make sure we're starting clean.
+          for (int i = 0; i < kAeReadbackFrames; ++i) {
+            aeReadbackPbos_[(std::size_t)i] = 0u;
+            aeReadbackFences_[(std::size_t)i] = nullptr;
+            aeReadbackTags_[(std::size_t)i] = 0;
+          }
+
+          gl::GenBuffers((GLsizei)kAeReadbackFrames, aeReadbackPbos_.data());
+          const GLsizeiptr sz = (GLsizeiptr)(sizeof(float) * 2);
+
+          for (int i = 0; i < kAeReadbackFrames; ++i) {
+            const unsigned int pbo = aeReadbackPbos_[(std::size_t)i];
+            gl::BindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+            gl::BufferData(GL_PIXEL_PACK_BUFFER, sz, nullptr, GL_STREAM_READ);
+          }
+          gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+          aeReadbackWrite_ = 0;
+          aeReadbackTagCounter_ = 1;
+          aeReadbackInited_ = true;
+          aeReadbackSupported_ = true;
+        }
+
+        // Enqueue the current readback into the ring.
+        const int wIdx = aeReadbackWrite_;
+        const unsigned int pbo = aeReadbackPbos_[(std::size_t)wIdx];
+
+        // If the slot still has a fence, delete it (we're overwriting that sample).
+        if (aeReadbackFences_[(std::size_t)wIdx]) {
+          gl::DeleteSync(reinterpret_cast<GLsync>(aeReadbackFences_[(std::size_t)wIdx]));
+          aeReadbackFences_[(std::size_t)wIdx] = nullptr;
+        }
+
+        gl::BindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+        gl::BindTexture(GL_TEXTURE_2D, lt);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_FLOAT, (void*)0);
+        gl::BindTexture(GL_TEXTURE_2D, 0);
+
+        aeReadbackFences_[(std::size_t)wIdx] =
+            reinterpret_cast<void*>(gl::FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
+        aeReadbackTags_[(std::size_t)wIdx] = aeReadbackTagCounter_++;
+
+        gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+        aeReadbackWrite_ = (aeReadbackWrite_ + 1) % kAeReadbackFrames;
+
+        // Consume the newest ready sample (if any) without stalling.
+        const GLsizeiptr sz = (GLsizeiptr)(sizeof(float) * 2);
+        int bestIdx = -1;
+        int bestTag = -1;
+
+        for (int i = 0; i < kAeReadbackFrames; ++i) {
+          void* fencePtr = aeReadbackFences_[(std::size_t)i];
+          if (!fencePtr) continue;
+
+          const int tag = aeReadbackTags_[(std::size_t)i];
+          if (tag <= bestTag) continue;
+
+          const GLenum res = gl::ClientWaitSync(reinterpret_cast<GLsync>(fencePtr), 0, 0);
+          if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) {
+            bestIdx = i;
+            bestTag = tag;
+          }
+        }
+
+        if (bestIdx >= 0) {
+          const unsigned int rpbo = aeReadbackPbos_[(std::size_t)bestIdx];
+          gl::BindBuffer(GL_PIXEL_PACK_BUFFER, rpbo);
+
+          void* ptr = gl::MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sz, GL_MAP_READ_BIT);
+          if (ptr) {
+            const float* rg = reinterpret_cast<const float*>(ptr);
+            applySample(rg[0], rg[1]);
+            gl::UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+          }
+
+          gl::BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+          // Done with this fence/sample.
+          gl::DeleteSync(reinterpret_cast<GLsync>(aeReadbackFences_[(std::size_t)bestIdx]));
+          aeReadbackFences_[(std::size_t)bestIdx] = nullptr;
+        }
+      } else {
+        // Fallback: synchronous readback (may stall).
+        float rg[2] = {0.0f, 1.0f};
+        gl::BindTexture(GL_TEXTURE_2D, lt);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_FLOAT, rg);
+        gl::BindTexture(GL_TEXTURE_2D, 0);
+        applySample(rg[0], rg[1]);
       }
     }
+  }
+  // --- Dynamic resolution update (applies next frame via configure) ----------
+  if (s.dynamicResolutionEnabled && dt > 0.0f) {
+    // Cooldown prevents resizing (and reallocation) too frequently.
+    drsCooldownSec_ = std::max(0.0f, drsCooldownSec_ - dt);
+
+    const float targetFps = std::max(1.0f, s.dynamicResolutionTargetFps);
+    const float targetMs = 1000.0f / targetFps;
+    const float hyster = std::clamp(s.dynamicResolutionHysteresis, 0.0f, 0.35f);
+    const float hi = targetMs * (1.0f + hyster);
+    const float lo = targetMs * (1.0f - hyster);
+
+    const float minS = std::clamp(clampScale(s.dynamicResolutionMinScale), 0.25f, 1.0f);
+    const float maxS = std::clamp(clampScale(s.dynamicResolutionMaxScale), minS, 1.0f);
+
+    // Update smoothed frame time (EMA). dt is already in seconds.
+    const float frameMs = std::clamp(dt * 1000.0f, 1.0f, 250.0f);
+    const float tau = 0.45f; // smoothing time constant
+    const float a = 1.0f - std::exp(-dt / std::max(1e-3f, tau));
+    smoothedFrameMs_ += (frameMs - smoothedFrameMs_) * a;
+
+    // Adjust scale in small steps. This is intentionally conservative.
+    if (drsCooldownSec_ <= 0.0f) {
+      const float resp = std::clamp(s.dynamicResolutionResponse, 0.1f, 8.0f);
+      const float downRate = 0.55f * resp; // scale units per second
+      const float upRate = 0.35f * resp;
+
+      float sc = dynamicScale_;
+      if (smoothedFrameMs_ > hi) {
+        sc -= downRate * dt;
+      } else if (smoothedFrameMs_ < lo) {
+        sc += upRate * dt;
+      }
+
+      // Clamp + quantize.
+      sc = std::clamp(sc, minS, maxS);
+      const float step = std::clamp(s.dynamicResolutionStep, 0.0f, 0.25f);
+      sc = std::clamp(quantize(sc, step), minS, maxS);
+
+      // If the effective scale changed, apply a brief cooldown to avoid thrash.
+      if (std::abs(sc - dynamicScale_) > 0.0005f) {
+        dynamicScale_ = sc;
+        drsCooldownSec_ = 0.25f;
+      }
+    }
+  } else if (!s.dynamicResolutionEnabled) {
+    // Keep the internal DRS state coherent with the manual slider.
+    dynamicScale_ = clampScale(s.renderScale);
+    drsCooldownSec_ = 0.0f;
   }
 
   glDepthMask(GL_TRUE);

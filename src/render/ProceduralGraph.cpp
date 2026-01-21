@@ -261,7 +261,7 @@ ProceduralGraphBaker::~ProceduralGraphBaker() {
 core::u64 ProceduralGraphBaker::structureKey(const ProcGraph& g) {
   // Shader structure key: depends only on topology (op + connections + output index).
   // Parameters and seeds are uploaded via uniforms and do NOT require a recompile.
-  core::u64 h = core::fnv1a64("ProcGraphShaderV1");
+  core::u64 h = core::fnv1a64("ProcGraphShaderV2");
   const int nodeCount = clampNodeCount((int)g.nodes.size());
   h = core::hashCombine(h, (core::u64)nodeCount);
   for (int i = 0; i < nodeCount; ++i) {
@@ -299,6 +299,9 @@ std::string ProceduralGraphBaker::buildFragmentShader(const ProcGraph& g) {
 
   ss << "uniform vec2 uResolution;\n";
   ss << "uniform float uTime;\n";
+  ss << "uniform int uGraphSeed;\n";
+  ss << "uniform float uDitherStrength;\n";
+  ss << "uniform int uPackHeightInAlpha;\n";
   ss << "uniform vec4 uP[MAX_NODES];\n";
   ss << "uniform int  uS[MAX_NODES];\n";
   ss << "uniform int  uUsePalette;\n";
@@ -452,6 +455,32 @@ vec3 palette(float t) {
     }
   }
   return uPal[n - 1].rgb;
+}
+
+// --- Dithering helpers ---
+// The procedural baker writes to RGBA8. A tiny amount of deterministic noise helps reduce
+// visible banding in smooth gradients.
+uint hashU32(uint x) {
+  x ^= x >> 16;
+  x *= 2246822519u;
+  x ^= x >> 13;
+  x *= 3266489917u;
+  x ^= x >> 16;
+  return x;
+}
+
+float dither1(ivec2 px, int seed) {
+  uint h = uint(px.x) * 1973u + uint(px.y) * 9277u + uint(seed) * 26699u;
+  h = hashU32(h);
+  // [0,1)
+  return float(h & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 ditherRgb(ivec2 px, int seed) {
+  float r = dither1(px, seed);
+  float g = dither1(px + ivec2(17, 11), seed + 19);
+  float b = dither1(px + ivec2(37, 29), seed + 47);
+  return vec3(r, g, b) - 0.5;
 }
 )GLSL";
 
@@ -624,7 +653,12 @@ vec3 palette(float t) {
 
   ss << "  t = clamp(t, 0.0, 1.0);\n";
   ss << "  vec3 col = (uUsePalette != 0) ? palette(t) : vec3(t);\n";
-  ss << "  oColor = vec4(col, 1.0);\n";
+  ss << "  if (uDitherStrength > 0.0) {\n";
+  ss << "    vec3 dn = ditherRgb(ivec2(gl_FragCoord.xy), uGraphSeed) * (uDitherStrength / 255.0);\n";
+  ss << "    col = clamp(col + dn, 0.0, 1.0);\n";
+  ss << "  }\n";
+  ss << "  float a = (uPackHeightInAlpha != 0) ? t : 1.0;\n";
+  ss << "  oColor = vec4(col, a);\n";
   ss << "}\n";
 
   return ss.str();
@@ -667,11 +701,15 @@ bool ProceduralGraphBaker::bake(const ProcGraph& g, int width, int height, float
   height = std::max(1, height);
 
   // Ensure FBO / shader are available.
-  if (!target_.isInited() || target_.width() != width || target_.height() != height) {
-    if (!target_.init(width, height)) {
-      if (outError) *outError = "ProceduralGraphBaker: failed to init RenderTarget2D";
-      return false;
-    }
+  // Note: the bake is a fullscreen pass; we don't need depth.
+  RenderTarget2DDesc rtDesc{};
+  rtDesc.hasDepth = false;
+  rtDesc.generateMips = generateMips_;
+
+  std::string rtErr;
+  if (!target_.init(width, height, rtDesc, &rtErr)) {
+    if (outError) *outError = std::string("ProceduralGraphBaker: ") + rtErr;
+    return false;
   }
 
   if (!ensureShader(g, outError)) return false;
@@ -744,6 +782,9 @@ bool ProceduralGraphBaker::bake(const ProcGraph& g, int width, int height, float
   shader_.setUniform1f("uTime", timeSec);
   shader_.setUniform1i("uUsePalette", g.usePalette ? 1 : 0);
   shader_.setUniform1i("uPalCount", palCount);
+  shader_.setUniform1i("uGraphSeed", (int)(g.seed & 0x7fffffffULL));
+  shader_.setUniform1f("uDitherStrength", ditherStrength_);
+  shader_.setUniform1i("uPackHeightInAlpha", packHeightInAlpha_ ? 1 : 0);
 
   // Array uniforms: upload in one call each.
   shader_.setUniform4fv("uP[0]", kProcGraphMaxNodes, packedParams_.data());
@@ -757,6 +798,17 @@ bool ProceduralGraphBaker::bake(const ProcGraph& g, int width, int height, float
 
   auto t1 = std::chrono::high_resolution_clock::now();
   stats_.drawMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  stats_.mipsGenerated = false;
+  stats_.mipGenMs = 0.0;
+
+  if (generateMips_) {
+    auto tm0 = std::chrono::high_resolution_clock::now();
+    target_.generateMips();
+    auto tm1 = std::chrono::high_resolution_clock::now();
+    stats_.mipsGenerated = true;
+    stats_.mipGenMs = std::chrono::duration<double, std::milli>(tm1 - tm0).count();
+  }
 
   // --- Restore GL state ---
   gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);

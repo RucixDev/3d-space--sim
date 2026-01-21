@@ -14,6 +14,9 @@ class Ship;
 
 namespace stellar::game {
 
+struct GameEvent;
+enum class GameEventKind : core::u8;
+
 // Lightweight flight telemetry recorder.
 //
 // Records the player's ship state at a configurable rate and allows exporting
@@ -33,6 +36,22 @@ struct FlightRecorderSample {
   // Full attitude (for ghost replays / debugging / trace exports).
   math::Quatd orient{1,0,0,0};
   math::Vec3d angVelRadS{};
+};
+
+// Discrete marker captured from Integration Hub events.
+//
+// Markers are stored with absolute timestamps and are mapped to the current
+// recording session when displayed / exported.
+struct FlightRecorderMarker {
+  double tRealSec{0.0};
+  double tSimDays{0.0};
+
+  GameEventKind kind{};
+  std::string tag;
+  std::string msg;
+
+  core::u64 u64a{0};
+  core::u64 u64b{0};
 };
 
 struct FlightRecorderWindowState {
@@ -61,6 +80,17 @@ struct FlightRecorderWindowState {
   bool traceIncludeOrientation{false};
   bool traceIncludeAngularVelocity{false};
   bool tracePretty{false};
+
+  // Trace: include Integration Hub markers as instant events.
+  bool traceIncludeMarkers{true};
+
+  // --- Markers (Integration Hub event stream) ---
+  // When enabled, Integration Hub events are mirrored into the flight recorder
+  // as discrete markers (useful for correlation in replays/exports).
+  bool captureMarkers{true};
+  bool captureMarkersIncludeDebug{false};
+  bool captureMarkersWhileNotRecording{false};
+  int maxMarkers{2048};
 
   // --- Replay / Ghost ---
   // This is intentionally simple and deterministic:
@@ -93,9 +123,36 @@ struct FlightRecorderWindowState {
   double prevSimDays{0.0};
 
   std::deque<FlightRecorderSample> samples;
+
+  // Marker ring buffer (oldest markers dropped).
+  std::deque<FlightRecorderMarker> markers;
 };
 
 using ToastFn = std::function<void(const std::string& msg, double ttlSec)>;
+
+// Programmatic control helpers (used by cross-system gameplay/devtools).
+void startFlightRecorderSession(FlightRecorderWindowState& st,
+                               double timeRealSec,
+                               double simTimeDays,
+                               const sim::Ship& ship);
+
+void stopFlightRecorderSession(FlightRecorderWindowState& st);
+
+// Jump the replay playhead to an absolute wall-clock timestamp (timeRealSec).
+//
+// This is used by cross-system tooling (Integration Hub) to quickly scrub the
+// flight recorder to an interesting event time.
+//
+// If the recorder has no samples, this is a no-op.
+void flightRecorderSeekToRealTime(FlightRecorderWindowState& st, double timeRealSec);
+
+// Marker helpers (cross-system integration with the Integration Hub).
+void flightRecorderCaptureMarkerFromEvent(FlightRecorderWindowState& st, const GameEvent& ev);
+void flightRecorderClearMarkers(FlightRecorderWindowState& st);
+
+// Export helpers (also used by Integration Hub actions).
+bool exportFlightRecorderCsv(const FlightRecorderWindowState& st, const char* path, std::string* err = nullptr);
+bool exportFlightRecorderTraceJson(const FlightRecorderWindowState& st, const char* path, std::string* err = nullptr);
 
 // Record telemetry (call once per frame).
 void tickFlightRecorder(FlightRecorderWindowState& st,

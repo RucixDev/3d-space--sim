@@ -16,7 +16,7 @@ namespace stellar::ui {
 // The VFX Lab started as an experimentation panel; VfxSettings makes those tweaks
 // part of the base game by persisting them to disk.
 struct VfxSettings {
-  int version{3};
+  int version{4};
   bool autoSaveOnExit{true};
 
   // --- Background ---
@@ -25,6 +25,7 @@ struct VfxSettings {
 
   bool starfieldEnabled{true};
   bool starfieldTextured{true};
+  bool starfieldGpuEnabled{true};
   int starCount{5200};
   double starRadiusU{18000.0};
 

@@ -318,13 +318,75 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
     if (ctx.toast) ctx.toast("Copied markup", 1.2);
   }
 
-  if (m.systemId != 0 && ctx.plotTo) {
+  const bool hasLocation = (m.systemId != 0);
+  const bool isLocalSystem = hasLocation && ctx.currentSystem && (ctx.currentSystem->stub.id == m.systemId);
+
+  // Location-based convenience actions: route planning + (optional) one-click auto-run/docking.
+  if (hasLocation && (ctx.goTo || ctx.plotTo)) {
     ImGui::SameLine();
-    if (ImGui::Button("Plot route")) {
-      ctx.plotTo(m.systemId, m.stationId);
+
+    if (ctx.goTo) {
+      const char* primaryLabel = isLocalSystem ? "Target" : "Plot route";
+      if (ImGui::Button(primaryLabel)) {
+        ctx.goTo(m.systemId, m.stationId, /*armAutoRun=*/false);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(isLocalSystem ? "Set this message's station as your current target." :
+                                         "Plot a nav route to the system and set the arrival station.");
+      }
+
+      ImGui::SameLine();
+      const char* autoLabel = (m.stationId != 0) ? "Go & Dock" : "Auto-run";
+      if (ImGui::Button(autoLabel)) {
+        ctx.goTo(m.systemId, m.stationId, /*armAutoRun=*/true);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Plot/target and arm auto-run: FSD jumps (if needed), supercruise approach, and docking.");
+      }
+    } else if (ctx.plotTo) {
+      if (ImGui::Button("Plot route")) {
+        ctx.plotTo(m.systemId, m.stationId);
+      }
     }
   }
 
+
+
+  // Mission deep-links: mission briefings carry the mission id in CommsMessage::relatedId.
+  // These actions bridge Comms -> Mission tracker -> Nav/autopilot via callbacks owned by main.cpp.
+  const bool hasMissionLink = (m.channel == sim::CommsChannel::Mission) && (m.relatedId != 0);
+  if (hasMissionLink && (ctx.trackMission || ctx.syncNavToMission)) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(" | Mission");
+
+    if (ctx.trackMission) {
+      ImGui::SameLine();
+      if (ImGui::Button("Track")) {
+        ctx.trackMission(m.relatedId);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Track this mission in the Objective HUD (id %llu).", (unsigned long long)m.relatedId);
+      }
+    }
+
+    if (ctx.syncNavToMission) {
+      ImGui::SameLine();
+      if (ImGui::Button("Plot")) {
+        ctx.syncNavToMission(m.relatedId, /*armAutoRun=*/false);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Sync nav route + arrival target to this mission's next stop.");
+      }
+
+      ImGui::SameLine();
+      if (ImGui::Button("Auto-run")) {
+        ctx.syncNavToMission(m.relatedId, /*armAutoRun=*/true);
+      }
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Sync nav to the mission and arm auto-run (jumps/supercruise/docking when possible).");
+      }
+    }
+  }
   ImGui::Separator();
 
   // Body

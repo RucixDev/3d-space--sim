@@ -188,6 +188,22 @@ void toastMaybe(const TradePlannerContext& ctx, std::string_view msg, double ttl
   if (ctx.toast) ctx.toast(msg, ttl);
 }
 
+void goToStationMaybe(const TradePlannerContext& ctx,
+                      stellar::sim::SystemId sysId,
+                      stellar::sim::StationId stId,
+                      bool armAutoRun) {
+  if (ctx.goToStation) {
+    ctx.goToStation(sysId, stId, armAutoRun);
+    return;
+  }
+  if (ctx.routeToStation) {
+    ctx.routeToStation(sysId, stId);
+    if (armAutoRun) {
+      toastMaybe(ctx, "Auto-run not available here (goToStation not wired).", 2.5);
+    }
+  }
+}
+
 // Lazily (re)create a job system if the requested thread count changes.
 void ensureJobSystem(TradePlannerWindowState& st) {
   if (!st.useParallel) {
@@ -238,6 +254,156 @@ void drawManifestSummary(const stellar::econ::CargoManifestPlan& plan, int maxLi
   if ((int)plan.lines.size() > n) {
     ImGui::TextDisabled("... +%d more", (int)plan.lines.size() - n);
   }
+}
+
+void armRouteFromRun(TradePlannerWindowState& st, const stellar::sim::TradeRun& r, double timeDays) {
+  auto& rr = st.route;
+  rr.legs.clear();
+  rr.legIndex = 0;
+  rr.isLoop = false;
+  rr.active = !r.legs.empty();
+  rr.startEventEmitted = false;
+  rr.endEventPending = false;
+  rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::None;
+  rr.startedAtDays = timeDays;
+  rr.lastAdvanceAtDays = timeDays;
+
+  rr.legs.reserve(r.legs.size());
+  for (const auto& leg : r.legs) {
+    TradePlannerWindowState::TradeRouteLeg out;
+    out.fromSystem = leg.fromSystem;
+    out.fromStation = leg.fromStation;
+    out.toSystem = leg.toSystem;
+    out.toStation = leg.toStation;
+    out.fromSystemName = leg.fromSystemName;
+    out.fromStationName = leg.fromStationName;
+    out.toSystemName = leg.toSystemName;
+    out.toStationName = leg.toStationName;
+    out.distanceLy = leg.routeDistanceLy;
+    out.hops = (int)leg.routeHops;
+    out.netProfitCr = leg.manifest.netProfitCr;
+    out.manifest = leg.manifest;
+    rr.legs.push_back(std::move(out));
+  }
+}
+
+void armRouteFromLoop(TradePlannerWindowState& st, const stellar::sim::TradeLoop& l, double timeDays) {
+  auto& rr = st.route;
+  rr.legs.clear();
+  rr.legIndex = 0;
+  rr.isLoop = true;
+  rr.active = !l.legs.empty();
+  rr.startEventEmitted = false;
+  rr.endEventPending = false;
+  rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::None;
+  rr.startedAtDays = timeDays;
+  rr.lastAdvanceAtDays = timeDays;
+
+  rr.legs.reserve(l.legs.size());
+  for (const auto& leg : l.legs) {
+    TradePlannerWindowState::TradeRouteLeg out;
+    out.fromSystem = leg.fromSystem;
+    out.fromStation = leg.fromStation;
+    out.toSystem = leg.toSystem;
+    out.toStation = leg.toStation;
+    out.fromSystemName = leg.fromSystemName;
+    out.fromStationName = leg.fromStationName;
+    out.toSystemName = leg.toSystemName;
+    out.toStationName = leg.toStationName;
+    out.distanceLy = leg.distanceLy;
+    out.hops = 0;
+    out.netProfitCr = leg.manifest.netProfitCr;
+    out.manifest = leg.manifest;
+    rr.legs.push_back(std::move(out));
+  }
+}
+
+void drawRouteRunnerPanel(TradePlannerWindowState& st, const TradePlannerContext& ctx) {
+  auto& rr = st.route;
+
+  ImGui::TextUnformatted("Route Runner");
+  ImGui::SameLine();
+  ImGui::TextDisabled("(trade plan -> nav auto-run -> docking -> comms)");
+
+  // Defaults apply when arming a new route.
+  ImGui::Checkbox("Arm auto-run when starting", &rr.armAutoRun);
+  ImGui::SameLine();
+  ImGui::Checkbox("Repeat loops", &rr.repeat);
+
+  if (!rr.active) {
+    ImGui::TextDisabled("No active route. Arm one from the results below.");
+    return;
+  }
+
+  const int total = (int)rr.legs.size();
+  const int idx = std::clamp(rr.legIndex, 0, std::max(0, total - 1));
+  const bool inRange = (idx >= 0 && idx < total);
+
+  if (!inRange) {
+    ImGui::TextDisabled("Route state invalid (no legs).");
+    if (ImGui::SmallButton("Clear route")) {
+      rr.active = false;
+      rr.legs.clear();
+      rr.legIndex = 0;
+      rr.endEventPending = true;
+      rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::Cancelled;
+      toastMaybe(ctx, "Route cleared.", 2.0);
+    }
+    return;
+  }
+
+  const auto& leg = rr.legs[(std::size_t)idx];
+  ImGui::Text("Leg %d / %d", idx + 1, total);
+  ImGui::Text("%s:%s  ->  %s:%s",
+              leg.fromSystemName.c_str(), leg.fromStationName.c_str(),
+              leg.toSystemName.c_str(), leg.toStationName.c_str());
+  if (leg.hops > 0) {
+    ImGui::TextDisabled("profit %.0f cr | dist %.2f ly | hops %d", leg.netProfitCr, leg.distanceLy, leg.hops);
+  } else {
+    ImGui::TextDisabled("profit %.0f cr | dist %.2f ly", leg.netProfitCr, leg.distanceLy);
+  }
+
+  ImGui::SameLine();
+  {
+    ImGui::BeginDisabled(!rr.isLoop);
+    ImGui::Checkbox("Repeat", &rr.repeat);
+    ImGui::EndDisabled();
+    if (!rr.isLoop) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(loops only)");
+    }
+  }
+
+  // Controls.
+  if (ImGui::SmallButton("Re-plot / go")) {
+    goToStationMaybe(ctx, leg.toSystem, leg.toStation, rr.armAutoRun);
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Skip")) {
+    rr.legIndex = std::min(total, rr.legIndex + 1);
+    if (rr.legIndex >= total) {
+      // End; main loop will emit completion if it ends naturally, but a manual
+      // skip to end is treated as cancel.
+      rr.active = false;
+      rr.endEventPending = true;
+      rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::Cancelled;
+      toastMaybe(ctx, "Route skipped to end (cancelled).", 2.5);
+    } else {
+      const auto& nextLeg = rr.legs[(std::size_t)rr.legIndex];
+      goToStationMaybe(ctx, nextLeg.toSystem, nextLeg.toStation, rr.armAutoRun);
+      toastMaybe(ctx, "Skipped to next leg.", 1.8);
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Cancel")) {
+    rr.active = false;
+    rr.endEventPending = true;
+    rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::Cancelled;
+    toastMaybe(ctx, "Trade route cancelled.", 2.0);
+  }
+
+  // Manifest summary.
+  drawManifestSummary(leg.manifest, 3);
 }
 
 } // namespace
@@ -698,6 +864,12 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
   }
   ImGui::Separator();
 
+  // ---- Route Runner ----
+  {
+    drawRouteRunnerPanel(st, ctx);
+    ImGui::Separator();
+  }
+
   // ---- Results ----
   if (st.mode == TradePlannerWindowState::Mode::Runs) {
     ImGui::Text("Runs: %d", (int)st.runs.size());
@@ -748,6 +920,20 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
               if (ctx.routeToStation && !r.legs.empty()) {
                 const auto& last = r.legs.back();
                 ctx.routeToStation(last.toSystem, last.toStation);
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(("Arm route##run" + std::to_string(i)).c_str())) {
+              if (!r.legs.empty()) {
+                armRouteFromRun(st, r, ctx.timeDays);
+                // Start at leg 1 destination.
+                const auto& first = st.route.legs.front();
+                goToStationMaybe(ctx, first.toSystem, first.toStation, st.route.armAutoRun);
+                toastMaybe(ctx,
+                          st.route.armAutoRun
+                            ? "Trade route armed (auto-run). Undock to begin."
+                            : "Trade route armed. Plot set to first stop.",
+                          2.6);
               }
             }
 
@@ -833,6 +1019,22 @@ void drawTradePlannerWindow(TradePlannerWindowState& st, const TradePlannerConte
             if (ImGui::SmallButton(("Plot first##loop" + std::to_string(i)).c_str())) {
               if (ctx.routeToStation && !l.legs.empty()) {
                 ctx.routeToStation(l.legs.front().toSystem, l.legs.front().toStation);
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(("Arm route##loop" + std::to_string(i)).c_str())) {
+              if (!l.legs.empty()) {
+                armRouteFromLoop(st, l, ctx.timeDays);
+                // Respect the user's last repeat toggle if they armed a loop before.
+                st.route.repeat = st.route.repeat && st.route.isLoop;
+
+                const auto& first = st.route.legs.front();
+                goToStationMaybe(ctx, first.toSystem, first.toStation, st.route.armAutoRun);
+                toastMaybe(ctx,
+                          st.route.armAutoRun
+                            ? "Trade loop armed (auto-run). Undock to begin."
+                            : "Trade loop armed. Plot set to first stop.",
+                          2.6);
               }
             }
 

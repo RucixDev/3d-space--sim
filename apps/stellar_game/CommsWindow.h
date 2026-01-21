@@ -61,6 +61,16 @@ struct CommsWindowContext {
 
   std::function<void(const std::string& msg, double ttlSec)> toast;
   std::function<void(sim::SystemId sysId, sim::StationId stId)> plotTo;
+
+  // Optional high-level travel hook.
+  // When provided, the Comms UI can offer one-click travel actions that
+  // optionally arm auto-run/docking.
+  std::function<void(sim::SystemId sysId, sim::StationId stId, bool armAutoRun)> goTo;
+
+  // Mission deep-links. Mission briefings carry the mission id in sim::CommsMessage::relatedId.
+  // These hooks let the Comms UI bridge into the mission tracker and nav/autopilot.
+  std::function<void(core::u64 missionId)> trackMission;
+  std::function<void(core::u64 missionId, bool armAutoRun)> syncNavToMission;
 };
 
 void enqueueCommsOverlay(CommsOverlayState& ov, core::u64 messageId);

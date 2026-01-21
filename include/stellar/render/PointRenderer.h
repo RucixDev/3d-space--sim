@@ -39,9 +39,23 @@ public:
                         PointBlendMode blend = PointBlendMode::Alpha);
 
 private:
+  // Double/triple-buffer the streamed point data to avoid stalls when the GPU
+  // is still consuming the previous frame's buffer.
+  static constexpr int kBufferRing = 3;
+
   ShaderProgram shader_{};
-  unsigned int vao_{0};
-  unsigned int vbo_{0};
+  unsigned int vao_[kBufferRing]{};
+  unsigned int vbo_[kBufferRing]{};
+
+  int ringIndex_{0};
+
+  // Cached VBO capacity (bytes).
+  //
+  // Starfields/nebula/particles stream point vertices every frame. Reallocating
+  // the buffer each draw (glBufferData with a new size) can cause significant
+  // driver overhead and stalls. We keep a capacity and only grow the buffer
+  // when required.
+  std::size_t vboCapacityBytes_[kBufferRing]{};
 
   float view_[16]{};
   float proj_[16]{};

@@ -8,6 +8,7 @@
 #endif
 
 #include "stellar/core/Log.h"
+#include "stellar/core/JsonWriter.h"
 #include "stellar/core/CVar.h"
 #include "stellar/core/Profiler.h"
 #include "stellar/core/JobSystem.h"
@@ -40,6 +41,7 @@
 #include "stellar/render/StarCoronaRenderer.h"
 #include "stellar/render/VolumetricAtmosphereRenderer.h"
 #include "stellar/render/Starfield.h"
+#include "stellar/render/StarfieldGpuRenderer.h"
 #include "stellar/render/Nebula.h"
 #include "stellar/render/ParticleSystem.h"
 #include "stellar/render/PostFX.h"
@@ -62,6 +64,7 @@
 #include "stellar/sim/Orbit.h"
 #include "stellar/sim/Gravity.h"
 #include "stellar/sim/Atmosphere.h"
+#include "stellar/sim/Aerodynamics.h"
 #include "stellar/sim/OrbitalMechanics.h"
 #include "stellar/sim/TrajectoryPredictor.h"
 #include "stellar/sim/ManeuverComputer.h"
@@ -70,6 +73,7 @@
 #include "stellar/sim/MissionAssist.h"
 #include "stellar/sim/MissionLogic.h"
 #include "stellar/sim/MissionBriefing.h"
+#include "stellar/sim/Mission.h"
 #include "stellar/sim/Contraband.h"
 #include "stellar/sim/CargoJettisonPlanner.h"
 #include "stellar/sim/Law.h"
@@ -105,6 +109,7 @@
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
 #include "stellar/sim/SystemConditions.h"
+#include "stellar/sim/DockingPads.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
 #include "stellar/sim/DockingClearanceService.h"
@@ -133,8 +138,12 @@
 #include "TradePlannerWindow.h"
 #include "ProfilerWindow.h"
 #include "BuildInfoWindow.h"
+#include "RuntimeValidationWindow.h"
 #include "FlightRecorderWindow.h"
 #include "CinematicCameraWindow.h"
+#include "CameraRigWindow.h"
+#include "TimeTrialWindow.h"
+#include "IntegrationHubWindow.h"
 #include "OrbitAnalyzerWindow.h"
 #include "TrafficLanesWindow.h"
 #include "SystemConditionsWindow.h"
@@ -189,6 +198,7 @@
 #include <cfloat>
 #include <cstring>
 #include <cstdio>
+#include <ctime>
 #include <cctype>
 #include <cstdint>
 #include <deque>
@@ -1697,6 +1707,18 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // GPU-driven starfield renderer (optional). This avoids per-frame starfield
+  // vertex expansion/uploads on the CPU.
+  render::StarfieldGpuRenderer starfieldGpu;
+  bool starfieldGpuAvailable = true;
+  {
+    std::string sfErr;
+    if (!starfieldGpu.init(&sfErr)) {
+      core::log(core::LogLevel::Warn, "StarfieldGpuRenderer disabled: " + sfErr);
+      starfieldGpuAvailable = false;
+    }
+  }
+
   // GPU-resident particle field (ping-pong float textures + shader simulation).
   // Optional: failure should not stop the game.
   render::GpuParticleField gpuDust;
@@ -1778,6 +1800,7 @@ int main(int argc, char** argv) {
 
   bool vfxStarfieldEnabled = true;
   bool vfxStarfieldTextured = true;
+  bool vfxStarfieldGpuEnabled = true;
   int vfxStarCount = 5200;
   double vfxStarRadiusU = 18000.0;
 
@@ -1839,6 +1862,7 @@ int main(int argc, char** argv) {
 
     vfxSettings.starfieldEnabled = vfxStarfieldEnabled;
     vfxSettings.starfieldTextured = vfxStarfieldTextured;
+    vfxSettings.starfieldGpuEnabled = vfxStarfieldGpuEnabled;
     vfxSettings.starCount = vfxStarCount;
     vfxSettings.starRadiusU = vfxStarRadiusU;
 
@@ -1903,6 +1927,7 @@ int main(int argc, char** argv) {
 
     vfxStarfieldEnabled = s.starfieldEnabled;
     vfxStarfieldTextured = s.starfieldTextured;
+    vfxStarfieldGpuEnabled = s.starfieldGpuEnabled;
     vfxStarCount = s.starCount;
     vfxStarRadiusU = s.starRadiusU;
 
@@ -2041,6 +2066,7 @@ int main(int argc, char** argv) {
         && skyEq(a.proceduralSky, b.proceduralSky)
         && a.starfieldEnabled == b.starfieldEnabled
         && a.starfieldTextured == b.starfieldTextured
+        && a.starfieldGpuEnabled == b.starfieldGpuEnabled
         && a.starCount == b.starCount
         && deq(a.starRadiusU, b.starRadiusU)
         && a.nebulaEnabled == b.nebulaEnabled
@@ -2131,6 +2157,9 @@ int main(int argc, char** argv) {
   int worldStarCoronaProminenceCount = 7;
   float worldStarCoronaProminenceSharpness = 3.2f;
   float worldStarCoronaPulseStrength = 0.08f;
+  // Performance knobs (reduce GPU work in the corona shader).
+  int worldStarCoronaNoiseOctaves = 5;     // 1..8
+  float worldStarCoronaRimEarlyOut = 0.0015f; // 0..~0.01
   core::u64 worldStarCoronaSeedNonce = 0;
 
   // Procedural normal maps (tangent-space) derived from the same seeded noise as the albedo.
@@ -2217,6 +2246,15 @@ int main(int argc, char** argv) {
   atmoPhysicsParams.heatingScale = 1.0;
   atmoPhysicsParams.maxRelSpeedKmS = 0.0; // 0 = disabled
   sim::AtmosphereSample atmoPlayerLast{};
+  // --- Physics (experimental): Aerodynamic lift + stability (3D flight model) ---
+  // Adds lift, induced drag, and simple stability/control surfaces when flying through an atmosphere.
+  // Requires a nearby atmospheric planet (and physicsAtmosphereEnabled) to sample air properties.
+  bool physicsAeroAffectsNpcs = true;
+  sim::AerodynamicsParams aeroPhysicsParams{};
+  // Disabled by default (opt-in).
+  aeroPhysicsParams.enabled = false;
+  sim::AerodynamicsSample aeroPlayerLast{};
+
 
   // --- Navigation (experimental): trajectory preview + maneuver node ---
   // Draws a predicted path line in-world (using LineRenderer) and exposes a simple
@@ -2399,6 +2437,10 @@ TrajectoryPreviewAsyncState trajPreviewAsync;
   render::Starfield starfield;
   starfield.setRadius(vfxStarRadiusU);
   starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+
+  if (starfieldGpuAvailable) {
+    starfieldGpu.upload(starfield);
+  }
 
   render::NebulaField nebula;
   {
@@ -2663,6 +2705,7 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
 
   // Time
   double timeDays = 0.0;
+  double timeRealSec = 0.0; // purely visual / UI timing (real seconds)
   double timeScale = 60.0; // simulated seconds per real second
   bool paused = false;
 
@@ -2937,6 +2980,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   // Docking state
   bool docked = false;
+  core::u16 dockedPad = 0; // 1-based hangar pad assignment
   sim::StationId dockedStationId = 0;
   std::unordered_map<sim::StationId, ClearanceState> clearances;
 
@@ -3018,9 +3062,13 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::LogWindowState logWindow{};
   game::ProfilerWindowState profilerWindow{};
   game::BuildInfoWindowState buildInfoWindow{};
+  game::RuntimeValidationWindowState runtimeValidationWindow{};
+  game::IntegrationHubWindowState integrationHubWindow{};
   game::AudioAnalyzerWindowState audioAnalyzerWindow{};
   game::FlightRecorderWindowState flightRecorderWindow{};
   game::CinematicCameraWindowState cinematicCameraWindow{};
+  game::CameraRigWindowState cameraRigWindow{};
+  game::TimeTrialWindowState timeTrialWindow{};
   game::OrbitAnalyzerWindowState orbitAnalyzerWindow{};
   game::TrafficLanesWindowState trafficLanesWindow{};
   game::SystemConditionsWindowState systemConditionsWindow{};
@@ -3035,6 +3083,12 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::ProceduralTradeSystemsLabWindowState proceduralTradeSystemsLabWindow{};
   game::SpectralMieLabWindowState spectralMieLabWindow{};
   game::GaussianSurfelReconstructionLabWindowState gaussianSurfelReconLabWindow{};
+
+  // Cross-system trace correlation: mirror Integration Hub events into the Flight Recorder
+  // as discrete markers so telemetry can be inspected alongside gameplay/devtools events.
+  integrationHubWindow.onEvent = [&](const game::GameEvent& ev) {
+    game::flightRecorderCaptureMarkerFromEvent(flightRecorderWindow, ev);
+  };
 
   struct PendingScreenshot { bool pending{false}; std::string path; bool copyToClipboard{false}; };
   PendingScreenshot shotWorld{};
@@ -3801,10 +3855,22 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"Profiler", "Profiler", "Debug", 55, false, true}, &profilerWindow.open,
                                 [&]() { profiler.setEnabled(true); }, [&]() { profiler.setEnabled(false); }, {}});
 
+    uiWindows.add(WindowBinding{WindowDesc{"RuntimeValidation", "Runtime Validation", "Debug", 55, false, true}, &runtimeValidationWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"IntegrationHub", "Integration Hub", "Debug", 55, false, true}, &integrationHubWindow.open,
+                                {}, {}, {}});
+
     uiWindows.add(WindowBinding{WindowDesc{"FlightRecorder", "Flight Recorder", "Tools", 55, false, true}, &flightRecorderWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"CinematicCamera", "Cinematic Camera", "Tools", 55, false, true}, &cinematicCameraWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"CameraRig", "3D Camera Rig", "Tools", 55, false, true}, &cameraRigWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"TimeTrials", "Time Trials", "Gameplay", 55, false, true}, &timeTrialWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"OrbitAnalyzer", "Orbit Analyzer", "Tools", 55, false, true}, &orbitAnalyzerWindow.open,
@@ -5676,6 +5742,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           toast(toasts,
                 "Mission complete: bounty target eliminated. +" + std::to_string((int)std::round(res.rewardCr)) + " cr",
                 3.0);
+          game::hubPushEvent(integrationHubWindow,
+                             game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                           "MissionComplete",
+                                           std::string("Mission complete: BountyKill +") + std::to_string((int)std::round(res.rewardCr)) + " cr" +
+                                             " (target " + std::to_string((core::u64)deadId) + ")",
+                                           true, ship.positionKm(), (core::u64)deadId, (core::u64)sysId});
         }
       }
 
@@ -5699,7 +5771,6 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
   bool running = true;
   auto last = std::chrono::high_resolution_clock::now();
 
-  double timeRealSec = 0.0; // for purely visual effects
 
   SDL_SetRelativeMouseMode(SDL_FALSE);
 
@@ -5713,6 +5784,10 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
     last = now;
 
     timeRealSec += dtReal;
+
+    // Integration Hub: reset per-frame automation budget.
+    integrationHubWindow.automationsActionsFiredThisFrame = 0;
+
 
     // Police heat decays in real time (stays stable even if you change timeScale).
     policeHeat = std::max(0.0, policeHeat - dtReal * 0.015);
@@ -5811,6 +5886,14 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
       if (event.type == SDL_QUIT) running = false;
       if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
 
+      // Camera rig: Alt+mouse orbit/pan/zoom, plus keyboard shortcuts.
+      // (Mouse handled here for all events; keyboard handled below in the KEYDOWN branch so rebind can intercept.)
+      if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEWHEEL) {
+        game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
+                                   [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
+      }
+
       if (event.type == SDL_KEYDOWN && !event.key.repeat) {
         const auto key = [&](const game::KeyChord& chord) { return game::chordMatchesEvent(chord, event.key); };
 
@@ -5818,6 +5901,11 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         if (game::handleControlsRebindKeydown(
                 controlsWindow, event.key, controls, controlsDirty,
                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
+          continue;
+        }
+
+        if (game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
+                                       [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
           continue;
         }
 
@@ -5994,6 +6082,36 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	          s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
 	          s.logbook = logbook;
 	          s.comms = commsLog.items();
+
+
+          // Integration Hub automations (player macros / glue rules)
+          s.hubAutomationsEnabled = integrationHubWindow.automationsEnabled;
+          s.hubAutomationRules.clear();
+          s.hubAutomationRules.reserve(integrationHubWindow.automationRules.size());
+          for (const auto& r : integrationHubWindow.automationRules) {
+            sim::IntegrationHubAutomationRuleState rs{};
+            rs.enabled = r.enabled;
+            rs.name = std::string(r.name);
+            rs.eventKind = (core::u8)r.kind;
+            rs.tagMatch = (core::u8)r.tagMatch;
+            rs.tagText = std::string(r.tagText);
+            rs.cooldownSec = std::max(0.0, r.cooldownSec);
+            rs.actions.reserve(r.actions.size());
+            for (const auto& a : r.actions) {
+              sim::IntegrationHubAutomationActionState as{};
+              as.kind = (core::u8)a.kind;
+              as.u64aSource = (core::u8)a.u64aSource;
+              as.u64aConst = a.u64aConst;
+              as.u64bSource = (core::u8)a.u64bSource;
+              as.u64bConst = a.u64bConst;
+              as.i32Const = a.i32Const;
+              as.bConst = a.bConst;
+              as.delaySec = std::max(0.0, a.delaySec);
+              as.msgTemplate = std::string(a.msgTemplate);
+              rs.actions.push_back(std::move(as));
+            }
+            s.hubAutomationRules.push_back(std::move(rs));
+          }
 
 	          // Procedural world persistence (signals / mining depletion)
 	          s.resolvedSignalIds.assign(resolvedSignalIds.begin(), resolvedSignalIds.end());
@@ -6219,6 +6337,63 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	            commsOverlay.activeId = 0;
 	            commsOverlay.activeStartSec = 0.0;
 	            commsOverlay.activeUntilSec = 0.0;
+
+
+            // Integration Hub automations (player macros / glue rules)
+            //
+            // v32+: the Integration Hub rule-set is persisted in SaveGame.
+            // Older saves simply keep whatever rules are currently loaded in memory.
+            integrationHubWindow.actions.clear();
+            integrationHubWindow.events.clear();
+            integrationHubWindow.scheduledActions.clear();
+            integrationHubWindow.selectedEventIndex = -1;
+            integrationHubWindow.totalEventsPushed = 0;
+            integrationHubWindow.totalActionsPushed = 0;
+            integrationHubWindow.totalActionsScheduled = 0;
+            integrationHubWindow.automationsActionsFiredThisFrame = 0;
+            integrationHubWindow.automationsRecursionDepth = 0;
+
+            if (s.version >= 32) {
+              integrationHubWindow.automationsEnabled = s.hubAutomationsEnabled;
+              integrationHubWindow.automationRules.clear();
+              integrationHubWindow.automationRules.reserve(s.hubAutomationRules.size());
+
+              auto copyCStr = [](char* dst, std::size_t dstSz, const std::string& src) {
+                if (!dst || dstSz == 0) return;
+                std::snprintf(dst, dstSz, "%s", src.c_str());
+              };
+
+              for (const auto& sr : s.hubAutomationRules) {
+                game::AutomationRule r{};
+                r.enabled = sr.enabled;
+                copyCStr(r.name, sizeof(r.name), sr.name);
+                r.kind = (game::GameEventKind)core::clampCast<core::u8>((int)sr.eventKind, 0, (int)game::GameEventKind::Debug);
+                r.tagMatch = (game::AutomationTagMatch)core::clampCast<core::u8>((int)sr.tagMatch, 0, (int)game::AutomationTagMatch::Suffix);
+                copyCStr(r.tagText, sizeof(r.tagText), sr.tagText);
+                r.cooldownSec = std::max(0.0, sr.cooldownSec);
+                r.lastFiredRealSec = -1e9;
+
+                r.actions.reserve(sr.actions.size());
+                for (const auto& sa : sr.actions) {
+                  game::AutomationActionTemplate a{};
+                  a.kind = (game::GameActionKind)core::clampCast<core::u8>((int)sa.kind, 0, (int)game::GameActionKind::SetCameraRigPreset);
+                  a.u64aSource = (game::AutomationValueSource)core::clampCast<core::u8>((int)sa.u64aSource, 0, (int)game::AutomationValueSource::EventU64b);
+                  a.u64aConst = sa.u64aConst;
+                  a.u64bSource = (game::AutomationValueSource)core::clampCast<core::u8>((int)sa.u64bSource, 0, (int)game::AutomationValueSource::EventU64b);
+                  a.u64bConst = sa.u64bConst;
+                  a.i32Const = sa.i32Const;
+                  a.bConst = sa.bConst;
+                  a.delaySec = std::max(0.0, sa.delaySec);
+                  copyCStr(a.msgTemplate, sizeof(a.msgTemplate), sa.msgTemplate);
+                  r.actions.push_back(std::move(a));
+                }
+
+                integrationHubWindow.automationRules.push_back(std::move(r));
+              }
+
+              // Prevent default rules from overwriting the loaded set.
+              integrationHubWindow.automationsInitialized = true;
+            }
 
 	            // Procedural world persistence (signals / mining depletion)
 	            resolvedSignalIds.clear();
@@ -6698,6 +6873,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               toast(toasts, "Auto-run canceled.", 1.8);
             } else {
               toast(toasts, "Docking computer disengaged.", 1.6);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "DockingComputerDisengaged", "Disengaged (manual)", true, ship.positionKm()});
             }
           } else {
             if (docked) {
@@ -6710,6 +6886,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               autopilot = true;
               dockingComputer.reset();
               toast(toasts, "Docking computer engaged.", 1.6);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "DockingComputerEngaged", "Engaged (manual)", true, ship.positionKm()});
             }
           }
         }
@@ -6853,6 +7030,39 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                       std::string("Nav assist: match velocity ") + name + " [" +
                         game::chordLabel(controls.actions.navAssistMatchVelocity) + "]",
                       2.2);
+              }
+            }
+          }
+        }
+
+        if (key(controls.actions.navAssistFollow) && !io.WantCaptureKeyboard) {
+          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Follow) {
+            navAssist.disengage();
+            navAssistLast = {};
+            toast(toasts, "Nav assist (follow) disengaged.", 1.6);
+          } else {
+            if (docked) {
+              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+            } else {
+              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+              double standoffKm = 0.0;
+              std::string name;
+              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                toast(toasts, "No valid target for nav assist.", 1.8);
+              } else {
+                if (autopilot) {
+                  autopilot = false;
+                  dockingComputer.reset();
+                }
+                navAssist.engageFollow(ship, tPos, tVel, standoffKm);
+                navAssistLast = {};
+                toast(toasts,
+                      std::string("Nav assist: follow ") + name + " (hold " +
+                        std::to_string((int)std::llround(standoffKm)) + " km behind) [" +
+                        game::chordLabel(controls.actions.navAssistFollow) + "]",
+                      2.3);
               }
             }
           }
@@ -7390,8 +7600,36 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
             const double traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearby);
             const auto dec = sim::requestDockingClearance(seed, st, timeDays, dist, cs, traffic01);
 
+            // Structured trace for cross-system debugging (Integration Hub).
+            {
+              const char* statusStr = "Unknown";
+              switch (dec.status) {
+                case sim::DockingClearanceStatus::Granted: statusStr = "Granted"; break;
+                case sim::DockingClearanceStatus::Denied: statusStr = "Denied"; break;
+                case sim::DockingClearanceStatus::OutOfRange: statusStr = "OutOfRange"; break;
+                case sim::DockingClearanceStatus::Throttled: statusStr = "Throttled"; break;
+                default: break;
+              }
+
+              const sim::DockingClearanceState csSnap = cs;
+              game::GameEvent ev{};
+              ev.tRealSec = timeRealSec;
+              ev.tSimDays = timeDays;
+              ev.kind = game::GameEventKind::Docking;
+              ev.tag = "Clearance";
+              ev.msg = std::string("Docking clearance ") + statusStr +
+                       (csSnap.assignedPad ? (std::string(" (pad ") + std::to_string((int)csSnap.assignedPad) + ")") : "");
+              ev.hasPos = true;
+              ev.posKm = ship.positionKm();
+              ev.u64a = (core::u64)st.id;
+              ev.u64b = (core::u64)csSnap.assignedPad;
+              game::hubPushEvent(integrationHubWindow, std::move(ev));
+            }
+
             if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
-              toast(toasts, "Docking clearance already granted.", 2.0);
+              std::string msg = "Docking clearance already granted.";
+              if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+              toast(toasts, msg, 2.0);
               audio.play(game::AudioEngine::Sfx::UiConfirm, 0.8f, 0.0f);
             } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
               toast(toasts, "Out of comms range for clearance.", 2.5);
@@ -7400,7 +7638,9 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
               audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
             } else if (dec.status == sim::DockingClearanceStatus::Granted) {
-              toast(toasts, "Docking clearance GRANTED.", 3.0);
+              std::string msg = "Docking clearance GRANTED.";
+              if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+              toast(toasts, msg, 3.0);
               audio.play(game::AudioEngine::Sfx::UiConfirm, 1.0f, 0.0f);
             } else {
               toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
@@ -7427,12 +7667,14 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               ship.setPositionKm(stPos + axis * (st.radiusKm * 1.8));
               ship.setVelocityKmS(sim::stationVelKmS(st, timeDays));
               ship.setAngularVelocityRadS({0,0,0});
-              ship.setOrientation(quatFromTo({0,0,1}, -axis));
+              ship.setOrientation(quatFromTo({0,0,1}, axis));
 
               const sim::StationId undockedFromStationId = dockedStationId;
               docked = false;
               dockedStationId = 0;
+              dockedPad = 0;
               toast(toasts, "Undocked.", 2.0);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Undock", "Undocked", true, ship.positionKm()});
               audio.play(game::AudioEngine::Sfx::Undocked, 1.0f, 0.0f);
 
               // Start any pending escort missions from this station by spawning their convoy
@@ -7588,6 +7830,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
             } else {
               docked = false;
               dockedStationId = 0;
+              dockedPad = 0;
             }
           } else {
             // Dock attempt: must be inside slot tunnel, aligned, and have clearance.
@@ -7610,13 +7853,16 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
               if (!clearanceValid) {
                 toast(toasts, "No valid clearance. Press L to request.", 2.5);
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", "Docking failed: no clearance (no valid clearance)", true, ship.positionKm(), (core::u64)st.id, (core::u64)cs.assignedPad});
               } else if (!sim::dockingSlotConditions(st, relLocalKm, relVelLocal, fwdLocal, upLocal, clearanceValid)) {
                 toast(toasts, "Docking failed: align and enter the slot under speed limit.", 2.8);
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", "Docking failed: bad alignment/speed", true, ship.positionKm(), (core::u64)st.id, (core::u64)cs.assignedPad});
               } else {
                 // Docked: lock ship to a point inside hangar.
                 docked = true;
                 dockedStationId = st.id;
                 selectedStationIndex = (int)target.index;
+                dockedPad = (cs.assignedPad != 0) ? cs.assignedPad : (core::u16)1;
 
                 ship.setVelocityKmS(stV);
                 ship.setAngularVelocityRadS({0,0,0});
@@ -7626,11 +7872,132 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
                 std::string msg = "Docked at " + st.name;
                 if (autoRunComplete) msg += " (auto-run)";
+                if (dockedPad != 0) msg += " (Pad " + std::to_string(dockedPad) + ")";
                 toast(toasts, msg, 2.5);
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", msg, true, ship.positionKm(), (core::u64)st.id, (core::u64)dockedPad});
                 audio.play(game::AudioEngine::Sfx::Docked, 1.0f, 0.0f);
+
+                // Trade Route Runner: advance when we dock at the planned destination station.
+                if (tradePlannerWindow.route.active && !tradePlannerWindow.route.legs.empty() && currentSystem) {
+                  auto& rr = tradePlannerWindow.route;
+                  const int idx = rr.legIndex;
+                  if (idx >= 0 && idx < (int)rr.legs.size()) {
+                    const auto& leg = rr.legs[(std::size_t)idx];
+                    if (leg.toSystem == currentSystem->stub.id && leg.toStation == st.id) {
+                      rr.lastAdvanceAtDays = timeDays;
+
+                      const std::string legDoneMsg = "Trade route leg " + std::to_string(idx + 1) + "/" +
+                                                     std::to_string((int)rr.legs.size()) + " complete at " + st.name + ".";
+                      game::hubPushEvent(integrationHubWindow,
+                                         game::GameEvent{timeRealSec,
+                                                         timeDays,
+                                                         game::GameEventKind::Gameplay,
+                                                         "TradeRouteLegComplete",
+                                                         legDoneMsg,
+                                                         true,
+                                                         ship.positionKm(),
+                                                         (core::u64)st.id,
+                                                         (core::u64)dockedPad});
+
+                      rr.legIndex = idx + 1;
+
+                      // Completed route?
+                      if (rr.legIndex >= (int)rr.legs.size()) {
+                        if (rr.isLoop && rr.repeat && !rr.legs.empty()) {
+                          rr.legIndex = 0;
+                          game::hubPushEvent(integrationHubWindow,
+                                             game::GameEvent{timeRealSec,
+                                                             timeDays,
+                                                             game::GameEventKind::Gameplay,
+                                                             "TradeRouteRepeat",
+                                                             "Trade loop repeating.",
+                                                             true,
+                                                             ship.positionKm(),
+                                                             (core::u64)st.id,
+                                                             (core::u64)dockedPad});
+                        } else {
+                          rr.active = false;
+
+                          const std::string doneMsg = "Trade route complete.";
+                          toast(toasts, doneMsg, 2.2);
+                          game::hubPushEvent(integrationHubWindow,
+                                             game::GameEvent{timeRealSec,
+                                                             timeDays,
+                                                             game::GameEventKind::Gameplay,
+                                                             "TradeRouteComplete",
+                                                             doneMsg,
+                                                             true,
+                                                             ship.positionKm(),
+                                                             (core::u64)st.id,
+                                                             (core::u64)dockedPad});
+                          game::pushGameAction(gameActions,
+                                               game::makeActionTransmitComms(timeRealSec,
+                                                                            timeDays,
+                                                                            "TradeRoute",
+                                                                            (core::i32)sim::CommsChannel::Trade,
+                                                                            0,
+                                                                            /*showOverlay=*/true,
+                                                                            std::string("Trade Route|") + doneMsg));
+                        }
+                      }
+
+                      // If route still active, arm next leg nav + send comms.
+                      if (rr.active && rr.legIndex >= 0 && rr.legIndex < (int)rr.legs.size()) {
+                        const auto& next = rr.legs[(std::size_t)rr.legIndex];
+
+                        game::pushGameAction(gameActions,
+                                             game::makeActionGoToStation(timeRealSec,
+                                                                        timeDays,
+                                                                        "TradeRoute",
+                                                                        (core::u64)next.toSystem,
+                                                                        (core::u64)next.toStation,
+                                                                        rr.armAutoRun));
+                        if (rr.armAutoRun) {
+                          game::pushGameAction(gameActions,
+                                               game::makeActionSetCameraRigPreset(timeRealSec,
+                                                                                  timeDays,
+                                                                                  "TradeRoute",
+                                                                                  (core::i32)game::CameraRigPreset::Travel));
+                        }
+
+                        std::ostringstream oss;
+                        oss << "Next stop: " << next.toSystemName << ":" << next.toStationName;
+                        if (next.manifest.netProfitCr != 0.0) {
+                          oss << "\nLeg net profit est: " << (long long)std::llround(next.manifest.netProfitCr) << " cr";
+                        }
+                        if (!next.manifest.lines.empty()) {
+                          oss << "\nSuggested cargo:";
+                          const int n = std::min<int>(3, (int)next.manifest.lines.size());
+                          for (int li = 0; li < n; ++li) {
+                            const auto& ln = next.manifest.lines[(std::size_t)li];
+                            const auto def = econ::commodityDef(ln.commodity);
+                            oss << "\n - " << def.name << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
+                          }
+                          if ((int)next.manifest.lines.size() > n) {
+                            oss << "\n - ... +" << ((int)next.manifest.lines.size() - n) << " more";
+                          }
+                        } else {
+                          oss << "\nNo cargo recommendation for this leg.";
+                        }
+                        oss << (rr.armAutoRun ? "\n\nUndock to continue. Auto-run is armed." : "\n\nUndock to continue. Fly manually.");
+
+                        game::pushGameAction(gameActions,
+                                             game::makeActionTransmitComms(timeRealSec,
+                                                                          timeDays,
+                                                                          "TradeRoute",
+                                                                          (core::i32)sim::CommsChannel::Trade,
+                                                                          0,
+                                                                          /*showOverlay=*/true,
+                                                                          std::string("Trade Route|") + oss.str()));
+                        toast(toasts, "Trade route: next stop set.", 1.6);
+                      }
+                    }
+                  }
+                }
               }
             } else {
               toast(toasts, "Target a station (T) before docking.", 2.5);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", "Docking failed: no station targeted", true, ship.positionKm()});
             }
           }
         }
@@ -7963,7 +8330,9 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           const auto dec = sim::autoRequestDockingClearance(seed, st, timeDays, distKm, cs, traffic01);
 
           if (dec.status == sim::DockingClearanceStatus::Granted) {
-            toast(toasts, "Docking clearance GRANTED.", 2.2);
+            std::string msg = "Docking clearance GRANTED.";
+            if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+            toast(toasts, msg, 2.2);
           } else if (dec.status == sim::DockingClearanceStatus::Denied) {
             toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
           }
@@ -7983,6 +8352,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           dockedStationId = st.id;
           selectedStationIndex = (int)target.index;
 
+          dockedPad = (cs.assignedPad != 0) ? cs.assignedPad : (core::u16)1;
+
           ship.setVelocityKmS(stV);
           ship.setAngularVelocityRadS({0,0,0});
 
@@ -7994,7 +8365,127 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
           std::string msg = "Docked at " + st.name + " (docking computer)";
           if (autoRunComplete) msg += " (auto-run)";
+          if (dockedPad != 0) msg += " (Pad " + std::to_string(dockedPad) + ")";
           toast(toasts, msg, 2.5);
+          game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", msg, true, ship.positionKm(), (core::u64)st.id, (core::u64)dockedPad});
+
+          // Trade Route Runner: advance when we dock at the planned destination station.
+          if (tradePlannerWindow.route.active && !tradePlannerWindow.route.legs.empty()) {
+            auto& rr = tradePlannerWindow.route;
+            const int idx = rr.legIndex;
+            if (idx >= 0 && idx < (int)rr.legs.size()) {
+              const auto& leg = rr.legs[(std::size_t)idx];
+              if (currentSystem && leg.toSystem == currentSystem->stub.id && leg.toStation == st.id) {
+                rr.lastAdvanceAtDays = timeDays;
+
+                const std::string legDoneMsg = "Trade route leg " + std::to_string(idx + 1) + "/" +
+                                               std::to_string((int)rr.legs.size()) + " complete at " + st.name + ".";
+                game::hubPushEvent(integrationHubWindow,
+                                   game::GameEvent{timeRealSec,
+                                                   timeDays,
+                                                   game::GameEventKind::Gameplay,
+                                                   "TradeRouteLegComplete",
+                                                   legDoneMsg,
+                                                   true,
+                                                   ship.positionKm(),
+                                                   (core::u64)st.id,
+                                                   (core::u64)dockedPad});
+
+                rr.legIndex = idx + 1;
+
+                // Completed route? Optionally repeat loops.
+                if (rr.legIndex >= (int)rr.legs.size()) {
+                  if (rr.isLoop && rr.repeat && !rr.legs.empty()) {
+                    rr.legIndex = 0;
+                    game::hubPushEvent(integrationHubWindow,
+                                       game::GameEvent{timeRealSec,
+                                                       timeDays,
+                                                       game::GameEventKind::Gameplay,
+                                                       "TradeRouteRepeat",
+                                                       "Trade loop repeating.",
+                                                       true,
+                                                       ship.positionKm(),
+                                                       (core::u64)st.id,
+                                                       (core::u64)dockedPad});
+                  } else {
+                    rr.active = false;
+
+                    const std::string doneMsg = "Trade route complete.";
+                    toast(toasts, doneMsg, 2.2);
+                    game::hubPushEvent(integrationHubWindow,
+                                       game::GameEvent{timeRealSec,
+                                                       timeDays,
+                                                       game::GameEventKind::Gameplay,
+                                                       "TradeRouteComplete",
+                                                       doneMsg,
+                                                       true,
+                                                       ship.positionKm(),
+                                                       (core::u64)st.id,
+                                                       (core::u64)dockedPad});
+                    game::pushGameAction(gameActions,
+                                         game::makeActionTransmitComms(timeRealSec,
+                                                                      timeDays,
+                                                                      "TradeRoute",
+                                                                      (core::i32)sim::CommsChannel::Trade,
+                                                                      0,
+                                                                      /*showOverlay=*/true,
+                                                                      std::string("Trade Route|") + doneMsg));
+                  }
+                }
+
+                // If route still active, arm next leg nav + send comms.
+                if (rr.active && rr.legIndex >= 0 && rr.legIndex < (int)rr.legs.size()) {
+                  const auto& next = rr.legs[(std::size_t)rr.legIndex];
+
+                  game::pushGameAction(gameActions,
+                                       game::makeActionGoToStation(timeRealSec,
+                                                                  timeDays,
+                                                                  "TradeRoute",
+                                                                  (core::u64)next.toSystem,
+                                                                  (core::u64)next.toStation,
+                                                                  rr.armAutoRun));
+                  if (rr.armAutoRun) {
+                    game::pushGameAction(gameActions,
+                                         game::makeActionSetCameraRigPreset(timeRealSec,
+                                                                            timeDays,
+                                                                            "TradeRoute",
+                                                                            (core::i32)game::CameraRigPreset::Travel));
+                  }
+
+                  std::ostringstream oss;
+                  oss << "Next stop: " << next.toSystemName << ":" << next.toStationName;
+                  if (next.manifest.netProfitCr != 0.0) {
+                    oss << "\nLeg net profit est: " << (long long)std::llround(next.manifest.netProfitCr) << " cr";
+                  }
+                  if (!next.manifest.lines.empty()) {
+                    oss << "\nSuggested cargo:";
+                    const int n = std::min<int>(3, (int)next.manifest.lines.size());
+                    for (int li = 0; li < n; ++li) {
+                      const auto& ln = next.manifest.lines[(std::size_t)li];
+                      const auto def = econ::commodityDef(ln.commodity);
+                      oss << "\n - " << def.name << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
+                    }
+                    if ((int)next.manifest.lines.size() > n) {
+                      oss << "\n - ... +" << ((int)next.manifest.lines.size() - n) << " more";
+                    }
+                  } else {
+                    oss << "\nNo cargo recommendation for this leg.";
+                  }
+                  oss << (rr.armAutoRun ? "\n\nUndock to continue. Auto-run is armed." : "\n\nUndock to continue. Fly manually.");
+
+                  game::pushGameAction(gameActions,
+                                       game::makeActionTransmitComms(timeRealSec,
+                                                                    timeDays,
+                                                                    "TradeRoute",
+                                                                    (core::i32)sim::CommsChannel::Trade,
+                                                                    0,
+                                                                    /*showOverlay=*/true,
+                                                                    std::string("Trade Route|") + oss.str()));
+                  toast(toasts, "Trade route: next stop set.", 1.6);
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -8663,6 +9154,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           // Clear transient state.
           docked = false;
           dockedStationId = 0;
+          dockedPad = 0;
           selectedStationIndex = 0;
           clearances.clear();
           contacts.clear();
@@ -8763,6 +9255,10 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           if (!haveStationTarget) {
             // Nothing more to do automatically.
             navAutoRun = false;
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                               "AutoRunComplete", "Auto-run complete: no station target.", false, {},
+                                               currentSystem ? (core::u64)currentSystem->stub.id : 0, 0});
           } else {
             const auto& st = currentSystem->stations[target.index];
 
@@ -8800,15 +9296,22 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
               scanning = false;
               scanProgressSec = 0.0;
 
-              toast(toasts,
-                    pirateNearby ? "Auto-run: supercruise charging... (pirate signals nearby)" : "Auto-run: supercruise charging...",
-                    2.2);
+              const char* autoRunMsg =
+                  pirateNearby ? "Auto-run: supercruise charging... (pirate signals nearby)" : "Auto-run: supercruise charging...";
+              toast(toasts, autoRunMsg, 2.2);
+              game::hubPushEvent(integrationHubWindow,
+                                 game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                 "AutoRunSupercruise", autoRunMsg, false, {}, (core::u64)st.id, 0});
             } else {
               // Engage docking computer for the final approach.
               if (!autopilot) {
                 autopilot = true;
                 dockingComputer.reset();
                 toast(toasts, "Auto-run: docking computer engaged.", 2.0);
+                game::hubPushEvent(integrationHubWindow,
+                                   game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                   "AutoRunDockingComputer", "Auto-run: docking computer engaged.", false, {},
+                                                   (core::u64)st.id, 0});
               }
             }
           }
@@ -8827,20 +9330,34 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                 // Try a one-shot replot to the final destination using the current planner settings.
                 if (replotted || navRoute.size() < 2) {
                   navAutoRun = false;
-                  toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                  const char* autoRunMsg = "Auto-run stopped: next hop is out of range (replot route).";
+                  toast(toasts, autoRunMsg, 2.8);
+                  game::hubPushEvent(integrationHubWindow,
+                                     game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                     "AutoRunStopRange", autoRunMsg, false, {}, (core::u64)nextId,
+                                                     navRoute.empty() ? 0 : (core::u64)navRoute.back()});
                   break;
                 }
                 const sim::SystemId finalDest = navRoute.back();
                 const bool ok = plotRouteToSystem(finalDest, /*showToast=*/false);
                 if (!ok) {
                   navAutoRun = false;
-                  toast(toasts, "Auto-run stopped: next hop is out of range (replot route).", 2.8);
+                  const char* autoRunMsg = "Auto-run stopped: next hop is out of range (replot route).";
+                  toast(toasts, autoRunMsg, 2.8);
+                  game::hubPushEvent(integrationHubWindow,
+                                     game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                     "AutoRunStopRange", autoRunMsg, false, {}, (core::u64)nextId,
+                                                     navRoute.empty() ? 0 : (core::u64)navRoute.back()});
                   break;
                 }
                 // plotRouteToSystem() disarms auto-run; re-arm and retry once.
                 navAutoRun = true;
                 replotted = true;
                 toast(toasts, "Auto-run: replotted route (jump range changed).", 2.6);
+                game::hubPushEvent(integrationHubWindow,
+                                   game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                   "AutoRunReplot", "Auto-run: replotted route (jump range changed).", false, {},
+                                                   navRoute.empty() ? 0 : (core::u64)navRoute.back(), 0});
                 continue;
               }
 
@@ -8864,9 +9381,19 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                   target.kind = TargetKind::Station;
                   target.index = bestIdx;
                   selectedStationIndex = (int)bestIdx;
-                  toast(toasts, "Auto-run stopped: not enough fuel (target set to " + currentSystem->stations[bestIdx].name + ").", 3.0);
+                  const std::string autoRunMsg =
+                      "Auto-run stopped: not enough fuel (target set to " + currentSystem->stations[bestIdx].name + ").";
+                  toast(toasts, autoRunMsg, 3.0);
+                  game::hubPushEvent(integrationHubWindow,
+                                     game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                     "AutoRunStopFuel", autoRunMsg, false, {}, (core::u64)nextId,
+                                                     (core::u64)currentSystem->stations[bestIdx].id});
                 } else {
-                  toast(toasts, "Auto-run stopped: not enough fuel for next hop.", 2.8);
+                  const char* autoRunMsg = "Auto-run stopped: not enough fuel for next hop.";
+                  toast(toasts, autoRunMsg, 2.8);
+                  game::hubPushEvent(integrationHubWindow,
+                                     game::GameEvent{timeRealSec, timeDays, game::GameEventKind::NavAssist,
+                                                     "AutoRunStopFuel", autoRunMsg, false, {}, (core::u64)nextId, 0});
                 }
                 break;
               }
@@ -8905,17 +9432,22 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       // Reset per-frame sample (keeps UI from showing stale values when leaving
       // normal space).
       atmoPlayerLast = {};
+      aeroPlayerLast = {};
+
 
       auto stepShipMaybeGravity = [&](sim::Ship& s,
                                       double dt,
                                       const sim::ShipInput& in,
                                       bool allowGravity) {
         math::Vec3d aExt{0,0,0};
-        bool useExt = false;
+        math::Vec3d angExtLocal{0,0,0};
+        bool useExtLin = false;
+        bool useExtAng = false;
 
         if (allowGravity && gravityActive) {
-          aExt = aExt + sim::systemGravityAccelKmS2(*currentSystem, timeDays, s.positionKm(), gravityParams);
-          useExt = true;
+          const math::Vec3d g = sim::systemGravityAccelKmS2(*currentSystem, timeDays, s.positionKm(), gravityParams);
+          aExt = aExt + g;
+          useExtLin = useExtLin || (g.lengthSq() > 1e-18);
         }
 
         if (allowGravity && atmosphereActive && (physicsAtmosphereAffectsNpcs || (&s == &ship))) {
@@ -8932,7 +9464,28 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                                                         atmoPhysicsParams);
           if (atmo.inAtmosphere) {
             aExt = aExt + atmo.dragAccelKmS2;
-            useExt = useExt || (atmo.dragAccelKmS2.lengthSq() > 1e-16);
+            useExtLin = useExtLin || (atmo.dragAccelKmS2.lengthSq() > 1e-16);
+          }
+
+          // 3D Flight Model: aerodynamic lift + induced drag + stability.
+          if (aeroPhysicsParams.enabled && (physicsAeroAffectsNpcs || (&s == &ship))) {
+            const auto aero = sim::computeAerodynamics(atmo,
+                                                       s.orientation(),
+                                                       s.angularVelocityRadS(),
+                                                       massKg,
+                                                       aeroPhysicsParams,
+                                                       in.torqueLocal);
+            if (aero.active) {
+              aExt = aExt + aero.liftAccelKmS2 + aero.extraDragAccelKmS2;
+              useExtLin = useExtLin || ((aero.liftAccelKmS2 + aero.extraDragAccelKmS2).lengthSq() > 1e-16);
+
+              angExtLocal = angExtLocal + aero.angAccelLocalRadS2;
+              useExtAng = useExtAng || (aero.angAccelLocalRadS2.lengthSq() > 1e-16);
+            }
+
+            if (&s == &ship) {
+              aeroPlayerLast = aero;
+            }
           }
 
           // Player-only HUD + heat.
@@ -8947,8 +9500,8 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           }
         }
 
-        if (useExt) {
-          s.stepWithExternalAccel(dt, in, aExt);
+        if (useExtLin || useExtAng) {
+          s.stepWithExternalForces(dt, in, aExt, angExtLocal);
         } else {
           s.step(dt, in);
         }
@@ -9034,12 +9587,18 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           const math::Quatd stQ = stationOrient(st, stPos, timeDays);
           const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
 
-          const double wz = st.radiusKm * 1.10;
-          const double dockZ = wz - st.slotDepthKm - st.radiusKm * 0.25;
-          const math::Vec3d dockLocal{0,0, dockZ};
-          ship.setPositionKm(stPos + stQ.rotate(dockLocal));
+          const math::Vec3d relWorldKm = ship.positionKm() - stPos;
+          const math::Vec3d relLocalKm = stQ.conjugate().rotate(relWorldKm);
+
+          if (dockedPad == 0) {
+            dockedPad = sim::nearestDockingPadIndex(seed, st, relLocalKm);
+          }
+
+          const sim::DockingPad pad = sim::stationDockingPad(seed, st, dockedPad != 0 ? dockedPad : (core::u16)1);
+          ship.setPositionKm(stPos + stQ.rotate(pad.localPosKm));
           ship.setVelocityKmS(stV);
-          ship.setOrientation(stQ * math::Quatd::fromAxisAngle({0,1,0}, math::kPi)); // face outward-ish
+          ship.setAngularVelocityRadS({0,0,0});
+          ship.setOrientation(stQ * pad.localOrient);
         }
       }
 
@@ -11558,6 +12117,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               }
 
               toast(toasts, "Mission complete: bounty scan uploaded! +" + std::to_string((int)std::round(res.rewardCr)) + " cr", 3.0);
+              game::hubPushEvent(integrationHubWindow,
+                                 game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                               "MissionComplete",
+                                               std::string("Mission complete: BountyScan +") + std::to_string((int)std::round(res.rewardCr)) + " cr" +
+                                                 " (target " + std::to_string((core::u64)c.id) + ")",
+                                               true, ship.positionKm(), (core::u64)c.id,
+                                               (core::u64)currentSystem->stub.id});
 
               scanning = false;
               scanProgressSec = 0.0;
@@ -13092,6 +13658,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
           if (!pm->failed && m.failed) {
             toast(toasts, "Mission failed: deadline missed.", 3.0);
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                             "MissionFailed",
+                                             std::string("Mission failed: ") + sim::missionTypeName(m.type) +
+                                               " (id " + std::to_string((core::u64)m.id) + ")",
+                                             true, ship.positionKm(), (core::u64)m.id,
+                                             currentSystem ? (core::u64)currentSystem->stub.id : 0});
             if (trackedMissionId == m.id) trackedMissionId = 0;
           }
 
@@ -13111,19 +13684,36 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             } else if (m.type == sim::MissionType::Salvage) {
               toast(toasts, "Mission complete: salvage recovered. +" + std::to_string((int)m.reward) + " cr", 3.0);
             }
+            // Integration Hub event for automations / debugging.
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                             "MissionComplete",
+                                             std::string("Mission complete: ") + sim::missionTypeName(m.type) +
+                                               " +" + std::to_string((int)m.reward) + " cr" +
+                                               " (id " + std::to_string((core::u64)m.id) + ")",
+                                             true, ship.positionKm(), (core::u64)m.id,
+                                             (core::u64)m.toStation});
             if (trackedMissionId == m.id) trackedMissionId = 0;
           }
 
           if (m.type == sim::MissionType::MultiDelivery && pm->leg == 0 && m.leg == 1 && !m.completed && !m.failed) {
             toast(toasts, "Multi-hop delivery: leg 1/2 complete.", 2.5);
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                             "MissionProgress",
+                                             std::string("MultiDelivery progressed: leg 2/2 unlocked (id ") +
+                                               std::to_string((core::u64)m.id) + ")",
+                                             true, ship.positionKm(), (core::u64)m.id, (core::u64)m.toSystem});
 
             // If the player is tracking this mission, optionally auto-plot the route to the final destination.
             if (missionTrackerAutoPlotNextLeg && trackedMissionId == m.id) {
-              if (plotRouteToSystem(m.toSystem, false)) {
-                pendingArrivalTargetStationId = m.toStation;
-                if (currentSystem && m.toSystem == currentSystem->stub.id && m.toStation != 0) tryTargetStationById(m.toStation);
-                toast(toasts, "Route updated: final destination plotted (leg 2/2).", 2.6);
-              }
+              // Keep mission tracker conveniences routed through the Integration Hub action pipeline.
+              // This makes the behavior traceable, and lets players extend it with automations.
+              game::hubPushAction(integrationHubWindow,
+                                  game::GameAction{timeRealSec, timeDays, "Automation:MissionTrackerAutoPlotNextLeg",
+                                                   game::GameActionKind::SyncNavToMission,
+                                                   (core::u64)m.id, 0, 0, /*armAutoRun=*/false, ""});
+              toast(toasts, "Route updated: final destination synced (leg 2/2).", 2.6);
             }
           }
         }
@@ -13468,6 +14058,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       missiles.clear();
       contacts.clear();
       docked = true;
+      dockedPad = 0;
       if (!currentSystem->stations.empty()) {
         dockedStationId = currentSystem->stations.front().id;
         selectedStationIndex = 0;
@@ -13534,17 +14125,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Cinematic camera (keyframed chase-rig)
     game::tickCinematicCamera(cinematicCameraWindow, dtReal, dtSim, paused);
 
-    // Default chase camera
-    double camFovDeg = 60.0;
-    math::Vec3d camOffsetLocalU{0.0, 2.0, -6.0};
-    bool camLookAtShip = false;
+    // Collect cinematic camera overrides (if enabled) for the camera rig.
+    double cinematicFovDeg = 60.0;
+    bool cinematicOverrideFov = false;
+    math::Vec3d cinematicOffsetLocalU{0.0, 2.0, -6.0};
+    bool cinematicLookAtShip = false;
 
     if (cinematicCameraWindow.enabled) {
       const auto sample = game::sampleCinematicCamera(cinematicCameraWindow);
-      camOffsetLocalU = sample.offsetLocalU;
-      camLookAtShip = cinematicCameraWindow.lookAtShip;
+      cinematicOffsetLocalU = sample.offsetLocalU;
+      cinematicLookAtShip = cinematicCameraWindow.lookAtShip;
       if (cinematicCameraWindow.overrideFov && sample.hasFov) {
-        camFovDeg = sample.fovDeg;
+        cinematicOverrideFov = true;
+        cinematicFovDeg = sample.fovDeg;
       }
     }
 
@@ -13552,26 +14145,27 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     int w = 1280, h = 720;
     SDL_GetWindowSize(window, &w, &h);
     glViewport(0, 0, w, h);
-    double aspect = (double)w / (double)h;
-    cam.setPerspective(math::degToRad(camFovDeg), aspect, 0.01, 20000.0);
+    const double aspect = (double)w / (double)h;
 
     const math::Vec3d shipPosU = toRenderPosU(ship.positionKm());
-    const math::Vec3d camOffsetU = ship.right() * camOffsetLocalU.x +
-                                   ship.up() * camOffsetLocalU.y +
-                                   ship.forward() * camOffsetLocalU.z;
-    const math::Vec3d camPosU = shipPosU + camOffsetU;
-    cam.setPosition(camPosU);
 
-    if (camLookAtShip) {
-      const math::Vec3d toShipU = shipPosU - camPosU;
-      if (toShipU.lengthSq() > 1e-12) {
-        cam.setOrientation(quatFromTo(math::Vec3d{0.0, 0.0, 1.0}, toShipU.normalized()));
-      } else {
-        cam.setOrientation(ship.orientation());
-      }
-    } else {
-      cam.setOrientation(ship.orientation());
-    }
+    const game::CameraRigFrame rig = game::computeCameraRigFrame(
+      cameraRigWindow,
+      ship,
+      shipPosU,
+      currentSystem,
+      timeDays,
+      gravityParams,
+      dtReal,
+      cinematicCameraWindow.enabled,
+      cinematicOffsetLocalU,
+      cinematicLookAtShip,
+      cinematicFovDeg,
+      cinematicOverrideFov);
+
+    cam.setPerspective(math::degToRad(rig.fovDeg), aspect, rig.nearPlane, rig.farPlane);
+    cam.setPosition(rig.posU);
+    cam.setOrientation(rig.orient);
 
     const math::Mat4d view = cam.viewMatrix();
     const math::Mat4d proj = cam.projectionMatrix();
@@ -13597,6 +14191,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         starCoronaRenderer.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
         starCoronaRenderer.setTimeSeconds((float)timeRealSec);
       }
+      if (starfieldGpuAvailable) {
+        starfieldGpu.setCameraPos((float)cp.x, (float)cp.y, (float)cp.z);
+        starfieldGpu.setTimeSeconds((float)timeRealSec);
+      }
     }
 
     atmosphereRenderer.setViewProj(viewF, projF);
@@ -13608,6 +14206,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     volumetricAtmosphereRenderer.setSunPos((float)sunPosU.x, (float)sunPosU.y, (float)sunPosU.z);
     lineRenderer.setViewProj(viewF, projF);
     pointRenderer.setViewProj(viewF, projF);
+
+    if (starfieldGpuAvailable) {
+      starfieldGpu.setViewProj(viewF, projF);
+    }
     gpuDust.setViewProj(viewF, projF);
 
     // Atmosphere needs the camera position in world/render units for the rim factor.
@@ -13619,13 +14221,26 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Update VFX render buffers.
     if (!vfxProceduralSkyEnabled && vfxStarfieldEnabled) {
+      bool regenerated = false;
       if ((int)starfield.starCount() != vfxStarCount) {
         starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+        regenerated = true;
       }
       if (std::abs(starfield.radius() - vfxStarRadiusU) > 1e-3) {
         starfield.setRadius(vfxStarRadiusU);
       }
-      starfield.update(cam.position(), timeRealSec);
+
+      const bool useGpuStarfield = vfxStarfieldGpuEnabled && starfieldGpuAvailable;
+      if (useGpuStarfield) {
+        // Upload only when the star distribution changes.
+        if (regenerated || starfieldGpu.starCount() != starfield.starCount()) {
+          starfieldGpu.upload(starfield);
+        }
+        starfieldGpu.setRadius((float)starfield.radius());
+      } else {
+        // CPU path (legacy): expands stars around the camera and streams PointVertex data.
+        starfield.update(cam.position(), timeRealSec);
+      }
     }
 
     if (!vfxProceduralSkyEnabled && vfxNebulaEnabled) {
@@ -14485,42 +15100,63 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
       }
     }
-    // Orbit lines (planets)
-    std::vector<render::LineVertex> lines;
-    lines.reserve(currentSystem->planets.size() * 128 + currentSystem->stations.size() * 64 + beams.size() * 2);
+    // Orbit lines (cached per system; avoids per-frame orbit sampling cost).
+    struct OrbitLineCache {
+      core::u64 systemId{0};
+      std::vector<render::LineVertex> staticLines;
+      bool valid{false};
+    };
 
-    for (const auto& p : currentSystem->planets) {
-      const int seg = 96;
-      math::Vec3d prev{};
-      for (int s = 0; s <= seg; ++s) {
-        const double t = (double)s / (double)seg * p.orbit.periodDays;
-        const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, t);
-        const math::Vec3d posU = toRenderPosU(posAU * kAU_KM);
+    static OrbitLineCache orbitLineCache;
 
-        if (s > 0) {
-          lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.22f,0.22f,0.25f});
-          lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.22f,0.22f,0.25f});
+    if (!orbitLineCache.valid || orbitLineCache.systemId != currentSystem->stub.id) {
+      orbitLineCache.valid = true;
+      orbitLineCache.systemId = currentSystem->stub.id;
+      orbitLineCache.staticLines.clear();
+      orbitLineCache.staticLines.reserve(currentSystem->planets.size() * 200 + currentSystem->stations.size() * 120);
+
+      // Planet orbits.
+      for (const auto& p : currentSystem->planets) {
+        const int seg = 96;
+        math::Vec3d prev{};
+        for (int s = 0; s <= seg; ++s) {
+          const double t = (double)s / (double)seg * p.orbit.periodDays;
+          const math::Vec3d posAU = sim::orbitPosition3DAU(p.orbit, t);
+          const math::Vec3d posU = toRenderPosU(posAU * kAU_KM);
+
+          if (s > 0) {
+            orbitLineCache.staticLines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.22f,0.22f,0.25f});
+            orbitLineCache.staticLines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.22f,0.22f,0.25f});
+          }
+          prev = posU;
         }
-        prev = posU;
+      }
+
+      // Station orbits (fewer segments; stations are secondary).
+      for (const auto& st : currentSystem->stations) {
+        const int seg = 48;
+        math::Vec3d prev{};
+        for (int s = 0; s <= seg; ++s) {
+          const double t = (double)s / (double)seg * st.orbit.periodDays;
+          const math::Vec3d posU = toRenderPosU(sim::orbitPosition3DAU(st.orbit, t) * kAU_KM);
+          if (s > 0) {
+            orbitLineCache.staticLines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.16f,0.18f,0.22f});
+            orbitLineCache.staticLines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.16f,0.18f,0.22f});
+          }
+          prev = posU;
+        }
       }
     }
 
-    // Station orbit lines + slot axis lines
+    static std::vector<render::LineVertex> lines;
+    lines.clear();
+    lines.reserve(orbitLineCache.staticLines.size() + beams.size() * 2 + 2048);
+    lines.insert(lines.end(), orbitLineCache.staticLines.begin(), orbitLineCache.staticLines.end());
+
+    // Docking corridor guidance for targeted station (dynamic)
+
     for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
       const auto& st = currentSystem->stations[i];
-
-      // orbit (fewer segs, stations are secondary)
-      const int seg = 48;
-      math::Vec3d prev{};
-      for (int s = 0; s <= seg; ++s) {
-        const double t = (double)s / (double)seg * st.orbit.periodDays;
-        const math::Vec3d posU = toRenderPosU(sim::orbitPosition3DAU(st.orbit, t) * kAU_KM);
-        if (s > 0) {
-          lines.push_back({(float)prev.x,(float)prev.y,(float)prev.z, 0.16f,0.18f,0.22f});
-          lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, 0.16f,0.18f,0.22f});
-        }
-        prev = posU;
-      }
 
       // docking corridor guidance for targeted station
       if (target.kind == TargetKind::Station && target.index == i) {
@@ -14681,6 +15317,37 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       }
     }
 
+    // Time Trial best-run ghost trail (racing)
+    if (timeTrialWindow.ghostEnabled && timeTrialWindow.ghostDrawTrail && timeTrialWindow.hasCourse) {
+      auto itG = timeTrialWindow.bestGhostSamples.find(timeTrialWindow.course.key);
+      if (itG != timeTrialWindow.bestGhostSamples.end() && itG->second.size() >= 2) {
+        const auto& s = itG->second;
+        const std::size_t n = s.size();
+        const std::size_t maxPts = 2048;
+        const std::size_t stride = std::max<std::size_t>(1, n / maxPts);
+
+        const float op = std::clamp(timeTrialWindow.ghostOpacity, 0.05f, 1.0f);
+        const float r = 0.15f * op;
+        const float g = 0.90f * op;
+        const float b = 0.95f * op;
+
+        math::Vec3d prevU{};
+        bool hasPrev = false;
+        std::size_t added = 0;
+
+        for (std::size_t i = 0; i < n; i += stride) {
+          const math::Vec3d posU = toRenderPosU(s[i].posKm);
+          if (hasPrev) {
+            lines.push_back({(float)prevU.x,(float)prevU.y,(float)prevU.z, r,g,b});
+            lines.push_back({(float)posU.x,(float)posU.y,(float)posU.z, r,g,b});
+            if (++added >= maxPts) break;
+          }
+          prevU = posU;
+          hasPrev = true;
+        }
+      }
+    }
+
     // Projectile tracers (draw a fixed-length tail so they're visible at astronomical scales)
     for (const auto& p : projectiles) {
       math::Vec3d tailKm = p.prevKm;
@@ -14797,6 +15464,18 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                        0.85f, 0.35f, 1.00f));
     }
 
+
+
+    // Time Trial best-run ghost (racing)
+    if (timeTrialWindow.ghostEnabled && timeTrialWindow.ghostDrawShip && timeTrialWindow.ghostSampleValid) {
+      const auto& gs = timeTrialWindow.ghostSample;
+      const float op = std::clamp(timeTrialWindow.ghostOpacity, 0.05f, 1.0f);
+      shipGhostInst.push_back(makeInst(toRenderPosU(gs.posKm),
+                                       {0.35, 0.20, 0.60},
+                                       gs.orient,
+                                       0.15f * op, 0.95f * op, 0.95f * op));
+    }
+
     // Contacts (pirates)
     for (const auto& c : contacts) {
       if (!c.alive) continue;
@@ -14822,20 +15501,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	    }
 
 	    // Asteroid mining nodes (procedural mesh variants, slow deterministic spin)
+	    struct AsteroidSpinParams {
+	      math::Vec3d axis{0, 1, 0};
+	      double phase{0.0};
+	      double speedRadPerDay{0.0};
+	    };
+
+	    static core::u64 asteroidSpinCacheSystemId = 0;
+	    static std::unordered_map<core::u64, AsteroidSpinParams> asteroidSpinCache;
+	    if (asteroidSpinCacheSystemId != currentSystem->stub.id) {
+	      asteroidSpinCacheSystemId = currentSystem->stub.id;
+	      asteroidSpinCache.clear();
+	      asteroidSpinCache.reserve(asteroids.size() * 2 + 64);
+	    }
+
 	    for (const auto& a : asteroids) {
 	      const float r = 0.55f, g = 0.55f, b = 0.58f;
 	      const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
 
 	      // Derive a stable spin axis + rate from the asteroid id so the field
-	      // feels alive without storing extra state in savegames.
-	      core::SplitMix64 rng(core::hashCombine(a.id, core::fnv1a64("rockSpin")));
-	      math::Vec3d axis{rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0};
-	      if (axis.lengthSq() < 1e-12) axis = {0, 1, 0};
-	      axis = axis.normalized();
-	      const double phase = rng.nextDouble() * (2.0 * math::kPi);
-	      const double speed = math::degToRad(12.0 + rng.nextDouble() * 28.0); // rad/day
-	      const double ang = std::fmod(phase + timeDays * speed, 2.0 * math::kPi);
-	      const math::Quatd q = math::Quatd::fromAxisAngle(axis, ang);
+	      // feels alive without storing extra state in savegames. Cache the derived
+	      // parameters to avoid per-frame RNG + normalization work.
+	      auto it = asteroidSpinCache.find(a.id);
+	      if (it == asteroidSpinCache.end()) {
+	        AsteroidSpinParams sp{};
+	        core::SplitMix64 rng(core::hashCombine(a.id, core::fnv1a64("rockSpin")));
+	        math::Vec3d axis{rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0, rng.nextDouble() * 2.0 - 1.0};
+	        if (axis.lengthSq() < 1e-12) axis = {0, 1, 0};
+	        sp.axis = axis.normalized();
+	        sp.phase = rng.nextDouble() * (2.0 * math::kPi);
+	        sp.speedRadPerDay = math::degToRad(12.0 + rng.nextDouble() * 28.0); // rad/day
+	        it = asteroidSpinCache.emplace(a.id, sp).first;
+	      }
+	      const AsteroidSpinParams& sp = it->second;
+	      const double ang = std::fmod(sp.phase + timeDays * sp.speedRadPerDay, 2.0 * math::kPi);
+	      const math::Quatd q = math::Quatd::fromAxisAngle(sp.axis, ang);
 
 	      const auto inst = makeInst(toRenderPosU(a.posKm),
 	                                 {0.55 * s, 0.55 * s, 0.55 * s},
@@ -14849,6 +15549,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        rockInstances.push_back(inst);
 	      }
 	    }
+
+
 
 	
 
@@ -14905,19 +15607,30 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
+    // When post-processing is enabled, we may render the 3D scene at a scaled
+    // resolution (dynamic resolution) and upscale in PostFX::present().
+    int sceneW = w;
+    int sceneH = h;
+
     if (postFxSettings.enabled) {
       // Apply FrameGraph flags before building passes this frame.
       // When a FrameGraph capture is queued, force-disable transient texture aliasing for a
       // single frame so pass outputs remain stable for readback.
       postFx.frameGraph().setAliasingEnabled(postFxFrameGraphAliasing && fgCaptureQueue.empty());
       postFx.frameGraph().setProfilingEnabled(postFxFrameGraphGpuTiming);
+
+      // Configure render-scale / dynamic resolution BEFORE allocating the scene target.
+      postFx.configure(postFxSettings);
       postFx.ensureSize(w, h);
       postFx.beginScene(w, h);
+
+      sceneW = postFx.width();
+      sceneH = postFx.height();
     } else {
       render::gl::BindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, sceneW, sceneH);
     glClearColor(0.01f, 0.01f, 0.02f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -14938,7 +15651,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       const float camPosU[3] = {(float)cp.x, (float)cp.y, (float)cp.z};
 
       const float tanHalfFovY = (float)std::tan(math::degToRad(camFovDeg) * 0.5);
-      proceduralSky.draw(w, h,
+      proceduralSky.draw(sceneW, sceneH,
                          vfxProceduralSky,
                          camRight, camUp, camForward,
                          camPosU,
@@ -14962,11 +15675,22 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Background stars (point sprites, additive blend). Don't write depth.
     if (!vfxProceduralSkyEnabled && vfxStarfieldEnabled) {
       glDepthMask(GL_FALSE);
-      if (vfxStarfieldTextured) {
-        pointRenderer.drawPointsSprite(starfield.points(), starPointSpriteTex, render::PointBlendMode::Additive);
+
+      const bool useGpuStarfield = vfxStarfieldGpuEnabled && starfieldGpuAvailable;
+      if (useGpuStarfield) {
+        if (vfxStarfieldTextured) {
+          starfieldGpu.draw(&starPointSpriteTex, render::PointBlendMode::Additive);
+        } else {
+          starfieldGpu.draw(nullptr, render::PointBlendMode::Additive);
+        }
       } else {
-        pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
+        if (vfxStarfieldTextured) {
+          pointRenderer.drawPointsSprite(starfield.points(), starPointSpriteTex, render::PointBlendMode::Additive);
+        } else {
+          pointRenderer.drawPoints(starfield.points(), render::PointBlendMode::Additive);
+        }
       }
+
       glDepthMask(GL_TRUE);
       glDisable(GL_BLEND);
     }
@@ -15014,6 +15738,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         cs.prominenceCount = worldStarCoronaProminenceCount;
         cs.prominenceSharpness = worldStarCoronaProminenceSharpness;
         cs.pulseStrength = worldStarCoronaPulseStrength;
+
+        cs.noiseOctaves = worldStarCoronaNoiseOctaves;
+        cs.rimEarlyOut = worldStarCoronaRimEarlyOut;
 
         starCoronaRenderer.setSettings(cs);
 
@@ -15632,6 +16359,665 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     // Flight telemetry recorder (sample after simulation + render, before UI).
     game::tickFlightRecorder(flightRecorderWindow, dtReal, timeRealSec, timeDays, ship, paused);
 
+    // 3D gameplay loop: deterministic gate courses (time trials).
+    // This can emit cross-system actions/events (target station, engage docking computer, set camera).
+    game::tickTimeTrial(timeTrialWindow,
+                        dtReal,
+                        timeRealSec,
+                        timeDays,
+                        ship,
+                        paused,
+                        docked,
+                        dockedStationId,
+                        [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                        [&](const game::GameAction& a) { game::hubPushAction(integrationHubWindow, a); },
+                        [&](const game::GameEvent& e) { game::hubPushEvent(integrationHubWindow, e); });
+
+    // Execute queued cross-system actions (Integration Hub).
+    {
+      // Move due scheduled actions into the pending queue (enables delayed automations).
+      game::hubTickScheduledActions(integrationHubWindow, timeRealSec);
+
+      game::GameAction a;
+      while (game::popGameAction(integrationHubWindow.actions, &a)) {
+        switch (a.kind) {
+          case game::GameActionKind::Toast: {
+            if (!a.msg.empty()) toast(toasts, a.msg, 1.8);
+            break;
+          }
+
+          case game::GameActionKind::SetTargetStationId: {
+            if (currentSystem && a.u64a != 0) {
+              int anchorIdx = -1;
+              for (int i = 0; i < (int)currentSystem->stations.size(); ++i) {
+                if ((core::u64)currentSystem->stations[i].id == a.u64a) {
+                  anchorIdx = i;
+                  break;
+                }
+              }
+              if (anchorIdx >= 0) {
+                target.kind = TargetKind::Station;
+                target.index = anchorIdx;
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay, "Action", "Target station set (origin: " + a.origin + ")", false, {}, a.u64a, 0});
+              } else {
+                toast(toasts, "Action: station not found in current system.", 2.2);
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay, "ActionFail", "Target station not found", false, {}, a.u64a, 0});
+              }
+            } else {
+              toast(toasts, "Action: no current system / invalid station id.", 2.2);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay, "ActionFail", "No current system / invalid station id", false, {}, a.u64a, 0});
+            }
+            break;
+          }
+
+
+
+          case game::GameActionKind::SyncNavToMission: {
+            const core::u64 mid = a.u64a;
+            const sim::Mission* mPtr = nullptr;
+            for (const auto& m : missions) {
+              if ((core::u64)m.id == mid) { mPtr = &m; break; }
+            }
+
+            // Avoid spamming UI toasts when fired from automation rules.
+            const bool userToast = (a.origin.rfind("Automation:", 0) != 0);
+
+            if (!mPtr) {
+              if (userToast) toast(toasts, "Action: mission not found (cannot sync nav).", 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                                      "ActionFail",
+                                                                      "SyncNavToMission: mission not found",
+                                                                      false, {}, mid, 0});
+              break;
+            }
+
+            const sim::Mission& m = *mPtr;
+
+            // Mirror the UI's "Next Stop" logic: for multi-leg passenger/multi-delivery missions,
+            // the first leg goes to the via stop.
+            const bool hasVia = (m.viaSystem != 0 && m.viaStation != 0 && m.leg == 0 &&
+                                 (m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Passenger));
+            const sim::SystemId destSys = hasVia ? m.viaSystem : m.toSystem;
+            const sim::StationId destSt = hasVia ? m.viaStation : m.toStation;
+
+            if (!currentSystem || destSys == 0) {
+              if (userToast) toast(toasts, "Action: no current system / invalid mission destination.", 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                                      "ActionFail",
+                                                                      "SyncNavToMission: no current system / invalid destination",
+                                                                      false, {}, (core::u64)m.id, (core::u64)destSys});
+              break;
+            }
+
+            if (!plotRouteToSystem(destSys, userToast)) {
+              // plotRouteToSystem can emit more detailed toasts when userToast==true.
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                                      "ActionFail",
+                                                                      "SyncNavToMission: route planner failed",
+                                                                      false, {}, (core::u64)m.id, (core::u64)destSys});
+              break;
+            }
+
+            // If we already are in the destination system, target the station immediately.
+            // Otherwise arm it for arrival (jump completion will auto-target).
+            if (destSt != 0) {
+              if (currentSystem && destSys == currentSystem->stub.id) {
+                tryTargetStationById(destSt);
+                pendingArrivalTargetStationId = 0;
+              } else {
+                pendingArrivalTargetStationId = destSt;
+              }
+            } else {
+              pendingArrivalTargetStationId = 0;
+            }
+
+            if (a.b) {
+              navAutoRun = true;
+              if (userToast) toast(toasts, "Auto-run armed for mission route.", 2.0);
+            }
+
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                                    "MissionNavSync",
+                                                                    "Nav synced to mission next stop (origin: " + a.origin + ")",
+                                                                    false, {}, (core::u64)m.id, (core::u64)destSys});
+            break;
+          }
+
+
+          case game::GameActionKind::SetTrackedMissionId: {
+            const core::u64 mid = a.u64a;
+            // Avoid spamming UI toasts when fired from automation rules.
+            const bool userToast = (a.origin.rfind("Automation:", 0) != 0);
+
+            if (mid == 0) {
+              const core::u64 prev = trackedMissionId;
+              trackedMissionId = 0;
+              if (userToast && prev != 0) toast(toasts, "Mission untracked.", 1.6);
+              game::hubPushEvent(integrationHubWindow,
+                                 game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                "MissionUntrack",
+                                                "Untracked mission (origin: " + a.origin + ")",
+                                                false, {}, prev, 0});
+              break;
+            }
+
+            const sim::Mission* mPtr = nullptr;
+            for (const auto& m : missions) {
+              if ((core::u64)m.id == mid) { mPtr = &m; break; }
+            }
+
+            if (!mPtr) {
+              if (userToast) toast(toasts, "Action: mission not found (cannot track).", 2.4);
+              game::hubPushEvent(integrationHubWindow,
+                                 game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                                "ActionFail",
+                                                "SetTrackedMissionId: mission not found",
+                                                false, {}, mid, 0});
+              break;
+            }
+
+            trackedMissionId = mid;
+            if (userToast) toast(toasts, std::string("Tracking mission #") + std::to_string(mid), 1.6);
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Gameplay,
+                                              "MissionTrack",
+                                              "Tracked mission (origin: " + a.origin + ")",
+                                              false, {}, mid, 0});
+            break;
+          }
+
+
+          case game::GameActionKind::GoToStation: {
+            const sim::SystemId reqSys = (sim::SystemId)a.u64b;
+            const sim::StationId reqSt = (sim::StationId)a.u64a;
+
+            // Avoid spamming UI toasts when fired from automation rules.
+            const bool userToast = (a.origin.rfind("Automation:", 0) != 0);
+
+            if (!currentSystem) {
+              if (userToast) toast(toasts, "Action: no current system (cannot go to station).", 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::NavAssist,
+                                                                      "ActionFail",
+                                                                      "GoToStation: no current system",
+                                                                      false, {}, (core::u64)reqSt, (core::u64)reqSys});
+              break;
+            }
+
+            const sim::SystemId destSys = (reqSys == 0) ? currentSystem->stub.id : reqSys;
+            const bool destIsLocal = (destSys == currentSystem->stub.id);
+
+            if (!destIsLocal) {
+              galaxySelectedSystemId = destSys;
+
+              // Mirror the UX: plotting shows the galaxy map, auto-run does not.
+              if (!a.b && userToast) {
+                showGalaxy = true;
+              }
+
+              if (!plotRouteToSystem(destSys, userToast)) {
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::NavAssist,
+                                                                        "ActionFail",
+                                                                        "GoToStation: route planner failed",
+                                                                        false, {}, (core::u64)reqSt, (core::u64)destSys});
+                break;
+              }
+            } else {
+              // Local go-to: if we are arming auto-run, clear any existing multi-hop route so we don't
+              // unintentionally jump away.
+              if (a.b) {
+                navRoute.clear();
+                navRouteHop = 0;
+              }
+            }
+
+            // Target station now (local) or arm it for arrival (cross-system).
+            if (reqSt != 0) {
+              if (destIsLocal) {
+                if (!tryTargetStationById(reqSt)) {
+                  if (userToast) toast(toasts, "Action: station not found in current system.", 2.2);
+                  game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::NavAssist,
+                                                                          "ActionFail",
+                                                                          "GoToStation: station not found",
+                                                                          false, {}, (core::u64)reqSt, (core::u64)destSys});
+                  break;
+                }
+                pendingArrivalTargetStationId = 0;
+              } else {
+                pendingArrivalTargetStationId = reqSt;
+              }
+            } else {
+              pendingArrivalTargetStationId = 0;
+            }
+
+            if (a.b) {
+              navAutoRun = true;
+              navAutoRunHoldUntilDays = timeDays + (2.0 / 86400.0);
+              if (userToast) toast(toasts, (reqSt != 0) ? "Auto-run armed: Go & Dock." : "Auto-run armed.", 2.0);
+            }
+
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::NavAssist,
+                                                                    "GoToStation",
+                                                                    std::string("GoToStation") + (a.b ? " (autorun)" : "") +
+                                                                        " (origin: " + a.origin + ")",
+                                                                    false, {}, (core::u64)reqSt, (core::u64)destSys});
+            break;
+          }
+          case game::GameActionKind::EngageDockingComputer: {
+            if (!a.b) {
+              // Allow systems to explicitly disengage via the same action kind.
+              autopilot = false;
+              dockingComputer.reset();
+              toast(toasts, "Docking computer disengaged (origin: " + a.origin + ").", 1.8);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Docking, "DockingComputerDisengaged", "Disengaged (origin: " + a.origin + ")"});
+              break;
+            }
+
+            if (docked) {
+              // Already docked: nothing to do.
+            } else if (target.kind == TargetKind::Station) {
+              if (navAssist.active()) navAssist.disengage();
+              autopilot = true;
+              dockingComputer.reset();
+              toast(toasts, "Docking computer engaged (origin: " + a.origin + ").", 2.0);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Docking, "DockingComputerEngaged", "Engaged (origin: " + a.origin + ")"});
+            } else {
+              toast(toasts, "Action: cannot engage docking computer (no station targeted).", 2.2);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Docking, "DockingComputerFail", "No station targeted"});
+            }
+            break;
+          }
+
+          case game::GameActionKind::SetCameraRigMode: {
+            const int m = std::clamp(a.i32a, 0, 1);
+            cameraRigWindow.mode = (m == 0) ? game::CameraRigMode::Chase : game::CameraRigMode::Orbit;
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Camera, "CameraMode", std::string("Set mode=") + (m==0?"Chase":"Orbit") + " (origin: " + a.origin + ")"});
+            break;
+          }
+
+          case game::GameActionKind::SetCameraRigPreset: {
+            const int pid = std::clamp(a.i32a, 0, 4);
+            game::applyCameraRigPreset(cameraRigWindow, (game::CameraRigPreset)pid,
+                                      [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Camera, "CameraPreset",
+                                                                    std::string("Applied preset=") + game::cameraRigPresetName((game::CameraRigPreset)pid) + " (origin: " + a.origin + ")",
+                                                                    false, {}, (core::u64)pid, 0});
+            break;
+          }
+
+          case game::GameActionKind::RequestScreenshot: {
+            // Bridge Integration Hub actions -> existing PhotoMode/screenshot pipeline.
+            // Payload (see GameSignals.h):
+            //   b    : include UI (true captures after UI pass)
+            //   i32a : ScreenshotFlag_* bitmask
+            //   msg  : "outDir|baseName" or just "baseName"
+
+            game::ScreenshotRequest req;
+            req.includeUi = a.b;
+            req.timestamp = (a.i32a & game::ScreenshotFlag_Timestamp) != 0;
+
+            std::string outDir = "screenshots";
+            std::string baseName = "shot";
+
+            auto trim = [](std::string s) {
+              auto isWs = [](unsigned char c) { return c <= 32; };
+              while (!s.empty() && isWs((unsigned char)s.front())) s.erase(s.begin());
+              while (!s.empty() && isWs((unsigned char)s.back())) s.pop_back();
+              return s;
+            };
+
+            if (!a.msg.empty()) {
+              const std::size_t bar = a.msg.find('|');
+              if (bar != std::string::npos) {
+                outDir = trim(a.msg.substr(0, bar));
+                baseName = trim(a.msg.substr(bar + 1));
+              } else {
+                baseName = trim(a.msg);
+              }
+            }
+            if (outDir.empty()) outDir = "screenshots";
+            if (baseName.empty()) baseName = "shot";
+            // Avoid accidental double-extension ("foo.png" -> "foo").
+            if (baseName.size() > 4 && baseName.rfind(".png") == baseName.size() - 4) {
+              baseName = baseName.substr(0, baseName.size() - 4);
+            }
+
+            req.outDir = outDir;
+            req.baseName = baseName;
+
+            std::string err;
+            const std::string path = game::buildScreenshotPath(req, &err);
+            if (path.empty()) {
+              toast(toasts, err.empty() ? "Screenshot failed (path builder)." : ("Screenshot failed: " + err), 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "ScreenshotFail", err.empty() ? "buildScreenshotPath failed" : err});
+              break;
+            }
+
+            PendingScreenshot& slot = req.includeUi ? shotUi : shotWorld;
+            slot.pending = true;
+            slot.path = path;
+            slot.copyToClipboard = (a.i32a & game::ScreenshotFlag_CopyToClipboard) != 0;
+
+            if ((a.i32a & game::ScreenshotFlag_PauseForCapture) != 0) {
+              shotPrevPaused = paused;
+              paused = true;
+              shotRestorePausedPending = true;
+            }
+
+            toast(toasts, std::string("Screenshot scheduled: ") + path, 1.8);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "Screenshot", (req.includeUi ? "UI" : "World") + std::string(" scheduled: ") + path});
+            break;
+          }
+
+          case game::GameActionKind::CaptureBundle: {
+            // High-level diagnostics capture: create a unique folder and enqueue a set of
+            // existing actions (screenshots, trace exports) plus an optional repro pack snapshot.
+            // Payload (see GameSignals.h):
+            //   i32a : CaptureBundleFlags bitmask (0 => CaptureBundle_Default)
+            //   msg  : "outDir|label" or just "label" (folder is sanitized + timestamped)
+
+            int flags = a.i32a;
+            if (flags == 0) flags = game::CaptureBundle_Default;
+
+            auto trim = [](std::string s) {
+              auto isWs = [](unsigned char c) { return c <= 32; };
+              while (!s.empty() && isWs((unsigned char)s.front())) s.erase(s.begin());
+              while (!s.empty() && isWs((unsigned char)s.back())) s.pop_back();
+              return s;
+            };
+
+            std::string outRoot = "captures";
+            std::string label = "bundle";
+
+            if (!a.msg.empty()) {
+              const std::size_t bar = a.msg.find('|');
+              if (bar != std::string::npos) {
+                outRoot = trim(a.msg.substr(0, bar));
+                label = trim(a.msg.substr(bar + 1));
+              } else {
+                label = trim(a.msg);
+              }
+            }
+            if (outRoot.empty()) outRoot = "captures";
+            if (label.empty()) label = "bundle";
+
+            auto timestampNow = []() -> std::string {
+              using namespace std::chrono;
+              const auto now = system_clock::now();
+              const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+              const std::time_t tt = system_clock::to_time_t(now);
+              std::tm tm{};
+            #if defined(_WIN32)
+              localtime_s(&tm, &tt);
+            #else
+              localtime_r(&tt, &tm);
+            #endif
+
+              char buf[64];
+              std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d_%03d",
+                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                            tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
+              return std::string(buf);
+            };
+
+            const std::string ts = timestampNow();
+            const std::string token = game::sanitizeFileToken(label);
+
+            const std::filesystem::path bundleDirPath = std::filesystem::path(outRoot) / (token + "_" + ts);
+            std::error_code ec;
+            std::filesystem::create_directories(bundleDirPath, ec);
+            if (ec) {
+              const std::string err = std::string("Capture bundle: could not create directory: ") + bundleDirPath.string();
+              toast(toasts, err, 2.8);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "CaptureBundleFail", err});
+              break;
+            }
+
+            const std::string bundleDir = bundleDirPath.string();
+            const std::string manifestPath = (bundleDirPath / "manifest.json").string();
+            const std::string worldShotPath = (bundleDirPath / "world.png").string();
+            const std::string uiShotPath = (bundleDirPath / "ui.png").string();
+            const std::string flightTracePath = (bundleDirPath / "flight_trace.json").string();
+            const std::string integrationTracePath = (bundleDirPath / "integration_trace.json").string();
+            const std::string reproPackPath = (bundleDirPath / "repro_pack.json").string();
+
+            // Write an up-front manifest (paths are stable because we use a unique folder and disable screenshot timestamps).
+            {
+              std::ofstream out(manifestPath, std::ios::binary);
+              if (!out) {
+                toast(toasts, std::string("Capture bundle: could not write manifest: ") + manifestPath, 2.6);
+              } else {
+                core::JsonWriter w(out, /*pretty=*/true);
+                w.beginObject();
+                w.key("type"); w.value("stellar_capture_bundle");
+                w.key("version"); w.value(1);
+                w.key("created"); w.value(ts);
+                w.key("origin"); w.value(a.origin);
+                w.key("flags"); w.value(flags);
+                w.key("tRealSec"); w.value(a.tRealSec);
+                w.key("tSimDays"); w.value(a.tSimDays);
+                w.key("dir"); w.value(bundleDir);
+
+                w.key("artifacts");
+                w.beginObject();
+                if ((flags & game::CaptureBundle_WorldScreenshot) != 0) { w.key("world"); w.value(worldShotPath); }
+                if ((flags & game::CaptureBundle_UiScreenshot) != 0) { w.key("ui"); w.value(uiShotPath); }
+                if ((flags & game::CaptureBundle_FlightRecorderTrace) != 0) { w.key("flightTrace"); w.value(flightTracePath); }
+                if ((flags & game::CaptureBundle_IntegrationTrace) != 0) { w.key("integrationTrace"); w.value(integrationTracePath); }
+                if ((flags & game::CaptureBundle_ReproPack) != 0) { w.key("reproPack"); w.value(reproPackPath); }
+                w.endObject();
+
+                w.endObject();
+              }
+            }
+
+            // Optional: write a repro pack snapshot immediately so it captures the current ship + telemetry slice.
+            if ((flags & game::CaptureBundle_ReproPack) != 0) {
+              std::string err;
+              const bool ok = game::exportReproPackJsonToPath(runtimeValidationWindow, ship, &flightRecorderWindow,
+                                                            &integrationHubWindow.events,
+                                                            a.tRealSec, a.tSimDays, paused,
+                                                            reproPackPath.c_str(), &err);
+              if (!ok) {
+                toast(toasts, err.empty() ? "Capture bundle: repro pack export failed." : ("Capture bundle: repro pack export failed: " + err), 2.8);
+                game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Validation, "ReproPackFail", err.empty() ? "repro pack export failed" : err});
+              }
+            }
+
+            // Stop recorder if requested.
+            if ((flags & game::CaptureBundle_StopFlightRecorder) != 0) {
+              game::hubPushAction(integrationHubWindow, game::makeActionStopFlightRecorder(a.tRealSec, a.tSimDays, "CaptureBundle"));
+            }
+
+            // Screenshots: stable file names inside the bundle folder.
+            int shotFlags = 0;
+            if ((flags & game::CaptureBundle_PauseForScreenshots) != 0) {
+              shotFlags |= game::ScreenshotFlag_PauseForCapture;
+            }
+
+            if ((flags & game::CaptureBundle_WorldScreenshot) != 0) {
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionRequestScreenshot(a.tRealSec, a.tSimDays, "CaptureBundle",
+                                                                   /*includeUi=*/false, shotFlags,
+                                                                   bundleDir, "world"));
+            }
+            if ((flags & game::CaptureBundle_UiScreenshot) != 0) {
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionRequestScreenshot(a.tRealSec, a.tSimDays, "CaptureBundle",
+                                                                   /*includeUi=*/true, shotFlags,
+                                                                   bundleDir, "ui"));
+            }
+
+            // Trace exports.
+            if ((flags & game::CaptureBundle_FlightRecorderTrace) != 0) {
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionExportFlightRecorderTrace(a.tRealSec, a.tSimDays, "CaptureBundle", flightTracePath));
+            }
+            if ((flags & game::CaptureBundle_IntegrationTrace) != 0) {
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionExportIntegrationTrace(a.tRealSec, a.tSimDays, "CaptureBundle", integrationTracePath));
+            }
+
+            if ((flags & game::CaptureBundle_CopyDirToClipboard) != 0) {
+              SDL_SetClipboardText(bundleDir.c_str());
+            }
+
+            toast(toasts, "Capture bundle created: " + bundleDir, 2.4);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug,
+                                                                    "CaptureBundle",
+                                                                    "Bundle dir: " + bundleDir,
+                                                                    false, {}, (core::u64)flags, 0});
+            break;
+          }
+
+          case game::GameActionKind::ClearIntegrationHub: {
+            integrationHubWindow.events.clear();
+            integrationHubWindow.actions.history.clear();
+            // Don't clear pending actions; those are the command pipeline.
+            toast(toasts, "Integration Hub log cleared (origin: " + a.origin + ").", 1.4);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "Clear", "Log cleared (origin: " + a.origin + ")"});
+            break;
+          }
+
+          case game::GameActionKind::StartFlightRecorder: {
+            game::startFlightRecorderSession(flightRecorderWindow, a.tRealSec, a.tSimDays, ship);
+            toast(toasts, "Flight recorder started (origin: " + a.origin + ").", 1.6);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::FlightRecorder, "Start", "Started (origin: " + a.origin + ")"});
+            break;
+          }
+
+          case game::GameActionKind::StopFlightRecorder: {
+            game::stopFlightRecorderSession(flightRecorderWindow);
+            toast(toasts, "Flight recorder stopped (origin: " + a.origin + ").", 1.6);
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::FlightRecorder, "Stop", "Stopped (origin: " + a.origin + ")"});
+            break;
+          }
+
+          case game::GameActionKind::ExportFlightRecorderTrace: {
+            if (a.msg.empty()) {
+              toast(toasts, "Export trace failed: empty path.", 2.2);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::FlightRecorder, "ExportFail", "Empty path"});
+              break;
+            }
+            std::string err;
+            const bool ok = game::exportFlightRecorderTraceJson(flightRecorderWindow, a.msg.c_str(), &err);
+            if (ok) {
+              toast(toasts, "Exported flight trace: " + a.msg, 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::FlightRecorder, "Export", "Exported trace", false, {}, 0, 0});
+            } else {
+              toast(toasts, err.empty() ? ("Export flight trace failed: " + a.msg) : err, 2.6);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::FlightRecorder, "ExportFail", err.empty() ? "Export failed" : err});
+            }
+            break;
+          }
+
+          case game::GameActionKind::ExportIntegrationTrace: {
+            if (a.msg.empty()) {
+              toast(toasts, "Export integration trace failed: empty path.", 2.2);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "ExportFail", "Empty path"});
+              break;
+            }
+            std::string err;
+            const bool ok = game::writeIntegrationTraceJson(integrationHubWindow, a.msg.c_str(), &err);
+            if (ok) {
+              toast(toasts, "Exported integration trace: " + a.msg, 2.4);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "Export", "Exported integration trace"});
+            } else {
+              toast(toasts, err.empty() ? ("Export integration trace failed: " + a.msg) : err, 2.6);
+              game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "ExportFail", err.empty() ? "Export failed" : err});
+            }
+            break;
+          }
+
+          case game::GameActionKind::TransmitComms: {
+            // Bridge Integration Hub automations/actions -> diegetic comms log.
+            // Payload:
+            //   i32a : sim::CommsChannel (0..6)
+            //   u64a : optional station id (used to attribute the message)
+            //   b    : show overlay
+            //   msg  : "subject|body" (if no '|', subject is derived and body=msg)
+
+            sim::CommsMessage m;
+            m.timeDays = a.tSimDays;
+
+            const int chMax = (int)sim::CommsChannel::Custom;
+            const int ch = std::clamp(a.i32a, 0, chMax);
+            m.channel = (sim::CommsChannel)ch;
+
+            if (currentSystem) {
+              m.systemId = currentSystem->stub.id;
+            }
+
+            const sim::Station* stp = nullptr;
+            if (currentSystem && a.u64a != 0) {
+              for (const auto& st : currentSystem->stations) {
+                if ((core::u64)st.id == a.u64a) {
+                  stp = &st;
+                  break;
+                }
+              }
+              if (stp) {
+                m.stationId = stp->id;
+              }
+            }
+
+            auto trim = [](std::string s) {
+              auto isWs = [](unsigned char c) { return c <= 32; };
+              while (!s.empty() && isWs((unsigned char)s.front())) s.erase(s.begin());
+              while (!s.empty() && isWs((unsigned char)s.back())) s.pop_back();
+              return s;
+            };
+
+            std::string subject;
+            std::string body;
+            {
+              const std::string& raw = a.msg;
+              const std::size_t bar = raw.find('|');
+              if (bar != std::string::npos) {
+                subject = trim(raw.substr(0, bar));
+                body = trim(raw.substr(bar + 1));
+              } else {
+                subject = trim(a.origin);
+                body = raw;
+              }
+            }
+
+            if (subject.empty()) {
+              subject = stp ? "Transmission" : "Message";
+            }
+
+            // Use the station name if we have it; otherwise fall back to origin.
+            if (stp) {
+              m.from = stp->name + std::string(" Control");
+            } else if (!a.origin.empty()) {
+              m.from = a.origin;
+            } else {
+              m.from = "Shipboard AI";
+            }
+
+            m.subject = std::move(subject);
+            m.body = std::move(body);
+
+            pushTransmission(std::move(m), a.b);
+
+            // Also log a small debug event for traceability.
+            game::hubPushEvent(integrationHubWindow, game::GameEvent{a.tRealSec, a.tSimDays, game::GameEventKind::Debug, "Comms", "TransmitComms (origin: " + a.origin + ")"});
+            break;
+          }
+
+
+          default:
+            break;
+        }
+      }
+    }
+    // Runtime validation: NaN/Inf watchdog + deterministic smoke checks (debug tooling).
+    game::tickRuntimeValidation(runtimeValidationWindow, ship, &flightRecorderWindow, timeRealSec, timeDays, paused,
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                [&](const game::GameEvent& e) { game::hubPushEvent(integrationHubWindow, e); },
+                                [&](const game::GameAction& a) { game::hubPushAction(integrationHubWindow, a); },
+                                &integrationHubWindow.events);
+
     // ---- UI ----
     // Rebuild fonts *before* starting a new ImGui frame.
     // (Font atlas changes must happen before ImGui::NewFrame.)
@@ -15713,6 +17099,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (ImGui::MenuItem("Profiler", nullptr, &profilerWindow.open)) { if (profilerWindow.open) profiler.setEnabled(true); }
         ImGui::MenuItem("Flight Recorder", nullptr, &flightRecorderWindow.open);
         ImGui::MenuItem("Cinematic Camera", nullptr, &cinematicCameraWindow.open);
+        ImGui::MenuItem("3D Camera Rig", nullptr, &cameraRigWindow.open);
+        ImGui::MenuItem("Time Trials", nullptr, &timeTrialWindow.open);
         ImGui::MenuItem("Orbit Analyzer", nullptr, &orbitAnalyzerWindow.open);
         ImGui::EndMenu();
       }
@@ -15912,6 +17300,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::MenuItem("ImGui Demo Window", nullptr, &showImGuiDemo);
         ImGui::MenuItem("ImGui Metrics Window", nullptr, &showImGuiMetrics);
         ImGui::MenuItem("Build Info", nullptr, &buildInfoWindow.open);
+        ImGui::MenuItem("Runtime Validation", nullptr, &runtimeValidationWindow.open);
 
         ImGui::Separator();
         if (ImGui::BeginMenu("Theme")) {
@@ -16495,7 +17884,30 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       cctx.timeRealSec = timeRealSec;
       cctx.log = &commsLog;
       cctx.toast = [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); };
+      cctx.goTo = [&](sim::SystemId sysId, sim::StationId stId, bool armAutoRun) {
+        if (sysId == 0) return;
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionGoToStation(timeRealSec, timeDays, "Comms",
+                                                       (core::u64)sysId, (core::u64)stId, armAutoRun));
+      };
+
+      // Mission deep-links: map Comms mission briefings to the mission tracker + nav assist.
+      cctx.trackMission = [&](core::u64 missionId) {
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionSetTrackedMission(timeRealSec, timeDays, "Comms", missionId));
+      };
+      cctx.syncNavToMission = [&](core::u64 missionId, bool armAutoRun) {
+        game::hubPushAction(integrationHubWindow,
+                            game::GameAction{timeRealSec, timeDays, "Comms", game::GameActionKind::SyncNavToMission,
+                                             missionId, 0, 0, armAutoRun, ""});
+      };
       cctx.plotTo = [&](sim::SystemId sysId, sim::StationId stId) {
+        if (cctx.goTo) {
+          cctx.goTo(sysId, stId, /*armAutoRun=*/false);
+          return;
+        }
+
+        // Backwards-compatible fallback: direct plotting only.
         if (sysId == 0) return;
         if (plotRouteToSystem(sysId, /*showToast=*/true)) {
           pendingArrivalTargetStationId = stId;
@@ -16520,46 +17932,98 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     game::drawBuildInfoWindow(buildInfoWindow,
                               [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
+    // Runtime validation: smoke checks + watchdog for NaN/Inf simulation corruption.
+    game::drawRuntimeValidationWindow(runtimeValidationWindow, ship, &flightRecorderWindow, timeRealSec, timeDays, paused,
+                                      [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                      [&](const game::GameEvent& e) { game::hubPushEvent(integrationHubWindow, e); },
+                                      [&](const game::GameAction& a) { game::hubPushAction(integrationHubWindow, a); },
+                                      &integrationHubWindow.events);
+
+    // Integration Hub: cross-system action queue + event timeline (bug report tooling).
+    // Wire optional hooks so timeline entries can jump the camera and scrub the flight recorder.
+    {
+      game::IntegrationHubUiHooks hubHooks;
+      hubHooks.focusCameraAtPosKm = [&](const math::Vec3d& posKm) {
+        const math::Vec3d shipPosU = toRenderPosU(ship.positionKm());
+        const math::Vec3d targetPosU = toRenderPosU(posKm);
+        game::cameraRigFocusOrbitPivot(cameraRigWindow, ship, currentSystem, timeDays, gravityParams, shipPosU, targetPosU);
+        cameraRigWindow.open = true;
+      };
+      hubHooks.scrubFlightRecorderToRealTimeSec = [&](double tRealSec) {
+        game::flightRecorderSeekToRealTime(flightRecorderWindow, tRealSec);
+        flightRecorderWindow.open = true;
+        flightRecorderWindow.ghostEnabled = true;
+      };
+
+      // Keep hub window aware of the current frame times for UI-triggered actions.
+      integrationHubWindow.nowRealSec = timeRealSec;
+      integrationHubWindow.nowSimDays = timeDays;
+
+      game::drawIntegrationHubWindow(integrationHubWindow,
+                                    [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                    &hubHooks);
+    }
+
     // Audio analyzer / oscilloscope (procedural audio tooling)
     game::drawAudioAnalyzerWindow(audioAnalyzerWindow, audio,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     // Flight telemetry recorder
     game::drawFlightRecorderWindow(flightRecorderWindow, ship, timeRealSec, timeDays, paused,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralLabWindow(proceduralLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralFluidLabWindow(proceduralFluidLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawTextAnimationLabWindow(textAnimationLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralMeshLabWindow(proceduralMeshLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralShaderLabWindow(proceduralShaderLabWindow, (float)timeRealSec,
-                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralGalaxyLabWindow(proceduralGalaxyLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralSystemLabWindow(proceduralSystemLabWindow, universe, currentSystem ? currentSystem->stub.id : 0, timeDays, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawProceduralTradeSystemsLabWindow(proceduralTradeSystemsLabWindow, universe, currentSystem, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
     game::drawSpectralMieLabWindow(spectralMieLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
     game::drawGaussianSurfelReconstructionLabWindow(gaussianSurfelReconLabWindow, (float)timeRealSec,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
 
 
     game::drawCinematicCameraWindow(cinematicCameraWindow,
-                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+                                 [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); },
+                                &integrationHubWindow.events);
+
+    game::drawCameraRigWindow(cameraRigWindow, ship, currentSystem, timeDays, gravityParams,
+                              [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+
+    // Time trials (gate courses) - lightweight 3D gameplay loop.
+    game::drawTimeTrialWindow(timeTrialWindow, currentSystem, timeDays, ship,
+                              [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
 
     // Orbit analyzer + maneuver planning helpers
     if (currentSystem) {
@@ -16961,6 +18425,95 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               std::snprintf(buf, sizeof(buf), "v %.2f km/s", spd);
               draw->AddText(ImVec2(drawP.x + sz * 0.58f, drawP.y - 7.0f), hudU32(hudColorText, (200.0f/255.0f)), buf);
             }
+          }
+        }
+      }
+
+      // Time Trials: gate marker (lightweight 3D gameplay)
+      if (timeTrialWindow.hudEnabled && timeTrialWindow.hasCourse && timeTrialWindow.showGateMarker && !docked
+          && timeTrialWindow.phase != game::TimeTrialPhase::Docking) {
+        auto drawGate = [&](const sim::TimeTrialGate& g, int gateIdx, float alphaMul, bool isPrimary) {
+          ImVec2 pAny{};
+          bool off = false;
+          if (!projectToScreenAny(toRenderPosU(g.posKm), view, proj, w, h, pAny, off)) return;
+
+          ImVec2 p = pAny;
+          if (off && timeTrialWindow.clampOffscreen) {
+            p = clampToEdge(pAny, 42.0f);
+          }
+
+          float a = std::clamp(timeTrialWindow.markerAlpha * alphaMul, 0.0f, 1.0f);
+          const ImU32 col = hudU32(isPrimary ? hudColorAccent : hudColorText, a);
+          const ImU32 fill = hudU32(isPrimary ? hudColorAccent : hudColorText, a * 0.12f);
+          const float th = std::clamp(timeTrialWindow.markerThickness, 1.0f, 6.0f);
+
+          // Estimate apparent gate radius in pixels by projecting an edge point.
+          float rPx = 22.0f;
+          {
+            math::Vec3d n = g.normal;
+            math::Vec3d ref = (std::abs(n.y) < 0.85) ? math::Vec3d{0,1,0} : math::Vec3d{1,0,0};
+            math::Vec3d u = math::cross(n, ref);
+            const double ls = u.lengthSq();
+            if (ls > 1e-18) u = u / std::sqrt(ls);
+            else u = math::Vec3d{1,0,0};
+
+            const math::Vec3d edgeKm = g.posKm + u * g.radiusKm;
+            ImVec2 edgePx{};
+            if (projectToScreen(toRenderPosU(edgeKm), view, proj, w, h, edgePx)) {
+              const float dx = edgePx.x - pAny.x;
+              const float dy = edgePx.y - pAny.y;
+              rPx = std::sqrt(dx * dx + dy * dy);
+              rPx = std::clamp(rPx, 12.0f, 180.0f);
+            } else {
+              const double distKm = (g.posKm - ship.positionKm()).length();
+              rPx = (float)std::clamp(220000.0 / std::max(1.0, distKm), 12.0, 120.0);
+            }
+          }
+
+          // Gate pulse on pass (tiny feedback loop).
+          float pulse = 1.0f;
+          if (isPrimary && timeTrialWindow.gatePulseSec > 0.0) {
+            const float t = (float)std::clamp(timeTrialWindow.gatePulseSec / 0.35, 0.0, 1.0);
+            pulse = 1.0f + 0.35f * t;
+          }
+          rPx *= pulse;
+
+          if (!off) {
+            draw->AddCircleFilled(p, rPx * 0.14f, fill, 20);
+          }
+          draw->AddCircle(p, rPx, col, 24, th);
+
+          if (isPrimary) {
+            const float s = rPx * 0.45f;
+            draw->AddLine(ImVec2(p.x - s, p.y), ImVec2(p.x + s, p.y), col, th * 0.85f);
+            draw->AddLine(ImVec2(p.x, p.y - s), ImVec2(p.x, p.y + s), col, th * 0.85f);
+
+            char buf[96];
+            const int total = (int)timeTrialWindow.course.gates.size();
+            const int gateNum = gateIdx + 1;
+            const double distKm = (g.posKm - ship.positionKm()).length();
+            std::snprintf(buf, sizeof(buf), "Gate %d/%d  %.0f km", gateNum, total, distKm);
+            draw->AddText(ImVec2(p.x + rPx * 0.65f + 6.0f, p.y - 7.0f), hudU32(hudColorText, a), buf);
+          }
+        };
+
+        const int total = (int)timeTrialWindow.course.gates.size();
+        if (total > 0) {
+          const int nextIdx = std::clamp(timeTrialWindow.nextGate, 0, std::max(0, total - 1));
+
+          if (timeTrialWindow.showAllGates) {
+            for (int i = 0; i < total; ++i) {
+              const bool isNext = (timeTrialWindow.phase != game::TimeTrialPhase::Finished) && (i == nextIdx);
+              float aMul = isNext ? 1.0f : 0.35f;
+              if (timeTrialWindow.nextGate > i) aMul *= 0.25f; // already passed
+              drawGate(timeTrialWindow.course.gates[i], i, aMul, isNext);
+            }
+          } else {
+            int drawIdx = nextIdx;
+            if (timeTrialWindow.phase == game::TimeTrialPhase::Finished) {
+              drawIdx = total - 1;
+            }
+            drawGate(timeTrialWindow.course.gates[drawIdx], drawIdx, 1.0f, true);
           }
         }
       }
@@ -18176,6 +19729,137 @@ if (showShipHud) {
 
 // Objective HUD overlay (tracked mission summary)
 if (objectiveHudEnabled) {
+  const bool showTimeTrialObjective = timeTrialWindow.hudEnabled && timeTrialWindow.hasCourse &&
+                                      (timeTrialWindow.phase != game::TimeTrialPhase::Inactive);
+
+  if (showTimeTrialObjective && currentSystem) {
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                        | ImGuiWindowFlags_AlwaysAutoResize
+                        | ImGuiWindowFlags_NoFocusOnAppearing
+                        | ImGuiWindowFlags_NoNav
+                        | ImGuiWindowFlags_NoSavedSettings;
+
+    auto& wLay = hudLayout.widget(ui::HudWidgetId::Objective);
+    const float uiScale = std::max(0.50f, wLay.scale);
+
+    ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha);
+    hudSetNextWindowPosFromLayout(ui::HudWidgetId::Objective);
+    if (hudLayoutEditMode) {
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    }
+    ImGui::Begin("Objective HUD##objective", nullptr, flags);
+    ImGui::SetWindowFontScale(uiScale);
+    if (hudLayoutEditMode) {
+      hudCaptureWindowPosToLayout(ui::HudWidgetId::Objective);
+    }
+
+    auto fmtTime = [](double sec) -> std::string {
+      if (!(sec > 0.0)) return "--:--.-";
+      const int m = (int)std::floor(sec / 60.0);
+      const double s = sec - (double)m * 60.0;
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%02d:%04.1f", m, s);
+      return std::string(buf);
+    };
+
+    ImGui::Text("Objective");
+    ImGui::Separator();
+
+    ImGui::TextWrapped("Time Trial \xe2\x80\x94 %s", timeTrialWindow.course.name.c_str());
+
+    const int total = (int)timeTrialWindow.course.gates.size();
+    const int nextIdx = (total > 0) ? std::clamp(timeTrialWindow.nextGate, 0, std::max(0, total - 1)) : 0;
+    const int showGate = (timeTrialWindow.phase == game::TimeTrialPhase::Finished) ? total : (nextIdx + 1);
+
+    if (timeTrialWindow.phase == game::TimeTrialPhase::Ready) {
+      ImGui::TextDisabled("Status: READY (fly through Gate 1 to start)");
+    } else if (timeTrialWindow.phase == game::TimeTrialPhase::Running) {
+      ImGui::TextDisabled("Status: RUNNING");
+    } else if (timeTrialWindow.phase == game::TimeTrialPhase::Docking) {
+      ImGui::TextDisabled("Status: DOCKING (dock at the anchor station to finish)");
+    } else if (timeTrialWindow.phase == game::TimeTrialPhase::Finished) {
+      ImGui::TextDisabled("Status: FINISHED");
+    }
+
+    if (total > 0) {
+      ImGui::Text("Gate: %d / %d", std::clamp(showGate, 0, total), total);
+      if (timeTrialWindow.phase == game::TimeTrialPhase::Docking) {
+        const sim::Station* anchor = nullptr;
+        for (const auto& st : currentSystem->stations) {
+          if (st.id == timeTrialWindow.anchorStationId) {
+            anchor = &st;
+            break;
+          }
+        }
+        if (anchor) {
+          const math::Vec3d stKm = sim::stationPosKm(*anchor, timeDays);
+          const double distKm = (stKm - ship.positionKm()).length();
+          ImGui::TextDisabled("Next: Dock at %s (%.0f km)", anchor->name.c_str(), distKm);
+        } else {
+          ImGui::TextDisabled("Next: Dock (anchor station unavailable)");
+        }
+      } else if (timeTrialWindow.phase != game::TimeTrialPhase::Finished) {
+        const double distKm = (timeTrialWindow.course.gates[nextIdx].posKm - ship.positionKm()).length();
+        ImGui::TextDisabled("Next: Gate %d (%.0f km)", nextIdx + 1, distKm);
+      }
+    } else {
+      ImGui::TextDisabled("Gate: (none)");
+    }
+
+    const double tNow = (timeTrialWindow.phase == game::TimeTrialPhase::Finished) ? timeTrialWindow.finishTimeSec : timeTrialWindow.timeSec;
+    const std::string cur = fmtTime(tNow);
+    const std::string best = fmtTime(timeTrialWindow.bestTimeSec);
+    ImGui::Text("Time: %s", cur.c_str());
+    ImGui::TextDisabled("Best: %s", best.c_str());
+
+    // Ghost split: compare distance to the next objective (gate or docking anchor)
+    // against the best-run ghost at the same elapsed time.
+    if (timeTrialWindow.ghostEnabled && timeTrialWindow.ghostShowSplitHud && timeTrialWindow.ghostSampleValid &&
+        timeTrialWindow.hasCourse &&
+        (timeTrialWindow.phase == game::TimeTrialPhase::Running || timeTrialWindow.phase == game::TimeTrialPhase::Docking) &&
+        total > 0) {
+      bool hasTarget = false;
+      math::Vec3d targetKm{};
+
+      if (timeTrialWindow.phase == game::TimeTrialPhase::Docking) {
+        const sim::Station* anchor = nullptr;
+        for (const auto& st : currentSystem->stations) {
+          if (st.id == timeTrialWindow.anchorStationId) { anchor = &st; break; }
+        }
+        if (anchor) {
+          targetKm = sim::stationPosKm(*anchor, timeDays);
+          hasTarget = true;
+        }
+      } else {
+        const int gi = std::clamp(timeTrialWindow.nextGate, 0, std::max(0, total - 1));
+        targetKm = timeTrialWindow.course.gates[gi].posKm;
+        hasTarget = true;
+      }
+
+      if (hasTarget) {
+        const double distYouKm = (targetKm - ship.positionKm()).length();
+        const double distGhostKm = (targetKm - timeTrialWindow.ghostSample.posKm).length();
+        const double deltaKm = distYouKm - distGhostKm;
+        if (std::abs(deltaKm) >= 1.0) {
+          const bool behind = (deltaKm > 0.0);
+          ImGui::TextDisabled("Ghost split: %s %.0f km", behind ? "behind" : "ahead", std::abs(deltaKm));
+        } else {
+          ImGui::TextDisabled("Ghost split: even");
+        }
+      }
+    }
+
+    if (ImGui::SmallButton("Open Time Trials")) timeTrialWindow.open = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Cancel")) timeTrialWindow.cancelRun();
+    if (timeTrialWindow.phase == game::TimeTrialPhase::Finished) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Restart")) timeTrialWindow.armFromCourse(timeTrialWindow.course);
+    }
+
+    ImGui::End();
+    if (hudLayoutEditMode) ImGui::PopStyleVar();
+  } else {
   sim::Mission* tracked = nullptr;
 
   if (trackedMissionId != 0) {
@@ -18306,13 +19990,24 @@ if (objectiveHudEnabled) {
             }
 
             if (ImGui::SmallButton("Plot source")) {
-              if (plotRouteToSystem(best.systemId)) {
-                pendingArrivalTargetStationId = best.stationId;
-                if (currentSystem && best.systemId == currentSystem->stub.id && best.stationId != 0) {
-                  tryTargetStationById(best.stationId);
-                }
-                toast(toasts, "Plotted route to cargo source.", 2.0);
-              }
+              // Use the Integration Hub action pipeline so this also shows up in the event/action timeline
+              // (and can be automated / captured via the flight recorder).
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionGoToStation(timeRealSec, timeDays, "ObjectiveHUD:Cargo",
+                                                             (core::u64)best.systemId, (core::u64)best.stationId,
+                                                             /*armAutoRun=*/false));
+              toast(toasts, "Queued route to cargo source.", 1.6);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Auto-run source")) {
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionSetCameraRigPreset(timeRealSec, timeDays, "ObjectiveHUD:Cargo",
+                                                                     (int)game::CameraRigPreset::Travel));
+              game::hubPushAction(integrationHubWindow,
+                                  game::makeActionGoToStation(timeRealSec, timeDays, "ObjectiveHUD:Cargo",
+                                                             (core::u64)best.systemId, (core::u64)best.stationId,
+                                                             /*armAutoRun=*/true));
+              toast(toasts, "Queued auto-run to cargo source.", 1.8);
             }
           } else {
             ImGui::TextDisabled("Source: (none found nearby)");
@@ -18415,12 +20110,52 @@ if (objectiveHudEnabled) {
         ImGui::TextDisabled("Auto-run: %s", phase);
       }
     } else if (destSys != 0 && currentSystem && destSys != currentSystem->stub.id) {
-      ImGui::TextDisabled("No route plotted (Plot Route in Ship/Status).");
+      ImGui::TextDisabled("No route plotted (use Plot mission or Ship/Status).");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Quick actions");
+
+    // Cross-integrate Objective HUD -> Integration Hub action pipeline.
+    // These are *queued* and executed next frame (same as other UI actions), so the HUD stays responsive.
+    if (tracked && tracked->id != 0) {
+      if (ImGui::SmallButton("Plot mission")) {
+        game::hubPushAction(integrationHubWindow,
+                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
+                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/false, ""});
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Auto-run mission")) {
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionSetCameraRigPreset(timeRealSec, timeDays, "ObjectiveHUD", (int)game::CameraRigPreset::Travel));
+        game::hubPushAction(integrationHubWindow,
+                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
+                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/true, ""});
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Capture + Auto-run")) {
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionClearIntegrationHub(timeRealSec, timeDays, "ObjectiveHUD"));
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionStartFlightRecorder(timeRealSec, timeDays, "ObjectiveHUD"));
+        game::hubPushAction(integrationHubWindow,
+                            game::makeActionSetCameraRigPreset(timeRealSec, timeDays, "ObjectiveHUD", (int)game::CameraRigPreset::Travel));
+        game::hubPushAction(integrationHubWindow,
+                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
+                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/true, ""});
+      }
+
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Clears the Integration Hub log, starts the flight recorder, then auto-runs the mission route.");
+        ImGui::EndTooltip();
+      }
     }
 
     ImGui::End();
     if (hudLayoutEditMode) ImGui::PopStyleVar();
   }
+}
 }
 
 // Traffic escort HUD (ambient contract)
@@ -18448,11 +20183,14 @@ if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruise
   const double leftSec = std::max(0.0, (trafficEscort.untilDays - timeDays) * 86400.0);
 
   const Contact* convoy = nullptr;
-  for (const auto& c : contacts) {
+  std::size_t convoyIdx = (std::size_t)-1;
+  for (std::size_t i = 0; i < contacts.size(); ++i) {
+    const auto& c = contacts[i];
     if (!c.alive) continue;
     if (!c.trafficConvoy || c.role != ContactRole::Trader) continue;
     if (c.id != trafficEscort.convoyId && c.trafficConvoyId != trafficEscort.convoyId) continue;
     convoy = &c;
+    convoyIdx = i;
     break;
   }
 
@@ -18497,6 +20235,63 @@ if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruise
   ImGui::TextDisabled("Time left: %.0f s", leftSec);
   ImGui::TextDisabled("Reward: %.0f cr (%.0f + %.0f) | Raiders down: %d",
                       totalCr, trafficEscort.rewardCr, bonusCr, trafficEscort.piratesKilled);
+
+  // Cross-integrate escort HUD -> Nav Assist Follow (formation) for comfy convoy flying.
+  ImGui::Separator();
+  if (ImGui::SmallButton("Target + Follow")) {
+    // Prefer targeting the physical convoy contact; fall back to the deterministic signal.
+    bool targeted = false;
+    if (convoy && convoyIdx != (std::size_t)-1) {
+      target.kind = TargetKind::Contact;
+      target.index = convoyIdx;
+      targeted = true;
+    } else {
+      for (std::size_t si = 0; si < signals.size(); ++si) {
+        const auto& ssrc = signals[si];
+        if (ssrc.type != SignalType::TrafficConvoy) continue;
+        if (ssrc.id != trafficEscort.convoyId) continue;
+        target.kind = TargetKind::Signal;
+        target.index = si;
+        targeted = true;
+        break;
+      }
+    }
+
+    if (targeted) {
+      // Docking computer and nav assist fight for control; always disengage docking.
+      if (autopilot) {
+        autopilot = false;
+        dockingComputer.reset();
+      }
+
+      math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+      if (convoy) {
+        tPos = convoy->ship.positionKm();
+        tVel = convoy->ship.velocityKmS();
+      } else {
+        for (const auto& ssrc : signals) {
+          if (ssrc.type != SignalType::TrafficConvoy) continue;
+          if (ssrc.id != trafficEscort.convoyId) continue;
+          tPos = ssrc.posKm;
+          tVel = ssrc.trafficState.velKmS;
+          break;
+        }
+      }
+
+      // Aim to stay comfortably inside maxRange (formation offset), with a sane clamp.
+      const double d = std::clamp(trafficEscort.maxRangeKm * 0.25, 1500.0, std::min(15000.0, trafficEscort.maxRangeKm * 0.8));
+      navAssist.engageFollow(ship, tPos, tVel, d);
+      navAssistLast = {};
+      toast(toasts,
+            std::string("Nav assist: follow convoy (hold ") + std::to_string((int)std::llround(d)) + " km behind) [" +
+              game::chordLabel(controls.actions.navAssistFollow) + "]",
+            2.4);
+    } else {
+      toast(toasts, "Convoy is not currently targetable.", 1.8);
+    }
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("[%s]", game::chordLabel(controls.actions.navAssistFollow).c_str());
   ImGui::End();
 }
 
@@ -18813,6 +20608,21 @@ if (showVfx) {
     if (vfxStarfieldEnabled) {
       ImGui::SameLine();
       ImGui::Checkbox("Textured", &vfxStarfieldTextured);
+
+      ImGui::SameLine();
+      if (!starfieldGpuAvailable) ImGui::BeginDisabled(true);
+      ImGui::Checkbox("GPU (faster)", &vfxStarfieldGpuEnabled);
+      if (!starfieldGpuAvailable) {
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(unavailable)");
+      } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "GPU starfield path:\n"
+            "- no per-frame CPU star expansion\n"
+            "- no per-frame vertex uploads\n"
+            "Positions + twinkle are computed in the vertex shader.");
+      }
     }
 
     if (vfxStarfieldEnabled) {
@@ -19316,6 +21126,48 @@ if (showPostFx) {
       }
     }
 
+    if (ImGui::CollapsingHeader("Performance / Render Scale", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::TextDisabled(
+          "Renders the 3D scene + post-FX at a lower resolution and upscales to the window. "
+          "This can significantly improve FPS on fill-rate-limited GPUs.");
+
+      ImGui::Checkbox("Dynamic resolution", &postFxSettings.dynamicResolutionEnabled);
+      ImGui::SliderFloat("Render scale", &postFxSettings.renderScale, 0.25f, 1.0f, "%.2f");
+
+      if (postFxSettings.dynamicResolutionEnabled) {
+        ImGui::Separator();
+        ImGui::SliderFloat("Target FPS", &postFxSettings.dynamicResolutionTargetFps, 30.0f, 144.0f, "%.0f");
+        ImGui::SliderFloat("Min scale", &postFxSettings.dynamicResolutionMinScale, 0.25f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Max scale", &postFxSettings.dynamicResolutionMaxScale, 0.25f, 1.0f, "%.2f");
+        if (postFxSettings.dynamicResolutionMaxScale < postFxSettings.dynamicResolutionMinScale) {
+          postFxSettings.dynamicResolutionMaxScale = postFxSettings.dynamicResolutionMinScale;
+        }
+        ImGui::SliderFloat("Step", &postFxSettings.dynamicResolutionStep, 0.005f, 0.10f, "%.3f");
+        ImGui::SliderFloat("Hysteresis", &postFxSettings.dynamicResolutionHysteresis, 0.00f, 0.15f, "%.2f");
+        ImGui::SliderFloat("Response", &postFxSettings.dynamicResolutionResponse, 0.25f, 4.0f, "%.2f");
+        ImGui::TextDisabled("Auto-adjusts based on smoothed CPU frame time. Scale changes are rate-limited to avoid thrash.");
+      } else {
+        ImGui::TextDisabled("Tip: Try 0.75 or 0.66 for a large FPS bump. 1.0 = native.");
+      }
+
+      ImGui::SliderFloat("Upscale sharpen", &postFxSettings.upsampleSharpen, 0.0f, 1.0f, "%.2f");
+
+      ImGui::Separator();
+      ImGui::TextDisabled("HDR buffer format (bandwidth / perf)");
+      {
+        int hdrIdx = (postFxSettings.hdrBufferFormat == render::HdrBufferFormat::R11G11B10f) ? 1 : 0;
+        const char* hdrItems[] = {"RGBA16F (quality)", "R11G11B10F (fast)"};
+        if (ImGui::Combo("HDR buffer", &hdrIdx, hdrItems, IM_ARRAYSIZE(hdrItems))) {
+          postFxSettings.hdrBufferFormat = (hdrIdx == 1) ? render::HdrBufferFormat::R11G11B10f
+                                                        : render::HdrBufferFormat::Rgba16f;
+        }
+        ImGui::TextDisabled("Active: %s (auto-fallback if unsupported)", postFx.hdrBufferFormatName());
+      }
+
+      ImGui::Separator();
+      ImGui::TextDisabled("Effective this frame: scale=%.2f, scene=%dx%d", postFx.renderScale(), postFx.width(), postFx.height());
+    }
+
     if (ImGui::CollapsingHeader("Bloom", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::Checkbox("Bloom enabled", &postFxSettings.bloomEnabled);
       ImGui::SliderFloat("Threshold", &postFxSettings.bloomThreshold, 0.10f, 3.50f, "%.2f");
@@ -19340,6 +21192,8 @@ if (showPostFx) {
         ImGui::SliderFloat("Speed down", &postFxSettings.autoExposureSpeedDown, 0.10f, 10.0f, "%.2f");
         ImGui::SliderFloat("Center weight", &postFxSettings.autoExposureCenterWeight, 0.0f, 1.0f, "%.2f");
         ImGui::SliderInt("Max buffer size", &postFxSettings.autoExposureMaxSize, 32, 512);
+        ImGui::Checkbox("Async readback (no stalls)", &postFxSettings.autoExposureAsyncReadback);
+        ImGui::TextDisabled("Async readback uses a small PBO ring + fence sync to avoid GPU/CPU stalls (adds ~1-2 frame latency).");
         ImGui::TextDisabled("Metered avgLum=%.4f | autoMul=%.3f", postFx.lastAvgLuminance(), postFx.lastAutoExposure());
       } else {
         ImGui::TextDisabled("(uses manual exposure only)");
@@ -19664,11 +21518,21 @@ if (showShip) {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Plot Route")) {
-          if (plotRouteToSystem(destSys)) {
-            pendingArrivalTargetStationId = destSt;
-            if (destSys == currentSystem->stub.id && destSt != 0) tryTargetStationById(destSt);
-            showGalaxy = true;
-          }
+          // Route plotting and arrival-targeting is now handled via the Integration Hub action pipeline
+          // (so automations, traces, and other systems can observe/extend it).
+          galaxySelectedSystemId = destSys;
+          showGalaxy = true;
+          game::hubPushAction(integrationHubWindow,
+                              game::GameAction{timeRealSec, timeDays, "MissionTracker", game::GameActionKind::SyncNavToMission,
+                                               (core::u64)tracked->id, 0, 0, false, ""});
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Auto-run")) {
+          galaxySelectedSystemId = destSys;
+          showGalaxy = true;
+          game::hubPushAction(integrationHubWindow,
+                              game::GameAction{timeRealSec, timeDays, "MissionTracker", game::GameActionKind::SyncNavToMission,
+                                               (core::u64)tracked->id, 0, 0, true, ""});
         }
         ImGui::SameLine();
         if (tracked->type == sim::MissionType::Salvage && destSys == currentSystem->stub.id && !tracked->scanned) {
@@ -19782,6 +21646,30 @@ if (showShip) {
                       atmoPlayerLast.relSpeedKmS,
                       dragMS2,
                       atmoPlayerLast.heatingHeatPerSec);
+
+          if (aeroPhysicsParams.enabled) {
+            if (aeroPlayerLast.active) {
+              const double aoaDeg = math::radToDeg(aeroPlayerLast.alphaRad);
+              const double slipDeg = math::radToDeg(aeroPlayerLast.betaRad);
+              const double liftMS2 = aeroPlayerLast.liftAccelKmS2.length() * 1000.0;
+              const double liftG = (sim::kStandardGravityMS2 > 0.0)
+                ? (liftMS2 / sim::kStandardGravityMS2)
+                : 0.0;
+              const double extraDragMS2 = aeroPlayerLast.extraDragAccelKmS2.length() * 1000.0;
+
+              ImGui::Text("Aero: AoA %.1f deg | Slip %.1f deg | CL %.2f | Stall %.0f%%",
+                          aoaDeg,
+                          slipDeg,
+                          aeroPlayerLast.cl,
+                          aeroPlayerLast.stall01 * 100.0);
+              ImGui::Text("Lift: %.2f m/s^2 (%.2fg) | Extra drag: %.2f m/s^2",
+                          liftMS2,
+                          liftG,
+                          extraDragMS2);
+            } else {
+              ImGui::TextDisabled("Aero: enabled (insufficient dynamic pressure)");
+            }
+          }
         }
       }
     }
@@ -21649,6 +23537,15 @@ if (showWorldVisuals) {
       ImGui::SliderFloat("Corona flow speed", &worldStarCoronaFlowSpeed, 0.0f, 1.0f, "%.3f");
 
       ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderInt("Corona noise octaves", &worldStarCoronaNoiseOctaves, 1, 8, "%d");
+      ImGui::SameLine();
+      ImGui::TextDisabled("(perf)");
+      ImGui::SetNextItemWidth(260.0f);
+      ImGui::SliderFloat("Corona rim early-out", &worldStarCoronaRimEarlyOut, 0.0f, 0.01f, "%.4f");
+      ImGui::SameLine();
+      ImGui::TextDisabled("(perf)");
+
+      ImGui::SetNextItemWidth(260.0f);
       ImGui::SliderFloat("Corona streamer strength", &worldStarCoronaStreamerStrength, 0.0f, 3.0f, "%.2f");
       ImGui::SetNextItemWidth(260.0f);
       ImGui::SliderFloat("Corona streamer sharpness", &worldStarCoronaStreamerSharpness, 0.5f, 12.0f, "%.2f");
@@ -21800,6 +23697,64 @@ if (showWorldVisuals) {
     ImGui::SameLine();
     ImGui::TextDisabled("(0 = disabled)");
 
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(!physicsAtmosphereEnabled);
+
+    ImGui::Checkbox("Aerodynamic lift + stability", &aeroPhysicsParams.enabled);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(3D flight model)");
+
+    ImGui::BeginDisabled(!aeroPhysicsParams.enabled);
+
+    ImGui::Checkbox("Affect NPC ships##Aero", &physicsAeroAffectsNpcs);
+    ImGui::SameLine();
+    ImGui::Checkbox("Control surfaces", &aeroPhysicsParams.controlSurfaces);
+    ImGui::SameLine();
+    ImGui::Checkbox("Align to velocity", &aeroPhysicsParams.alignToVelocity);
+
+    static const double kWingMin = 5.0;
+    static const double kWingMax = 520.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Wing area (m^2)", ImGuiDataType_Double, &aeroPhysicsParams.wingAreaM2, &kWingMin, &kWingMax, "%.0f");
+
+    static const double kLiftSlopeMin = 0.5;
+    static const double kLiftSlopeMax = 12.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Lift slope (dCL/dalpha)", ImGuiDataType_Double, &aeroPhysicsParams.liftSlopePerRad, &kLiftSlopeMin, &kLiftSlopeMax, "%.2f");
+
+    static const double kCLMaxMin = 0.2;
+    static const double kCLMaxMax = 2.5;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("CL max", ImGuiDataType_Double, &aeroPhysicsParams.clMax, &kCLMaxMin, &kCLMaxMax, "%.2f");
+
+    static const double kStallMin = 5.0;
+    static const double kStallMax = 45.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Stall angle (deg)", ImGuiDataType_Double, &aeroPhysicsParams.stallAngleDeg, &kStallMin, &kStallMax, "%.1f");
+
+    static const double kInducedMin = 0.0;
+    static const double kInducedMax = 0.4;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Induced drag k", ImGuiDataType_Double, &aeroPhysicsParams.inducedDragK, &kInducedMin, &kInducedMax, "%.3f");
+
+    static const double kStallCdMin = 0.0;
+    static const double kStallCdMax = 4.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Stall drag Cd", ImGuiDataType_Double, &aeroPhysicsParams.stallDragCd, &kStallCdMin, &kStallCdMax, "%.2f");
+
+    static const double kQRefMin = 1000.0;
+    static const double kQRefMax = 80000.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("qRef (Pa)", ImGuiDataType_Double, &aeroPhysicsParams.qRefPa, &kQRefMin, &kQRefMax, "%.0f");
+
+    static const double kAlignMin = 0.0;
+    static const double kAlignMax = 8.0;
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::SliderScalar("Align gain", ImGuiDataType_Double, &aeroPhysicsParams.alignGain, &kAlignMin, &kAlignMax, "%.2f");
+
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
 
     ImGui::TextDisabled("Tip: use Ship / Status for live orbit + atmosphere readouts.");
@@ -25087,11 +27042,89 @@ if (canTrade) {
           }
         }
       };
+
+      // Cross-system integration: let the Trade Planner directly arm navigation auto-run.
+      // (Uses the Integration Hub action so it is traceable / automatable.)
+      tctx.goToStation = [&](sim::SystemId sysId, sim::StationId stId, bool armAutoRun) {
+        game::pushGameAction(gameActions,
+                             game::makeActionGoToStation(timeRealSec,
+                                                        timeDays,
+                                                        "TradePlanner",
+                                                        (core::u64)sysId,
+                                                        (core::u64)stId,
+                                                        armAutoRun));
+        if (armAutoRun) {
+          game::pushGameAction(gameActions,
+                               game::makeActionSetCameraRigPreset(timeRealSec,
+                                                                  timeDays,
+                                                                  "TradePlanner",
+                                                                  (core::i32)game::CameraRigPreset::Travel));
+        }
+      };
       tctx.toast = [&](std::string_view msg, double ttlSec) {
         toast(toasts, std::string(msg), ttlSec);
       };
 
       game::drawTradePlannerWindow(tradePlannerWindow, tctx);
+
+      // Trade Route Runner lifecycle events (armed/cancelled) originate from the UI.
+      // We emit integration events + comms here so they're recorded in the hub/recorder.
+      if (tradePlannerWindow.route.active && !tradePlannerWindow.route.startEventEmitted) {
+        tradePlannerWindow.route.startEventEmitted = true;
+
+        std::string msg = "Trade route armed";
+        if (!tradePlannerWindow.route.legs.empty()) {
+          const auto& leg0 = tradePlannerWindow.route.legs.front();
+          msg += " (" + std::to_string(tradePlannerWindow.route.legs.size()) + " legs). Next: " +
+                 leg0.toSystemName + ":" + leg0.toStationName;
+        }
+
+        game::hubPushEvent(integrationHubWindow,
+                           game::GameEvent{timeRealSec,
+                                           timeDays,
+                                           game::GameEventKind::Gameplay,
+                                           "TradeRoute",
+                                           msg,
+                                           true,
+                                           ship.positionKm()});
+
+        std::string body = msg;
+        body += tradePlannerWindow.route.armAutoRun
+                  ? "\n\nUndock to begin. Auto-run + auto-dock are armed."
+                  : "\n\nUndock to begin. Route is plotted; fly manually.";
+        game::pushGameAction(gameActions,
+                             game::makeActionTransmitComms(timeRealSec,
+                                                          timeDays,
+                                                          "TradeRoute",
+                                                          (core::i32)sim::CommsChannel::Trade,
+                                                          0,
+                                                          /*showOverlay=*/true,
+                                                          std::string("Trade Route|") + body));
+      }
+
+      if (tradePlannerWindow.route.endEventPending &&
+          tradePlannerWindow.route.endReason == game::TradePlannerWindowState::TradeRouteRunner::EndReason::Cancelled) {
+        tradePlannerWindow.route.endEventPending = false;
+        tradePlannerWindow.route.endReason = game::TradePlannerWindowState::TradeRouteRunner::EndReason::None;
+
+        const std::string msg = "Trade route cancelled.";
+        game::hubPushEvent(integrationHubWindow,
+                           game::GameEvent{timeRealSec,
+                                           timeDays,
+                                           game::GameEventKind::Gameplay,
+                                           "TradeRouteCancel",
+                                           msg,
+                                           true,
+                                           ship.positionKm()});
+        game::pushGameAction(gameActions,
+                             game::makeActionTransmitComms(timeRealSec,
+                                                          timeDays,
+                                                          "TradeRoute",
+                                                          (core::i32)sim::CommsChannel::Trade,
+                                                          0,
+                                                          /*showOverlay=*/false,
+                                                          std::string("Trade Route|") + msg));
+      }
     }
 
     if (logbookWindow.open) {
@@ -25808,12 +27841,12 @@ if (canTrade) {
                       toast(toasts, "No nearby station found with the required cargo.", 2.4);
                     } else {
                       const auto& best = plan.candidates.front();
-                      if (plotRouteToSystem(best.systemId)) {
-                        pendingArrivalTargetStationId = best.stationId;
-                        galaxySelectedSystemId = best.systemId;
-                        showGalaxy = true;
-                        toast(toasts, "Plotted route to cargo source.", 2.2);
-                      }
+                      // Route plotting through the Integration Hub action pipeline so it can be traced / automated.
+                      game::hubPushAction(integrationHubWindow,
+                                          game::makeActionGoToStation(timeRealSec, timeDays, "Missions:Cargo",
+                                                                     (core::u64)best.systemId, (core::u64)best.stationId,
+                                                                     /*armAutoRun=*/false));
+                      toast(toasts, "Queued route to cargo source.", 1.8);
                     }
                   }
                   if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -25853,21 +27886,19 @@ if (canTrade) {
                   destSys = m.viaSystem;
                   destSt = m.viaStation;
                 }
-                if (plotRouteToSystem(destSys)) {
-                  pendingArrivalTargetStationId = destSt;
-                  if (currentSystem && destSys == currentSystem->stub.id && destSt != 0) tryTargetStationById(destSt);
-                  showGalaxy = true;
-                }
+
+                // Route plotting through the Integration Hub action pipeline so it can be traced / automated
+                // (and optionally captured by the flight recorder).
+                game::hubPushAction(integrationHubWindow,
+                                    game::makeActionGoToStation(timeRealSec, timeDays, "Missions",
+                                                               (core::u64)destSys, (core::u64)destSt,
+                                                               /*armAutoRun=*/false));
               }
               ImGui::SameLine();
               if (ImGui::SmallButton(trackedMissionId == m.id ? "Untrack" : "Track")) {
-                if (trackedMissionId == m.id) {
-                  trackedMissionId = 0;
-                  toast(toasts, "Mission untracked.", 1.6);
-                } else {
-                  trackedMissionId = m.id;
-                  toast(toasts, "Mission tracked (shown in Ship/Status).", 2.0);
-                }
+                game::hubPushAction(integrationHubWindow,
+                                    game::makeActionSetTrackedMission(timeRealSec, timeDays, "Missions",
+                                                                   (trackedMissionId == m.id) ? 0ull : (core::u64)m.id));
               }
               ImGui::SameLine();
               if (ImGui::SmallButton("Abandon")) {
@@ -26155,6 +28186,19 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                 }
                 toast(toasts, "Mission accepted.", 2.0);
 
+                // Integration Hub: emit a structured mission event so other systems (automations, recorders) can react.
+                if (!missions.empty()) {
+                  const sim::Mission& m = missions.back();
+                  game::hubPushEvent(
+                      integrationHubWindow,
+                      game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
+                                     "MissionAccepted",
+                                     std::string("Mission accepted: ") + sim::missionTypeName(m.type) +
+                                       " (id " + std::to_string((core::u64)m.id) + ")",
+                                     true, ship.positionKm(),
+                                     (core::u64)m.id, (core::u64)st.id});
+                }
+
                 // Log the contract briefing to Comms so players can reference details later.
                 if (!missions.empty() && currentSystem) {
                   sim::MissionBriefingParams bp;
@@ -26179,15 +28223,17 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                 }
 
                 if (autoPlot) {
+                  // Cross-integrate with the Integration Hub action pipeline so auto-plotting is observable
+                  // (and extensible) by automations, traces, and tooling.
                   const bool hasVia = (chosen.viaSystem != 0 && chosen.viaStation != 0 && chosen.leg == 0);
                   const sim::SystemId destSys = hasVia ? chosen.viaSystem : chosen.toSystem;
-                  const sim::StationId destSt = hasVia ? chosen.viaStation : chosen.toStation;
-                  plotRouteToSystem(destSys);
-                  pendingArrivalTargetStationId = destSt;
-                  if (destSys == currentSystem->stub.id) {
-                    tryTargetStationById(destSt);
-                  }
+                  galaxySelectedSystemId = destSys;
                   showGalaxy = true;
+
+                  const core::u64 mid = (core::u64)missions.back().id;
+                  game::hubPushAction(integrationHubWindow,
+                                      game::GameAction{timeRealSec, timeDays, "MissionAccepted", game::GameActionKind::SyncNavToMission,
+                                                       mid, 0, 0, /*armAutoRun=*/false, ""});
                 }
 
                 return true;
@@ -30325,6 +32371,8 @@ draw_command_palette:
                   [&]() { pushChord(controls.actions.navAssistApproach); });
           addItem("Match Vel", "Nav Assist", game::chordLabel(controls.actions.navAssistMatchVelocity), canAct,
                   [&]() { pushChord(controls.actions.navAssistMatchVelocity); });
+          addItem("Follow", "Nav Assist", game::chordLabel(controls.actions.navAssistFollow), canAct,
+                  [&]() { pushChord(controls.actions.navAssistFollow); });
           addItem("Tactical", (showTacticalOverlay ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleTacticalOverlay), canAct,
                   [&]() { pushChord(controls.actions.toggleTacticalOverlay); });
         }

@@ -101,6 +101,9 @@ struct ProceduralMeshLabWindowState {
   core::u64 texSeed{0xDEC0ADDEULL};
   int texResolution{512};
   bool texAutoBake{true};
+  bool texGenerateMips{true};
+  float texDitherStrength{1.0f};
+  bool texPackHeightInAlpha{false};
   bool showTexShader{false};
   char texGraphPath[256]{"proc_graphs/rocky.procgraph"};
   render::ProcGraph texGraph{render::ProcGraph::makeDefault()};

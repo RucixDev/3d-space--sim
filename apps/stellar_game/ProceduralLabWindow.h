@@ -20,6 +20,11 @@ struct ProceduralLabWindowState {
   int resolution{512};
   bool autoBake{true};
 
+  // Bake quality
+  bool bakeGenerateMips{true};
+  float bakeDitherStrength{1.0f};
+  bool bakePackHeightInAlpha{false};
+
   // Output options
   bool usePalette{true};
   bool showShaderSource{false};
