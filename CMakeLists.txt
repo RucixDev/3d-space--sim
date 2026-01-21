@@ -213,6 +213,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SupercruiseComputer.cpp
   src/sim/Interdiction.cpp
   src/sim/EncounterDirector.cpp
+  src/sim/FormationPlanner.cpp
   src/sim/SquadTactics.cpp
   src/sim/SecurityModel.cpp
   src/sim/SystemSecurityDynamics.cpp

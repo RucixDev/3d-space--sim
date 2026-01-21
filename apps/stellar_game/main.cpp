@@ -105,6 +105,7 @@
 #include "stellar/sim/EncounterDirector.h"
 #include "stellar/sim/SquadTactics.h"
 #include "stellar/sim/Formation.h"
+#include "stellar/sim/FormationPlanner.h"
 #include "stellar/sim/SecurityModel.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
@@ -2986,6 +2987,10 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   // Contacts (pirates etc.)
   std::vector<Contact> contacts;
+
+  // Convoy-escort formation slot memory (ephemeral, not saved).
+  // Helps keep escort wings from thrashing slots frame-to-frame.
+  std::unordered_map<core::u64, int> escortSlotMemory;
   core::SplitMix64 rng(seed ^ 0xC0FFEEu);
   sim::EncounterDirectorState encounterDirector = sim::makeEncounterDirector(seed, timeDays);
 
@@ -10657,6 +10662,101 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
   }
 
+  // Convoy escort wings look better (and collide less) when each ship is assigned to the
+  // closest formation slot, rather than a purely id-based ordering.
+  //
+  // We precompute an optimal slot assignment per-followId using a deterministic
+  // Hungarian solver (see sim/FormationPlanner.h).
+  std::unordered_map<core::u64, int> escortSlotIndexById;
+  escortSlotIndexById.reserve(contacts.size());
+
+  // Fast lookup for planning.
+  std::unordered_map<core::u64, const Contact*> contactById;
+  contactById.reserve(contacts.size());
+  for (const auto& c : contacts) {
+    if (c.alive) contactById[c.id] = &c;
+  }
+
+  // Prune stale slot memory.
+  for (auto it = escortSlotMemory.begin(); it != escortSlotMemory.end();) {
+    if (contactById.find(it->first) == contactById.end()) it = escortSlotMemory.erase(it);
+    else ++it;
+  }
+
+  auto escortFormationStandoffKm = [&](int slotCount, bool wing) -> double {
+    double standoff = 36000.0 + (wing ? 5500.0 : 0.0);
+    // Wider wings need more lateral clearance.
+    const double extra = std::clamp((double)slotCount - 2.0, 0.0, 8.0);
+    standoff += extra * 1600.0;
+    return standoff;
+  };
+
+  for (const auto& kv : escortIdsByFollow) {
+    const core::u64 followId = kv.first;
+    const auto itLeader = contactById.find(followId);
+    if (itLeader == contactById.end()) continue;
+    const Contact* leader = itLeader->second;
+
+    const auto& ids = kv.second;
+    if (ids.empty()) continue;
+
+    std::vector<sim::FormationMember> members;
+    std::vector<sim::FormationSlotHint> hints;
+    members.reserve(ids.size());
+    hints.reserve(ids.size());
+
+    bool wing = false;
+    for (core::u64 id : ids) {
+      const auto itM = contactById.find(id);
+      if (itM == contactById.end()) continue;
+
+      sim::FormationMember m{};
+      m.id = id;
+      m.posKm = itM->second->ship.positionKm();
+      members.push_back(m);
+
+      sim::FormationSlotHint h{};
+      h.memberId = id;
+      if (auto itS = escortSlotMemory.find(id); itS != escortSlotMemory.end()) h.priorSlot = itS->second;
+      hints.push_back(h);
+
+      if (itM->second->leaderId != 0) wing = true;
+    }
+
+    if (members.empty()) continue;
+
+    sim::FormationPlanParams pp{};
+    pp.formation.radiusKm = escortFormationStandoffKm((int)members.size(), wing);
+    pp.formation.lateralScale = 0.55;
+    pp.formation.verticalScale = 0.25;
+    pp.formation.behindScale = 1.0;
+    pp.formation.rowSpacingScale = 0.55;
+    pp.formation.jitterKm = 1200.0;
+    pp.costQuantizeMeters = 10.0;
+    pp.stickySlotPenaltyMeters = 600000.0; // 600 km
+
+    const math::Vec3d leaderVel = leader->ship.velocityKmS();
+    const math::Vec3d leaderFwd = (leaderVel.lengthSq() > 1e-9) ? leaderVel : leader->ship.forward();
+
+    const core::u64 fseed = core::hashCombine(universe.seed(), core::hashCombine(followId, 0x4553434f5254ull)); // "ESCORT"
+
+    const sim::FormationPlan plan = sim::planFormation(
+      leader->ship.positionKm(),
+      leaderVel,
+      leaderFwd,
+      leader->ship.up(),
+      std::span<const sim::FormationMember>(members.data(), members.size()),
+      fseed,
+      pp,
+      std::span<const sim::FormationSlotHint>(hints.data(), hints.size())
+    );
+
+    for (const auto& a : plan.assignments) {
+      escortSlotIndexById[a.memberId] = a.slotIndex;
+      escortSlotMemory[a.memberId] = a.slotIndex;
+    }
+  }
+
   for (auto& c : contacts) {
     if (!c.alive) continue;
 
@@ -10755,21 +10855,13 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       if (timeDays >= c.evadeDirRefreshUntilDays && missileThreat.missileIndex < missiles.size()) {
         const auto& m = missiles[missileThreat.missileIndex];
 
-        const math::Vec3d mvDir = (m.velKmS.lengthSq() > 1e-12) ? m.velKmS.normalized() : math::Vec3d{0, 0, 1};
-        const math::Vec3d toTgt = c.ship.positionKm() - m.posKm;
-        const math::Vec3d toDir = (toTgt.lengthSq() > 1e-12) ? toTgt.normalized() : math::Vec3d{0, 0, 1};
-
-        math::Vec3d evade = math::cross(mvDir, toDir);
-        if (evade.lengthSq() < 1e-12) evade = math::cross(mvDir, math::Vec3d{0, 1, 0});
-        if (evade.lengthSq() < 1e-12) evade = math::cross(mvDir, math::Vec3d{1, 0, 0});
-        if (evade.lengthSq() > 1e-12) evade = evade.normalized();
-
-        // Deterministic sign flip so two ships don't always dodge the same way.
+        // Deterministic tie-break seed so two ships don't always dodge the same way.
         const core::u64 phase = (core::u64)std::floor((timeDays * 86400.0) / 0.75);
-        const core::u64 h = core::hashCombine(core::hashCombine(universe.seed(), c.id), core::hashCombine(m.shooterId, phase));
-        if ((h & 1ull) != 0ull) evade *= -1.0;
+        const core::u64 h = core::hashCombine(core::hashCombine(universe.seed(), c.id),
+                                              core::hashCombine(m.shooterId, phase));
 
-        c.evadeDirWorld = evade;
+        const auto plan = sim::planMissileEvasion(m, c.ship.positionKm(), c.ship.velocityKmS(), h);
+        c.evadeDirWorld = plan.valid ? plan.dirWorld : math::Vec3d{0, 0, 0};
 
         const double refreshSec = 0.55 + 1.05 * (1.0 - c.aiSkill);
         c.evadeDirRefreshUntilDays = timeDays + refreshSec / 86400.0;
@@ -11305,20 +11397,25 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        // Convoy escort behaviour: keep a deterministic formation around the followed contact.
 	        // This prevents all escorts from converging on the same chase point and produces readable
 	        // "wing" structure around convoys.
-	        const double standoff = 36000.0 + ((c.leaderId != 0) ? 5500.0 : 0.0) + (double)((c.id % 3) * 1200);
 
-	        int slotIndex = 0;
-	        int slotCount = 1;
-	        if (auto it = escortIdsByFollow.find(c.followId); it != escortIdsByFollow.end()) {
-	          const auto& ids = it->second;
-	          slotCount = (int)ids.size();
-	          if (!ids.empty()) {
-	            auto f = std::lower_bound(ids.begin(), ids.end(), c.id);
-	            if (f != ids.end() && *f == c.id) slotIndex = (int)std::distance(ids.begin(), f);
-	          }
-	        }
+        int slotIndex = 0;
+        int slotCount = 1;
+        if (auto it = escortIdsByFollow.find(c.followId); it != escortIdsByFollow.end()) {
+          const auto& ids = it->second;
+          slotCount = (int)ids.size();
+          if (auto itSlot = escortSlotIndexById.find(c.id); itSlot != escortSlotIndexById.end()) {
+            slotIndex = itSlot->second;
+          } else if (!ids.empty()) {
+            auto f = std::lower_bound(ids.begin(), ids.end(), c.id);
+            if (f != ids.end() && *f == c.id) slotIndex = (int)std::distance(ids.begin(), f);
+          }
+        }
+        if (slotCount <= 0) slotCount = 1;
+        slotIndex = std::clamp(slotIndex, 0, slotCount - 1);
 
-	        sim::FormationParams fp{};
+        const double standoff = escortFormationStandoffKm(slotCount, (c.leaderId != 0));
+
+        sim::FormationParams fp{};
 	        fp.radiusKm = standoff;
 	        fp.lateralScale = 0.55;
 	        fp.verticalScale = 0.25;

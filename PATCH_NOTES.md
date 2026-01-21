@@ -1,3 +1,112 @@
+## Round 130 - TrafficLanes: corridor-bundled dual-carriageway lanes + geometry API
+
+This round targets a very visible but under-developed system: **in-system traffic lanes**.
+Previously, each convoy picked a lane arc based on its unique id, which meant traffic looked like a set of
+independent, slightly-random curves rather than a coherent set of **shared corridors**.
+
+We introduce **corridor-bundled lanes**: lane geometry is now derived from the *station pair* so multiple convoys
+between the same endpoints follow the same corridor. We also add an optional **dual-carriageway** behavior so
+opposite-direction traffic uses mirrored arcs (reducing head-on overlap and making the lane map read better).
+
+### Highlights
+
+- **New `sim::TrafficLaneGeometry` + `computeTrafficLaneGeometry(...)`**
+  - Computes and exposes a stable **laneKey**, a chord-aligned frame (`dir/side/up`), and arc parameters.
+  - Enables efficient sampling/evaluation when tools/UI need many points.
+
+- **Corridor-bundled lane mode (default-on)**
+  - New `TrafficLaneParams::bundleByStationPair` groups convoys into shared corridors using
+    `(systemId, min(from,to), max(from,to))`.
+
+- **Dual-carriageway lanes (default-on)**
+  - New `TrafficLaneParams::dualCarriageway` mirrors the corridor for reverse direction, producing distinct
+    inbound/outbound lanes.
+
+- **More stable RNG consumption**
+  - Lane direction sampling now uses a fixed-cost spherical method (no rejection sampling), making it easier
+    to extend the lane model without accidentally perturbing unrelated random draws.
+
+- **Tests**
+  - Added new coverage validating corridor bundling, dual-carriageway sign flip, mid-flight arc sanity,
+    and legacy (unbundled) behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/TrafficLanes.h`
+- `src/sim/TrafficLanes.cpp`
+- `src/sim/TrafficConvoyLayer.cpp`
+- `tests/test_traffic_lane_geometry.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 129 - FormationPlanner: min-cost convoy escort slot assignment (no crossovers)
+
+This round focuses on an under-developed, very visible behavior: **convoy police escorts flying formation**.
+Previously, escorts were assigned slots by an id-ordering heuristic, which could cause ships to **swap sides** and
+"cross" through the formation (and occasionally bump) whenever the ordering disagreed with their current positions.
+
+We add a small, headless planner that solves a **min-cost assignment** (Hungarian / Kuhn–Munkres) between escorts
+and candidate formation slots. The result is a more readable, stable wing with less crossing and better spacing.
+
+### Highlights
+
+- **New headless `sim::FormationPlanner` (Hungarian assignment)**
+  - Builds candidate slot targets using the existing `Formation.h` helpers.
+  - Assigns members to slots by minimizing total travel distance, using **integer-quantized costs** for determinism.
+  - Optional **sticky slot hints** (penalty-based) to avoid near-tie thrash.
+
+- **Game integration (police convoy escorts)**
+  - `stellar_game` now precomputes an optimal slot index for each escort in a follow-wing each frame.
+  - Adds a small per-escort **slot memory** so wings keep their structure unless there's a clear benefit to swapping.
+  - Formation radius now scales gently with wing size for additional clearance.
+
+- **Tests**
+  - New coverage for side-swap avoidance, determinism, and stickiness tie-breaking.
+
+### Files changed/added
+
+- `include/stellar/sim/FormationPlanner.h`
+- `src/sim/FormationPlanner.cpp`
+- `tests/test_formation_planner.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 128 - MissileDefense: deterministic evasion vectors (smarter jinks)
+
+This round focuses on an under-developed combat layer: **missile defense beyond detection**.
+We add a small, headless helper that computes a **deterministic evasion direction** based on
+closest-approach geometry, and wire it into the game so NPCs jink more intelligently.
+
+### Highlights
+
+- **New headless `sim::planMissileEvasion(...)`**
+  - Computes a unit vector that moves the target **away from the predicted closest-approach point**
+    under a constant relative-velocity estimate.
+  - Optional projection into the **plane perpendicular to the line-of-sight** to produce a more
+    lateral jink (tends to increase LOS rate against PN-like guidance).
+  - Deterministic, seeded tie-breaking for near head-on cases.
+
+- **Game integration**
+  - `stellar_game` now uses `planMissileEvasion()` when refreshing an NPC’s evasion direction,
+    replacing the ad-hoc `cross(missileVelDir, toTargetDir)` heuristic.
+
+- **Tests**
+  - Added coverage for offset-pass behavior, LOS-lateral constraint, and determinism.
+
+### Files changed
+
+- `include/stellar/sim/MissileDefense.h`
+- `src/sim/MissileDefense.cpp`
+- `tests/test_missile_defense.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 123 - Dynamic resolution render scale (FPS boost)
 
 This round introduces a **render-scale / dynamic resolution** path that can noticeably improve FPS by rendering the 3D scene + post-processing at a lower internal resolution and upscaling in the final compositor.
