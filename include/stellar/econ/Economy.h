@@ -65,6 +65,18 @@ void updateEconomyTo(StationEconomyState& state,
                      core::SplitMix64& rng,
                      double sampleIntervalDays = 0.25);
 
+// Like updateEconomyTo(), but also applies an additional per-commodity net flow (units/day)
+// added to (productionPerDay - consumptionPerDay). This is useful for layering external
+// effects (system events, traffic disruptions, etc.) without mutating the StationEconomyModel.
+//
+// If extraNetPerDay is null, behaves identically to updateEconomyTo().
+void updateEconomyToWithExtraNet(StationEconomyState& state,
+                                const StationEconomyModel& model,
+                                double timeDays,
+                                core::SplitMix64& rng,
+                                const std::array<double, kCommodityCount>* extraNetPerDay,
+                                double sampleIntervalDays = 0.25);
+
 // Compute a "mid" price for a commodity given current inventory.
 double midPrice(const StationEconomyState& state, const StationEconomyModel& model, CommodityId id);
 

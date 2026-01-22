@@ -6,6 +6,9 @@
 #include "stellar/sim/Faction.h"
 #include "stellar/sim/System.h"
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/SystemEventEconomy.h"
+#include "stellar/sim/SystemSecurityDynamics.h"
+
 
 #include <list>
 #include <optional>
@@ -55,6 +58,16 @@ public:
   // Economy state access for a station. Will create deterministic initial state if missing,
   // then advance it to `timeDays`.
   econ::StationEconomyState& stationEconomy(const Station& station, double timeDays);
+
+  // Optional hooks to let the Universe align economy updates with the
+  // game's live system security deltas and tuning params.
+  //
+  // If unset, the Universe uses default params and ignores delta states.
+  void setSystemSecurityDeltaMap(const std::unordered_map<SystemId, SystemSecurityDeltaState>* deltas);
+  void setSystemSecurityDynamicsParams(const SystemSecurityDynamicsParams& params);
+  void setSystemEventParams(const SystemEventParams& params);
+  void setSystemEventEconomyParams(const SystemEventEconomyParams& params);
+  void setEnableSystemEventEconomy(bool enable);
 
   // Persist/restore known station economy states (only what you have in cache / visited).
   std::vector<StationEconomyOverride> exportStationOverrides() const;
@@ -208,6 +221,17 @@ private:
   proc::GalaxyGenerator galaxyGen_{0, {}};
 
   std::vector<Faction> factions_{};
+
+  // Optional pointer to the game's security delta map.
+  // If null, station economies use only baseline (procedural) security.
+  const std::unordered_map<SystemId, SystemSecurityDeltaState>* systemSecurityDeltaMap_{nullptr};
+
+  // Cached copies of simulation parameters so tests/tools can run without
+  // needing game-side state. Games can update these via setters each frame.
+  SystemSecurityDynamicsParams systemSecurityDynParams_{};
+  SystemEventParams systemEventParams_{};
+  SystemEventEconomyParams systemEventEconomyParams_{};
+  bool enableSystemEventEconomy_{true};
 
   LruCache<proc::SectorCoord, proc::Sector, proc::SectorCoordHash> sectorCache_{256};
   LruCache<SystemId, StarSystem> systemCache_{256};

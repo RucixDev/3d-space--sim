@@ -218,6 +218,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SecurityModel.cpp
   src/sim/SystemSecurityDynamics.cpp
   src/sim/SystemEvents.cpp
+  src/sim/SystemEventEconomy.cpp
   src/sim/SystemConditions.cpp
   src/sim/DockingPads.cpp
   src/sim/Docking.cpp
@@ -256,6 +257,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/SmugglingScanner.cpp
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
+  src/sim/SalvageSweep.cpp
   src/sim/TradeRunPlanner.cpp
   src/sim/MarketAnalysis.cpp
   src/sim/Universe.cpp

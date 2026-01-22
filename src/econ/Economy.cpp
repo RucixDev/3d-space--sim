@@ -205,6 +205,15 @@ void updateEconomyTo(StationEconomyState& state,
                      double timeDays,
                      core::SplitMix64& rng,
                      double sampleIntervalDays) {
+  updateEconomyToWithExtraNet(state, model, timeDays, rng, nullptr, sampleIntervalDays);
+}
+
+void updateEconomyToWithExtraNet(StationEconomyState& state,
+                                const StationEconomyModel& model,
+                                double timeDays,
+                                core::SplitMix64& rng,
+                                const std::array<double, kCommodityCount>* extraNetPerDay,
+                                double sampleIntervalDays) {
   if (timeDays <= state.lastUpdateDay) return;
 
   // Defensive clamp: avoid weird sampling behavior / infinite loops.
@@ -233,6 +242,7 @@ void updateEconomyTo(StationEconomyState& state,
 
     for (std::size_t i = 0; i < kCommodityCount; ++i) {
       double net = model.productionPerDay[i] - model.consumptionPerDay[i];
+      if (extraNetPerDay) net += (*extraNetPerDay)[i];
 
       if (shockVol > 0.0) {
         // Deterministic daily shock in [-1, 1].
@@ -265,5 +275,6 @@ void updateEconomyTo(StationEconomyState& state,
 
   state.lastUpdateDay = timeDays;
 }
+
 
 } // namespace stellar::econ

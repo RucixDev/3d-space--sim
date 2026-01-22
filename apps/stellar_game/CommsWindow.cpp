@@ -387,6 +387,88 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
       }
     }
   }
+
+  // Live Security response (authority scans / bounty submission).
+  // This keeps the Comms inbox diegetic while still letting players react quickly
+  // (especially useful if they missed the HUD prompt).
+  if (ctx.querySecurityDemand && (m.channel == sim::CommsChannel::Security)) {
+    const SecurityDemandUi sd = ctx.querySecurityDemand(m);
+    if (sd.kind != SecurityDemandUi::Kind::None) {
+      ImGui::Separator();
+
+      const ImVec4 c = (sd.kind == SecurityDemandUi::Kind::BribeOffer)
+                           ? ImVec4(1.0f, 0.75f, 0.35f, 1.0f)
+                           : ImVec4(1.0f, 0.70f, 0.40f, 1.0f);
+      ImGui::TextColored(c, "Live authority channel");
+      if (!sd.authorityName.empty()) {
+        ImGui::TextDisabled("Source: %s", sd.authorityName.c_str());
+      }
+
+      if (sd.kind == SecurityDemandUi::Kind::BribeOffer) {
+        ImGui::Text("Bribe: %.0f cr", sd.bribeCr);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(fine %.0f cr if you comply)", sd.fineCr);
+
+        if (!sd.detail.empty()) {
+          ImGui::TextDisabled("Detected: %s", sd.detail.c_str());
+        }
+
+        // Actions
+        std::string bribeLbl = "Pay bribe";
+        if (!ctx.securityBribeChord.empty()) bribeLbl += " (" + ctx.securityBribeChord + ")";
+        std::string complyLbl = "Comply";
+        if (!ctx.securityComplyChord.empty()) complyLbl += " (" + ctx.securityComplyChord + ")";
+
+        const bool canBribe = sd.actionAllowed && sd.canPay && (sd.bribeCr > 0.0) && ((bool)ctx.actSecurityBribe);
+        const bool canComply = sd.actionAllowed && ((bool)ctx.actSecurityComplyOrSubmit);
+
+        ImGui::BeginDisabled(!canBribe);
+        if (ImGui::Button(bribeLbl.c_str())) {
+          ctx.actSecurityBribe();
+        }
+        ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!canComply);
+        if (ImGui::Button(complyLbl.c_str())) {
+          ctx.actSecurityComplyOrSubmit();
+        }
+        ImGui::EndDisabled();
+
+        if (!sd.actionAllowed) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(not available while docked/jumping)");
+        } else if (!sd.canPay) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(insufficient credits)");
+        }
+      } else if (sd.kind == SecurityDemandUi::Kind::BountyDemand) {
+        ImGui::Text("Outstanding bounty: %.0f cr", sd.bountyCr);
+
+        std::string submitLbl = "Submit / pay bounty";
+        if (!ctx.securityComplyChord.empty()) submitLbl += " (" + ctx.securityComplyChord + ")";
+
+        const bool canSubmit = sd.actionAllowed && (sd.bountyCr > 0.0) && ((bool)ctx.actSecurityComplyOrSubmit);
+        ImGui::BeginDisabled(!canSubmit);
+        if (ImGui::Button(submitLbl.c_str())) {
+          ctx.actSecurityComplyOrSubmit();
+        }
+        ImGui::EndDisabled();
+
+        if (!sd.actionAllowed) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(not available while docked/jumping)");
+        }
+      }
+
+      // Countdown
+      const double total = std::max(0.001, sd.secondsTotal);
+      const double frac = std::clamp(1.0 - (sd.secondsLeft / total), 0.0, 1.0);
+      ImGui::ProgressBar((float)frac, ImVec2(-1, 0));
+      ImGui::TextDisabled("Time remaining: %.1f s", std::max(0.0, sd.secondsLeft));
+    }
+  }
+
   ImGui::Separator();
 
   // Body

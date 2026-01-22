@@ -9,6 +9,7 @@ namespace stellar::sim {
 
 struct Station {
   StationId id{0};
+  SystemId systemId{0};           // owning system id (procedural convenience)
   std::string name;
   econ::StationType type{econ::StationType::Outpost};
   core::u32 factionId{0};       // 0 = independent

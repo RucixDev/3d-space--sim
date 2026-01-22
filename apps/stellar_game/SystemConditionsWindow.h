@@ -20,6 +20,22 @@ namespace stellar::game {
 struct SystemConditionsWindowState {
   bool open{false};
 
+  // GalNet bulletin settings.
+  // These are gameplay-facing toggles that control when the game posts system-event
+  // bulletins to the player's Comms inbox.
+  bool galNetAutoBroadcastLocal{true};
+  bool galNetAutoBroadcastWatched{true};
+  bool galNetBroadcastEventEnds{false};
+
+  // Presentation toggles for auto-broadcasts.
+  bool galNetLocalShowOverlay{true};
+  bool galNetLocalShowToast{true};
+  bool galNetWatchedShowOverlay{false};
+  bool galNetWatchedShowToast{false};
+
+  // Ignore events below this severity when auto-broadcasting.
+  float galNetMinSeverity{0.0f};
+
   // Query controls.
   float radiusLy{220.0f};
   int maxResults{96};
@@ -77,6 +93,11 @@ struct SystemConditionsWindowContext {
   stellar::sim::SystemEventParams eventParams{};
 
   // Optional UI callbacks.
+  // Optional: GalNet integration.
+  // The window can manage a player watchlist and publish system-event bulletins to Comms.
+  std::vector<stellar::sim::SystemId>* watchSystems{nullptr};
+  std::function<void(stellar::sim::SystemId systemId, bool showOverlay, bool showToast)> postGalNetBulletin;
+
   std::function<bool(stellar::sim::SystemId)> plotRouteToSystem;
   std::function<void(stellar::sim::SystemId)> targetSystem;
   std::function<void(std::string_view msg, double ttlSec)> toast;

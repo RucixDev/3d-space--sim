@@ -349,12 +349,34 @@ MissionBriefing generateMissionBriefing(Universe& universe,
   const std::string stName = nextSt ? nextSt->name : std::string("(site)");
 
   b.titleMarkup = titleForType(mission.type, params.useMarkup);
+  if (mission.priority) {
+    if (params.useMarkup) {
+      b.titleMarkup = "[color #ff4a4a]PRIORITY[/color] " + b.titleMarkup;
+    } else {
+      b.titleMarkup = "PRIORITY: " + b.titleMarkup;
+    }
+  }
 
   // Short synopsis
   {
     std::ostringstream oss;
     oss.setf(std::ios::fixed);
     oss.precision(0);
+
+    if (mission.priority && mission.sourceKind == MissionSourceKind::SystemEvent) {
+      const char* evName = systemEventKindName(mission.sourceEventKind);
+      const double hoursLeft = std::max(0.0, (mission.sourceEventEndDay - timeDays) * 24.0);
+      if (params.useMarkup) {
+        oss << "[color #ff4a4a]PRIORITY[/color] " << evName;
+      } else {
+        oss << "PRIORITY " << evName;
+      }
+      if (std::isfinite(hoursLeft) && hoursLeft > 0.0) {
+        oss << " (ends in " << hoursLeft << "h). ";
+      } else {
+        oss << ". ";
+      }
+    }
 
     switch (mission.type) {
       case MissionType::Courier:

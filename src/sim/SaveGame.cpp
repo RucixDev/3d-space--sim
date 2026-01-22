@@ -27,6 +27,8 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "timeDays " << s.timeDays << "\n";
   f << "currentSystem " << s.currentSystem << "\n";
   f << "dockedStation " << s.dockedStation << "\n";
+  f << "lastDockedSystem " << s.lastDockedSystem << "\n";
+  f << "lastDockedStation " << s.lastDockedStation << "\n";
 
   f << "shipPosKm " << s.shipPosKm.x << " " << s.shipPosKm.y << " " << s.shipPosKm.z << "\n";
   f << "shipVelKmS " << s.shipVelKmS.x << " " << s.shipVelKmS.y << " " << s.shipVelKmS.z << "\n";
@@ -35,6 +37,16 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
 
   f << "credits " << s.credits << "\n";
   f << "insuranceDebtCr " << s.insuranceDebtCr << "\n";
+
+  // Persistent progression unlock state (license-style gating).
+  f << "creditsHighWaterCr " << s.creditsHighWaterCr << "\n";
+  f << "repHighWater " << s.repHighWater << "\n";
+  f << "unlockedHullMask " << s.unlockedHullMask << "\n";
+  f << "unlockedCoreMk " << (int)s.unlockedCoreMk << "\n";
+  f << "unlockedSmuggleHoldMk " << (int)s.unlockedSmuggleHoldMk << "\n";
+  f << "unlockedFuelScoopMk " << (int)s.unlockedFuelScoopMk << "\n";
+  f << "unlockedWeaponMask " << s.unlockedWeaponMask << "\n";
+
 
   // Ship meta / progression
   f << "fuel " << s.fuel << "\n";
@@ -135,6 +147,13 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << "\n";
   }
 
+  // GalNet watchlist (system event bulletins)
+  f << "galnetWatchSystems " << s.galNetWatchSystems.size() << "\n";
+  for (auto sysId : s.galNetWatchSystems) {
+    f << "watch " << sysId << "\n";
+  }
+
+
   // Integration Hub automations (stellar_game)
   //
   // Persisted so Integration Hub (IFTTT-style) rules survive quicksave/quickload.
@@ -197,7 +216,13 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << m.factionId << " "
       << m.viaSystem << " " << m.viaStation << " "
       << static_cast<int>(m.leg) << " "
-      << (m.scanned ? 1 : 0)
+      << (m.scanned ? 1 : 0) << " "
+      // Mission provenance (Round 17+) -- appended for backward compatibility
+      << static_cast<int>(m.sourceKind) << " "
+      << static_cast<int>(m.sourceEventKind) << " "
+      << m.sourceEventSeverity01 << " "
+      << m.sourceEventEndDay << " "
+      << (m.priority ? 1 : 0)
       << "\n";
   }
 
@@ -284,7 +309,13 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
       << m.factionId << " "
       << m.viaSystem << " " << m.viaStation << " "
       << static_cast<int>(m.leg) << " "
-      << (m.scanned ? 1 : 0)
+      << (m.scanned ? 1 : 0) << " "
+      // Mission provenance (Round 17+) -- appended for backward compatibility
+      << static_cast<int>(m.sourceKind) << " "
+      << static_cast<int>(m.sourceEventKind) << " "
+      << m.sourceEventSeverity01 << " "
+      << m.sourceEventEndDay << " "
+      << (m.priority ? 1 : 0)
       << "\n";
   }
 
@@ -468,6 +499,10 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.currentSystem;
     } else if (key == "dockedStation") {
       f >> out.dockedStation;
+    } else if (key == "lastDockedSystem") {
+      f >> out.lastDockedSystem;
+    } else if (key == "lastDockedStation") {
+      f >> out.lastDockedStation;
     } else if (key == "shipPosKm") {
       f >> out.shipPosKm.x >> out.shipPosKm.y >> out.shipPosKm.z;
     } else if (key == "shipVelKmS") {
@@ -480,6 +515,30 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.credits;
     } else if (key == "insuranceDebtCr") {
       f >> out.insuranceDebtCr;
+    } else if (key == "creditsHighWaterCr") {
+      f >> out.creditsHighWaterCr;
+      out.creditsHighWaterCr = std::max(0.0, out.creditsHighWaterCr);
+    } else if (key == "repHighWater") {
+      f >> out.repHighWater;
+      out.repHighWater = std::clamp(out.repHighWater, 0.0, 100.0);
+    } else if (key == "unlockedHullMask") {
+      f >> out.unlockedHullMask;
+    } else if (key == "unlockedCoreMk") {
+      int v = 1;
+      f >> v;
+      out.unlockedCoreMk = core::clampCast<core::u8>(v, 1, 3);
+    } else if (key == "unlockedSmuggleHoldMk") {
+      int v = 0;
+      f >> v;
+      out.unlockedSmuggleHoldMk = core::clampCast<core::u8>(v, 0, 3);
+    } else if (key == "unlockedFuelScoopMk") {
+      int v = 0;
+      f >> v;
+      out.unlockedFuelScoopMk = core::clampCast<core::u8>(v, 0, 3);
+    } else if (key == "unlockedWeaponMask") {
+      f >> out.unlockedWeaponMask;
+      // Ensure starter weapons remain available even if a file is edited by hand.
+      out.unlockedWeaponMask |= ((1u << 0) | (1u << 2));
     } else if (key == "fuel") {
       f >> out.fuel;
     } else if (key == "fuelMax") {
@@ -718,6 +777,30 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
 
         out.comms.push_back(std::move(m));
       }
+    } else if (key == "galnetWatchSystems") {
+      std::size_t n = 0;
+      f >> n;
+      out.galNetWatchSystems.clear();
+      out.galNetWatchSystems.reserve(std::min<std::size_t>(n, 4096));
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "watch") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+        SystemId id = 0;
+        if (!(f >> id)) break;
+        if (id != 0) out.galNetWatchSystems.push_back(id);
+      }
+
+      std::sort(out.galNetWatchSystems.begin(), out.galNetWatchSystems.end());
+      out.galNetWatchSystems.erase(
+          std::unique(out.galNetWatchSystems.begin(), out.galNetWatchSystems.end()),
+          out.galNetWatchSystems.end());
     } else if (key == "hubAutomationsEnabled") {
       int v = 1;
       f >> v;
@@ -897,6 +980,21 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (iss >> m.factionId >> m.viaSystem >> m.viaStation >> leg >> scanned) {
           m.leg = static_cast<core::u8>(std::clamp(leg, 0, 255));
           m.scanned = (scanned != 0);
+
+          // Optional: mission provenance / priority (Round 17+).
+          int sourceKind = 0;
+          int sourceEventKind = 0;
+          double sev = 0.0;
+          double endDay = 0.0;
+          int priority = 0;
+
+          if (iss >> sourceKind >> sourceEventKind >> sev >> endDay >> priority) {
+            m.sourceKind = static_cast<MissionSourceKind>(std::clamp(sourceKind, 0, 255));
+            m.sourceEventKind = static_cast<SystemEventKind>(std::clamp(sourceEventKind, 0, 255));
+            m.sourceEventSeverity01 = std::clamp(sev, 0.0, 1.0);
+            m.sourceEventEndDay = std::isfinite(endDay) ? endDay : 0.0;
+            m.priority = (priority != 0);
+          }
         }
 
         out.missions.push_back(std::move(m));
@@ -1087,6 +1185,21 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         if (iss >> m.factionId >> m.viaSystem >> m.viaStation >> leg >> scanned) {
           m.leg = static_cast<core::u8>(std::clamp(leg, 0, 255));
           m.scanned = (scanned != 0);
+
+          // Optional: mission provenance / priority (Round 17+).
+          int sourceKind = 0;
+          int sourceEventKind = 0;
+          double sev = 0.0;
+          double endDay = 0.0;
+          int priority = 0;
+
+          if (iss >> sourceKind >> sourceEventKind >> sev >> endDay >> priority) {
+            m.sourceKind = static_cast<MissionSourceKind>(std::clamp(sourceKind, 0, 255));
+            m.sourceEventKind = static_cast<SystemEventKind>(std::clamp(sourceEventKind, 0, 255));
+            m.sourceEventSeverity01 = std::clamp(sev, 0.0, 1.0);
+            m.sourceEventEndDay = std::isfinite(endDay) ? endDay : 0.0;
+            m.priority = (priority != 0);
+          }
         }
 
         out.missionOffers.push_back(std::move(m));

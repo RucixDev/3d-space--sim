@@ -8,6 +8,7 @@
 #include "stellar/sim/Logbook.h"
 #include "stellar/sim/Comms.h"
 #include "stellar/sim/TrafficEscort.h"
+#include "stellar/sim/SystemEvents.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 
 #include <array>
@@ -211,6 +212,16 @@ enum class MissionType : core::u8 {
   Escort        = 8,
 };
 
+// Mission provenance (where/why a contract exists).
+//
+// IMPORTANT: MissionSourceKind is persisted in save files as an integer.
+// Always use explicit, stable numeric values here.
+// Do not reorder existing members, or older saves can silently remap source kinds.
+enum class MissionSourceKind : core::u8 {
+  Normal     = 0,
+  SystemEvent = 1,
+};
+
 struct Mission {
   core::u64 id{0};
   MissionType type{MissionType::Courier};
@@ -251,6 +262,26 @@ struct Mission {
   // If true, the station provided the cargo at acceptance time (taking from station inventory).
   // If false, the player must source the cargo themselves.
   bool cargoProvided{true};
+
+  // --- Provenance / priority (optional) ---
+  // These fields are appended to save lines (backward compatible).
+
+  // Where the contract came from (Normal vs deterministic SystemEvent-driven priority).
+  MissionSourceKind sourceKind{MissionSourceKind::Normal};
+
+  // If sourceKind==SystemEvent, stores the triggering SystemEventKind.
+  // (SystemEventKind is stable in save files as an integer.)
+  SystemEventKind sourceEventKind{SystemEventKind::None};
+
+  // Cached event severity (0..1) when the contract was generated.
+  double sourceEventSeverity01{0.0};
+
+  // End day of the event cycle used to generate this contract.
+  // Used for UI messaging only; gameplay doesn't depend on it.
+  double sourceEventEndDay{0.0};
+
+  // True if this contract is flagged as a short-deadline, higher-pay "priority" job.
+  bool priority{false};
 };
 
 // -----------------------------------------------------------------------------
@@ -305,13 +336,17 @@ struct IntegrationHubAutomationRuleState {
 };
 
 struct SaveGame {
-  int version{32};
+  int version{35};
 
   core::u64 seed{0};
   double timeDays{0.0};
 
   SystemId currentSystem{0};
   StationId dockedStation{0};
+
+  // Last docked location (used for insurance / rebuy respawns).
+  SystemId lastDockedSystem{0};
+  StationId lastDockedStation{0};
 
   // Player ship
   math::Vec3d shipPosKm{0,0,0};
@@ -333,6 +368,11 @@ struct SaveGame {
   // Comms / inbox: diegetic transmissions history.
   // Stored in the SaveGame so quicksave/quickload preserves narrative and warnings.
   std::vector<CommsMessage> comms{};
+
+  // GalNet: persistent watchlist for system event bulletins.
+  // If a system is in this list, the game may post GalNet bulletins to the Comms inbox
+  // when that system's System Event rolls over to a new cycle.
+  std::vector<SystemId> galNetWatchSystems{};
 
   // Integration Hub (stellar_game) automation rules + toggles.
   // Persisted so your cross-system "glue" survives quicksave/quickload.
@@ -405,6 +445,32 @@ struct SaveGame {
 
   // Fuel scoop module (0 = none, 1..3 = Mk1..Mk3)
   core::u8 fuelScoopMk{0};
+
+  // Persistent progression unlock state (license-style gating).
+  //
+  // These are designed to be monotonic: once unlocked, they remain unlocked even if
+  // the player spends credits or temporarily loses reputation.
+  //
+  // creditsHighWaterCr: highest credits held at any point (cash-threshold unlocks).
+  // repHighWater: highest positive rep achieved with any faction (rep-threshold unlocks).
+  double creditsHighWaterCr{0.0};
+  double repHighWater{0.0};
+
+  // Bit i corresponds to shipHull i (0 = Scout, 1 = Hauler, 2 = Fighter).
+  // At minimum the starter hull (bit 0) is always unlocked.
+  core::u32 unlockedHullMask{1u};
+
+  // Max Mk tier unlocked for core modules (thrusters/shields/distributor).
+  core::u8 unlockedCoreMk{1}; // 1..3
+
+  // Max Mk tiers unlocked for optional modules.
+  core::u8 unlockedSmuggleHoldMk{0}; // 0..3
+  core::u8 unlockedFuelScoopMk{0};   // 0..3
+
+  // Bit i corresponds to WeaponType i (see ShipLoadout.h).
+  // At minimum Beam Laser (0) and Cannon (2) are always unlocked.
+  core::u32 unlockedWeaponMask{(1u << 0) | (1u << 2)};
+
 
   // Missions
   core::u64 nextMissionId{1};

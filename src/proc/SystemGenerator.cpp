@@ -900,6 +900,7 @@ sim::StarSystem generateSystem(core::u64 universeSeed,
   for (int i = 0; i < nStations; ++i) {
     sim::Station st{};
     st.id = core::hashCombine(static_cast<core::u64>(stub.id), static_cast<core::u64>(i + 1));
+    st.systemId = stub.id;
     st.name = ng.stationName(stub.name, i);
     st.type = stationTypes[static_cast<std::size_t>(i)];
 

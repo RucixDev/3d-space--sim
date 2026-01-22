@@ -1,5 +1,6 @@
 #include "stellar/sim/MissionLogic.h"
 
+#include "stellar/core/Hash.h"
 #include "stellar/core/Random.h"
 #include "stellar/econ/Cargo.h"
 #include "stellar/econ/Market.h"
@@ -28,6 +29,208 @@ struct CargoMissionSpec {
   econ::MarketQuote originQ{};
   econ::MarketQuote destQ{};
 };
+
+static core::u64 stableMissionOfferId(core::u64 boardSeed, std::size_t offerIndex) {
+  // Deterministic, non-zero, stable per board seed + offer slot.
+  // (Offers are persisted in the save file and used as seeds for briefings/UI.)
+  core::u64 h = core::hashCombine(boardSeed, static_cast<core::u64>(offerIndex + 1u));
+  if (h == 0) h = static_cast<core::u64>(offerIndex + 1u);
+  return h;
+}
+
+static double affinityForEvent(SystemEventKind ev, MissionType t) {
+  // Heuristic mapping: choose mission types that "feel" relevant to the active system event.
+  // Returns roughly [0,1].
+  switch (ev) {
+    case SystemEventKind::TradeBoom:
+      switch (t) {
+        case MissionType::Delivery:      return 1.00;
+        case MissionType::MultiDelivery: return 0.90;
+        case MissionType::Courier:       return 0.75;
+        case MissionType::Passenger:     return 0.65;
+        case MissionType::Escort:        return 0.55;
+        case MissionType::Salvage:       return 0.35;
+        case MissionType::Smuggle:       return 0.25;
+        case MissionType::BountyScan:    return 0.15;
+        case MissionType::BountyKill:    return 0.10;
+      }
+      break;
+
+    case SystemEventKind::TradeBust:
+      switch (t) {
+        case MissionType::Delivery:      return 0.95;
+        case MissionType::MultiDelivery: return 0.85;
+        case MissionType::Courier:       return 0.65;
+        case MissionType::Salvage:       return 0.55;
+        case MissionType::Escort:        return 0.55;
+        case MissionType::Smuggle:       return 0.45;
+        case MissionType::Passenger:     return 0.35;
+        case MissionType::BountyScan:    return 0.20;
+        case MissionType::BountyKill:    return 0.20;
+      }
+      break;
+
+    case SystemEventKind::PirateRaid:
+      switch (t) {
+        case MissionType::BountyKill:    return 1.00;
+        case MissionType::BountyScan:    return 0.85;
+        case MissionType::Escort:        return 0.75;
+        case MissionType::Salvage:       return 0.60;
+        case MissionType::Courier:       return 0.30;
+        case MissionType::Delivery:      return 0.25;
+        case MissionType::MultiDelivery: return 0.25;
+        case MissionType::Passenger:     return 0.20;
+        case MissionType::Smuggle:       return 0.15;
+      }
+      break;
+
+    case SystemEventKind::SecurityCrackdown:
+      switch (t) {
+        case MissionType::BountyScan:    return 0.90;
+        case MissionType::BountyKill:    return 0.75;
+        case MissionType::Smuggle:       return 0.65;
+        case MissionType::Courier:       return 0.55;
+        case MissionType::Delivery:      return 0.40;
+        case MissionType::MultiDelivery: return 0.40;
+        case MissionType::Escort:        return 0.40;
+        case MissionType::Passenger:     return 0.30;
+        case MissionType::Salvage:       return 0.20;
+      }
+      break;
+
+    case SystemEventKind::CivilUnrest:
+      switch (t) {
+        case MissionType::Escort:        return 0.95;
+        case MissionType::Courier:       return 0.75;
+        case MissionType::Passenger:     return 0.75;
+        case MissionType::Delivery:      return 0.65;
+        case MissionType::MultiDelivery: return 0.60;
+        case MissionType::Salvage:       return 0.45;
+        case MissionType::BountyKill:    return 0.40;
+        case MissionType::BountyScan:    return 0.35;
+        case MissionType::Smuggle:       return 0.30;
+      }
+      break;
+
+    case SystemEventKind::ResearchBreakthrough:
+      switch (t) {
+        case MissionType::Courier:       return 0.95;
+        case MissionType::Passenger:     return 0.80;
+        case MissionType::Delivery:      return 0.70;
+        case MissionType::MultiDelivery: return 0.65;
+        case MissionType::Escort:        return 0.55;
+        case MissionType::Salvage:       return 0.45;
+        case MissionType::Smuggle:       return 0.25;
+        case MissionType::BountyScan:    return 0.15;
+        case MissionType::BountyKill:    return 0.10;
+      }
+      break;
+
+    case SystemEventKind::None:
+    default:
+      break;
+  }
+  return 0.0;
+}
+
+static double minPriorityDeadlineDays(MissionType t) {
+  // Safety floor so priority contracts don't become impossible.
+  switch (t) {
+    case MissionType::Salvage:
+    case MissionType::BountyScan:
+    case MissionType::BountyKill:
+      return 0.18;
+    case MissionType::Escort:
+      return 0.22;
+    case MissionType::Courier:
+      return 0.28;
+    case MissionType::Delivery:
+    case MissionType::MultiDelivery:
+    case MissionType::Passenger:
+      return 0.40;
+    case MissionType::Smuggle:
+      return 0.35;
+    default:
+      return 0.28;
+  }
+}
+
+static void applyPriorityTag(Mission& m, const SystemEvent& ev, double timeDays) {
+  if (m.priority) return;
+  if (!ev.active || ev.kind == SystemEventKind::None) return;
+
+  m.priority = true;
+  m.sourceKind = MissionSourceKind::SystemEvent;
+  m.sourceEventKind = ev.kind;
+  m.sourceEventSeverity01 = std::clamp(ev.severity01, 0.0, 1.0);
+  m.sourceEventEndDay = std::isfinite(ev.endDay) ? ev.endDay : 0.0;
+
+  const double sev = m.sourceEventSeverity01;
+
+  // Pay boost: modest but noticeable.
+  if (std::isfinite(m.reward) && m.reward > 0.0) {
+    const double boost = 1.0 + (0.10 + 0.20 * sev); // ~+17%..+30%
+    m.reward *= boost;
+  }
+
+  // Deadline squeeze: scale remaining time down, but never increase it.
+  if (std::isfinite(m.deadlineDay) && m.deadlineDay > 0.0 && std::isfinite(timeDays)) {
+    const double remain = m.deadlineDay - timeDays;
+    if (remain > 0.0 && std::isfinite(remain)) {
+      const double scale = std::clamp(0.85 - 0.35 * sev, 0.45, 0.85);
+      const double minRemain = minPriorityDeadlineDays(m.type);
+      const double squeezed = remain * scale;
+      const double newRemain = std::max(squeezed, std::min(remain, minRemain));
+      m.deadlineDay = timeDays + std::min(remain, newRemain);
+    }
+  }
+}
+
+static void applyPriorityContractsToOffers(std::vector<Mission>& offers,
+                                          const SystemEvent& ev,
+                                          core::u64 boardSeed,
+                                          double timeDays) {
+  if (!ev.active || ev.kind == SystemEventKind::None) return;
+  if (offers.empty()) return;
+
+  const double sev = std::clamp(ev.severity01, 0.0, 1.0);
+  int desired = 1;
+  if (sev > 0.60) desired++;
+  if (sev > 0.85) desired++;
+  desired = std::clamp(desired, 1, (int)offers.size());
+
+  struct Candidate {
+    std::size_t idx{0};
+    double score{0.0};
+  };
+
+  std::vector<Candidate> cand;
+  cand.reserve(offers.size());
+
+  for (std::size_t i = 0; i < offers.size(); ++i) {
+    const Mission& m = offers[i];
+    double score = affinityForEvent(ev.kind, m.type);
+
+    // Favor contracts with actual deadlines (they read as "urgent").
+    if (m.deadlineDay > 0.0 && std::isfinite(m.deadlineDay)) score += 0.05;
+
+    // Stable, deterministic tie-breaker noise.
+    const core::u64 h = core::hashCombine(boardSeed, m.id);
+    const double noise = (double)(h & 0xFFFFu) / 65535.0;
+    score += noise * 1e-3;
+
+    cand.push_back({i, score});
+  }
+
+  std::sort(cand.begin(), cand.end(), [](const Candidate& a, const Candidate& b) {
+    return a.score > b.score;
+  });
+
+  for (int k = 0; k < desired; ++k) {
+    Mission& m = offers[cand[(std::size_t)k].idx];
+    applyPriorityTag(m, ev, timeDays);
+  }
+}
 
 // Pick a commodity + unit count for a cargo-style mission.
 //
@@ -206,13 +409,44 @@ void refreshMissionOffers(Universe& universe,
                           SaveGame& ioSave,
                           const MissionBoardParams& params) {
   const int dayStamp = (int)std::floor(timeDays);
-  if (ioSave.missionOffersStationId == dockedStation.id && ioSave.missionOffersDayStamp == dayStamp) return;
+  const core::u64 boardSeed = missionBoardSeed(dockedStation.id, dayStamp, dockedStation.factionId);
+  const bool sameBoard = (ioSave.missionOffersStationId == dockedStation.id && ioSave.missionOffersDayStamp == dayStamp);
+
+  // Fast path: if offers are already cached for this station/day and already have
+  // stable IDs + priority metadata (Round 17+), we can return immediately.
+  if (sameBoard) {
+    bool needIdFix = false;
+    for (const auto& o : ioSave.missionOffers) {
+      if (o.id == 0) { needIdFix = true; break; }
+    }
+
+    if (!needIdFix) return;
+
+    // Patch older cached offers in-place (e.g., from older save files).
+    const SystemSecurityDeltaState* localDelta = nullptr;
+    for (const auto& d : ioSave.systemSecurityDeltas) {
+      if (d.systemId == currentSystem.stub.id) { localDelta = &d; break; }
+    }
+    SystemEvent localEvent{};
+    (void)effectiveSystemSecurityProfile(universe.seed(), currentSystem, timeDays, localDelta,
+                                         params.dynamicsParams, params.eventParams, &localEvent);
+
+    if (needIdFix) {
+      for (std::size_t i = 0; i < ioSave.missionOffers.size(); ++i) {
+        if (ioSave.missionOffers[i].id != 0) continue;
+        ioSave.missionOffers[i].id = stableMissionOfferId(boardSeed, i);
+      }
+    }
+
+    applyPriorityContractsToOffers(ioSave.missionOffers, localEvent, boardSeed, timeDays);
+    return;
+  }
 
   ioSave.missionOffersStationId = dockedStation.id;
   ioSave.missionOffersDayStamp = dayStamp;
   ioSave.missionOffers.clear();
 
-  core::SplitMix64 mrng(missionBoardSeed(dockedStation.id, dayStamp, dockedStation.factionId));
+  core::SplitMix64 mrng(boardSeed);
 
   auto candidates = universe.queryNearby(currentSystem.stub.posLy, params.searchRadiusLy, params.maxCandidates);
   std::vector<SystemStub> dests;
@@ -269,9 +503,10 @@ void refreshMissionOffers(Universe& universe,
   };
 
   const auto* localDelta = deltaForSystem(currentSystem.stub.id);
+  SystemEvent localEvent{};
   SystemSecurityProfile localSec =
       effectiveSystemSecurityProfile(universe.seed(), currentSystem, timeDays, localDelta,
-                                     params.dynamicsParams, params.eventParams);
+                                     params.dynamicsParams, params.eventParams, &localEvent);
 
   const FactionProfile issuerTraits = factionProfile(universe.seed(), dockedStation.factionId);
 
@@ -452,7 +687,6 @@ void refreshMissionOffers(Universe& universe,
     }
 
     Mission m{};
-    m.id = 0; // offers are not persisted as "accepted" missions
     m.factionId = dockedStation.factionId;
     m.fromSystem = currentSystem.stub.id;
     m.fromStation = dockedStation.id;
@@ -1008,8 +1242,18 @@ void refreshMissionOffers(Universe& universe,
     }
 
     m.reward *= repScale;
+
+    // Give every offer a deterministic non-zero ID. This prevents briefing/contract
+    // codes from collapsing to a single repeated value when offers are cached across
+    // save/load or revisited in the same in-game day.
+    m.id = stableMissionOfferId(boardSeed, ioSave.missionOffers.size());
+
     ioSave.missionOffers.push_back(std::move(m));
   }
+
+  // Mark a small number of offers as PRIORITY contracts when a system event is active.
+  // This happens *after* offer generation so we can choose the best-fitting types.
+  applyPriorityContractsToOffers(ioSave.missionOffers, localEvent, boardSeed, timeDays);
 }
 
 bool acceptMissionOffer(Universe& universe,

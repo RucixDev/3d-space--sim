@@ -91,6 +91,7 @@
 #include "stellar/sim/IndustryService.h"
 #include "stellar/sim/ShipyardService.h"
 #include "stellar/sim/TradeScanner.h"
+#include "stellar/sim/TradeLoopScanner.h"
 #include "stellar/sim/Ship.h"
 #include "stellar/sim/ShipLoadout.h"
 #include "stellar/sim/Combat.h"
@@ -100,6 +101,7 @@
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
 #include "stellar/sim/NavAssistComputer.h"
+#include "stellar/sim/SalvageSweep.h"
 #include "stellar/sim/SupercruiseComputer.h"
 #include "stellar/sim/Interdiction.h"
 #include "stellar/sim/EncounterDirector.h"
@@ -209,6 +211,8 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -669,6 +673,58 @@ enum class TargetKind : int {
 struct Target {
   TargetKind kind{TargetKind::None};
   std::size_t index{0}; // index into the relevant list for kind (stations/planets/contacts/...) 
+};
+
+enum class FieldOpsMode : int {
+  Off = 0,
+  SalvageSweep = 1,
+  RescueAssist = 2,
+};
+
+static const char* fieldOpsModeLabel(FieldOpsMode m) {
+  switch (m) {
+    case FieldOpsMode::Off: return "Off";
+    case FieldOpsMode::SalvageSweep: return "Salvage Sweep";
+    case FieldOpsMode::RescueAssist: return "Rescue Assist";
+    default: return "?";
+  }
+}
+
+// Lightweight "Field Ops" automation state.
+// Implemented in the game layer (apps/stellar_game) but backed by deterministic
+// headless helpers in stellar::sim where possible.
+struct FieldOpsRuntimeState {
+  FieldOpsMode mode{FieldOpsMode::Off};
+
+  // UI
+  bool hudVisible{true};
+
+  // Safety behavior
+  bool pauseOnHostiles{true};
+  double hostilePauseRangeKm{140000.0};
+
+  // Salvage sweep behavior
+  bool autoDeployCargoScoop{true};
+
+  // Rescue assist behavior
+  bool autoScanDistress{true};
+
+  // Runtime status (for HUD/feedback)
+  bool paused{false};
+  std::string pauseReason;
+  core::u64 targetId{0};
+  std::string targetLabel;
+
+  // Internal timers
+  double nextAutoScanAtRealSec{0.0};
+
+  bool engagedNavAssist{false};
+
+  // Activation snapshot for summary toasts.
+  std::array<double, econ::kCommodityCount> cargoSnapshot{};
+
+  // Core selector
+  sim::SalvageSweepComputer salvage;
 };
 
 enum class ContactRole : int { Pirate=0, Trader=1, Police=2 };
@@ -2719,6 +2775,39 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   int passengerSeats = 2;
   int selectedStationIndex = 0;
 
+  // Last safe dock (for insurance respawns).
+  sim::SystemId lastSafeDockSystemId = 0;
+  sim::StationId lastSafeDockStationId = 0;
+
+  // Death / insurance rebuy overlay state.
+  struct DeathRebuyState {
+    bool active = false;
+    int selectedOption = 0;
+
+    // 0 = last docked (if known), 1 = nearest station in current system at time of death.
+    int respawnChoice = 0;
+
+    bool openStationMenuAfterRespawn = true;
+
+    double creditsBefore = 0.0;
+    double debtBefore = 0.0;
+
+    double timeDaysAtDeath = 0.0;
+    double timeRealSecAtDeath = 0.0;
+    math::Vec3d shipPosKmAtDeath{0, 0, 0};
+
+    sim::SystemId systemAtDeath{0};
+    sim::StationId nearestStationAtDeath{0};
+
+    sim::SystemId lastDockedSystem{0};
+    sim::StationId lastDockedStation{0};
+
+    std::array<sim::PlayerShipEconomyState, 3> options{};
+  };
+
+  DeathRebuyState deathRebuy{};
+  bool autoRebuyOnDeath = false;
+
   // Ship meta / progression
   double fuel = 45.0;
   double fuelMax = 45.0;
@@ -2747,6 +2836,405 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   bool missionTrackerAutoPlotNextLeg = true;
   bool objectiveHudEnabled = true; // overlay showing tracked mission objective in-flight
   std::unordered_map<core::u32, double> repByFaction;
+
+  // ---------------------------------------------------------------------------
+  // Progression (feedback + unlock gating)
+  // ---------------------------------------------------------------------------
+  struct UnlockReq {
+    double creditsHighWaterCr = 0.0;
+    double repHighWater = 0.0;
+  };
+
+  // Ship hull unlocks (also require the actual purchase cost to buy).
+  const UnlockReq unlockHaulerHull{7000.0, 8.0};
+  const UnlockReq unlockFighterHull{16000.0, 20.0};
+
+  // Core module tier license (thrusters/shields/distributor).
+  // Index by Mk (0..3) for convenience; only Mk2/Mk3 are gated.
+  const std::array<UnlockReq, 4> unlockCoreMk{{
+    UnlockReq{0.0, 0.0},  // Mk0 (unused)
+    UnlockReq{0.0, 0.0},  // Mk1 (starter)
+    UnlockReq{6000.0, 6.0},   // Mk2
+    UnlockReq{14000.0, 18.0}, // Mk3
+  }};
+
+  // Optional modules.
+  const std::array<UnlockReq, 4> unlockSmuggleHoldMk{{
+    UnlockReq{0.0, 0.0},      // Mk0 (none)
+    UnlockReq{5000.0, 5.0},   // Mk1
+    UnlockReq{9000.0, 12.0},  // Mk2
+    UnlockReq{15000.0, 22.0}, // Mk3
+  }};
+  const std::array<UnlockReq, 4> unlockFuelScoopMk{{
+    UnlockReq{0.0, 0.0},       // Mk0 (none)
+    UnlockReq{5000.0, 6.0},    // Mk1
+    UnlockReq{10000.0, 14.0},  // Mk2
+    UnlockReq{18000.0, 28.0},  // Mk3
+  }};
+
+// Weapons (license gating for advanced weapons; starter weapons remain unlocked).
+// Bit i corresponds to WeaponType i.
+const core::u32 kStarterWeaponMask =
+    (1u << static_cast<core::u32>(WeaponType::BeamLaser)) |
+    (1u << static_cast<core::u32>(WeaponType::Cannon));
+
+const std::array<UnlockReq, 7> unlockWeapon{{
+  UnlockReq{0.0, 0.0},       // Beam Laser (starter)
+  UnlockReq{4500.0, 5.0},    // Pulse Laser
+  UnlockReq{0.0, 0.0},       // Cannon (starter)
+  UnlockReq{9000.0, 12.0},   // Railgun
+  UnlockReq{5000.0, 6.0},    // Mining Laser
+  UnlockReq{13000.0, 18.0},  // Homing Missile
+  UnlockReq{17000.0, 26.0},  // Radar Missile
+}};
+static_assert(std::size(kWeaponDefs) == unlockWeapon.size(), "unlockWeapon must match kWeaponDefs");
+
+
+  struct ProgressionUnlockState {
+    double creditsHighWaterCr = 0.0; // monotonic high-water mark
+    double repHighWater = 0.0;       // monotonic high-water mark (max positive rep)
+
+    // Bit i corresponds to ShipHullClass i.
+    core::u32 unlockedHullMask = 1u; // Scout always unlocked
+
+    core::u8 unlockedCoreMk = 1;        // 1..3
+    core::u8 unlockedSmuggleHoldMk = 0; // 0..3
+    core::u8 unlockedFuelScoopMk = 0;   // 0..3
+
+    core::u32 unlockedWeaponMask = kStarterWeaponMask;
+
+    bool isHullUnlocked(ShipHullClass hc) const {
+      const core::u32 bit = 1u << static_cast<core::u32>(hc);
+      return (unlockedHullMask & bit) != 0;
+    }
+
+    void unlockHull(ShipHullClass hc) {
+      unlockedHullMask |= (1u << static_cast<core::u32>(hc));
+    }
+
+    bool isWeaponUnlocked(WeaponType wt) const {
+      const core::u32 bit = 1u << static_cast<core::u32>(wt);
+      return (unlockedWeaponMask & bit) != 0;
+    }
+
+    void unlockWeapon(WeaponType wt) {
+      unlockedWeaponMask |= (1u << static_cast<core::u32>(wt));
+    }
+  };
+
+  ProgressionUnlockState progression{};
+
+  // Progression feedback: we aggregate credit/rep deltas into a small, readable stream.
+  struct ProgressionFeedbackState {
+    bool creditToasts = true;
+    bool repToasts = true;
+    bool unlockToasts = true;
+
+    // Feed (HUD + history) for progression events.
+    bool feedHistory = true;
+    bool feedHud = true;
+    bool feedCredits = true;
+    bool feedRep = true;
+    bool feedUnlocks = true;
+
+    int feedHudMaxLines = 4;
+    double feedHudTtlSec = 6.0;
+    std::size_t feedCap = 160;
+
+    enum class FeedKind : core::u8 { Credits, Rep, Unlock };
+
+    struct FeedEvent {
+      FeedKind kind = FeedKind::Credits;
+      double timeRealSec = 0.0;
+      double timeDays = 0.0;
+
+      long long creditsDelta = 0; // for credits
+      core::u32 factionId = 0;    // for rep
+      double repDelta = 0.0;      // for rep
+      std::string text;           // for unlocks / generic messages
+    };
+
+    std::deque<FeedEvent> feed;
+
+    // Session totals since last load/new game.
+    double sessionCreditsIn = 0.0;
+    double sessionCreditsOut = 0.0;
+    std::unordered_map<core::u32, double> sessionRepNet;
+    core::u32 sessionUnlockCount = 0;
+
+    void pushFeedEvent(FeedEvent e) {
+      if (!feedHistory) return;
+      feed.push_front(std::move(e));
+      while (feed.size() > feedCap) feed.pop_back();
+    }
+
+    // Credit delta aggregation.
+    double lastCreditsSample = 0.0;
+    double creditsAccum = 0.0;
+    double creditsLastChangeRealSec = 0.0;
+    double creditsQuietDelaySec = 0.35;
+    double creditsMinAbsToast = 1.0;
+
+    // Rep delta aggregation.
+    std::unordered_map<core::u32, double> repAccum;
+    double repLastChangeRealSec = 0.0;
+    double repQuietDelaySec = 0.45;
+    double repMinAbsToast = 0.05;
+
+    // For UI/debug: a short history of recent unlocks.
+    std::deque<std::string> recentUnlocks;
+
+    // Suppression window used after load / new game to avoid noisy spam.
+    double suppressToastsUntilRealSec = 0.0;
+
+    void clearAndReseed(double nowRealSec, double creditsNow) {
+      lastCreditsSample = creditsNow;
+      creditsAccum = 0.0;
+      creditsLastChangeRealSec = nowRealSec;
+
+      repAccum.clear();
+      repLastChangeRealSec = nowRealSec;
+
+      recentUnlocks.clear();
+
+      feed.clear();
+      sessionCreditsIn = 0.0;
+      sessionCreditsOut = 0.0;
+      sessionRepNet.clear();
+      sessionUnlockCount = 0;
+
+      suppressToastsUntilRealSec = nowRealSec + 0.60;
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Progression guidance: "what should I unlock next?"
+  // ---------------------------------------------------------------------------
+  enum class ProgressionGoal : int {
+    None = 0,
+    Auto = 1,
+    HaulerHull,
+    FighterHull,
+    CoreMk2,
+    CoreMk3,
+    SmuggleMk1,
+    SmuggleMk2,
+    SmuggleMk3,
+    FuelMk1,
+    FuelMk2,
+    FuelMk3,
+    WeaponPulseLaser,
+    WeaponMiningLaser,
+    WeaponRailgun,
+    WeaponHomingMissile,
+    WeaponRadarMissile,
+  };
+
+  struct ProgressionGuidanceState {
+    // Always-visible mini tracker that points at the next unlock milestone.
+    bool goalHud = true;
+    ProgressionGoal goal = ProgressionGoal::Auto;
+
+    // Optional: a tiny timeline for "progress feels" feedback.
+    bool timelineRecord = true;
+    int timelineMaxSamples = 240;        // ~4 minutes at 1Hz
+    double timelineSamplePeriodSec = 1.0;
+    double timelineNextSampleRealSec = 0.0;
+
+    std::vector<float> timelineCredits;
+    std::vector<float> timelineCreditsHighWater;
+    std::vector<float> timelineRepHighWater;
+    std::vector<float> timelineGoalProgress;
+    int timelineHead = 0;
+    int timelineCount = 0;
+
+    ProgressionGoal lastResolvedGoal = ProgressionGoal::None;
+
+    void clearTimeline() {
+      timelineCredits.clear();
+      timelineCreditsHighWater.clear();
+      timelineRepHighWater.clear();
+      timelineGoalProgress.clear();
+      timelineHead = 0;
+      timelineCount = 0;
+    }
+
+    void ensureTimelineSize() {
+      const int n = std::clamp(timelineMaxSamples, 32, 4096);
+      if ((int)timelineCredits.size() == n &&
+          (int)timelineCreditsHighWater.size() == n &&
+          (int)timelineRepHighWater.size() == n &&
+          (int)timelineGoalProgress.size() == n) {
+        return;
+      }
+      timelineCredits.assign(n, 0.0f);
+      timelineCreditsHighWater.assign(n, 0.0f);
+      timelineRepHighWater.assign(n, 0.0f);
+      timelineGoalProgress.assign(n, 0.0f);
+      timelineHead = 0;
+      timelineCount = 0;
+    }
+
+    void pushTimeline(float creditsNow, float creditsHW, float repHW, float goalP) {
+      if (!timelineRecord) return;
+      ensureTimelineSize();
+      const int n = (int)timelineCredits.size();
+      if (n <= 0) return;
+
+      timelineCredits[timelineHead] = creditsNow;
+      timelineCreditsHighWater[timelineHead] = creditsHW;
+      timelineRepHighWater[timelineHead] = repHW;
+      timelineGoalProgress[timelineHead] = goalP;
+
+      timelineHead = (timelineHead + 1) % n;
+      timelineCount = std::min(timelineCount + 1, n);
+    }
+  };
+
+  ProgressionGuidanceState progGuide{};
+
+  ProgressionFeedbackState progFeed{};
+  progFeed.lastCreditsSample = credits;
+  progGuide.timelineNextSampleRealSec = timeRealSec + progGuide.timelineSamplePeriodSec;
+
+  // Seed progression with the starter ship + starting credits.
+  progression.creditsHighWaterCr = credits;
+  progression.repHighWater = 0.0;
+  progression.unlockedHullMask |= 1u; // Scout always
+  progression.unlockHull(shipHullClass);
+
+  {
+    const int coreMkInitial = std::max(thrusterMk, std::max(shieldMk, distributorMk));
+    progression.unlockedCoreMk = static_cast<core::u8>(std::clamp(coreMkInitial, 1, 3));
+  }
+  progression.unlockedSmuggleHoldMk = static_cast<core::u8>(std::clamp(smuggleHoldMk, 0, 3));
+  progression.unlockedFuelScoopMk = static_cast<core::u8>(std::clamp(fuelScoopMk, 0, 3));
+
+progression.unlockedWeaponMask |= kStarterWeaponMask;
+progression.unlockWeapon(weaponPrimary);
+progression.unlockWeapon(weaponSecondary);
+
+
+  // Goal / guidance helpers (kept data-driven so we can expand milestones cheaply).
+  const std::array<ProgressionGoal, 15> progressionGoalList = {
+    ProgressionGoal::HaulerHull,
+    ProgressionGoal::CoreMk2,
+    ProgressionGoal::WeaponPulseLaser,
+    ProgressionGoal::WeaponMiningLaser,
+    ProgressionGoal::SmuggleMk1,
+    ProgressionGoal::FuelMk1,
+    ProgressionGoal::FighterHull,
+    ProgressionGoal::CoreMk3,
+    ProgressionGoal::WeaponRailgun,
+    ProgressionGoal::SmuggleMk2,
+    ProgressionGoal::FuelMk2,
+    ProgressionGoal::WeaponHomingMissile,
+    ProgressionGoal::SmuggleMk3,
+    ProgressionGoal::FuelMk3,
+    ProgressionGoal::WeaponRadarMissile,
+  };
+
+  auto goalName = [&](ProgressionGoal g) -> const char* {
+    switch (g) {
+      case ProgressionGoal::None: return "None";
+      case ProgressionGoal::Auto: return "Auto (closest unlock)";
+      case ProgressionGoal::HaulerHull: return "Hauler hull";
+      case ProgressionGoal::FighterHull: return "Fighter hull";
+      case ProgressionGoal::CoreMk2: return "Core modules Mk2";
+      case ProgressionGoal::CoreMk3: return "Core modules Mk3";
+      case ProgressionGoal::SmuggleMk1: return "Smuggle hold Mk1";
+      case ProgressionGoal::SmuggleMk2: return "Smuggle hold Mk2";
+      case ProgressionGoal::SmuggleMk3: return "Smuggle hold Mk3";
+      case ProgressionGoal::FuelMk1: return "Fuel scoop Mk1";
+      case ProgressionGoal::FuelMk2: return "Fuel scoop Mk2";
+      case ProgressionGoal::FuelMk3: return "Fuel scoop Mk3";
+      case ProgressionGoal::WeaponPulseLaser: return "Weapon: Pulse Laser";
+      case ProgressionGoal::WeaponMiningLaser: return "Weapon: Mining Laser";
+      case ProgressionGoal::WeaponRailgun: return "Weapon: Railgun";
+      case ProgressionGoal::WeaponHomingMissile: return "Weapon: Homing Missile";
+      case ProgressionGoal::WeaponRadarMissile: return "Weapon: Radar Missile";
+      default: return "Goal";
+    }
+  };
+
+  auto goalReq = [&](ProgressionGoal g) -> UnlockReq {
+    switch (g) {
+      case ProgressionGoal::HaulerHull: return unlockHaulerHull;
+      case ProgressionGoal::FighterHull: return unlockFighterHull;
+      case ProgressionGoal::CoreMk2: return unlockCoreMk[2];
+      case ProgressionGoal::CoreMk3: return unlockCoreMk[3];
+      case ProgressionGoal::SmuggleMk1: return unlockSmuggleHoldMk[1];
+      case ProgressionGoal::SmuggleMk2: return unlockSmuggleHoldMk[2];
+      case ProgressionGoal::SmuggleMk3: return unlockSmuggleHoldMk[3];
+      case ProgressionGoal::FuelMk1: return unlockFuelScoopMk[1];
+      case ProgressionGoal::FuelMk2: return unlockFuelScoopMk[2];
+      case ProgressionGoal::FuelMk3: return unlockFuelScoopMk[3];
+      case ProgressionGoal::WeaponPulseLaser: return unlockWeapon[(int)WeaponType::PulseLaser];
+      case ProgressionGoal::WeaponMiningLaser: return unlockWeapon[(int)WeaponType::MiningLaser];
+      case ProgressionGoal::WeaponRailgun: return unlockWeapon[(int)WeaponType::Railgun];
+      case ProgressionGoal::WeaponHomingMissile: return unlockWeapon[(int)WeaponType::HomingMissile];
+      case ProgressionGoal::WeaponRadarMissile: return unlockWeapon[(int)WeaponType::RadarMissile];
+      default: return UnlockReq{0.0, 0.0};
+    }
+  };
+
+  auto isGoalUnlocked = [&](ProgressionGoal g) -> bool {
+    switch (g) {
+      case ProgressionGoal::HaulerHull: return progression.isHullUnlocked(ShipHullClass::Hauler);
+      case ProgressionGoal::FighterHull: return progression.isHullUnlocked(ShipHullClass::Fighter);
+      case ProgressionGoal::CoreMk2: return (int)progression.unlockedCoreMk >= 2;
+      case ProgressionGoal::CoreMk3: return (int)progression.unlockedCoreMk >= 3;
+      case ProgressionGoal::SmuggleMk1: return (int)progression.unlockedSmuggleHoldMk >= 1;
+      case ProgressionGoal::SmuggleMk2: return (int)progression.unlockedSmuggleHoldMk >= 2;
+      case ProgressionGoal::SmuggleMk3: return (int)progression.unlockedSmuggleHoldMk >= 3;
+      case ProgressionGoal::FuelMk1: return (int)progression.unlockedFuelScoopMk >= 1;
+      case ProgressionGoal::FuelMk2: return (int)progression.unlockedFuelScoopMk >= 2;
+      case ProgressionGoal::FuelMk3: return (int)progression.unlockedFuelScoopMk >= 3;
+      case ProgressionGoal::WeaponPulseLaser: return progression.isWeaponUnlocked(WeaponType::PulseLaser);
+      case ProgressionGoal::WeaponMiningLaser: return progression.isWeaponUnlocked(WeaponType::MiningLaser);
+      case ProgressionGoal::WeaponRailgun: return progression.isWeaponUnlocked(WeaponType::Railgun);
+      case ProgressionGoal::WeaponHomingMissile: return progression.isWeaponUnlocked(WeaponType::HomingMissile);
+      case ProgressionGoal::WeaponRadarMissile: return progression.isWeaponUnlocked(WeaponType::RadarMissile);
+      case ProgressionGoal::None: return true;
+      case ProgressionGoal::Auto: return false;
+      default: return false;
+    }
+  };
+
+  auto unlockReqProgress = [&](const UnlockReq& req) -> float {
+    const double crPct = (req.creditsHighWaterCr > 0.0)
+        ? (progression.creditsHighWaterCr / req.creditsHighWaterCr)
+        : 1.0;
+    const double repPct = (req.repHighWater > 0.0) ? (progression.repHighWater / req.repHighWater) : 1.0;
+    const double p = std::max(crPct, repPct);
+    return (float)std::clamp(p, 0.0, 1.0);
+  };
+
+  auto goalProgress = [&](ProgressionGoal g) -> float {
+    if (g == ProgressionGoal::None) return 1.0f;
+    if (g == ProgressionGoal::Auto) return 0.0f;
+    return unlockReqProgress(goalReq(g));
+  };
+
+  auto resolveAutoGoal = [&]() -> ProgressionGoal {
+    ProgressionGoal best = ProgressionGoal::None;
+    float bestP = -1.0f;
+    for (ProgressionGoal g : progressionGoalList) {
+      if (isGoalUnlocked(g)) continue;
+      const float p = goalProgress(g);
+      if (p > bestP) {
+        bestP = p;
+        best = g;
+      }
+    }
+    return best;
+  };
+
+  auto resolveGoal = [&]() -> ProgressionGoal {
+    if (progGuide.goal == ProgressionGoal::Auto) return resolveAutoGoal();
+    return progGuide.goal;
+  };
+
 
   // Smuggling / contraband legality:
   //  - Per-faction deterministic bitmask of illegal commodities
@@ -2823,6 +3311,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     bool active{false};
     core::u32 factionId{0};
     double amountCr{0.0};
+    double startDays{0.0};
     double untilDays{0.0};
     std::string sourceName;
   };
@@ -2967,8 +3456,11 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   bool tradeUseFreeHold = true;
   bool tradeIncludeSameSystem = true;
 
+  // Trade helper UI mode.
+  // 0 = Ideas (single commodity), 1 = Cargo Mix (manifest), 2 = Loops (multi-leg).
+  int tradeHelperTab = 0;
+
   // Multi-commodity trade "mix" (cargo manifest) mode.
-  bool tradeUseManifest = false;
   std::vector<sim::TradeManifestOpportunity> tradeMixIdeas;
   sim::StationId tradeMixFromStationId = 0;
   int tradeMixDayStamp = -1;
@@ -2977,6 +3469,48 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   bool tradeMixSimulateImpact = true;
   bool tradeMixBeamSearch = false;
   int tradeMixBeamWidth = 24;
+
+  // Trade loop scan mode (closed 2-3 leg loops).
+  std::vector<sim::TradeLoop> tradeLoops;
+  sim::StationId tradeLoopsFromStationId = 0;
+  int tradeLoopsDayStamp = -1;
+  int tradeLoopLegs = 2; // 2 or 3
+  double tradeLoopMinLegProfit = 0.0;
+  double tradeLoopMinLoopProfit = 0.0;
+  int tradeLoopMaxLegCandidates = 16;
+  int tradeLoopMaxResults = 12;
+  bool tradeLoopUseCreditsLimit = false; // display mode: ignore credits by default
+  double tradeLoopStepKg = 1.0;
+  bool tradeLoopSimulateImpact = true;
+  bool tradeLoopBeamSearch = false;
+  int tradeLoopBeamWidth = 24;
+
+  // Ephemeral tracked trade loop (guidance in objective HUD).
+  struct TrackedTradeLoop {
+    bool active{false};
+    sim::TradeLoop loop{};
+    int legIndex{0};
+    sim::StationId originStationId{0};
+
+    // Docking edge detection (avoid advancing every frame while docked).
+    bool lastDocked{false};
+    sim::SystemId lastDockedSystemId{0};
+    sim::StationId lastDockedStationId{0};
+
+    // Dockside automation: execute the loop's inbound sell + outbound buy when docking at
+    // the expected destination station. This is intentionally opt-in (off by default)
+    // because it spends/earns credits and changes cargo.
+    bool autoTradeOnDock{false};
+    bool autoTradeArmAutoRun{false};
+    bool autoTradeToast{true};
+
+    // Last execution summary (for HUD feedback).
+    double lastTradeTimeDays{0.0};
+    sim::StationId lastTradeStationId{0};
+    double lastTradeCreditsDelta{0.0};
+    double lastTradeSoldCr{0.0};
+    double lastTradeBoughtCr{0.0};
+  } trackedTradeLoop;
 
 
   // Docking state
@@ -3154,6 +3688,103 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   bool showWorldVisuals = false;
   bool showHangar = false;
   // controls window state lives in controlsWindow
+
+// Main Menu / Save Slots ------------------------------------------------
+// A lightweight front-end for starting/loading sessions without needing an external launcher.
+enum class MainMenuPage {
+  Root = 0,
+  NewGame = 1,
+  LoadGame = 2,
+  Options = 3,
+};
+
+bool showMainMenu = true;
+bool mainMenuWasOpen = false;
+bool mainMenuPrevPaused = false;
+MainMenuPage mainMenuPage = MainMenuPage::Root;
+
+core::u64 mainMenuSeed = seed;
+bool mainMenuUseRandomSeed = true;
+std::string mainMenuStatus{};
+double mainMenuStatusHideAtRealSec = 0.0;
+
+static constexpr int kSaveSlotCount = 5;
+const std::filesystem::path saveSlotsDir = std::filesystem::path("saves");
+auto saveSlotPath = [&](int slotIdx) -> std::filesystem::path {
+  slotIdx = std::clamp(slotIdx, 0, kSaveSlotCount - 1);
+  return saveSlotsDir / ("slot" + std::to_string(slotIdx + 1) + ".sav");
+};
+
+struct SaveSlotMeta {
+  bool exists{false};
+  bool valid{false};
+  std::filesystem::path path{};
+  core::u64 seed{0};
+  double timeDays{0.0};
+  sim::SystemId systemId{0};
+  sim::StationId dockedStation{0};
+  double credits{0.0};
+  std::filesystem::file_time_type lastWrite{};
+};
+
+std::array<SaveSlotMeta, kSaveSlotCount> saveSlotMeta{};
+bool saveSlotMetaDirty = true;
+int mainMenuSelectedSlot = 0;
+int mainMenuDeleteSlot = -1;
+
+// Pause Menu ------------------------------------------------------------
+// In-game pause overlay (ESC) with Resume / Options / Save-Load / Quit-to-menu.
+enum class PauseMenuPage {
+  Root = 0,
+  Options = 1,
+  SaveLoad = 2,
+};
+
+bool showPauseMenu = false;
+bool pauseMenuWasOpen = false;
+bool pauseMenuPrevPaused = false;
+bool pauseMenuPrevMouseSteer = false;
+bool pauseMenuSuppressedMouseSteer = false;
+PauseMenuPage pauseMenuPage = PauseMenuPage::Root;
+
+std::string pauseMenuStatus{};
+double pauseMenuStatusHideAtRealSec = 0.0;
+
+int pauseMenuSelectedSlot = 0;
+int pauseMenuDeleteSlot = -1;
+bool pauseMenuWantsQuitToMenuConfirm = false;
+
+// Station Menu ----------------------------------------------------------
+// Docked station hub overlay: Mission Board / Market-Trade / Shipyard / Warehouse / Services / Undock.
+enum class StationMenuPage {
+  Root = 0,
+  MissionBoard = 1,
+  MarketTrade = 2,
+  Shipyard = 3,
+  Warehouse = 4,
+  Services = 5,
+  ConfirmUndock = 6,
+};
+
+bool showStationMenu = false;
+StationMenuPage stationMenuPage = StationMenuPage::Root;
+bool stationMenuAutoOpenOnDock = true;
+
+// Requests used by the docked station menu to focus/scroll other windows.
+enum class MarketDetailsJumpTarget {
+  None = 0,
+  Services = 1,
+  Warehouse = 2,
+  Shipyard = 3,
+  Market = 4,
+};
+MarketDetailsJumpTarget marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
+bool focusMarketDetailsWindow = false;
+
+// Missions window: request selecting a tab next time it opens (0=Active, 1=Mission Board).
+int missionsTabRequest = -1;
+bool focusMissionsWindow = false;
+
 
   // HUD overlays
   bool showRadarHud = true;
@@ -3504,6 +4135,9 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   bool navAssistDisengageOnManualInput = true;
   double navAssistManualDeadzone = 0.20;
 
+  // Field Ops automation (salvage sweep / rescue assist).
+  FieldOpsRuntimeState fieldOps;
+
   // Local reference frame ("space is local" feel near moving bodies)
   bool localFrameEnabled = true;
   math::Vec3d localFrameVelKmS{0,0,0};
@@ -3666,6 +4300,8 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   // Persistent notification history (auto-filled via the `toast()` helper).
   std::deque<ToastHistoryEntry> toastHistory;
   bool showNotifications = false;
+  bool showProgressionWindow = false;
+  bool showFactionsWindow = false;
   int notificationsSelected = -1;
   char notificationsFilter[128]{};
 
@@ -3673,6 +4309,17 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   sim::CommsLog commsLog;
   game::CommsOverlayState commsOverlay;
   game::CommsWindowState commsWindow;
+
+  // GalNet: persistent watchlist of systems to receive system-event bulletins for.
+  // This list is saved/loaded via SaveGame.
+  std::vector<sim::SystemId> galNetWatchSystems;
+
+  struct GalNetAnnounceState {
+    double lastCycleStartDay{-1.0};
+    bool lastCycleHadActiveEvent{false};
+  };
+  std::unordered_map<sim::SystemId, GalNetAnnounceState> galNetAnnouncedBySystem;
+  int galNetLastWatchScanCycleStamp = 0;
 
   auto pushTransmission = [&](sim::CommsMessage msg, bool showOverlay = true) {
     const core::u64 id = commsLog.push(std::move(msg));
@@ -3688,6 +4335,144 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   std::vector<game::ActionWheelItem> actionWheelItems;
   bool actionWheelPrevMouseSteer = false;
   bool actionWheelSuppressedMouseSteer = false;
+
+
+// ------------------------------------------------------------------
+// Field Ops helpers
+// ------------------------------------------------------------------
+auto fieldOpsSummarizeCargoDelta = [&](const std::array<double, econ::kCommodityCount>& before) -> std::string {
+  std::string out;
+  int shown = 0;
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    const double d = cargo[i] - before[i];
+    if (d <= 0.5) continue;
+    const auto cid = (econ::CommodityId)i;
+    const auto def = econ::commodityDef(cid);
+    if (!out.empty()) out += ", ";
+    out += fmt::format("{} +{}u", def.name, (long long)std::llround(d));
+    shown++;
+    if (shown >= 3) break;
+  }
+  if (shown >= 3) out += ", ...";
+  return out;
+};
+
+auto fieldOpsStop = [&](std::string reason, bool allowSummary = true) {
+  if (fieldOps.mode == FieldOpsMode::Off) return;
+
+  const FieldOpsMode prev = fieldOps.mode;
+
+  fieldOps.mode = FieldOpsMode::Off;
+  fieldOps.paused = false;
+  fieldOps.pauseReason.clear();
+  fieldOps.targetId = 0;
+  fieldOps.targetLabel.clear();
+  fieldOps.nextAutoScanAtRealSec = 0.0;
+  fieldOps.engagedNavAssist = false;
+
+  // If the player toggled automation off mid-scan, don't leave the scan state hanging.
+  if (scanning) {
+    scanning = false;
+    scanProgressSec = 0.0;
+    scanLockedTarget = {};
+    scanLockedId = 0;
+    scanLabel.clear();
+  }
+
+  // Disengage nav assist so the player gets immediate manual control back.
+  if (navAssist.active()) {
+    navAssist.disengage();
+    navAssistLast = {};
+  }
+
+  fieldOps.salvage.reset();
+
+  if (!reason.empty()) {
+    if (allowSummary && prev == FieldOpsMode::SalvageSweep) {
+      const std::string delta = fieldOpsSummarizeCargoDelta(fieldOps.cargoSnapshot);
+      if (!delta.empty()) reason += " • " + delta;
+    }
+    toast(toasts, reason, 2.4);
+  }
+};
+
+auto fieldOpsCanEngage = [&]() -> bool {
+  if (docked) {
+    toast(toasts, "Field Ops unavailable while docked.", 2.0);
+    return false;
+  }
+  if (fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle) {
+    toast(toasts, "Field Ops unavailable in supercruise/FSD.", 2.0);
+    return false;
+  }
+  if (!currentSystem) {
+    toast(toasts, "Field Ops unavailable: no system loaded.", 2.0);
+    return false;
+  }
+  return true;
+};
+
+auto fieldOpsStart = [&](FieldOpsMode m, std::string onToast) {
+  if (!fieldOpsCanEngage()) return;
+
+  // Stop any other mode first (silently).
+  fieldOpsStop(std::string(), /*allowSummary=*/false);
+
+  // Docking computer and Field Ops fight for control; always disengage docking.
+  if (autopilot) {
+    autopilot = false;
+    dockingComputer.reset();
+  }
+  if (navAutoRun) {
+    navAutoRun = false;
+    toast(toasts, "Auto-run canceled (Field Ops engaged).", 2.0);
+  }
+
+  fieldOps.mode = m;
+  fieldOps.paused = false;
+  fieldOps.pauseReason.clear();
+  fieldOps.targetId = 0;
+  fieldOps.targetLabel.clear();
+  fieldOps.nextAutoScanAtRealSec = 0.0;
+  fieldOps.engagedNavAssist = false;
+
+  fieldOps.cargoSnapshot = cargo;
+
+  // Tune the default selector params a bit for in-game scales.
+  sim::SalvageSweepParams sp = fieldOps.salvage.params();
+  sp.distScaleKm = 85000.0;
+  sp.valueScaleCr = 6000.0;
+  sp.missionBonus = 0.85;
+  fieldOps.salvage.setParams(sp);
+  fieldOps.salvage.reset();
+
+  toast(toasts, std::move(onToast), 2.2);
+};
+
+auto toggleFieldOpsSalvageSweep = [&]() {
+  if (fieldOps.mode == FieldOpsMode::SalvageSweep) {
+    fieldOpsStop("Field Ops: Salvage Sweep OFF");
+  } else {
+    fieldOpsStart(FieldOpsMode::SalvageSweep, "Field Ops: Salvage Sweep ON");
+  }
+};
+
+auto toggleFieldOpsRescueAssist = [&]() {
+  if (fieldOps.mode == FieldOpsMode::RescueAssist) {
+    fieldOpsStop("Field Ops: Rescue Assist OFF");
+  } else {
+    fieldOpsStart(FieldOpsMode::RescueAssist, "Field Ops: Rescue Assist ON");
+  }
+};
+
+auto fieldOpsSkipTarget = [&]() {
+  if (fieldOps.mode != FieldOpsMode::SalvageSweep || fieldOps.targetId == 0) {
+    toast(toasts, "No salvage target to skip.", 1.6);
+    return;
+  }
+  fieldOps.salvage.skip(fieldOps.targetId, timeRealSec);
+  toast(toasts, "Salvage sweep: skipped current target.", 1.8);
+};
 
   // Wire the toast history sink now that timeDays + storage exist.
   setToastHistorySink(&toastHistory, &timeDays);
@@ -3845,6 +4630,12 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"Notifications", "Notifications", "UI", 80, false, true}, &showNotifications,
                                 {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Progression", "Progression", "UI", 80, false, true}, &showProgressionWindow,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"Factions", "Factions / Standing", "UI", 80, false, true}, &showFactionsWindow,
+                                {}, {}, {}});
+
+
     uiWindows.add(WindowBinding{WindowDesc{"Comms", "Comms / Inbox", "UI", 80, false, true}, &commsWindow.open,
                                 {}, {}, {}});
 
@@ -3887,7 +4678,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     uiWindows.add(WindowBinding{WindowDesc{"TrafficLanes", "Traffic Lanes", "Tools", 55, false, true}, &trafficLanesWindow.open,
                                 {}, {}, {}});
 
-    uiWindows.add(WindowBinding{WindowDesc{"SystemConditions", "System Conditions", "Tools", 55, false, true}, &systemConditionsWindow.open,
+    uiWindows.add(WindowBinding{WindowDesc{"SystemConditions", "GalNet", "Gameplay", 55, false, true}, &systemConditionsWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
@@ -4256,6 +5047,91 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   galaxySelectedSystemId = currentSystem->stub.id;
 
+
+  auto findStationIndexById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> int {
+    for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+      if (sys.stations[i].id == stationId) return (int)i;
+    }
+    return -1;
+  };
+
+  auto stationNameById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> std::string {
+    const int idx = findStationIndexById(sys, stationId);
+    if (idx >= 0) return sys.stations[(std::size_t)idx].name;
+    return "Station " + std::to_string((core::u64)stationId);
+  };
+
+  // Respawn docked at a station (used by the insurance rebuy flow).
+  // This resets transient in-space state and deterministically reseeds system signals/asteroids,
+  // avoiding "zombie" missiles, beams, scans, etc that can otherwise linger across a hard reset.
+  auto respawnDockedAtStation = [&](sim::SystemId systemId, sim::StationId stationId) {
+    const auto& sys = universe.getSystem(systemId);
+    currentStub = sys.stub;
+    currentSystem = &sys;
+
+    // Reset transient in-space state; then deterministically reseed the system.
+    clearances.clear();
+    contacts.clear();
+    beams.clear();
+    projectiles.clear();
+    missiles.clear();
+    floatingCargo.clear();
+
+    // Signals/asteroids are re-seeded deterministically.
+    signals.clear();
+    asteroids.clear();
+    resourceFieldSites.clear();
+    resourceFieldIndexById.clear();
+
+    // Clear combat / navigation transient state.
+    interdiction = sim::InterdictionState{};
+    interdictionSubmitRequested = false;
+    interdictionPirateName.clear();
+    scanning = false;
+    scanProgressSec = 0.0;
+    fsdState = FsdState::Idle;
+    fsdTargetSystem = 0;
+    fsdChargeRemainingSec = 0.0;
+    fsdTravelRemainingSec = 0.0;
+    fsdTravelTotalSec = 0.0;
+    supercruiseState = SupercruiseState::Idle;
+    supercruiseChargeRemainingSec = 0.0;
+    supercruiseCooldownRemainingSec = 0.0;
+    supercruiseDropRequested = false;
+    navAutoRun = false;
+    autopilot = false;
+    selectedStationIndex = 0;
+
+    seedSystemSpaceObjects(*currentSystem);
+    syncTrafficConvoySignals(*currentSystem);
+    nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
+
+    galaxySelectedSystemId = currentSystem->stub.id;
+
+    // Choose station index (fallback to first).
+    int stIdx = findStationIndexById(*currentSystem, stationId);
+    if (stIdx < 0) stIdx = (!currentSystem->stations.empty() ? 0 : -1);
+    if (stIdx >= 0) {
+      stationId = currentSystem->stations[(std::size_t)stIdx].id;
+      selectedStationIndex = stIdx;
+
+      // Spawn near the station, then mark as docked so the normal docking snap logic takes over next tick.
+      respawnNearStation(*currentSystem, (std::size_t)stIdx);
+
+      docked = true;
+      dockedPad = 0;
+      dockedStationId = stationId;
+
+      lastSafeDockSystemId = currentSystem->stub.id;
+      lastSafeDockStationId = dockedStationId;
+    } else {
+      docked = false;
+      dockedStationId = 0;
+      dockedPad = 0;
+      respawnNearStation(*currentSystem, 0);
+    }
+  };
+
   auto findFaction = [&](core::u32 factionId) -> const sim::Faction* {
     for (const auto& f : universe.factions()) {
       if (f.id == factionId) return &f;
@@ -4269,6 +5145,199 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
     return "Faction " + std::to_string(factionId);
   };
 
+  // --- GalNet bulletins ------------------------------------------------------
+  auto systemEventKindLabel = [](sim::SystemEventKind kind) -> const char* {
+    switch (kind) {
+      case sim::SystemEventKind::TradeBoom:
+        return "Trade Boom";
+      case sim::SystemEventKind::TradeBust:
+        return "Trade Bust";
+      case sim::SystemEventKind::PirateRaid:
+        return "Pirate Raid";
+      case sim::SystemEventKind::CivilUnrest:
+        return "Civil Unrest";
+      case sim::SystemEventKind::SecurityCrackdown:
+        return "Security Crackdown";
+      case sim::SystemEventKind::ResearchBreakthrough:
+        return "Research Breakthrough";
+      case sim::SystemEventKind::None:
+      default:
+        return "None";
+    }
+  };
+
+  auto systemEventKindTip = [](sim::SystemEventKind kind) -> const char* {
+    switch (kind) {
+      case sim::SystemEventKind::TradeBoom:
+        return "Higher traffic and more lawful activity; good time for honest trade routes.";
+      case sim::SystemEventKind::TradeBust:
+        return "Thin margins and jittery markets; expect fewer traders and rougher deals.";
+      case sim::SystemEventKind::PirateRaid:
+        return "Pirates are active; keep your shields up and consider escorts.";
+      case sim::SystemEventKind::CivilUnrest:
+        return "Unpredictable conditions; opportunists and agitators may be active.";
+      case sim::SystemEventKind::SecurityCrackdown:
+        return "Increased patrol presence; illegal cargo and wanted pilots face more scrutiny.";
+      case sim::SystemEventKind::ResearchBreakthrough:
+        return "Experimental traffic and unusual activity; keep an eye out for odd signals.";
+      case sim::SystemEventKind::None:
+      default:
+        return "";
+    }
+  };
+
+  auto publishGalNetBulletin = [&](sim::SystemId systemId,
+                                   bool showOverlay,
+                                   bool showToast,
+                                   bool allowWhenNoEvent,
+                                   std::string_view contextTag) -> bool {
+    if (systemId == 0) return false;
+
+    const sim::StarSystem& sys = universe.getSystem(systemId);
+    const auto snap = snapshotSystemConditions(sys);
+
+    if (!snap.event.active && !allowWhenNoEvent) return false;
+
+    const auto pct = [](double x) -> int {
+      return (int)std::lround(std::clamp(x, 0.0, 1.0) * 100.0);
+    };
+
+    const int baseSec = pct(snap.base.security01);
+    const int effSec = pct(snap.effective.security01);
+    const int basePir = pct(snap.base.piracy01);
+    const int effPir = pct(snap.effective.piracy01);
+    const int baseTrf = pct(snap.base.traffic01);
+    const int effTrf = pct(snap.effective.traffic01);
+
+    const int dSec = effSec - baseSec;
+    const int dPir = effPir - basePir;
+    const int dTrf = effTrf - baseTrf;
+
+    const double remainingDays = std::max(0.0, snap.event.endDay - timeDays);
+    const int remainingHours = (int)std::ceil(remainingDays * 24.0);
+    std::string endsIn;
+    if (remainingHours < 48) {
+      endsIn = std::to_string(remainingHours) + "h";
+    } else {
+      endsIn = std::to_string((int)std::ceil(remainingDays)) + "d";
+    }
+
+    const char* eventLabel = systemEventKindLabel(snap.event.kind);
+    const char* tip = systemEventKindTip(snap.event.kind);
+
+    sim::CommsChannel channel = sim::CommsChannel::System;
+    if (snap.event.active) {
+      switch (snap.event.kind) {
+        case sim::SystemEventKind::TradeBoom:
+        case sim::SystemEventKind::TradeBust:
+          channel = sim::CommsChannel::Trade;
+          break;
+        case sim::SystemEventKind::PirateRaid:
+          channel = sim::CommsChannel::Pirate;
+          break;
+        case sim::SystemEventKind::SecurityCrackdown:
+          channel = sim::CommsChannel::Security;
+          break;
+        case sim::SystemEventKind::CivilUnrest:
+        case sim::SystemEventKind::ResearchBreakthrough:
+        case sim::SystemEventKind::None:
+        default:
+          channel = sim::CommsChannel::System;
+          break;
+      }
+    }
+
+    std::string subject;
+    if (snap.event.active) {
+      subject = std::string("GalNet: ") + eventLabel + " — " + sys.stub.name;
+    } else {
+      subject = std::string("GalNet: System status update — ") + sys.stub.name;
+    }
+
+    std::string body;
+    if (!contextTag.empty()) {
+      body += std::string(contextTag);
+      body += "\n\n";
+    }
+
+    body += "System: " + sys.stub.name + "\n";
+    if (snap.base.controllingFactionId != 0) {
+      const auto fn = factionName(snap.base.controllingFactionId);
+      if (!fn.empty()) {
+        body += "Controlling faction: " + fn + "\n";
+      }
+    }
+
+    if (snap.event.active) {
+      body += "Event: " + std::string(eventLabel) + "\n";
+      body += "Severity: " +
+              std::to_string((int)std::lround(std::clamp(snap.event.severity01, 0.0, 1.0) * 100.0)) +
+              "%\n";
+      body += "Ends in: " + endsIn + "\n\n";
+    } else {
+      body += "Event: None\n";
+      body += "Cycle ends in: " + endsIn + "\n\n";
+    }
+
+    auto fmtDelta = [](int d) -> std::string {
+      if (d == 0) return "0";
+      return (d > 0 ? "+" : "") + std::to_string(d);
+    };
+
+    body += "Conditions:\n";
+    body += "  Security: " + std::to_string(effSec) + "% (" + fmtDelta(dSec) + "%)\n";
+    body += "  Piracy: " + std::to_string(effPir) + "% (" + fmtDelta(dPir) + "%)\n";
+    body += "  Traffic: " + std::to_string(effTrf) + "% (" + fmtDelta(dTrf) + "%)\n";
+
+    {
+      const std::string econLine = sim::systemEventEconomySummary(snap.event);
+      if (!econLine.empty()) {
+        body += "\n";
+        body += econLine;
+        body += "\n";
+      }
+    }
+
+
+    if (snap.event.active && tip && tip[0] != 0) {
+      body += "\nTip: ";
+      body += tip;
+      body += "\n";
+    }
+
+    sim::CommsMessage m{};
+    m.timeDays = timeDays;
+    m.channel = channel;
+    m.from = "GalNet";
+    m.subject = std::move(subject);
+    m.body = std::move(body);
+    m.systemId = systemId;
+    m.factionId = snap.base.controllingFactionId;
+    m.importance01 = snap.event.active ? std::clamp(snap.event.severity01, 0.0, 1.0) : 0.25;
+
+    pushTransmission(m, showOverlay);
+
+    if (showToast) {
+      toast(toasts, "GalNet bulletin received.", 2.0);
+    }
+
+    // Also log to the Integration Hub timeline (helps tie events to player decisions).
+    game::hubPushEvent(
+        integrationHubWindow,
+        game::GameEvent{timeRealSec,
+                        timeDays,
+                        game::GameEventKind::Gameplay,
+                        "GalNet",
+                        ui::stripMarkup(m.subject),
+                        /*important*/ (m.importance01 >= 0.75),
+                        ship.positionKm(),
+                        /*refA*/ (core::u64)systemId,
+                        /*refB*/ 0});
+
+    return true;
+  };
+
+
   auto getRep = [&](core::u32 factionId) -> double {
     auto it = repByFaction.find(factionId);
     return it == repByFaction.end() ? 0.0 : it->second;
@@ -4276,6 +5345,13 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   auto addRep = [&](core::u32 factionId, double delta) {
     if (factionId == 0) return;
+
+    if (std::abs(delta) > 1e-9) {
+      progFeed.repAccum[factionId] += delta;
+      progFeed.repLastChangeRealSec = timeRealSec;
+      progFeed.sessionRepNet[factionId] += delta;
+    }
+
     repByFaction[factionId] = clampRep(getRep(factionId) + delta);
   };
 
@@ -4520,6 +5596,271 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
 
   auto effectiveFeeRate = [&](const sim::Station& st) -> double {
     return applyRepToFee(st.feeRate, getRep(st.factionId));
+  };
+
+
+  // --- Docking access gating (reputation / law) ------------------------------
+  // Stations can deny docking clearance if you are hostile to their faction or
+  // if you have an outstanding bounty. This gives reputation / crime tangible
+  // gameplay impact while keeping escape valves so the player isn't soft-locked.
+  struct DockingAccessCheck {
+    bool blocked{false};
+    bool byBounty{false};
+    bool byRep{false};
+    core::u32 factionId{0};
+    double rep{0.0};
+    double bountyCr{0.0};
+
+    // Bribe override (temporary clearance purchase).
+    bool bribeActive{false};
+    double bribeLeftSec{0.0};
+
+    bool allowed() const { return !blocked || bribeActive; }
+  };
+
+  // Tuning knobs (prototype values).
+  const double kDockDenyRep = -12.0;
+  const double kDockDenyBountyMinCr = 1.0;
+
+  const double kRemoteSettlementFeeBase = 0.18; // +18% base fee to pay remotely
+  const double kRemoteSettlementFeeMin = 0.10;
+  const double kRemoteSettlementFeeMax = 0.45;
+
+  const double kDockingBribeBaseCr = 350.0;
+  const double kDockingBribeDurationSec = 6.0 * 60.0;
+  const double kDockingBribeMinGrantProb = 0.96;
+
+  // Runtime state (not saved): stationId -> days until a purchased clearance override expires.
+  std::unordered_map<sim::StationId, double> dockingBribeUntilDays;
+  // Spam protection for repeated auto-requests.
+  std::unordered_map<sim::StationId, double> dockingDeniedToastCooldownUntilDays;
+
+  auto dockingBribeActive = [&](sim::StationId stationId) -> bool {
+    auto it = dockingBribeUntilDays.find(stationId);
+    return it != dockingBribeUntilDays.end() && timeDays <= it->second;
+  };
+
+  auto dockingAccessCheck = [&](const sim::Station& st) -> DockingAccessCheck {
+    DockingAccessCheck c{};
+    c.factionId = st.factionId;
+    if (c.factionId == 0) return c;
+
+    c.rep = getRep(c.factionId);
+    c.bountyCr = getBounty(c.factionId);
+
+    if (c.bountyCr > kDockDenyBountyMinCr) {
+      c.blocked = true;
+      c.byBounty = true;
+    }
+    if (c.rep <= kDockDenyRep) {
+      c.blocked = true;
+      c.byRep = true;
+    }
+
+    c.bribeActive = dockingBribeActive(st.id);
+    if (c.bribeActive) {
+      auto it = dockingBribeUntilDays.find(st.id);
+      if (it != dockingBribeUntilDays.end()) {
+        c.bribeLeftSec = std::max(0.0, (it->second - timeDays) * 86400.0);
+      }
+    }
+    return c;
+  };
+
+  auto dockingAccessReasonShort = [&](const DockingAccessCheck& c) -> std::string {
+    if (!c.blocked) return {};
+    std::string s;
+    if (c.byBounty) {
+      s += "bounty " + std::to_string((int)std::llround(c.bountyCr)) + " cr";
+    }
+    if (c.byRep) {
+      if (!s.empty()) s += ", ";
+      s += "hostile rep " + std::to_string((int)std::llround(c.rep));
+    }
+    return s;
+  };
+
+  auto dockingRemoteSettlementFeeRate = [&](const sim::Station& st, const DockingAccessCheck& c) -> double {
+    // Remote payments should cost more than paying dockside, and be worse if the faction hates you.
+    const double repPenalty = std::clamp((-c.rep) / 40.0, 0.0, 0.5); // 0..0.5
+    const double base = kRemoteSettlementFeeBase + 0.65 * effectiveFeeRate(st) + repPenalty;
+    return std::clamp(base, kRemoteSettlementFeeMin, kRemoteSettlementFeeMax);
+  };
+
+  auto dockingBribeCostCr = [&](const sim::Station& st, const DockingAccessCheck& c) -> double {
+    const double repSeverity = std::clamp(-c.rep, 0.0, 50.0);
+    const double bountyPart = std::clamp(c.bountyCr * 0.10, 0.0, 2500.0);
+    const double feePart = 120.0 + 900.0 * effectiveFeeRate(st);
+    return std::ceil(kDockingBribeBaseCr + repSeverity * 55.0 + bountyPart + feePart);
+  };
+
+  auto payBountyRemotely = [&](const sim::Station& st, const char* sourceTag) -> bool {
+    const double distKm = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
+    if (distKm > st.commsRangeKm) {
+      toast(toasts, "Out of comms range to settle bounty.", 2.0);
+      return false;
+    }
+
+    DockingAccessCheck c = dockingAccessCheck(st);
+    if (!(c.bountyCr > kDockDenyBountyMinCr)) {
+      toast(toasts, "No outstanding bounty to settle for " + factionName(st.factionId) + ".", 1.8);
+      return false;
+    }
+
+    const double feeRate = dockingRemoteSettlementFeeRate(st, c);
+    const double total = std::ceil(c.bountyCr * (1.0 + feeRate));
+    if (credits + 1e-6 < total) {
+      toast(toasts, "Insufficient credits to settle bounty remotely (" + std::to_string((int)total) + " cr).", 2.4);
+      return false;
+    }
+
+    credits -= total;
+    clearBounty(st.factionId);
+
+    // Small positive rep for making things right.
+    addRep(st.factionId, +0.8);
+    policeHeat = std::max(0.0, policeHeat - 1.25);
+
+    const std::string msg = "Bounty settled remotely (" + std::to_string((int)total) + " cr inc. fees).";
+    toast(toasts, msg, 2.8);
+
+    game::hubPushEvent(integrationHubWindow,
+                       game::GameEvent{timeRealSec,
+                                       timeDays,
+                                       game::GameEventKind::Gameplay,
+                                       "BountyRemoteSettle",
+                                       (sourceTag ? std::string(sourceTag) + ": " : std::string()) + msg,
+                                       true,
+                                       ship.positionKm(),
+                                       (core::u64)st.factionId,
+                                       (core::u64)std::llround(total)});
+    return true;
+  };
+
+  auto buyDockingBribe = [&](const sim::Station& st, const char* sourceTag) -> bool {
+    const double distKm = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
+    if (distKm > st.commsRangeKm) {
+      toast(toasts, "Out of comms range to negotiate clearance.", 2.0);
+      return false;
+    }
+
+    DockingAccessCheck c = dockingAccessCheck(st);
+    if (st.factionId == 0) {
+      toast(toasts, "This station is independent; a bribe is unnecessary.", 1.8);
+      return false;
+    }
+
+    const double cost = dockingBribeCostCr(st, c);
+    if (credits + 1e-6 < cost) {
+      toast(toasts, "Insufficient credits for temporary clearance (" + std::to_string((int)cost) + " cr).", 2.4);
+      return false;
+    }
+
+    credits -= cost;
+    dockingBribeUntilDays[st.id] = timeDays + (kDockingBribeDurationSec / 86400.0);
+
+    const std::string msg =
+      "Temporary clearance purchased (" + std::to_string((int)cost) + " cr). Request clearance now.";
+    toast(toasts, msg, 3.0);
+
+    game::hubPushEvent(integrationHubWindow,
+                       game::GameEvent{timeRealSec,
+                                       timeDays,
+                                       game::GameEventKind::Docking,
+                                       "DockingBribe",
+                                       (sourceTag ? std::string(sourceTag) + ": " : std::string()) + msg,
+                                       true,
+                                       ship.positionKm(),
+                                       (core::u64)st.id,
+                                       (core::u64)std::llround(cost)});
+    return true;
+  };
+
+  // Centralized clearance request helper so the keybind, the objective HUD, and the docking
+  // computer all share the same rules + telemetry.
+  struct DockingRequestOutcome {
+    sim::DockingClearanceDecision decision{};
+    DockingAccessCheck access{};
+    double traffic01{0.0};
+  };
+
+  auto requestDockingClearanceCommon = [&](const sim::Station& st,
+                                          double distKm,
+                                          bool autoMode,
+                                          bool allowToast,
+                                          const char* sourceTag) -> DockingRequestOutcome {
+    DockingRequestOutcome out{};
+    out.access = dockingAccessCheck(st);
+
+    // Allow bribe override (temporary clearance purchase).
+    if (!out.access.allowed()) {
+      out.decision.status = sim::DockingClearanceStatus::Denied;
+
+      // Throttle spammy toasts for autopilots that call every frame.
+      if (autoMode) {
+        double& cd = dockingDeniedToastCooldownUntilDays[st.id];
+        if (timeDays < cd) return out;
+        cd = timeDays + (8.0 / 86400.0);
+      }
+
+      if (allowToast) {
+        std::string m = "Docking denied: " + dockingAccessReasonShort(out.access) + ".";
+        toast(toasts, m, 2.8);
+
+        // A diegetic comms ping makes the denial obvious without requiring the HUD.
+        sim::CommsMessage msg{};
+        msg.timeDays = timeDays;
+        msg.channel = sim::CommsChannel::Security;
+        msg.factionId = st.factionId;
+        if (currentSystem) msg.systemId = currentSystem->stub.id;
+        msg.stationId = st.id;
+        msg.from = st.name + " Control";
+        msg.subject = "Docking denied";
+        msg.body = "Docking clearance denied (" + dockingAccessReasonShort(out.access) + ").";
+        msg.body += "\n\nYou can settle a bounty or purchase temporary clearance from the target panel.";
+        pushTransmission(std::move(msg), true);
+      }
+
+      game::hubPushEvent(integrationHubWindow,
+                         game::GameEvent{timeRealSec,
+                                         timeDays,
+                                         game::GameEventKind::Docking,
+                                         "ClearanceDeniedAccess",
+                                         (sourceTag ? std::string(sourceTag) + ": " : std::string()) +
+                                           dockingAccessReasonShort(out.access),
+                                         true,
+                                         ship.positionKm(),
+                                         (core::u64)st.id,
+                                         (core::u64)out.access.factionId});
+      return out;
+    }
+
+    auto& cs = clearances[st.id];
+
+    // Approximate docking traffic from nearby ships.
+    int nearbyShips = 0;
+    for (const auto& c : contacts) {
+      if (!c.alive) continue;
+      const double d = (c.ship.positionKm() - ship.positionKm()).length();
+      if (d < st.commsRangeKm) nearbyShips++;
+    }
+    out.traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearbyShips);
+
+    // Clearance grant probability is influenced by reputation (small effect).
+    sim::DockingClearanceParams params{};
+    const double rep = getRep(st.factionId);
+    params.baseGrantProb = std::clamp(params.baseGrantProb + rep * 0.008, 0.15, 0.98);
+
+    if (out.access.bribeActive) {
+      params.baseGrantProb = std::max(params.baseGrantProb, kDockingBribeMinGrantProb);
+      params.trafficPenalty = std::max(0.05, params.trafficPenalty * 0.55);
+      params.allowRefresh = true;
+    }
+
+    if (autoMode) out.decision = sim::autoRequestDockingClearance(seed, st, timeDays, distKm, cs, out.traffic01, params);
+    else out.decision = sim::requestDockingClearance(seed, st, timeDays, distKm, cs, out.traffic01, params);
+
+    return out;
   };
 
   // FSD / jump parameters
@@ -5736,9 +7077,76 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           tmp.reputation.push_back(sim::FactionReputation{kv.first, kv.second});
         }
 
+        const auto prevMissions = tmp.missions;
+
         const sim::SystemId sysId = currentSystem ? currentSystem->stub.id : 0;
         const auto res = sim::tryCompleteBountyKill(tmp, sysId, deadId, +2.0);
         if (res.completed > 0) {
+          auto applyPriorityContractImpulse = [&](const sim::Mission& m) {
+            if (!m.priority) return;
+            if (m.fromSystem == 0) return;
+            if (m.sourceKind != sim::MissionSourceKind::SystemEvent) return;
+
+            const double sev = std::clamp(m.sourceEventSeverity01, 0.0, 1.0);
+            const double mag = 0.006 + 0.010 * sev;
+
+            double dSec = 0.0;
+            double dPiracy = 0.0;
+            double dTraffic = 0.0;
+
+            switch (m.sourceEventKind) {
+              case sim::SystemEventKind::PirateRaid:
+                dSec = +mag;
+                dPiracy = -mag;
+                dTraffic = +0.5 * mag;
+                break;
+              case sim::SystemEventKind::SecurityCrackdown:
+                dSec = +0.8 * mag;
+                dPiracy = -0.6 * mag;
+                dTraffic = -0.2 * mag;
+                break;
+              case sim::SystemEventKind::CivilUnrest:
+                dSec = +0.6 * mag;
+                dPiracy = -0.4 * mag;
+                dTraffic = +0.4 * mag;
+                break;
+              case sim::SystemEventKind::TradeBoom:
+                dTraffic = +mag;
+                dSec = +0.4 * mag;
+                dPiracy = -0.2 * mag;
+                break;
+              case sim::SystemEventKind::TradeBust:
+                dTraffic = +0.7 * mag;
+                dSec = +0.3 * mag;
+                dPiracy = -0.2 * mag;
+                break;
+              case sim::SystemEventKind::ResearchBreakthrough:
+                dTraffic = +0.8 * mag;
+                dSec = +0.2 * mag;
+                break;
+              case sim::SystemEventKind::None:
+              default:
+                break;
+            }
+
+            applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+          };
+
+          auto findPrev = [&](core::u64 id) -> const sim::Mission* {
+            for (const auto& pm : prevMissions) if (pm.id == id) return &pm;
+            return nullptr;
+          };
+
+          bool anyPriority = false;
+          for (const auto& m : tmp.missions) {
+            const sim::Mission* pm = findPrev(m.id);
+            if (!pm) continue;
+            if (!pm->completed && m.completed) {
+              anyPriority = anyPriority || m.priority;
+              applyPriorityContractImpulse(m);
+            }
+          }
+
           credits = tmp.credits;
           missions = std::move(tmp.missions);
 
@@ -5747,8 +7155,9 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
             repByFaction[r.factionId] = r.rep;
           }
 
+          const std::string pfx = anyPriority ? std::string("PRIORITY ") : std::string();
           toast(toasts,
-                "Mission complete: bounty target eliminated. +" + std::to_string((int)std::round(res.rewardCr)) + " cr",
+                pfx + "Mission complete: bounty target eliminated. +" + std::to_string((int)std::round(res.rewardCr)) + " cr",
                 3.0);
           game::hubPushEvent(integrationHubWindow,
                              game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
@@ -5780,171 +7189,152 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
   auto last = std::chrono::high_resolution_clock::now();
 
 
-  SDL_SetRelativeMouseMode(SDL_FALSE);
+// ----------------------------------------------------------------------
+// Main menu / save slots helpers
+// ----------------------------------------------------------------------
+auto randomSeedU64 = [&]() -> core::u64 {
+  // Best-effort entropy: random_device + SDL tick count.
+  std::random_device rd;
+  const core::u64 a = (core::u64(rd()) << 32) ^ core::u64(rd());
+  const core::u64 b = (core::u64(rd()) << 32) ^ core::u64(rd());
+  const core::u64 t = (core::u64)SDL_GetTicks64();
+  return core::hashCombine(core::hashCombine(a, b), t ^ 0xA5A5A5A5A5A5A5A5ull);
+};
 
-  while (running) {
-    profiler.beginFrame();
-      STELLAR_PROFILE_SCOPE("Frame");
+auto setMainMenuStatus = [&](const std::string& msg, double ttlSec) {
+  mainMenuStatus = msg;
+  mainMenuStatusHideAtRealSec = timeRealSec + std::max(0.0, ttlSec);
+};
 
-    // Timing
-    auto now = std::chrono::high_resolution_clock::now();
-    const double dtReal = std::chrono::duration<double>(now - last).count();
-    last = now;
+auto setPauseMenuStatus = [&](const std::string& msg, double ttlSec) {
+  pauseMenuStatus = msg;
+  pauseMenuStatusHideAtRealSec = timeRealSec + std::max(0.0, ttlSec);
+};
 
-    timeRealSec += dtReal;
+auto readSaveHeader = [&](const std::filesystem::path& p, SaveSlotMeta& out) -> bool {
+  std::ifstream f(p);
+  if (!f) return false;
 
-    // Integration Hub: reset per-frame automation budget.
-    integrationHubWindow.automationsActionsFiredThisFrame = 0;
+  std::string magic;
+  int version = 0;
+  f >> magic >> version;
+  if (magic != "StellarForgeSave") return false;
 
+  // Consume remainder of the header line.
+  std::string line;
+  std::getline(f, line);
 
-    // Police heat decays in real time (stays stable even if you change timeScale).
-    policeHeat = std::max(0.0, policeHeat - dtReal * 0.015);
+  bool gotSeed = false;
+  bool gotTime = false;
+  bool gotSys = false;
+  bool gotDock = false;
+  bool gotCredits = false;
 
-    // Missile lock (player): build/decay lock progress for guided weapons.
-    {
-      auto updateLock = [&](MissileLockState& st, WeaponType wt, int ammo) {
-        const WeaponDef& wd = weaponDef(wt);
-        if (!wd.guided || ammo <= 0 || docked || paused || supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
-          st.active = false;
-          st.progress = 0.0;
-          st.targetId = 0;
-          return;
-        }
-
-        st.active = true;
-
-        const double dt = std::clamp(dtReal, 0.0, 0.25);
-        const double lockTimeSec = 1.25;
-        const double decayTimeSec = 0.75;
-        const double lockConeCos = 0.995; // tight forward cone
-        const double lockRangeKm = wd.rangeKm;
-
-        core::u64 candId = 0;
-        std::size_t candIdx = 0;
-        double candAim = lockConeCos;
-
-        const math::Vec3d origin = ship.positionKm();
-        math::Vec3d fwd = ship.forward();
-        if (fwd.lengthSq() < 1e-12) fwd = {0,0,1};
-        fwd = fwd.normalized();
-
-        auto consider = [&](std::size_t idx) {
-          const auto& c = contacts[idx];
-          if (!c.alive) return;
-          const math::Vec3d to = c.ship.positionKm() - origin;
-          const double dist2 = to.lengthSq();
-          if (dist2 < 1e-12) return;
-          const double dist = std::sqrt(dist2);
-          if (dist > lockRangeKm) return;
-          const double aim = math::dot(fwd, to / dist);
-          if (aim < lockConeCos) return;
-          if (candId == 0 || aim > candAim) {
-            candId = c.id;
-            candIdx = idx;
-            candAim = aim;
-          }
-        };
-
-        if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
-          consider((std::size_t)target.index);
-        } else {
-          for (std::size_t i = 0; i < contacts.size(); ++i) consider(i);
-        }
-
-        if (candId != 0) {
-          if (st.targetId != candId) {
-            st.targetId = candId;
-            st.targetIndex = candIdx;
-            st.progress = 0.0;
-          }
-          st.progress = std::min(1.0, st.progress + dt / lockTimeSec);
-        } else {
-          st.progress = std::max(0.0, st.progress - dt / decayTimeSec);
-          if (st.progress <= 0.0) st.targetId = 0;
-        }
-      };
-
-      updateLock(missileLockPrimary, weaponPrimary, (int)weaponAmmoPrimary);
-      updateLock(missileLockSecondary, weaponSecondary, (int)weaponAmmoSecondary);
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    std::istringstream iss(line);
+    std::string key;
+    iss >> key;
+    if (key == "seed") {
+      iss >> out.seed;
+      gotSeed = true;
+    } else if (key == "timeDays") {
+      iss >> out.timeDays;
+      gotTime = true;
+    } else if (key == "currentSystem") {
+      core::u64 v = 0;
+      iss >> v;
+      out.systemId = (sim::SystemId)v;
+      gotSys = true;
+    } else if (key == "dockedStation") {
+      core::u64 v = 0;
+      iss >> v;
+      out.dockedStation = (sim::StationId)v;
+      gotDock = true;
+    } else if (key == "credits") {
+      iss >> out.credits;
+      gotCredits = true;
     }
 
-    // Keep relative mouse mode in sync with our control mode.
-    // (Automatically release the mouse when docked so UI interaction is painless.)
-    if (docked && mouseSteer) {
-      mouseSteer = false;
-      SDL_SetRelativeMouseMode(SDL_FALSE);
-      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
-      toast(toasts, "Mouse steer disabled while docked.", 2.0);
+    if (gotSeed && gotTime && gotSys && gotDock && gotCredits) break;
+  }
+
+  out.valid = gotSeed && gotTime && gotSys;
+  return out.valid;
+};
+
+auto formatSaveSummary = [&](const SaveSlotMeta& m) -> std::string {
+  if (!m.exists) return "Empty";
+  if (!m.valid) return "Unreadable";
+  char dayBuf[64];
+  std::snprintf(dayBuf, sizeof(dayBuf), "Day %.2f", m.timeDays);
+  std::string s = std::string(dayBuf);
+  s += " • Seed ";
+  s += std::to_string((unsigned long long)m.seed);
+  s += " • Sys ";
+  s += std::to_string((unsigned long long)m.systemId);
+  if (m.dockedStation != 0) {
+    s += " • Docked";
+  }
+  return s;
+};
+
+auto refreshSaveSlotMetaNow = [&]() {
+  for (int i = 0; i < kSaveSlotCount; ++i) {
+    SaveSlotMeta m{};
+    m.path = saveSlotPath(i);
+
+    std::error_code ec;
+    m.exists = std::filesystem::exists(m.path, ec) && !ec;
+    if (m.exists) {
+      (void)readSaveHeader(m.path, m);
+      std::error_code ec2;
+      m.lastWrite = std::filesystem::last_write_time(m.path, ec2);
     }
 
-    const SDL_bool wantRelMouse = mouseSteer ? SDL_TRUE : SDL_FALSE;
-    if (SDL_GetRelativeMouseMode() != wantRelMouse) {
-      SDL_SetRelativeMouseMode(wantRelMouse);
-      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+    saveSlotMeta[(std::size_t)i] = std::move(m);
+  }
+  saveSlotMetaDirty = false;
+};
+
+auto findMostRecentSavePath = [&]() -> std::optional<std::filesystem::path> {
+  std::optional<std::filesystem::path> best{};
+  std::filesystem::file_time_type bestTime{};
+
+  auto consider = [&](const std::filesystem::path& p) {
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec) || ec) return;
+    const auto t = std::filesystem::last_write_time(p, ec);
+    if (ec) return;
+    if (!best || t > bestTime) {
+      best = p;
+      bestTime = t;
     }
+  };
 
-    // Events
-    SDL_Event event;
-    {
-      STELLAR_PROFILE_SCOPE("InputEvents");
+  // Legacy quicksave
+  consider(std::filesystem::path(savePath));
 
-    while (SDL_PollEvent(&event)) {
-      ImGui_ImplSDL2_ProcessEvent(&event);
+  // Slot saves
+  for (int i = 0; i < kSaveSlotCount; ++i) {
+    consider(saveSlotPath(i));
+  }
 
-      if (event.type == SDL_QUIT) running = false;
-      if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
+  return best;
+};
 
-      // Camera rig: Alt+mouse orbit/pan/zoom, plus keyboard shortcuts.
-      // (Mouse handled here for all events; keyboard handled below in the KEYDOWN branch so rebind can intercept.)
-      if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEWHEEL) {
-        game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
-                                   [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
-      }
 
-      if (event.type == SDL_KEYDOWN && !event.key.repeat) {
-        const auto key = [&](const game::KeyChord& chord) { return game::chordMatchesEvent(chord, event.key); };
-
-        // If we're rebinding a control, capture this key press and don't also trigger gameplay actions.
-        if (game::handleControlsRebindKeydown(
-                controlsWindow, event.key, controls, controlsDirty,
-                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
-          continue;
-        }
-
-        if (game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
-                                       [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
-          continue;
-        }
-
-        // Radial action wheel: hold to open, release to activate.
-        if (key(controls.actions.actionWheel) && !actionWheel.open && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
-          game::openActionWheel(actionWheel);
-
-          // If mouse-steer is enabled, temporarily release the cursor so the wheel can be used.
-          actionWheelPrevMouseSteer = mouseSteer;
-          actionWheelSuppressedMouseSteer = false;
-          if (mouseSteer) {
-            mouseSteer = false;
-            actionWheelSuppressedMouseSteer = true;
-            SDL_SetRelativeMouseMode(SDL_FALSE);
-            SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
-          }
-
-          continue;
-        }
-
-        if (key(controls.actions.commandPalette) && !io.WantCaptureKeyboard) {
-          game::openCommandPalette(commandPalette);
-        }
-
-        if (key(controls.actions.quit)) running = false;
-
-        if (key(controls.actions.quicksave)) {
+  // ----------------------------------------------------------------------
+  // Save/Load entry points (used by quicksave/quickload and the main menu)
+  // ----------------------------------------------------------------------
+  auto buildSaveGameSnapshot = [&]() -> sim::SaveGame {
           sim::SaveGame s{};
           s.seed = universe.seed();
           s.timeDays = timeDays;
           s.currentSystem = currentSystem->stub.id;
           s.dockedStation = docked ? dockedStationId : 0;
+          s.lastDockedSystem = lastSafeDockSystemId;
+          s.lastDockedStation = lastSafeDockStationId;
 
           s.shipPosKm = ship.positionKm();
           s.shipVelKmS = ship.velocityKmS();
@@ -5953,6 +7343,15 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
           s.credits = credits;
           s.insuranceDebtCr = insuranceDebtCr;
+
+          // Progression unlock state (monotonic / persistent).
+          s.creditsHighWaterCr = progression.creditsHighWaterCr;
+          s.repHighWater = progression.repHighWater;
+          s.unlockedHullMask = progression.unlockedHullMask;
+          s.unlockedCoreMk = progression.unlockedCoreMk;
+          s.unlockedSmuggleHoldMk = progression.unlockedSmuggleHoldMk;
+          s.unlockedFuelScoopMk = progression.unlockedFuelScoopMk;
+          s.unlockedWeaponMask = progression.unlockedWeaponMask;
           s.cargo = cargo;
           s.cargoCapacityKg = cargoCapacityKg;
           s.passengerSeats = passengerSeats;
@@ -6089,6 +7488,15 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	          s.scannedKeys.assign(scannedKeys.begin(), scannedKeys.end());
 	          s.logbook = logbook;
 	          s.comms = commsLog.items();
+
+    s.galNetWatchSystems = galNetWatchSystems;
+    s.galNetWatchSystems.erase(
+        std::remove(s.galNetWatchSystems.begin(), s.galNetWatchSystems.end(), (sim::SystemId)0),
+        s.galNetWatchSystems.end());
+    std::sort(s.galNetWatchSystems.begin(), s.galNetWatchSystems.end());
+    s.galNetWatchSystems.erase(
+        std::unique(s.galNetWatchSystems.begin(), s.galNetWatchSystems.end()),
+        s.galNetWatchSystems.end());
 
 
           // Integration Hub automations (player macros / glue rules)
@@ -6248,15 +7656,26 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                         return a.systemId < b.systemId;
                       });
           }
+          return s;
+  };
 
-          if (sim::saveToFile(s, savePath)) {
-            toast(toasts, "Saved to " + savePath, 2.5);
-          }
-        }
+  auto applySaveGameSnapshot = [&](const sim::SaveGame& s) {
+            // Keep session-level seed in sync (used by visuals + encounter systems).
+            seed = s.seed;
+            mainMenuSeed = seed;
 
-        if (key(controls.actions.quickload)) {
-          sim::SaveGame s{};
-          if (sim::loadFromFile(savePath, s)) {
+            // Keep sky/backdrop visuals deterministic per save seed.
+            starfield.regenerate(seed ^ 0xC5A0F1A9u, vfxStarCount);
+            vfxStarCountLast = vfxStarCount;
+
+            const core::u64 nSeed =
+                core::hashCombine(seed ^ 0xBADC0FFEE0DDF00DULL, (core::u64)vfxNebulaVariant);
+            nebula.regenerate(nSeed, vfxNebulaPuffCount, vfxNebulaBandPower);
+            vfxNebulaVariantLast = vfxNebulaVariant;
+            vfxNebulaBandPowerLast = vfxNebulaBandPower;
+
+            particles.reseed(seed ^ 0xBADC0FFEu);
+
             universe = sim::Universe(s.seed);
             universe.importStationOverrides(s.stationOverrides);
 
@@ -6265,6 +7684,18 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
             const sim::StarSystem& sys = universe.getSystem(s.currentSystem);
             currentStub = sys.stub;
             currentSystem = &sys;
+
+            lastSafeDockSystemId = s.lastDockedSystem;
+            lastSafeDockStationId = s.lastDockedStation;
+            if (lastSafeDockStationId != 0 && lastSafeDockSystemId == 0) {
+              // Backward-compat fallback: old saves won't have lastDockedSystem.
+              lastSafeDockSystemId = s.currentSystem;
+            }
+            if (lastSafeDockStationId == 0 && s.dockedStation != 0) {
+              // If the save itself was docked, treat that as the last safe dock.
+              lastSafeDockSystemId = s.currentSystem;
+              lastSafeDockStationId = s.dockedStation;
+            }
 
             ship.setPositionKm(s.shipPosKm);
             ship.setVelocityKmS(s.shipVelKmS);
@@ -6295,6 +7726,57 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
             smuggleHoldMk = std::clamp((int)s.smuggleHoldMk, 0, 3);
             fuelScoopMk = std::clamp((int)s.fuelScoopMk, 0, 3);
             recalcPlayerStats();
+
+            // Progression unlock state (v33+).
+            // Older saves (v32 and earlier) won't contain these fields, so we reconstruct a
+            // conservative baseline and then promote unlocks based on equipped gear.
+            if (s.version >= 33) {
+              progression.creditsHighWaterCr = std::max(s.creditsHighWaterCr, s.credits);
+              progression.repHighWater = std::clamp(s.repHighWater, 0.0, 100.0);
+
+              progression.unlockedHullMask = (s.unlockedHullMask | 1u); // ensure starter hull
+              progression.unlockedCoreMk = static_cast<core::u8>(std::clamp((int)s.unlockedCoreMk, 1, 3));
+              progression.unlockedSmuggleHoldMk =
+                  static_cast<core::u8>(std::clamp((int)s.unlockedSmuggleHoldMk, 0, 3));
+              progression.unlockedFuelScoopMk =
+                  static_cast<core::u8>(std::clamp((int)s.unlockedFuelScoopMk, 0, 3));
+if (s.version >= 34) {
+  progression.unlockedWeaponMask = (s.unlockedWeaponMask | kStarterWeaponMask);
+} else {
+  progression.unlockedWeaponMask = kStarterWeaponMask;
+}
+
+            } else {
+              progression.creditsHighWaterCr = s.credits;
+              progression.repHighWater = 0.0;
+              progression.unlockedHullMask = 1u; // starter
+              progression.unlockedCoreMk = 1;
+              progression.unlockedSmuggleHoldMk = 0;
+              progression.unlockedFuelScoopMk = 0;
+              progression.unlockedWeaponMask = kStarterWeaponMask;
+            }
+
+            // Never allow "locked but equipped" states.
+            progression.unlockHull(shipHullClass);
+            {
+              const int coreMkEquipped = std::max(thrusterMk, std::max(shieldMk, distributorMk));
+              const int coreMkUnlocked =
+                  std::max((int)progression.unlockedCoreMk, coreMkEquipped);
+              progression.unlockedCoreMk = static_cast<core::u8>(std::clamp(coreMkUnlocked, 1, 3));
+            }
+            progression.unlockedSmuggleHoldMk =
+                static_cast<core::u8>(std::clamp(std::max((int)progression.unlockedSmuggleHoldMk, smuggleHoldMk), 0, 3));
+            progression.unlockedFuelScoopMk =
+                static_cast<core::u8>(std::clamp(std::max((int)progression.unlockedFuelScoopMk, fuelScoopMk), 0, 3));
+
+// Weapons are license-gated too; never allow an equipped weapon to be "locked".
+progression.unlockedWeaponMask |= kStarterWeaponMask;
+progression.unlockWeapon(weaponPrimary);
+progression.unlockWeapon(weaponSecondary);
+
+
+            // High-water marks must never be below current values.
+            progression.creditsHighWaterCr = std::max(progression.creditsHighWaterCr, credits);
 
             playerHull = std::clamp(s.hull, 0.0, 1.0) * playerHullMax;
             playerShield = std::clamp(s.shield, 0.0, 1.0) * playerShieldMax;
@@ -6332,12 +7814,46 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	            repByFaction.clear();
 	            for (const auto& r : s.reputation) repByFaction[r.factionId] = r.rep;
 
+	            // Make sure rep high-water never falls behind the loaded state.
+	            {
+	              double repMax = 0.0;
+	              for (const auto& kv : repByFaction) repMax = std::max(repMax, kv.second);
+	              progression.repHighWater = std::max(progression.repHighWater, repMax);
+	            }
+
 	            // Exploration / law
 	            explorationDataCr = s.explorationDataCr;
 	            scannedKeys.clear();
 	            for (core::u64 k : s.scannedKeys) scannedKeys.insert(k);
 	            logbook = s.logbook;
 	            commsLog.replace(std::move(s.comms));
+
+
+	            galNetWatchSystems = std::move(s.galNetWatchSystems);
+
+	            galNetWatchSystems.erase(
+
+	                std::remove(galNetWatchSystems.begin(), galNetWatchSystems.end(), (sim::SystemId)0),
+
+	                galNetWatchSystems.end());
+
+	            std::sort(galNetWatchSystems.begin(), galNetWatchSystems.end());
+
+	            galNetWatchSystems.erase(
+
+	                std::unique(galNetWatchSystems.begin(), galNetWatchSystems.end()),
+
+	                galNetWatchSystems.end());
+
+	            if (galNetWatchSystems.size() > 64) galNetWatchSystems.resize(64);
+
+
+	            // Reset announcement state so we don't immediately spam watched-system bulletins on load.
+
+	            galNetAnnouncedBySystem.clear();
+
+	            galNetLastWatchScanCycleStamp = (int)std::floor(timeDays / systemEventParams.cycleDays);
+
 	            commsWindow.selectedId = 0;
 	            commsWindow.selectedOpenedSec = 0.0;
 	            commsOverlay.queue.clear();
@@ -6762,10 +8278,526 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	              }
 	            }
 
-            toast(toasts, "Loaded " + savePath, 2.5);
+            // Ensure traffic convoy signals are present immediately after a load.
+            nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
+            if (currentSystem) {
+              syncTrafficConvoySignals(*currentSystem);
+            }
+
+            // Avoid noisy "catch-up" toasts after loading/resetting.
+            progFeed.clearAndReseed(timeRealSec, credits);
+  };
+
+  auto saveGameToPath = [&](const std::filesystem::path& p) -> bool {
+    std::error_code ec;
+    if (!p.parent_path().empty()) {
+      std::filesystem::create_directories(p.parent_path(), ec);
+    }
+    sim::SaveGame s = buildSaveGameSnapshot();
+    return sim::saveToFile(s, p.string());
+  };
+
+  auto loadGameFromPath = [&](const std::filesystem::path& p) -> bool {
+    sim::SaveGame s{};
+    if (!sim::loadFromFile(p.string(), s)) {
+      return false;
+    }
+    applySaveGameSnapshot(s);
+    return true;
+  };
+
+  auto startNewGameWithSeed = [&](core::u64 newSeed) {
+    if (newSeed == 0) {
+      newSeed = 1;
+    }
+
+    // Build a clean "new game" snapshot and re-apply it through the same load path
+    // used for saves. This keeps resets consistent and avoids missing state.
+    core::u32 startSystemId = 0;
+    {
+      const sim::Universe tmpUniverse(newSeed);
+      if (auto s = tmpUniverse.findClosestSystem(math::Vec3d{0.0, 0.0, 0.0}, 80.0)) {
+        startSystemId = s->id;
+      }
+    }
+
+    sim::SaveGame sg{};
+    sg.seed = newSeed;
+    sg.timeDays = 0.0;
+    sg.currentSystem = startSystemId;
+    sg.dockedStation = 0;
+
+    // Starter ship defaults.
+    sg.shipHull = (int)ShipHullClass::Scout;
+    sg.thrusterMk = 1;
+    sg.shieldMk = 1;
+    sg.distributorMk = 1;
+    sg.smuggleHoldMk = 0;
+    sg.fuelScoopMk = 0;
+
+    sg.weaponPrimary = (int)WeaponType::BeamLaser;
+    sg.weaponSecondary = (int)WeaponType::Cannon;
+    sg.weaponAmmoPrimary = 255;
+    sg.weaponAmmoSecondary = 255;
+
+    // Economy / inventory.
+    sg.credits = 2500.0;
+    sg.insuranceDebtCr = 0.0;
+    sg.cargo.fill(0.0);
+    sg.cargoCapacityKg = 420.0;
+    sg.passengerSeats = 2;
+
+    // Ship state.
+    sg.shipPosKm = math::Vec3d{0.0, 0.0, 0.0};
+    sg.shipVelKmS = math::Vec3d{0.0, 0.0, 0.0};
+    sg.shipOrient = math::Quatd::identity();
+    sg.shipAngVelRadS = math::Vec3d{0.0, 0.0, 0.0};
+
+    sg.fuel = 45.0;
+    sg.fuelMax = 45.0;
+    sg.fsdRangeLy = 18.0;
+    sg.fsdReadyDay = 0.0;
+
+    sg.hull = 1.0;
+    sg.shield = 1.0;
+    sg.heat = 0.0;
+
+    // Countermeasures / distributor.
+    {
+      const auto caps = sim::countermeasureCapsForHull(ShipHullClass::Scout);
+      sg.cmFlares = caps.flares;
+      sg.cmChaff = caps.chaff;
+      sg.cmHeatSinks = caps.heatSinks;
+    }
+    sg.pipsEng = 2;
+    sg.pipsSys = 2;
+    sg.pipsWep = 2;
+    sg.capEngFrac = 1.0;
+    sg.capSysFrac = 1.0;
+    sg.capWepFrac = 1.0;
+
+    // Progression unlock state starts at "starter tier".
+    sg.creditsHighWaterCr = sg.credits;
+    sg.repHighWater = 0.0;
+    sg.unlockedHullMask = 1u; // Scout
+    sg.unlockedCoreMk = 1;
+    sg.unlockedSmuggleHoldMk = 0;
+    sg.unlockedFuelScoopMk = 0;
+
+    sg.unlockedWeaponMask = kStarterWeaponMask;
+
+    applySaveGameSnapshot(sg);
+
+    // Place the player near the first station for an immediate "flyable" start.
+    if (currentSystem && !currentSystem->stations.empty()) {
+      respawnNearStation(*currentSystem, 0);
+    }
+  };
+
+  SDL_SetRelativeMouseMode(SDL_FALSE);
+
+  while (running) {
+    profiler.beginFrame();
+      STELLAR_PROFILE_SCOPE("Frame");
+
+    // Timing
+    auto now = std::chrono::high_resolution_clock::now();
+    const double dtReal = std::chrono::duration<double>(now - last).count();
+    last = now;
+
+    timeRealSec += dtReal;
+
+    // Sync live system-security + event parameters into the Universe so
+    // station economies can reflect system events (and thus GalNet).
+    universe.setSystemSecurityDeltaMap(&systemSecurityDeltaBySystem);
+    universe.setSystemSecurityDynamicsParams(systemSecurityDynParams);
+    universe.setSystemEventParams(systemEventParams);
+
+    // Main menu dominates other overlays.
+    if (showMainMenu && showPauseMenu) {
+      showPauseMenu = false;
+    }
+
+    // Pause Menu: force pause + release mouse while open.
+    if (showPauseMenu && !pauseMenuWasOpen) {
+      pauseMenuWasOpen = true;
+      pauseMenuPrevPaused = paused;
+      paused = true;
+
+      // If the radial action wheel was open, close it now so mouse-steer can be restored properly.
+      if (actionWheel.open) {
+        game::closeActionWheel(actionWheel);
+        if (actionWheelSuppressedMouseSteer && actionWheelPrevMouseSteer && !docked) {
+          mouseSteer = true;
+          SDL_SetRelativeMouseMode(SDL_TRUE);
+          SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+        }
+        actionWheelPrevMouseSteer = false;
+        actionWheelSuppressedMouseSteer = false;
+      }
+
+      pauseMenuPage = PauseMenuPage::Root;
+      saveSlotMetaDirty = true;
+      pauseMenuDeleteSlot = -1;
+      pauseMenuWantsQuitToMenuConfirm = false;
+    } else if (!showPauseMenu && pauseMenuWasOpen) {
+      pauseMenuWasOpen = false;
+      paused = pauseMenuPrevPaused;
+
+      // Restore mouse-steer if we temporarily released it for the pause menu.
+      if (pauseMenuSuppressedMouseSteer && pauseMenuPrevMouseSteer && !docked) {
+        mouseSteer = true;
+        SDL_SetRelativeMouseMode(SDL_TRUE);
+        SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+      }
+      pauseMenuPrevMouseSteer = false;
+      pauseMenuSuppressedMouseSteer = false;
+    }
+
+    if (showPauseMenu) {
+      if (saveSlotMetaDirty) {
+        refreshSaveSlotMetaNow();
+      }
+      if (mouseSteer) {
+        pauseMenuPrevMouseSteer = true;
+        pauseMenuSuppressedMouseSteer = true;
+        mouseSteer = false;
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+      }
+    }
+
+    // Main Menu: force pause + release mouse while open.
+    if (showMainMenu && !mainMenuWasOpen) {
+      mainMenuWasOpen = true;
+      mainMenuPrevPaused = paused;
+      paused = true;
+
+      mainMenuPage = MainMenuPage::Root;
+      mainMenuSeed = seed;
+      mainMenuUseRandomSeed = true;
+      saveSlotMetaDirty = true;
+      setMainMenuStatus("", 0.0);
+    } else if (!showMainMenu && mainMenuWasOpen) {
+      mainMenuWasOpen = false;
+      paused = mainMenuPrevPaused;
+    }
+
+    if (showMainMenu) {
+      if (saveSlotMetaDirty) {
+        refreshSaveSlotMetaNow();
+      }
+      if (mouseSteer) {
+        mouseSteer = false;
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+      }
+    }
+
+    // Integration Hub: reset per-frame automation budget.
+    integrationHubWindow.automationsActionsFiredThisFrame = 0;
+
+
+    // Police heat decays in real time (stays stable even if you change timeScale).
+    policeHeat = std::max(0.0, policeHeat - dtReal * 0.015);
+
+    // Missile lock (player): build/decay lock progress for guided weapons.
+    {
+      auto updateLock = [&](MissileLockState& st, WeaponType wt, int ammo) {
+        const WeaponDef& wd = weaponDef(wt);
+        if (!wd.guided || ammo <= 0 || docked || paused || supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+          st.active = false;
+          st.progress = 0.0;
+          st.targetId = 0;
+          return;
+        }
+
+        st.active = true;
+
+        const double dt = std::clamp(dtReal, 0.0, 0.25);
+        const double lockTimeSec = 1.25;
+        const double decayTimeSec = 0.75;
+        const double lockConeCos = 0.995; // tight forward cone
+        const double lockRangeKm = wd.rangeKm;
+
+        core::u64 candId = 0;
+        std::size_t candIdx = 0;
+        double candAim = lockConeCos;
+
+        const math::Vec3d origin = ship.positionKm();
+        math::Vec3d fwd = ship.forward();
+        if (fwd.lengthSq() < 1e-12) fwd = {0,0,1};
+        fwd = fwd.normalized();
+
+        auto consider = [&](std::size_t idx) {
+          const auto& c = contacts[idx];
+          if (!c.alive) return;
+          const math::Vec3d to = c.ship.positionKm() - origin;
+          const double dist2 = to.lengthSq();
+          if (dist2 < 1e-12) return;
+          const double dist = std::sqrt(dist2);
+          if (dist > lockRangeKm) return;
+          const double aim = math::dot(fwd, to / dist);
+          if (aim < lockConeCos) return;
+          if (candId == 0 || aim > candAim) {
+            candId = c.id;
+            candIdx = idx;
+            candAim = aim;
+          }
+        };
+
+        if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
+          consider((std::size_t)target.index);
+        } else {
+          for (std::size_t i = 0; i < contacts.size(); ++i) consider(i);
+        }
+
+        if (candId != 0) {
+          if (st.targetId != candId) {
+            st.targetId = candId;
+            st.targetIndex = candIdx;
+            st.progress = 0.0;
+          }
+          st.progress = std::min(1.0, st.progress + dt / lockTimeSec);
+        } else {
+          st.progress = std::max(0.0, st.progress - dt / decayTimeSec);
+          if (st.progress <= 0.0) st.targetId = 0;
+        }
+      };
+
+      updateLock(missileLockPrimary, weaponPrimary, (int)weaponAmmoPrimary);
+      updateLock(missileLockSecondary, weaponSecondary, (int)weaponAmmoSecondary);
+    }
+
+    // Keep relative mouse mode in sync with our control mode.
+    // (Automatically release the mouse when docked so UI interaction is painless.)
+    if (docked && mouseSteer) {
+      mouseSteer = false;
+      SDL_SetRelativeMouseMode(SDL_FALSE);
+      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+      toast(toasts, "Mouse steer disabled while docked.", 2.0);
+    }
+
+    const SDL_bool wantRelMouse = mouseSteer ? SDL_TRUE : SDL_FALSE;
+    if (SDL_GetRelativeMouseMode() != wantRelMouse) {
+      SDL_SetRelativeMouseMode(wantRelMouse);
+      SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+    }
+
+    // --- Authority demand actions (shared by HUD / Comms / keybinds) ----------------
+    // Police scans can prompt the player to either pay a bribe or comply (risking confiscation/fines),
+    // and wanted players can be forced to submit and pay down bounties.
+    // These helpers centralize that logic so UI buttons and keybinds behave identically.
+    const auto authorityActionAllowed = [&]() -> bool {
+      return !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle;
+    };
+
+    const auto doAuthorityComplyOrSubmit = [&](const char* origin, bool requireNoUiCapture) -> bool {
+      (void)origin;
+      if (requireNoUiCapture && io.WantCaptureKeyboard) return false;
+      if (!authorityActionAllowed()) return false;
+
+      // Contraband scan resolution takes priority over bounty submission.
+      if (bribeOffer.active && timeDays < bribeOffer.untilDays) {
+        enforceContraband(bribeOffer.factionId,
+                          bribeOffer.sourceName.empty() ? "Security" : bribeOffer.sourceName,
+                          bribeOffer.illegalValueCr,
+                          bribeOffer.detail,
+                          bribeOffer.scannedIllegal);
+        bribeOffer = BribeOffer{};
+        return true;
+      }
+
+      // Submit to an outstanding bounty demand.
+      if (policeDemand.active && timeDays < policeDemand.untilDays) {
+        const core::u32 fid = policeDemand.factionId;
+        const double owed = getBounty(fid);
+        const double pay = std::min(credits, owed);
+        if (pay > 0.0) {
+          credits -= pay;
+          addBounty(fid, -pay);
+        }
+        const double remaining = getBounty(fid);
+        if (remaining <= 0.0) {
+          clearBounty(fid);
+          policeAlertUntilDays = timeDays;
+          toast(toasts, "Submitted. Bounty paid: CLEAN.", 2.4);
+          policeDemand = PoliceDemand{};
+        } else {
+          toast(toasts,
+                "Submitted. Partial payment " + std::to_string((int)pay) + " cr. Remaining bounty " +
+                  std::to_string((int)remaining) + " cr.",
+                3.0);
+          // Unable to settle: authorities will escalate immediately.
+          policeDemand.active = false;
+          policeDemand.untilDays = timeDays;
+          policeDemand.amountCr = remaining;
+        }
+        return true;
+      }
+
+      toast(toasts, "No active authority demand to submit to.", 1.8);
+      return true;
+    };
+
+    const auto doAuthorityBribe = [&](const char* origin, bool requireNoUiCapture) -> bool {
+      (void)origin;
+      if (requireNoUiCapture && io.WantCaptureKeyboard) return false;
+      if (!authorityActionAllowed()) return false;
+
+      if (bribeOffer.active && timeDays < bribeOffer.untilDays) {
+        if (credits + 1e-6 < bribeOffer.amountCr) {
+          toast(toasts,
+                "Insufficient credits for bribe (" + std::to_string((int)std::round(bribeOffer.amountCr)) + " cr).",
+                2.6);
+          return true;
+        }
+
+        credits -= bribeOffer.amountCr;
+
+        // Bribery still generates some local alert, but avoids confiscation + formal bounty.
+        policeHeat = std::clamp(policeHeat + std::min(0.9, 0.35 + bribeOffer.illegalValueCr / 12000.0), 0.0, 6.0);
+        addRep(bribeOffer.factionId, -1.0);
+
+        // If the player somehow lost the smuggle package while the offer was up, fail it.
+        int failedSmuggle = 0;
+        for (auto& m : missions) {
+          if (m.completed || m.failed) continue;
+          if (m.type != sim::MissionType::Smuggle) continue;
+          const std::size_t mi = (std::size_t)m.commodity;
+          if (mi >= econ::kCommodityCount) continue;
+          if (bribeOffer.scannedIllegal[mi] <= 1e-6) continue;
+          if (cargo[mi] + 1e-6 < m.units) {
+            m.failed = true;
+            addRep(m.factionId, -4.0);
+            ++failedSmuggle;
+          }
+        }
+        if (failedSmuggle > 0) {
+          toast(toasts, "Smuggle mission failed: package missing.", 3.2);
+        }
+
+        toast(toasts,
+              (bribeOffer.sourceName.empty() ? "Security" : bribeOffer.sourceName) +
+                std::string(": bribe accepted. Cargo scan waived."),
+              3.2);
+        bribeOffer = BribeOffer{};
+        return true;
+      }
+
+      toast(toasts, "No active bribe offer.", 1.8);
+      return true;
+    };
+
+    // Events
+    SDL_Event event;
+    {
+      STELLAR_PROFILE_SCOPE("InputEvents");
+
+    while (SDL_PollEvent(&event)) {
+      ImGui_ImplSDL2_ProcessEvent(&event);
+
+      if (event.type == SDL_QUIT) running = false;
+      if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) running = false;
+
+      // Camera rig: Alt+mouse orbit/pan/zoom, plus keyboard shortcuts.
+      // (Mouse handled here for all events; keyboard handled below in the KEYDOWN branch so rebind can intercept.)
+      if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEWHEEL) {
+        game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
+                                   [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); });
+      }
+
+      if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+        const auto key = [&](const game::KeyChord& chord) { return game::chordMatchesEvent(chord, event.key); };
+
+        // If we're rebinding a control, capture this key press and don't also trigger gameplay actions.
+        if (game::handleControlsRebindKeydown(
+                controlsWindow, event.key, controls, controlsDirty,
+                [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
+          continue;
+        }
+
+        if (game::handleCameraRigEvent(cameraRigWindow, event, io, mouseSteer, actionWheel.open,
+                                       [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); })) {
+          continue;
+        }
+
+        // Radial action wheel: hold to open, release to activate.
+        if (key(controls.actions.actionWheel) && !actionWheel.open && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
+          game::openActionWheel(actionWheel);
+
+          // If mouse-steer is enabled, temporarily release the cursor so the wheel can be used.
+          actionWheelPrevMouseSteer = mouseSteer;
+          actionWheelSuppressedMouseSteer = false;
+          if (mouseSteer) {
+            mouseSteer = false;
+            actionWheelSuppressedMouseSteer = true;
+            SDL_SetRelativeMouseMode(SDL_FALSE);
+            SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+          }
+
+          continue;
+        }
+
+        if (key(controls.actions.commandPalette) && !io.WantCaptureKeyboard) {
+          game::openCommandPalette(commandPalette);
+        }
+
+        // ESC: toggle in-game pause menu (closes first if already open).
+        if (event.key.keysym.sym == SDLK_ESCAPE) {
+          if (deathRebuy.active) continue;
+          // Close the pause menu even if ImGui wants the keyboard (the menu owns ESC).
+          if (showPauseMenu) {
+            showPauseMenu = false;
+            continue;
+          }
+
+          // If the docked station menu is open, close it first.
+          if (showStationMenu) {
+            showStationMenu = false;
+            stationMenuPage = StationMenuPage::Root;
+            continue;
+          }
+
+          // If an action wheel is open, close it first (ESC acts as a "cancel").
+          if (actionWheel.open) {
+            game::closeActionWheel(actionWheel);
+            if (actionWheelSuppressedMouseSteer && actionWheelPrevMouseSteer && !docked) {
+              mouseSteer = true;
+              SDL_SetRelativeMouseMode(SDL_TRUE);
+              SDL_GetRelativeMouseState(nullptr, nullptr); // flush deltas
+            }
+            actionWheelPrevMouseSteer = false;
+            actionWheelSuppressedMouseSteer = false;
+            continue;
+          }
+
+          // Don't open the pause menu if another UI is actively capturing input.
+          if (!showMainMenu && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
+            showPauseMenu = true;
+            pauseMenuPage = PauseMenuPage::Root;
+            saveSlotMetaDirty = true;
+            continue;
           }
         }
 
+        if (key(controls.actions.quit)) running = false;
+
+        // Quicksave / quickload (legacy paths).
+        if (key(controls.actions.quicksave)) {
+          if (saveGameToPath(std::filesystem::path(savePath))) {
+            toast(toasts, "Saved to " + savePath, 2.5);
+          } else {
+            toast(toasts, "Failed to save to " + savePath, 2.5);
+          }
+        }
+        if (key(controls.actions.quickload)) {
+          if (loadGameFromPath(std::filesystem::path(savePath))) {
+            toast(toasts, "Loaded " + savePath, 2.5);
+          } else {
+            toast(toasts, "Failed to load " + savePath, 2.5);
+          }
+        }
 
         // Window toggles
         if (key(controls.actions.toggleGalaxy) && !io.WantCaptureKeyboard) showGalaxy = !showGalaxy;
@@ -7263,88 +9295,12 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 	              target.index = cands[pick].idx;
 	            }
 	          }
-
-	        if (key(controls.actions.complyOrSubmit)) {
-          if (!io.WantCaptureKeyboard && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
-            // Contraband scan resolution takes priority over bounty submission.
-            if (bribeOffer.active && timeDays < bribeOffer.untilDays) {
-              enforceContraband(bribeOffer.factionId,
-                                bribeOffer.sourceName.empty() ? "Security" : bribeOffer.sourceName,
-                                bribeOffer.illegalValueCr,
-                                bribeOffer.detail,
-                                bribeOffer.scannedIllegal);
-              bribeOffer = BribeOffer{};
-            } else if (policeDemand.active && timeDays < policeDemand.untilDays) {
-              const core::u32 fid = policeDemand.factionId;
-              const double owed = getBounty(fid);
-              const double pay = std::min(credits, owed);
-              if (pay > 0.0) {
-                credits -= pay;
-                addBounty(fid, -pay);
-              }
-              const double remaining = getBounty(fid);
-              if (remaining <= 0.0) {
-                clearBounty(fid);
-                policeAlertUntilDays = timeDays;
-                toast(toasts, "Submitted. Bounty paid: CLEAN.", 2.4);
-                policeDemand = PoliceDemand{};
-              } else {
-                toast(toasts,
-                      "Submitted. Partial payment " + std::to_string((int)pay) + " cr. Remaining bounty " + std::to_string((int)remaining) + " cr.",
-                      3.0);
-                // Unable to settle: authorities will escalate immediately.
-                policeDemand.active = false;
-                policeDemand.untilDays = timeDays;
-                policeDemand.amountCr = remaining;
-              }
-            } else {
-              toast(toasts, "No active authority demand to submit to.", 1.8);
-            }
-          }
+        if (key(controls.actions.complyOrSubmit)) {
+          doAuthorityComplyOrSubmit("Keybind", /*requireNoUiCapture=*/true);
         }
 
         if (key(controls.actions.bribe)) {
-          if (!io.WantCaptureKeyboard && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
-            if (bribeOffer.active && timeDays < bribeOffer.untilDays) {
-              if (credits + 1e-6 < bribeOffer.amountCr) {
-                toast(toasts,
-                      "Insufficient credits for bribe (" + std::to_string((int)std::round(bribeOffer.amountCr)) + " cr).",
-                      2.6);
-              } else {
-                credits -= bribeOffer.amountCr;
-
-                // Bribery still generates some local alert, but avoids confiscation + formal bounty.
-                policeHeat = std::clamp(policeHeat + std::min(0.9, 0.35 + bribeOffer.illegalValueCr / 12000.0), 0.0, 6.0);
-                addRep(bribeOffer.factionId, -1.0);
-
-                // If the player somehow lost the smuggle package while the offer was up, fail it.
-                int failedSmuggle = 0;
-                for (auto& m : missions) {
-                  if (m.completed || m.failed) continue;
-                  if (m.type != sim::MissionType::Smuggle) continue;
-                  const std::size_t mi = (std::size_t)m.commodity;
-                  if (mi >= econ::kCommodityCount) continue;
-                  if (bribeOffer.scannedIllegal[mi] <= 1e-6) continue;
-                  if (cargo[mi] + 1e-6 < m.units) {
-                    m.failed = true;
-                    addRep(m.factionId, -4.0);
-                    ++failedSmuggle;
-                  }
-                }
-                if (failedSmuggle > 0) {
-                  toast(toasts, "Smuggle mission failed: package missing.", 3.2);
-                }
-
-                toast(toasts,
-                      (bribeOffer.sourceName.empty() ? "Security" : bribeOffer.sourceName) +
-                        std::string(": bribe accepted. Cargo scan waived."),
-                      3.2);
-                bribeOffer = BribeOffer{};
-              }
-            } else {
-              toast(toasts, "No active bribe offer.", 1.8);
-            }
-          }
+          doAuthorityBribe("Keybind", /*requireNoUiCapture=*/true);
         }
 
         if (key(controls.actions.toggleMouseSteer)) {
@@ -7597,61 +9553,61 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
             const bool hadValid = sim::dockingClearanceValid(cs, timeDays);
 
-            // Optional congestion hint: count nearby ships in comms range (excluding the player).
-            int nearby = 0;
-            for (const auto& c : contacts) {
-              if (!c.alive) continue;
-              if ((c.ship.positionKm() - stPos).length() <= st.commsRangeKm) ++nearby;
-            }
+            const auto out = requestDockingClearanceCommon(st, dist, /*autoMode=*/false, /*allowToast=*/true, "Keybind");
+            if (!out.access.allowed()) {
+              // Denied by reputation / law (helper already notified + logged).
+              audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
+            } else {
+              const double traffic01 = out.traffic01;
+              const auto dec = out.decision;
 
-            const double traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearby);
-            const auto dec = sim::requestDockingClearance(seed, st, timeDays, dist, cs, traffic01);
+              // Structured trace for cross-system debugging (Integration Hub).
+              {
+                const char* statusStr = "Unknown";
+                switch (dec.status) {
+                  case sim::DockingClearanceStatus::Granted: statusStr = "Granted"; break;
+                  case sim::DockingClearanceStatus::Denied: statusStr = "Denied"; break;
+                  case sim::DockingClearanceStatus::OutOfRange: statusStr = "OutOfRange"; break;
+                  case sim::DockingClearanceStatus::Throttled: statusStr = "Throttled"; break;
+                  default: break;
+                }
 
-            // Structured trace for cross-system debugging (Integration Hub).
-            {
-              const char* statusStr = "Unknown";
-              switch (dec.status) {
-                case sim::DockingClearanceStatus::Granted: statusStr = "Granted"; break;
-                case sim::DockingClearanceStatus::Denied: statusStr = "Denied"; break;
-                case sim::DockingClearanceStatus::OutOfRange: statusStr = "OutOfRange"; break;
-                case sim::DockingClearanceStatus::Throttled: statusStr = "Throttled"; break;
-                default: break;
+                const sim::DockingClearanceState csSnap = cs;
+                game::GameEvent ev{};
+                ev.tRealSec = timeRealSec;
+                ev.tSimDays = timeDays;
+                ev.kind = game::GameEventKind::Docking;
+                ev.tag = "Clearance";
+                ev.msg = std::string("Docking clearance ") + statusStr +
+                         (csSnap.assignedPad ? (std::string(" (pad ") + std::to_string((int)csSnap.assignedPad) + ")") : "") +
+                         " (traffic " + std::to_string((int)std::llround(traffic01 * 100.0)) + "%)";
+                ev.hasPos = true;
+                ev.posKm = ship.positionKm();
+                ev.u64a = (core::u64)st.id;
+                ev.u64b = (core::u64)csSnap.assignedPad;
+                game::hubPushEvent(integrationHubWindow, std::move(ev));
               }
 
-              const sim::DockingClearanceState csSnap = cs;
-              game::GameEvent ev{};
-              ev.tRealSec = timeRealSec;
-              ev.tSimDays = timeDays;
-              ev.kind = game::GameEventKind::Docking;
-              ev.tag = "Clearance";
-              ev.msg = std::string("Docking clearance ") + statusStr +
-                       (csSnap.assignedPad ? (std::string(" (pad ") + std::to_string((int)csSnap.assignedPad) + ")") : "");
-              ev.hasPos = true;
-              ev.posKm = ship.positionKm();
-              ev.u64a = (core::u64)st.id;
-              ev.u64b = (core::u64)csSnap.assignedPad;
-              game::hubPushEvent(integrationHubWindow, std::move(ev));
-            }
-
-            if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
-              std::string msg = "Docking clearance already granted.";
-              if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
-              toast(toasts, msg, 2.0);
-              audio.play(game::AudioEngine::Sfx::UiConfirm, 0.8f, 0.0f);
-            } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
-              toast(toasts, "Out of comms range for clearance.", 2.5);
-              audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
-            } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
-              toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
-              audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
-            } else if (dec.status == sim::DockingClearanceStatus::Granted) {
-              std::string msg = "Docking clearance GRANTED.";
-              if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
-              toast(toasts, msg, 3.0);
-              audio.play(game::AudioEngine::Sfx::UiConfirm, 1.0f, 0.0f);
-            } else {
-              toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
-              audio.play(game::AudioEngine::Sfx::UiError, 1.0f, 0.0f);
+              if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
+                std::string msg = "Docking clearance already granted.";
+                if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+                toast(toasts, msg, 2.0);
+                audio.play(game::AudioEngine::Sfx::UiConfirm, 0.8f, 0.0f);
+              } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
+                toast(toasts, "Out of comms range for clearance.", 2.5);
+                audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
+              } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
+                toast(toasts, "Clearance channel busy. Try again soon.", 2.5);
+                audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
+              } else if (dec.status == sim::DockingClearanceStatus::Granted) {
+                std::string msg = "Docking clearance GRANTED.";
+                if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+                toast(toasts, msg, 3.0);
+                audio.play(game::AudioEngine::Sfx::UiConfirm, 1.0f, 0.0f);
+              } else {
+                toast(toasts, "Docking clearance DENIED. (traffic)", 3.0);
+                audio.play(game::AudioEngine::Sfx::UiError, 1.0f, 0.0f);
+              }
             }
           } else {
             toast(toasts, "No station targeted for clearance.", 2.0);
@@ -7680,6 +9636,8 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
               docked = false;
               dockedStationId = 0;
               dockedPad = 0;
+              showStationMenu = false;
+              stationMenuPage = StationMenuPage::Root;
               toast(toasts, "Undocked.", 2.0);
             game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Undock", "Undocked", true, ship.positionKm()});
               audio.play(game::AudioEngine::Sfx::Undocked, 1.0f, 0.0f);
@@ -7883,6 +9841,11 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                 toast(toasts, msg, 2.5);
                 game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", msg, true, ship.positionKm(), (core::u64)st.id, (core::u64)dockedPad});
                 audio.play(game::AudioEngine::Sfx::Docked, 1.0f, 0.0f);
+
+                if (stationMenuAutoOpenOnDock) {
+                  showStationMenu = true;
+                  stationMenuPage = StationMenuPage::Root;
+                }
 
                 // Trade Route Runner: advance when we dock at the planned destination station.
                 if (tradePlannerWindow.route.active && !tradePlannerWindow.route.legs.empty() && currentSystem) {
@@ -8231,8 +10194,6 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                             const double t = std::clamp(1.0 - d / blastRadiusKm, 0.0, 1.0);
                             const double dmg = 55.0 * t;
                             applyDamage(dmg, playerShield, playerHull);
-                          }
-                        }
                       }
                     } else {
                       toast(toasts, "Asteroid depleted.", 1.5);
@@ -8327,21 +10288,38 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
 
         // If we don't have clearance yet, try to request it automatically when in comms range.
         if (!clearanceValid) {
-          int nearby = 0;
-          for (const auto& c : contacts) {
-            if (!c.alive) continue;
-            if ((c.ship.positionKm() - stPos).length() <= st.commsRangeKm) ++nearby;
-          }
+          const auto out =
+            requestDockingClearanceCommon(st, distKm, /*autoMode=*/true, /*allowToast=*/true, "DockingComputer");
 
-          const double traffic01 = sim::estimateDockingTraffic01(seed, st, timeDays, nearby);
-          const auto dec = sim::autoRequestDockingClearance(seed, st, timeDays, distKm, cs, traffic01);
+          if (!out.access.allowed()) {
+            toast(toasts,
+                  "Docking computer disengaged: clearance denied (" + dockingAccessReasonShort(out.access) + ").",
+                  3.0);
+            audio.play(game::AudioEngine::Sfx::UiError, 1.0f, 0.0f);
 
-          if (dec.status == sim::DockingClearanceStatus::Granted) {
-            std::string msg = "Docking clearance GRANTED.";
-            if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
-            toast(toasts, msg, 2.2);
-          } else if (dec.status == sim::DockingClearanceStatus::Denied) {
-            toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
+            autopilot = false;
+            dockingComputer.reset();
+            navAutoRun = false;
+
+            game::hubPushEvent(integrationHubWindow,
+                               game::GameEvent{timeRealSec,
+                                               timeDays,
+                                               game::GameEventKind::Docking,
+                                               "DockingComputerDisengaged",
+                                               "Disengaged (denied: " + dockingAccessReasonShort(out.access) + ")",
+                                               true,
+                                               ship.positionKm(),
+                                               (core::u64)st.id});
+          } else {
+            const auto dec = out.decision;
+
+            if (dec.status == sim::DockingClearanceStatus::Granted) {
+              std::string msg = "Docking clearance GRANTED.";
+              if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+              toast(toasts, msg, 2.2);
+            } else if (dec.status == sim::DockingClearanceStatus::Denied) {
+              toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
+            }
           }
         }
 
@@ -8375,6 +10353,11 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           if (dockedPad != 0) msg += " (Pad " + std::to_string(dockedPad) + ")";
           toast(toasts, msg, 2.5);
           game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "Dock", msg, true, ship.positionKm(), (core::u64)st.id, (core::u64)dockedPad});
+
+          if (stationMenuAutoOpenOnDock) {
+            showStationMenu = true;
+            stationMenuPage = StationMenuPage::Root;
+          }
 
           // Trade Route Runner: advance when we dock at the planned destination station.
           if (tradePlannerWindow.route.active && !tradePlannerWindow.route.legs.empty()) {
@@ -8526,11 +10509,18 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
         };
         const double thrustMag = magMax(input.thrustLocal.x, input.thrustLocal.y, input.thrustLocal.z);
         const double torqueMag = magMax(input.torqueLocal.x, input.torqueLocal.y, input.torqueLocal.z);
-        if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone || input.boost || input.brake) {
-          navAssist.disengage();
-          navAssistLast = {};
-          toast(toasts, "Nav assist disengaged (manual override).", 1.6);
-        }
+
+if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone || input.boost || input.brake) {
+  navAssist.disengage();
+  navAssistLast = {};
+
+  // If Field Ops is driving nav assist, treat this as a manual override cancellation.
+  if (fieldOps.mode != FieldOpsMode::Off) {
+    fieldOpsStop("Field Ops disengaged (manual override).");
+  } else {
+    toast(toasts, "Nav assist disengaged (manual override).", 1.6);
+  }
+}
       }
 
       if (navAssist.active()) {
@@ -9189,6 +11179,91 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
           respawnNearStation(*currentSystem, 0);
           galaxySelectedSystemId = currentSystem->stub.id;
 
+
+  auto findStationIndexById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> int {
+    for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+      if (sys.stations[i].id == stationId) return (int)i;
+    }
+    return -1;
+  };
+
+  auto stationNameById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> std::string {
+    const int idx = findStationIndexById(sys, stationId);
+    if (idx >= 0) return sys.stations[(std::size_t)idx].name;
+    return "Station " + std::to_string((core::u64)stationId);
+  };
+
+  // Respawn docked at a station (used by the insurance rebuy flow).
+  // This resets transient in-space state and deterministically reseeds system signals/asteroids,
+  // avoiding "zombie" missiles, beams, scans, etc that can otherwise linger across a hard reset.
+  auto respawnDockedAtStation = [&](sim::SystemId systemId, sim::StationId stationId) {
+    const auto& sys = universe.getSystem(systemId);
+    currentStub = sys.stub;
+    currentSystem = &sys;
+
+    // Reset transient in-space state; then deterministically reseed the system.
+    clearances.clear();
+    contacts.clear();
+    beams.clear();
+    projectiles.clear();
+    missiles.clear();
+    floatingCargo.clear();
+
+    // Signals/asteroids are re-seeded deterministically.
+    signals.clear();
+    asteroids.clear();
+    resourceFieldSites.clear();
+    resourceFieldIndexById.clear();
+
+    // Clear combat / navigation transient state.
+    interdiction = sim::InterdictionState{};
+    interdictionSubmitRequested = false;
+    interdictionPirateName.clear();
+    scanning = false;
+    scanProgressSec = 0.0;
+    fsdState = FsdState::Idle;
+    fsdTargetSystem = 0;
+    fsdChargeRemainingSec = 0.0;
+    fsdTravelRemainingSec = 0.0;
+    fsdTravelTotalSec = 0.0;
+    supercruiseState = SupercruiseState::Idle;
+    supercruiseChargeRemainingSec = 0.0;
+    supercruiseCooldownRemainingSec = 0.0;
+    supercruiseDropRequested = false;
+    navAutoRun = false;
+    autopilot = false;
+    selectedStationIndex = 0;
+
+    seedSystemSpaceObjects(*currentSystem);
+    syncTrafficConvoySignals(*currentSystem);
+    nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
+
+    galaxySelectedSystemId = currentSystem->stub.id;
+
+    // Choose station index (fallback to first).
+    int stIdx = findStationIndexById(*currentSystem, stationId);
+    if (stIdx < 0) stIdx = (!currentSystem->stations.empty() ? 0 : -1);
+    if (stIdx >= 0) {
+      stationId = currentSystem->stations[(std::size_t)stIdx].id;
+      selectedStationIndex = stIdx;
+
+      // Spawn near the station, then mark as docked so the normal docking snap logic takes over next tick.
+      respawnNearStation(*currentSystem, (std::size_t)stIdx);
+
+      docked = true;
+      dockedPad = 0;
+      dockedStationId = stationId;
+
+      lastSafeDockSystemId = currentSystem->stub.id;
+      lastSafeDockStationId = dockedStationId;
+    } else {
+      docked = false;
+      dockedStationId = 0;
+      dockedPad = 0;
+      respawnNearStation(*currentSystem, 0);
+    }
+  };
+
           // If we have a pending arrival target station (from missions / trade helper), auto-target it when we reach its system.
           if (pendingArrivalTargetStationId != 0) {
             for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
@@ -9229,6 +11304,91 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
   galaxySelectedSystemId = navRoute[navRouteHop + 1];
 } else {
   galaxySelectedSystemId = currentSystem->stub.id;
+
+
+  auto findStationIndexById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> int {
+    for (std::size_t i = 0; i < sys.stations.size(); ++i) {
+      if (sys.stations[i].id == stationId) return (int)i;
+    }
+    return -1;
+  };
+
+  auto stationNameById = [&](const sim::StarSystem& sys, sim::StationId stationId) -> std::string {
+    const int idx = findStationIndexById(sys, stationId);
+    if (idx >= 0) return sys.stations[(std::size_t)idx].name;
+    return "Station " + std::to_string((core::u64)stationId);
+  };
+
+  // Respawn docked at a station (used by the insurance rebuy flow).
+  // This resets transient in-space state and deterministically reseeds system signals/asteroids,
+  // avoiding "zombie" missiles, beams, scans, etc that can otherwise linger across a hard reset.
+  auto respawnDockedAtStation = [&](sim::SystemId systemId, sim::StationId stationId) {
+    const auto& sys = universe.getSystem(systemId);
+    currentStub = sys.stub;
+    currentSystem = &sys;
+
+    // Reset transient in-space state; then deterministically reseed the system.
+    clearances.clear();
+    contacts.clear();
+    beams.clear();
+    projectiles.clear();
+    missiles.clear();
+    floatingCargo.clear();
+
+    // Signals/asteroids are re-seeded deterministically.
+    signals.clear();
+    asteroids.clear();
+    resourceFieldSites.clear();
+    resourceFieldIndexById.clear();
+
+    // Clear combat / navigation transient state.
+    interdiction = sim::InterdictionState{};
+    interdictionSubmitRequested = false;
+    interdictionPirateName.clear();
+    scanning = false;
+    scanProgressSec = 0.0;
+    fsdState = FsdState::Idle;
+    fsdTargetSystem = 0;
+    fsdChargeRemainingSec = 0.0;
+    fsdTravelRemainingSec = 0.0;
+    fsdTravelTotalSec = 0.0;
+    supercruiseState = SupercruiseState::Idle;
+    supercruiseChargeRemainingSec = 0.0;
+    supercruiseCooldownRemainingSec = 0.0;
+    supercruiseDropRequested = false;
+    navAutoRun = false;
+    autopilot = false;
+    selectedStationIndex = 0;
+
+    seedSystemSpaceObjects(*currentSystem);
+    syncTrafficConvoySignals(*currentSystem);
+    nextTrafficConvoyRefreshDays = timeDays + trafficConvoyRefreshIntervalDays;
+
+    galaxySelectedSystemId = currentSystem->stub.id;
+
+    // Choose station index (fallback to first).
+    int stIdx = findStationIndexById(*currentSystem, stationId);
+    if (stIdx < 0) stIdx = (!currentSystem->stations.empty() ? 0 : -1);
+    if (stIdx >= 0) {
+      stationId = currentSystem->stations[(std::size_t)stIdx].id;
+      selectedStationIndex = stIdx;
+
+      // Spawn near the station, then mark as docked so the normal docking snap logic takes over next tick.
+      respawnNearStation(*currentSystem, (std::size_t)stIdx);
+
+      docked = true;
+      dockedPad = 0;
+      dockedStationId = stationId;
+
+      lastSafeDockSystemId = currentSystem->stub.id;
+      lastSafeDockStationId = dockedStationId;
+    } else {
+      docked = false;
+      dockedStationId = 0;
+      dockedPad = 0;
+      respawnNearStation(*currentSystem, 0);
+    }
+  };
 }
 
 
@@ -11960,6 +14120,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                     policeDemand.active = true;
                     policeDemand.factionId = scanFaction;
                     policeDemand.amountCr = bounty;
+                    policeDemand.startDays = timeDays;
                     policeDemand.untilDays = timeDays + (18.0 / 86400.0);
                     policeDemand.sourceName = cargoScanSourceName.empty() ? "Authorities" : cargoScanSourceName;
                     toast(toasts, policeDemand.sourceName + ": outstanding bounty detected. Submit (I) or face enforcement.", 3.2);
@@ -12158,7 +14319,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                if (rewardI > 0) credits += (double)rewardI;
 	
 	                if (c.distressPayerFactionId != 0 && c.distressRepReward != 0.0) {
-	                  repByFaction[c.distressPayerFactionId] = repByFaction[c.distressPayerFactionId] + c.distressRepReward;
+	                  addRep(c.distressPayerFactionId, c.distressRepReward);
 	                }
 
 	                // Mark the parent signal (if any) as completed for UI.
@@ -12205,17 +14366,95 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               tmp.reputation.push_back(sim::FactionReputation{kv.first, kv.second});
             }
 
+            const auto prevMissions = tmp.missions;
+
             const auto res = sim::tryCompleteBountyScan(tmp, currentSystem->stub.id, c.id, +2.0);
             if (res.completed > 0) {
+              auto applyPriorityContractImpulse = [&](const sim::Mission& m) {
+                if (!m.priority) return;
+                if (m.fromSystem == 0) return;
+                if (m.sourceKind != sim::MissionSourceKind::SystemEvent) return;
+
+                const double sev = std::clamp(m.sourceEventSeverity01, 0.0, 1.0);
+                const double mag = 0.006 + 0.010 * sev;
+
+                double dSec = 0.0;
+                double dPiracy = 0.0;
+                double dTraffic = 0.0;
+
+                switch (m.sourceEventKind) {
+                  case sim::SystemEventKind::PirateRaid:
+                    dSec = +mag;
+                    dPiracy = -mag;
+                    dTraffic = +0.5 * mag;
+                    break;
+                  case sim::SystemEventKind::SecurityCrackdown:
+                    dSec = +0.8 * mag;
+                    dPiracy = -0.6 * mag;
+                    dTraffic = -0.2 * mag;
+                    break;
+                  case sim::SystemEventKind::CivilUnrest:
+                    dSec = +0.6 * mag;
+                    dPiracy = -0.4 * mag;
+                    dTraffic = +0.4 * mag;
+                    break;
+                  case sim::SystemEventKind::TradeBoom:
+                    dTraffic = +mag;
+                    dSec = +0.4 * mag;
+                    dPiracy = -0.2 * mag;
+                    break;
+                  case sim::SystemEventKind::TradeBust:
+                    dTraffic = +0.7 * mag;
+                    dSec = +0.3 * mag;
+                    dPiracy = -0.2 * mag;
+                    break;
+                  case sim::SystemEventKind::ResearchBreakthrough:
+                    dTraffic = +0.8 * mag;
+                    dSec = +0.2 * mag;
+                    break;
+                  case sim::SystemEventKind::None:
+                  default:
+                    break;
+                }
+
+                applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+              };
+
+              auto findPrev = [&](core::u64 id) -> const sim::Mission* {
+                for (const auto& pm : prevMissions) if (pm.id == id) return &pm;
+                return nullptr;
+              };
+
+              bool anyPriority = false;
+              for (const auto& m : tmp.missions) {
+                const sim::Mission* pm = findPrev(m.id);
+                if (!pm) continue;
+                if (!pm->completed && m.completed) {
+                  anyPriority = anyPriority || m.priority;
+                  applyPriorityContractImpulse(m);
+                }
+              }
+
               credits = tmp.credits;
               missions = std::move(tmp.missions);
+
+              // Track rep deltas for progression feedback before we overwrite the map.
+              for (const auto& r : tmp.reputation) {
+                const double oldRep = getRep(r.factionId);
+                const double deltaRep = r.rep - oldRep;
+                if (std::abs(deltaRep) > 1e-9) {
+                  progFeed.repAccum[r.factionId] += deltaRep;
+                  progFeed.repLastChangeRealSec = timeRealSec;
+                }
+              }
 
               repByFaction.clear();
               for (const auto& r : tmp.reputation) {
                 repByFaction[r.factionId] = r.rep;
               }
 
-              toast(toasts, "Mission complete: bounty scan uploaded! +" + std::to_string((int)std::round(res.rewardCr)) + " cr", 3.0);
+              const std::string pfx = anyPriority ? std::string("PRIORITY ") : std::string();
+              toast(toasts, pfx + "Mission complete: bounty scan uploaded! +" + std::to_string((int)std::round(res.rewardCr)) + " cr", 3.0);
               game::hubPushEvent(integrationHubWindow,
                                  game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
                                                "MissionComplete",
@@ -13410,6 +15649,78 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       // Convert any overdue fines into bounties (warrants) once per sim step.
       processOverdueFines();
 
+      // --- GalNet auto-broadcast (system events) ---
+      {
+        const double cycleDays = std::max(0.001, systemEventParams.cycleDays);
+        const int cycleStampNow = (int)std::floor(timeDays / cycleDays);
+
+        auto meetsMinSeverity = [&](const sim::SystemConditionsSnapshot& snap) -> bool {
+          if (!snap.event.active) return false;
+          return (float)snap.event.severity01 + 1e-6f >= systemConditionsWindow.galNetMinSeverity;
+        };
+
+        auto maybeAutoBroadcast = [&](const sim::StarSystem& sys,
+                                     const sim::SystemConditionsSnapshot& snap,
+                                     bool watched) {
+          auto& a = galNetAnnouncedBySystem[sys.stub.id];
+          if (a.lastCycleStartDay == snap.event.startDay) return;
+
+          const bool autoEnabled =
+              watched ? systemConditionsWindow.galNetAutoBroadcastWatched
+                      : systemConditionsWindow.galNetAutoBroadcastLocal;
+
+          const bool showOverlay =
+              watched ? systemConditionsWindow.galNetWatchedShowOverlay
+                      : systemConditionsWindow.galNetLocalShowOverlay;
+
+          const bool showToast =
+              watched ? systemConditionsWindow.galNetWatchedShowToast
+                      : systemConditionsWindow.galNetLocalShowToast;
+
+          const bool activeAndSevereEnough = meetsMinSeverity(snap);
+
+          if (autoEnabled && activeAndSevereEnough) {
+            publishGalNetBulletin(sys.stub.id, showOverlay, showToast, /*allowWhenNoEvent=*/false,
+                                  watched ? "Watched system update" : "Local system update");
+          } else if (autoEnabled && systemConditionsWindow.galNetBroadcastEventEnds && a.lastCycleHadActiveEvent &&
+                     !snap.event.active) {
+            publishGalNetBulletin(sys.stub.id, showOverlay, showToast, /*allowWhenNoEvent=*/true,
+                                  watched ? "Watched system update" : "Local system update");
+          }
+
+          // Update tracking even if autoEnabled is off, to avoid retroactive spam when enabling.
+          a.lastCycleStartDay = snap.event.startDay;
+          a.lastCycleHadActiveEvent = snap.event.active;
+        };
+
+        if (currentSystem) {
+          const auto snap = snapshotSystemConditions(*currentSystem);
+          maybeAutoBroadcast(*currentSystem, snap, /*watched=*/false);
+        }
+
+        // Only scan watched systems once per cycle boundary.
+        if (cycleStampNow != galNetLastWatchScanCycleStamp) {
+          galNetLastWatchScanCycleStamp = cycleStampNow;
+
+          if (!galNetWatchSystems.empty()) {
+            for (const auto sysId : galNetWatchSystems) {
+              if (sysId == 0) continue;
+              if (currentSystem && sysId == currentSystem->stub.id) continue;
+              const auto& sys = universe.getSystem(sysId);
+              const auto snap = snapshotSystemConditions(sys);
+
+              if (systemConditionsWindow.galNetAutoBroadcastWatched) {
+                maybeAutoBroadcast(sys, snap, /*watched=*/true);
+              } else {
+                auto& a = galNetAnnouncedBySystem[sys.stub.id];
+                a.lastCycleStartDay = snap.event.startDay;
+                a.lastCycleHadActiveEvent = snap.event.active;
+              }
+            }
+          }
+        }
+      }
+
 
       // --- Background NPC trade traffic (market nudging) ---
       if (currentSystem) {
@@ -13456,8 +15767,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         };
 
         auto repDelta = [&](core::u32 fid, double delta) {
-          auto& r = repByFaction[fid];
-          r = std::clamp(r + delta, -100.0, 100.0);
+          addRep(fid, delta);
         };
 
         auto cleanupEscort = [&](const sim::Mission& m) {
@@ -13751,12 +16061,67 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           return nullptr;
         };
 
+        auto applyPriorityContractImpulse = [&](const sim::Mission& m, bool success) {
+          if (!m.priority) return;
+          if (m.fromSystem == 0) return;
+          if (m.sourceKind != sim::MissionSourceKind::SystemEvent) return;
+
+          const double sev = std::clamp(m.sourceEventSeverity01, 0.0, 1.0);
+          const double mag = 0.006 + 0.010 * sev;
+
+          double dSec = 0.0;
+          double dPiracy = 0.0;
+          double dTraffic = 0.0;
+
+          switch (m.sourceEventKind) {
+            case sim::SystemEventKind::PirateRaid:
+              dSec = success ? +mag : -mag;
+              dPiracy = success ? -mag : +mag;
+              dTraffic = success ? +0.5 * mag : -0.5 * mag;
+              break;
+            case sim::SystemEventKind::SecurityCrackdown:
+              dSec = success ? +0.8 * mag : -0.8 * mag;
+              dPiracy = success ? -0.6 * mag : +0.6 * mag;
+              dTraffic = success ? -0.2 * mag : +0.2 * mag;
+              break;
+            case sim::SystemEventKind::CivilUnrest:
+              dSec = success ? +0.6 * mag : -0.6 * mag;
+              dPiracy = success ? -0.4 * mag : +0.4 * mag;
+              dTraffic = success ? +0.4 * mag : -0.4 * mag;
+              break;
+            case sim::SystemEventKind::TradeBoom:
+              dTraffic = success ? +mag : -mag;
+              dSec = success ? +0.4 * mag : -0.4 * mag;
+              dPiracy = success ? -0.2 * mag : +0.2 * mag;
+              break;
+            case sim::SystemEventKind::TradeBust:
+              dTraffic = success ? +0.7 * mag : -0.7 * mag;
+              dSec = success ? +0.3 * mag : -0.3 * mag;
+              dPiracy = success ? -0.2 * mag : +0.2 * mag;
+              break;
+            case sim::SystemEventKind::ResearchBreakthrough:
+              dTraffic = success ? +0.8 * mag : -0.8 * mag;
+              dSec = success ? +0.2 * mag : -0.2 * mag;
+              break;
+            case sim::SystemEventKind::None:
+            default:
+              break;
+          }
+
+          applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+        };
+
         for (const auto& m : tmp.missions) {
           const sim::Mission* pm = findPrev(m.id);
           if (!pm) continue;
 
           if (!pm->failed && m.failed) {
-            toast(toasts, "Mission failed: deadline missed.", 3.0);
+            if (m.priority) {
+              toast(toasts, "PRIORITY contract failed: deadline missed.", 3.0);
+            } else {
+              toast(toasts, "Mission failed: deadline missed.", 3.0);
+            }
+            applyPriorityContractImpulse(m, false);
             game::hubPushEvent(integrationHubWindow,
                                game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
                                              "MissionFailed",
@@ -13768,21 +16133,24 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           }
 
           if (!pm->completed && m.completed) {
+            const std::string pfx = m.priority ? std::string("PRIORITY ") : std::string();
             if (m.type == sim::MissionType::Courier) {
-              toast(toasts, "Mission complete: courier delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: courier delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::Escort) {
-              toast(toasts, "Mission complete: convoy escorted. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: convoy escorted. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::Passenger) {
-              toast(toasts, "Mission complete: passengers delivered. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: passengers delivered. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::Smuggle) {
-              toast(toasts, "Mission complete: contraband delivered. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: contraband delivered. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::MultiDelivery) {
-              toast(toasts, "Mission complete: multi-hop delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: multi-hop delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::Delivery) {
-              toast(toasts, "Mission complete: delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: delivery. +" + std::to_string((int)m.reward) + " cr", 3.0);
             } else if (m.type == sim::MissionType::Salvage) {
-              toast(toasts, "Mission complete: salvage recovered. +" + std::to_string((int)m.reward) + " cr", 3.0);
+              toast(toasts, pfx + "Mission complete: salvage recovered. +" + std::to_string((int)m.reward) + " cr", 3.0);
             }
+
+            applyPriorityContractImpulse(m, true);
             // Integration Hub event for automations / debugging.
             game::hubPushEvent(integrationHubWindow,
                                game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
@@ -13821,6 +16189,16 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         credits = tmp.credits;
         cargo = tmp.cargo;
         missions = std::move(tmp.missions);
+
+        // Track rep deltas for progression feedback before we overwrite the map.
+        for (const auto& r : tmp.reputation) {
+          const double oldRep = getRep(r.factionId);
+          const double deltaRep = r.rep - oldRep;
+          if (std::abs(deltaRep) > 1e-9) {
+            progFeed.repAccum[r.factionId] += deltaRep;
+            progFeed.repLastChangeRealSec = timeRealSec;
+          }
+        }
 
         repByFaction.clear();
         for (const auto& r : tmp.reputation) {
@@ -14063,30 +16441,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     }
 
-    // Death / respawn
+    // Death / insurance rebuy
     if (playerHull <= 0.0) {
-      // Insurance rebuy: replacement cost scales with the player's ship progression.
-      // May issue an emergency loan; if the player cannot cover even with loan
-      // headroom, they get a basic loaner ship.
-      sim::InsurancePolicy pol{};
-      sim::PlayerShipEconomyState econShip{};
-      econShip.hull = shipHullClass;
-      econShip.thrusterMk = thrusterMk;
-      econShip.shieldMk = shieldMk;
-      econShip.distributorMk = distributorMk;
-      econShip.weaponPrimary = weaponPrimary;
-      econShip.weaponSecondary = weaponSecondary;
-      econShip.smuggleHoldMk = smuggleHoldMk;
-      econShip.fuelScoopMk = fuelScoopMk;
-      econShip.cargoCapacityKg = cargoCapacityKg;
-      econShip.fuelMax = fuelMax;
-      econShip.passengerSeats = passengerSeats;
-      econShip.fsdRangeLy = fsdRangeLy;
+      if (autoRebuyOnDeath) {
+        // Legacy behavior: instantly process the insurance claim and respawn docked.
+        sim::InsurancePolicy pol{};
+        sim::PlayerShipEconomyState econShip{};
+        econShip.shipHullClass = shipHullClass;
+        econShip.thrusterMk = thrusterMk;
+        econShip.shieldMk = shieldMk;
+        econShip.distributorMk = distributorMk;
+        econShip.weaponPrimary = weaponPrimary;
+        econShip.weaponSecondary = weaponSecondary;
+        econShip.smuggleHoldMk = smuggleHoldMk;
+        econShip.fuelScoopMk = fuelScoopMk;
+        econShip.cargoCapacityKg = cargoCapacityKg;
+        econShip.fuelMax = fuelMax;
+        econShip.passengerSeats = passengerSeats;
+        econShip.fsdRangeLy = fsdRangeLy;
 
-      const auto rebuy = sim::applyRebuyOnDeath(pol, econShip, credits, insuranceDebtCr);
+        const auto rebuy = sim::applyRebuyOnDeath(pol, econShip, credits, insuranceDebtCr);
 
-      if (rebuy.shipReset) {
-        shipHullClass = econShip.hull;
+        shipHullClass = econShip.shipHullClass;
         thrusterMk = econShip.thrusterMk;
         shieldMk = econShip.shieldMk;
         distributorMk = econShip.distributorMk;
@@ -14094,77 +16470,154 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         weaponSecondary = econShip.weaponSecondary;
         smuggleHoldMk = econShip.smuggleHoldMk;
         fuelScoopMk = econShip.fuelScoopMk;
-        fuelScoopDeployed = false;
         cargoCapacityKg = econShip.cargoCapacityKg;
         fuelMax = econShip.fuelMax;
         passengerSeats = econShip.passengerSeats;
         fsdRangeLy = econShip.fsdRangeLy;
         recalcPlayerStats();
-      }
 
-      {
-        std::string msg = "Ship destroyed! ";
-        const int rebuyCr = (int)std::round(rebuy.rebuyCostCr);
-        if (rebuy.result == sim::RebuyResult::Paid) {
-          msg += "Rebuy cost -" + std::to_string(rebuyCr) + " cr.";
-        } else if (rebuy.result == sim::RebuyResult::Loan) {
-          const int loanCr = (int)std::round(rebuy.loanTakenCr);
-          const int debtCr = (int)std::round(insuranceDebtCr);
-          msg += "Rebuy -" + std::to_string(rebuyCr) + " cr (loan " + std::to_string(loanCr) + "). Debt: " + std::to_string(debtCr) + " cr.";
-        } else {
-          msg += "Bankrupt. Issued loaner ship.";
+        if (vfxShockwaveEnabled) {
+          vfx::ShockwaveFx fx{};
+          fx.posKm = ship.positionKm();
+          fx.baseRadiusKm = 0.05;
+          fx.maxRadiusKm = 0.65;
+          fx.lifetimeSec = 1.0;
+          shockwaves.push_back(fx);
         }
-        msg += " (Cargo lost)";
-        toast(toasts, msg, 4.2);
+
+        // Reset ship state.
+        playerHull = playerHullMax;
+        playerShield = playerShieldMax * 0.6;
+        cargo.fill(0.0);
+        fuel = fuelMax;
+        scanProgressSec = 0.0;
+        scanning = false;
+        heat = 0.0;
+        heatImpulse = 0.0;
+
+        incomingMissileToastCooldownUntilDays = timeDays + (8.0 / 86400.0);
+        miningToastPendingUnits.fill(0.0);
+        miningToastLastDays.fill(-9999.0);
+        dockingDeniedToastCooldownUntilDays.clear();
+
+        // Prefer respawning at last safe dock; otherwise fall back to the nearest station in the current system.
+        sim::SystemId respawnSystemId = currentSystem ? currentSystem->stub.id : 0;
+        sim::StationId respawnStationId = (currentSystem && !currentSystem->stations.empty()) ? currentSystem->stations.front().id : 0;
+        if (lastSafeDockSystemId != 0 && lastSafeDockStationId != 0) {
+          respawnSystemId = lastSafeDockSystemId;
+          respawnStationId = lastSafeDockStationId;
+        }
+
+        if (respawnSystemId != 0 && respawnStationId != 0) {
+          respawnDockedAtStation(respawnSystemId, respawnStationId);
+        }
+
+        showStationMenu = true;
+        stationMenuPage = StationMenuPage::Root;
+
+        if (rebuy.shipReset) {
+          toast(toasts, "Ship destroyed. Bankrupt reset applied (loaner ship issued).", 3.0);
+        } else if (rebuy.loanTakenCr > 0.0) {
+          toast(toasts, "Ship destroyed. Insurance claim processed (loan taken).", 3.0);
+        } else {
+          toast(toasts, "Ship destroyed. Insurance claim processed.", 3.0);
+        }
+      } else if (!deathRebuy.active) {
+        // Enter the insurance claim screen (pauses sim until the player chooses a rebuy option).
+        if (vfxShockwaveEnabled) {
+          vfx::ShockwaveFx fx{};
+          fx.posKm = ship.positionKm();
+          fx.baseRadiusKm = 0.05;
+          fx.maxRadiusKm = 0.65;
+          fx.lifetimeSec = 1.0;
+          shockwaves.push_back(fx);
+        }
+
+        toast(toasts, "SHIP DESTROYED", 2.5);
+
+        deathRebuy.active = true;
+        deathRebuy.creditsBefore = credits;
+        deathRebuy.debtBefore = insuranceDebtCr;
+        deathRebuy.timeDaysAtDeath = timeDays;
+        deathRebuy.timeRealSecAtDeath = timeRealSec;
+        deathRebuy.shipPosKmAtDeath = ship.positionKm();
+        deathRebuy.systemAtDeath = currentSystem ? currentSystem->stub.id : 0;
+        deathRebuy.lastDockedSystem = lastSafeDockSystemId;
+        deathRebuy.lastDockedStation = lastSafeDockStationId;
+
+        // Determine the nearest station in the current system at time of death.
+        deathRebuy.nearestStationAtDeath = 0;
+        if (currentSystem) {
+          double bestD2 = 1e99;
+          for (const auto& st : currentSystem->stations) {
+            const double d2 = (sim::stationPosKm(st, timeDays) - deathRebuy.shipPosKmAtDeath).lengthSq();
+            if (d2 < bestD2) {
+              bestD2 = d2;
+              deathRebuy.nearestStationAtDeath = st.id;
+            }
+          }
+        }
+
+        // Build rebuy presets.
+        sim::PlayerShipEconomyState full{};
+        full.shipHullClass = shipHullClass;
+        full.thrusterMk = thrusterMk;
+        full.shieldMk = shieldMk;
+        full.distributorMk = distributorMk;
+        full.weaponPrimary = weaponPrimary;
+        full.weaponSecondary = weaponSecondary;
+        full.smuggleHoldMk = smuggleHoldMk;
+        full.fuelScoopMk = fuelScoopMk;
+        full.cargoCapacityKg = cargoCapacityKg;
+        full.fuelMax = fuelMax;
+        full.passengerSeats = passengerSeats;
+        full.fsdRangeLy = fsdRangeLy;
+
+        sim::PlayerShipEconomyState budget = full;
+        budget.thrusterMk = 1;
+        budget.shieldMk = 1;
+        budget.distributorMk = 1;
+        budget.weaponPrimary = sim::WeaponType::BeamLaser;
+        budget.weaponSecondary = sim::WeaponType::Cannon;
+        budget.smuggleHoldMk = 0;
+        budget.fuelScoopMk = 0;
+
+        sim::PlayerShipEconomyState loaner{};
+        loaner.shipHullClass = sim::ShipHullClass::Scout;
+        loaner.thrusterMk = 1;
+        loaner.shieldMk = 1;
+        loaner.distributorMk = 1;
+        loaner.weaponPrimary = sim::WeaponType::BeamLaser;
+        loaner.weaponSecondary = sim::WeaponType::Cannon;
+        loaner.smuggleHoldMk = 0;
+        loaner.fuelScoopMk = 0;
+        loaner.cargoCapacityKg = 420;
+        loaner.fuelMax = 45.0;
+        loaner.passengerSeats = 2;
+        loaner.fsdRangeLy = 18.0;
+
+        deathRebuy.options[0] = full;
+        deathRebuy.options[1] = budget;
+        deathRebuy.options[2] = loaner;
+        deathRebuy.selectedOption = 0;
+
+        // Prefer last docked respawn if we know it; otherwise nearest station in current system.
+        deathRebuy.respawnChoice = (deathRebuy.lastDockedSystem != 0 && deathRebuy.lastDockedStation != 0) ? 0 : 1;
+
+        // Freeze sim and suppress other overlays while the insurance UI is up.
+        paused = true;
+        showPauseMenu = false;
+        showStationMenu = false;
+        navAutoRun = false;
+        autopilot = false;
       }
+      // If the rebuy screen is already active, we do nothing here until it resolves.
+    }
 
-      if (vfxParticlesEnabled && vfxExplosionsEnabled) {
-        const double eBase = 2.2 * (double)vfxParticleIntensity;
-        particles.spawnExplosion(toRenderPosU(ship.positionKm()), toRenderVelU(ship.velocityKmS()), eBase);
-      }
-
-      playerHull = playerHullMax;
-      playerShield = playerShieldMax * 0.60;
-      cargo.fill(0.0);
-      fuel = fuelMax;
-      supercruiseState = SupercruiseState::Idle;
-      supercruiseChargeRemainingSec = 0.0;
-      supercruiseCooldownRemainingSec = 0.0;
-      supercruiseDropRequested = false;
-      interdiction = sim::InterdictionState{};
-      interdictionSubmitRequested = false;
-      interdictionPirateName.clear();
-      scanning = false;
-      scanProgressSec = 0.0;
-      fsdState = FsdState::Idle;
-      fsdTargetSystem = 0;
-      fsdChargeRemainingSec = 0.0;
-      fsdTravelRemainingSec = 0.0;
-      fsdTravelTotalSec = 0.0;
-      navAutoRun = false;
-      incomingMissileToastCooldownUntilDays = 0.0;
-
-      // Re-arm countermeasures on rebuy (fresh ship in hangar).
-      restockCountermeasureAmmo();
-      countermeasureCooldownUntilDays = 0.0;
-
-  miningToastPendingUnits.fill(0.0);
-  miningToastCooldownUntilDays = 0.0;
-  resourceFieldSites.clear();
-  resourceFieldIndexById.clear();
-      beams.clear();
-      projectiles.clear();
-      missiles.clear();
-      contacts.clear();
-      docked = true;
-      dockedPad = 0;
-      if (!currentSystem->stations.empty()) {
-        dockedStationId = currentSystem->stations.front().id;
-        selectedStationIndex = 0;
-      } else {
-        dockedStationId = 0;
-      }
-      // Will snap to dock position next tick.
+    // Track last safe dock (even when paused).
+    if (docked && currentSystem && dockedStationId != 0) {
+      lastSafeDockSystemId = currentSystem->stub.id;
+      lastSafeDockStationId = dockedStationId;
     }
 
     // Update beam TTL
@@ -17165,6 +19618,98 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         return std::string(label) + " (" + k + ")";
       };
 
+      if (ImGui::BeginMenu("Game")) {
+        if (showMainMenu) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Pause Menu (Esc)")) {
+          showPauseMenu = true;
+          pauseMenuPage = PauseMenuPage::Root;
+        }
+        if (showMainMenu) ImGui::EndDisabled();
+
+        // Docked station hub (only available while docked).
+        if (showMainMenu || !docked) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Station Menu")) {
+          showStationMenu = true;
+          stationMenuPage = StationMenuPage::Root;
+        }
+        if (showMainMenu || !docked) ImGui::EndDisabled();
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Main Menu")) {
+          showMainMenu = true;
+          mainMenuPage = MainMenuPage::Root;
+        }
+        if (ImGui::MenuItem("New Game")) {
+          showMainMenu = true;
+          mainMenuPage = MainMenuPage::NewGame;
+        }
+        if (ImGui::MenuItem("Load Game")) {
+          showMainMenu = true;
+          mainMenuPage = MainMenuPage::LoadGame;
+        }
+
+        ImGui::Separator();
+
+        // Continue = load most recent save across quicksave + slots.
+        {
+          const auto mostRecent = findMostRecentSavePath();
+          const bool hasSave = mostRecent.has_value();
+          if (!hasSave) ImGui::BeginDisabled();
+          if (ImGui::MenuItem("Continue")) {
+            if (mostRecent && loadGameFromPath(*mostRecent)) {
+              toast(toasts, "Loaded " + mostRecent->string(), 2.5);
+              paused = false;
+            } else {
+              toast(toasts, "Failed to load latest save", 2.5);
+            }
+          }
+          if (!hasSave) ImGui::EndDisabled();
+        }
+
+        // Slot saves.
+        if (saveSlotMetaDirty) {
+          refreshSaveSlotMetaNow();
+        }
+
+        if (ImGui::BeginMenu("Save Slot")) {
+          for (int i = 0; i < kSaveSlotCount; ++i) {
+            const std::string label =
+                "Slot " + std::to_string(i + 1) + "  (" + formatSaveSummary(saveSlotMeta[(std::size_t)i]) + ")";
+            if (ImGui::MenuItem(label.c_str())) {
+              if (saveGameToPath(saveSlotPath(i))) {
+                toast(toasts, "Saved " + saveSlotPath(i).string(), 2.5);
+                saveSlotMetaDirty = true;
+              } else {
+                toast(toasts, "Failed to save slot " + std::to_string(i + 1), 2.5);
+              }
+            }
+          }
+          ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Load Slot")) {
+          for (int i = 0; i < kSaveSlotCount; ++i) {
+            const auto& meta = saveSlotMeta[(std::size_t)i];
+            const std::string label =
+                "Slot " + std::to_string(i + 1) + "  (" + formatSaveSummary(meta) + ")";
+
+            if (!meta.exists) ImGui::BeginDisabled();
+            if (ImGui::MenuItem(label.c_str())) {
+              if (loadGameFromPath(saveSlotPath(i))) {
+                toast(toasts, "Loaded " + saveSlotPath(i).string(), 2.5);
+                paused = false;
+              } else {
+                toast(toasts, "Failed to load slot " + std::to_string(i + 1), 2.5);
+              }
+            }
+            if (!meta.exists) ImGui::EndDisabled();
+          }
+          ImGui::EndMenu();
+        }
+
+        ImGui::EndMenu();
+      }
+
       if (ImGui::BeginMenu("Windows")) {
         ImGui::MenuItem("Window Manager...", nullptr, &showWindowManagerWindow);
         ImGui::Separator();
@@ -17188,6 +19733,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         ImGui::Separator();
         ImGui::MenuItem(withKey("Controls", controls.actions.toggleControlsWindow).c_str(), nullptr, &controlsWindow.open);
         ImGui::MenuItem("Notifications", nullptr, &showNotifications);
+        ImGui::MenuItem("Factions", nullptr, &showFactionsWindow);
+        ImGui::MenuItem("Progression", nullptr, &showProgressionWindow);
         ImGui::MenuItem("Audio Settings", nullptr, &showAudioSettingsWindow);
         ImGui::MenuItem("Audio Analyzer", nullptr, &audioAnalyzerWindow.open);
         if (ImGui::MenuItem("Photo Mode", nullptr, &photoModeWindow.open)) { if (photoModeWindow.open) photoModeWindow.focusDir = true; }
@@ -18011,6 +20558,64 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           pendingArrivalTargetStationId = stId;
         }
       };
+      // Live Security response actions (authority bribe/comply/bounty submit).
+      // These callbacks let the Comms inbox act like a diegetic "radio" UI: you can respond
+      // to an active demand directly from the message that triggered it.
+      cctx.querySecurityDemand = [&](const sim::CommsMessage& m) -> game::SecurityDemandUi {
+        game::SecurityDemandUi out{};
+        if (!currentSystem) return out;
+        if (m.channel != sim::CommsChannel::Security) return out;
+
+        // Only treat local-system Security orders as "live".
+        if (m.systemId != 0 && m.systemId != currentSystem->stub.id) return out;
+
+        const std::string subj = ui::stripMarkup(m.subject);
+        const bool isBribeMsg = (subj.find("DISCRETIONARY") != std::string::npos);
+        const bool isBountyMsg = (subj.find("ENFORCEMENT") != std::string::npos);
+
+        const bool actionAllowed = (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
+
+        if (isBribeMsg && bribeOffer.active && timeDays < bribeOffer.untilDays) {
+          if (m.factionId != 0 && bribeOffer.factionId != 0 && m.factionId != bribeOffer.factionId) return out;
+
+          out.kind = game::SecurityDemandUi::Kind::BribeOffer;
+          out.factionId = bribeOffer.factionId;
+          out.authorityName = bribeOffer.sourceName.empty() ? "Security" : bribeOffer.sourceName;
+          out.detail = bribeOffer.detail;
+          out.bribeCr = bribeOffer.amountCr;
+          out.fineCr = bribeOffer.fineCr;
+          out.secondsLeft = std::max(0.0, (bribeOffer.untilDays - timeDays) * 86400.0);
+          out.secondsTotal = std::max(0.001, (bribeOffer.untilDays - bribeOffer.startDays) * 86400.0);
+          out.canPay = (credits + 1e-6 >= bribeOffer.amountCr);
+          out.actionAllowed = actionAllowed;
+          return out;
+        }
+
+        if (isBountyMsg && policeDemand.active && timeDays < policeDemand.untilDays) {
+          if (m.factionId != 0 && policeDemand.factionId != 0 && m.factionId != policeDemand.factionId) return out;
+
+          const double owed = std::max(0.0, getBounty(policeDemand.factionId));
+          if (owed <= 1e-6) return out;
+
+          out.kind = game::SecurityDemandUi::Kind::BountyDemand;
+          out.factionId = policeDemand.factionId;
+          out.authorityName = policeDemand.sourceName.empty() ? "Security" : policeDemand.sourceName;
+          out.bountyCr = owed;
+          out.secondsLeft = std::max(0.0, (policeDemand.untilDays - timeDays) * 86400.0);
+          out.secondsTotal = std::max(0.001, (policeDemand.untilDays - policeDemand.startDays) * 86400.0);
+          out.canPay = (credits > 0.0);
+          out.actionAllowed = actionAllowed;
+          return out;
+        }
+
+        return out;
+      };
+
+      cctx.actSecurityBribe = [&]() { doAuthorityBribe("Comms", /*requireNoUiCapture=*/false); };
+      cctx.actSecurityComplyOrSubmit = [&]() { doAuthorityComplyOrSubmit("Comms", /*requireNoUiCapture=*/false); };
+      cctx.securityBribeChord = game::chordLabel(controls.actions.bribe);
+      cctx.securityComplyChord = game::chordLabel(controls.actions.complyOrSubmit);
+
       game::drawCommsWindow(commsWindow, commsOverlay, cctx);
     }
 
@@ -18229,6 +20834,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       scCtx.plotRouteToSystem = [&](sim::SystemId id) { return plotRouteToSystem(id, false); };
       scCtx.targetSystem = [&](sim::SystemId id) { galaxySelectedSystemId = id; };
       scCtx.toast = [&](std::string_view msg, double ttlSec) { toast(toasts, std::string(msg), ttlSec); };
+      scCtx.watchSystems = &galNetWatchSystems;
+      scCtx.postGalNetBulletin = [&](sim::SystemId systemId, bool showOverlay, bool showToast) {
+        (void)publishGalNetBulletin(systemId, showOverlay, showToast, /*allowWhenNoEvent=*/false, "Manual bulletin");
+      };
+
       game::drawSystemConditionsWindow(systemConditionsWindow, scCtx);
     }
 
@@ -18787,6 +21397,116 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
             const std::string s = tgtLabel + "  " + std::to_string((int)distKm) + " km";
             draw->AddText({iconC.x + 14.0f, iconC.y - 7.0f}, hudU32(hudColorAccent, (210.0f/255.0f)), s.c_str());
+          }
+        }
+      }
+
+
+      // Mission waypoint indicator (in-system next objective, separate from the "target" marker)
+      if (currentSystem && !docked) {
+        // Resolve a tracked mission (fall back to the first active mission).
+        sim::Mission* wpMission = nullptr;
+        if (trackedMissionId != 0) {
+          for (auto& m : missions) {
+            if (m.id == trackedMissionId && m.active) {
+              wpMission = &m;
+              break;
+            }
+          }
+        }
+        if (!wpMission) {
+          for (auto& m : missions) {
+            if (m.active) {
+              wpMission = &m;
+              trackedMissionId = m.id;
+              break;
+            }
+          }
+        }
+
+        sim::SystemId wpSys = 0;
+        sim::StationId wpSt = 0;
+        if (wpMission) {
+          const auto dest = uiMissionNextStop(*wpMission);
+          wpSys = dest.first;
+          wpSt = dest.second;
+        }
+
+        Target wp{};
+        wp.kind = TargetKind::None;
+        wp.index = 0;
+        math::Vec3d wpPosKm{};
+        const char* wpLabel = nullptr;
+        std::optional<std::pair<render::SpriteKind, core::u64>> wpIcon;
+
+        if (wpMission && wpSys != 0 && wpSys == currentSystem->stub.id) {
+          if (wpMission->type == sim::MissionType::Salvage && !wpMission->scanned) {
+            for (std::size_t i = 0; i < signals.size(); ++i) {
+              if (signals[i].id == wpMission->targetNpcId) {
+                wp.kind = TargetKind::Signal;
+                wp.index = i;
+                wpPosKm = signals[i].posKm;
+                wpLabel = "MISSION SITE";
+                wpIcon = std::pair<render::SpriteKind, core::u64>{render::SpriteKind::Signal, (core::u64)signals[i].id};
+                break;
+              }
+            }
+          } else if (wpMission->type == sim::MissionType::BountyScan && !wpMission->scanned) {
+            for (std::size_t i = 0; i < contacts.size(); ++i) {
+              if (contacts[i].id == wpMission->targetNpcId) {
+                wp.kind = TargetKind::Contact;
+                wp.index = i;
+                wpPosKm = contacts[i].ship.positionKm();
+                wpLabel = "BOUNTY TARGET";
+                wpIcon = std::pair<render::SpriteKind, core::u64>{render::SpriteKind::Mission, (core::u64)wpMission->id};
+                break;
+              }
+            }
+          } else if (wpSt != 0) {
+            for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+              if (currentSystem->stations[i].id == wpSt) {
+                wp.kind = TargetKind::Station;
+                wp.index = i;
+                const auto& st = currentSystem->stations[i];
+                wpPosKm = sim::stationPosKm(st, timeDays);
+                wpLabel = "MISSION DOCK";
+                wpIcon = std::pair<render::SpriteKind, core::u64>{render::SpriteKind::Station, (core::u64)st.id};
+                break;
+              }
+            }
+          }
+        }
+
+        if (wp.kind != TargetKind::None && wpLabel &&
+            !(wp.kind == target.kind && wp.index == target.index)) {
+          const auto sp = projectToScreenAny(toRenderPosU(wpPosKm, ship.positionKm()), view, proj, w, h, 0.96);
+          const ImU32 col = ImColor(hudColorPrimary);
+
+          if (sp.ok) {
+            const ImVec2 p(sp.x, sp.y);
+            draw->AddCircle(p, 14.0f * dpiScale, col, 0, 2.0f * dpiScale);
+
+            if (wpIcon) {
+              const auto spr = hudAtlas.get(wpIcon->first, wpIcon->second);
+              const ImVec2 p0(p.x - 12.0f * dpiScale, p.y - 12.0f * dpiScale);
+              const ImVec2 p1(p.x + 12.0f * dpiScale, p.y + 12.0f * dpiScale);
+              draw->AddImage(atlasId, p0, p1, spr.uv0, spr.uv1, col);
+            }
+
+            draw->AddText(ImVec2(p.x + 16.0f * dpiScale, p.y - 8.0f * dpiScale), col, wpLabel);
+          } else if (hudOffscreenTargetIndicator) {
+            const ImVec2 c(w * 0.5f, h * 0.5f);
+            const ImVec2 dir = ImVec2(sp.x - c.x, sp.y - c.y);
+            const float ang = std::atan2f(dir.y, dir.x);
+
+            const ImVec2 pe = clampToEdge(c, dir, w, h, 24.0f * dpiScale);
+
+            std::array<ImVec2, 3> tri = {ImVec2(14.0f, 0.0f), ImVec2(-10.0f, 8.0f), ImVec2(-10.0f, -8.0f)};
+            tri = triangleRotated(tri, ang);
+            for (auto& v : tri) v += pe;
+
+            draw->AddTriangleFilled(tri[0], tri[1], tri[2], col);
+            draw->AddText(ImVec2(pe.x - 6.0f * dpiScale, pe.y - 22.0f * dpiScale), col, wpLabel);
           }
         }
       }
@@ -19812,6 +22532,291 @@ if (showShipHud) {
 
 
 
+
+
+// Tracked trade loop: advance to the next leg when we dock at the expected destination.
+auto currentTradeLoopLeg = [&]() -> const sim::TradeLoopLeg* {
+  if (!trackedTradeLoop.active) return nullptr;
+  const auto& legs = trackedTradeLoop.loop.legs;
+  if (legs.empty()) return nullptr;
+  const int maxIdx = (int)legs.size() - 1;
+  const int idx = std::clamp(trackedTradeLoop.legIndex, 0, maxIdx);
+  return &legs[(std::size_t)idx];
+};
+
+// Inbound leg (the leg we just flew). Once the tracker advances `legIndex` on docking,
+// the inbound leg becomes the previous index and the current leg is the outbound one.
+auto prevTradeLoopLeg = [&]() -> const sim::TradeLoopLeg* {
+  if (!trackedTradeLoop.active) return nullptr;
+  const auto& legs = trackedTradeLoop.loop.legs;
+  if (legs.empty()) return nullptr;
+  const int n = (int)legs.size();
+  int idx = trackedTradeLoop.legIndex - 1;
+  if (idx < 0) idx += n;
+  idx = std::clamp(idx, 0, n - 1);
+  return &legs[(std::size_t)idx];
+};
+
+// Execute the tracked trade loop's dockside turn:
+//  1) Sell cargo from the inbound manifest (previous leg) at the current station.
+//  2) Buy cargo for the outbound manifest (current leg) at the current station.
+// This is a quality-of-life helper that makes trade loops feel like a coherent loop.
+auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const char* originTag) {
+  if (!trackedTradeLoop.active) return;
+  if (!docked || !currentSystem || dockedStationId == 0) return;
+
+  const sim::TradeLoopLeg* outLeg = currentTradeLoopLeg();
+  const sim::TradeLoopLeg* inLeg = prevTradeLoopLeg();
+  if (!outLeg || !inLeg) return;
+
+  // Safety: only execute when docked at the expected outbound station.
+  if (outLeg->fromSystem != currentSystem->stub.id || outLeg->fromStation != dockedStationId) {
+    if (showToast) toast(toasts, "Trade loop: dock at the loop station to execute trades.", 2.4);
+    return;
+  }
+
+  sim::Station* st = currentSystemStationById(dockedStationId);
+  if (!st) return;
+
+  // Reserve mission cargo (delivery/smuggle/etc) so automation never sells it.
+  std::array<double, econ::kCommodityCount> reservedMissionUnits{};
+  reservedMissionUnits.fill(0.0);
+  for (const auto& m : missions) {
+    if (m.completed || m.failed) continue;
+    if (m.type != sim::MissionType::Delivery &&
+        m.type != sim::MissionType::MultiDelivery &&
+        m.type != sim::MissionType::Smuggle) {
+      continue;
+    }
+    const std::size_t ci = (std::size_t)m.commodity;
+    if (ci >= econ::kCommodityCount) continue;
+    reservedMissionUnits[ci] += std::max(0.0, m.units);
+  }
+
+  auto& stEcon = universe.stationEconomy(*st, timeDays);
+  const double feeEff = effectiveFeeRate(*st);
+
+  // Use the same spread as the Market UI for consistency.
+  const double kSpread = 0.10;
+  const double kBlackMarketMult = 1.35;
+
+  const double creditsBefore = credits;
+  double soldCr = 0.0;
+  double boughtCr = 0.0;
+  int soldLines = 0;
+  int boughtLines = 0;
+  int illegalSkips = 0;
+  int buyFailures = 0;
+  int sellFailures = 0;
+
+  // Local cargo mass tracker for capacity checks.
+  double usedKg = cargoMassKg(cargo);
+  const double capKg = std::max(0.0, cargoCapacityKg);
+
+  // -------------------------------------------------------------------------
+  // 1) Sell inbound manifest
+  // -------------------------------------------------------------------------
+  for (const auto& line : inLeg->manifest.lines) {
+    const std::size_t ci = (std::size_t)line.commodity;
+    if (ci >= econ::kCommodityCount) continue;
+
+    const double have = std::max(0.0, cargo[ci]);
+    const double reserved = std::max(0.0, reservedMissionUnits[ci]);
+    const double freeForSale = std::max(0.0, have - reserved);
+    const double want = std::clamp(line.units, 0.0, freeForSale);
+    if (want <= 1e-9) continue;
+
+    const econ::CommodityId cid = line.commodity;
+    const auto def = econ::commodityDef(cid);
+    const bool illegalHere = isIllegalCommodityAtStation(*st, cid);
+
+    if (illegalHere) {
+      // Black market sell: add to inventory (clamped) and pay a premium.
+      const auto q = econ::quote(stEcon, st->economyModel, cid, kSpread);
+      const double moved = econ::addInventory(stEcon, st->economyModel, cid, want);
+      if (moved <= 1e-9) {
+        sellFailures++;
+        continue;
+      }
+      const double payout = q.bid * moved * kBlackMarketMult;
+      credits += payout;
+      soldCr += payout;
+      cargo[ci] = std::max(0.0, cargo[ci] - moved);
+      usedKg = std::max(0.0, usedKg - moved * def.massKg);
+
+      // Risk cost: heat + minor rep hit.
+      policeHeat = std::clamp(policeHeat + std::min(0.75, 0.10 + moved * 0.01), 0.0, 6.0);
+      addRep(st->factionId, -std::min(1.2, moved * 0.02));
+
+      soldLines++;
+      continue;
+    }
+
+    // Legal sell: clamp to station capacity.
+    double capU = 0.0;
+    double invU = 0.0;
+    {
+      capU = st->economyModel.capacity[ci];
+      if (!std::isfinite(capU)) capU = 0.0;
+      capU = std::max(0.0, capU);
+      invU = stEcon.inventory[ci];
+      if (!std::isfinite(invU)) invU = 0.0;
+      invU = std::clamp(invU, 0.0, capU);
+    }
+    const double spaceU = std::max(0.0, capU - invU);
+    const double sellU = std::clamp(want, 0.0, spaceU);
+    if (sellU <= 1e-9) {
+      sellFailures++;
+      continue;
+    }
+
+    const double before = credits;
+    const auto tr = econ::sell(stEcon, st->economyModel, cid, sellU, credits, kSpread, feeEff);
+    if (!tr.ok) {
+      sellFailures++;
+      continue;
+    }
+
+    const double gained = std::max(0.0, credits - before);
+    soldCr += gained;
+    cargo[ci] = std::max(0.0, cargo[ci] - sellU);
+    usedKg = std::max(0.0, usedKg - sellU * def.massKg);
+    soldLines++;
+  }
+
+  // -------------------------------------------------------------------------
+  // 2) Buy outbound manifest
+  // -------------------------------------------------------------------------
+  for (const auto& line : outLeg->manifest.lines) {
+    const std::size_t ci = (std::size_t)line.commodity;
+    if (ci >= econ::kCommodityCount) continue;
+
+    const econ::CommodityId cid = line.commodity;
+    const auto def = econ::commodityDef(cid);
+    if (def.massKg <= 1e-9) continue;
+
+    const bool illegalHere = isIllegalCommodityAtStation(*st, cid);
+    if (illegalHere) {
+      illegalSkips++;
+      continue; // no legal buy path (black market buy not supported)
+    }
+
+    const double want = std::max(0.0, line.units);
+    if (want <= 1e-9) continue;
+
+    const auto q = econ::quote(stEcon, st->economyModel, cid, kSpread);
+
+    const double availKg = std::max(0.0, capKg - usedKg);
+    const double maxByMass = (availKg > 0.0) ? (availKg / def.massKg) : 0.0;
+
+    const double costPerU = q.ask * (1.0 + feeEff);
+    const double maxByCredits = (costPerU > 1e-12) ? (credits / costPerU) : 0.0;
+
+    const double buyU = std::min({want, q.inventory, maxByMass, maxByCredits});
+    if (buyU <= 1e-9) {
+      buyFailures++;
+      continue;
+    }
+
+    const double before = credits;
+    const auto tr = econ::buy(stEcon, st->economyModel, cid, buyU, credits, kSpread, feeEff);
+    if (!tr.ok) {
+      buyFailures++;
+      continue;
+    }
+    const double spent = std::max(0.0, before - credits);
+    boughtCr += spent;
+    cargo[ci] = std::max(0.0, cargo[ci] + buyU);
+    usedKg = std::min(capKg, usedKg + buyU * def.massKg);
+    boughtLines++;
+  }
+
+  const double creditsAfter = credits;
+  const double delta = creditsAfter - creditsBefore;
+
+  trackedTradeLoop.lastTradeTimeDays = timeDays;
+  trackedTradeLoop.lastTradeStationId = dockedStationId;
+  trackedTradeLoop.lastTradeCreditsDelta = delta;
+  trackedTradeLoop.lastTradeSoldCr = soldCr;
+  trackedTradeLoop.lastTradeBoughtCr = boughtCr;
+
+  if (showToast) {
+    std::string msg = "Trade loop: ";
+    if (soldLines == 0 && boughtLines == 0) {
+      msg += "no trades executed.";
+    } else {
+      msg += "sold +" + std::to_string((long long)std::llround(soldCr)) +
+             " cr, bought -" + std::to_string((long long)std::llround(boughtCr)) +
+             " cr (net " + std::string(delta >= 0.0 ? "+" : "") +
+             std::to_string((long long)std::llround(delta)) + " cr)";
+      if (illegalSkips > 0) msg += " — skipped illegal buys";
+    }
+    toast(toasts, msg, 3.2);
+  }
+
+  // Optional: immediately queue the next leg as an auto-run.
+  if (plotAndAutoRun) {
+    game::hubPushAction(integrationHubWindow,
+                        game::makeActionSetCameraRigPreset(timeRealSec, timeDays, originTag ? originTag : "TradeLoop",
+                                                           (int)game::CameraRigPreset::Travel));
+    game::hubPushAction(integrationHubWindow,
+                        game::makeActionGoToStation(timeRealSec, timeDays, originTag ? originTag : "TradeLoop",
+                                                    (core::u64)outLeg->toSystem, (core::u64)outLeg->toStation,
+                                                    /*armAutoRun=*/true));
+  }
+};
+
+if (trackedTradeLoop.active) {
+  if (trackedTradeLoop.loop.legs.empty()) {
+    trackedTradeLoop.active = false;
+  } else if (!docked || !currentSystem || dockedStationId == 0) {
+    trackedTradeLoop.lastDocked = false;
+    trackedTradeLoop.lastDockedSystemId = 0;
+    trackedTradeLoop.lastDockedStationId = 0;
+  } else {
+    const bool dockEdge = (!trackedTradeLoop.lastDocked) ||
+                          (trackedTradeLoop.lastDockedSystemId != currentSystem->stub.id) ||
+                          (trackedTradeLoop.lastDockedStationId != dockedStationId);
+
+    trackedTradeLoop.lastDocked = true;
+    trackedTradeLoop.lastDockedSystemId = currentSystem->stub.id;
+    trackedTradeLoop.lastDockedStationId = dockedStationId;
+
+    if (dockEdge) {
+      const sim::TradeLoopLeg* leg = currentTradeLoopLeg();
+      if (leg && leg->toSystem == currentSystem->stub.id && leg->toStation == dockedStationId) {
+        const int legCount = (int)trackedTradeLoop.loop.legs.size();
+        const int nextIdx = (trackedTradeLoop.legIndex + 1) % std::max(1, legCount);
+        trackedTradeLoop.legIndex = nextIdx;
+
+        const sim::TradeLoopLeg* nextLeg = currentTradeLoopLeg();
+        if (nextLeg) {
+          const bool wrapped = (nextIdx == 0);
+          toast(toasts,
+                std::string(wrapped ? "Trade loop complete! Next: " : "Trade loop next: ") +
+                  (nextLeg->toStationName.empty() ? "Unknown Station" : nextLeg->toStationName) +
+                  " (" +
+                  (nextLeg->toSystemName.empty() ? "Unknown System" : nextLeg->toSystemName) +
+                  ")",
+                4.0);
+        }
+
+        // Optional dockside automation: as soon as we arrive at the expected station,
+        // sell inbound cargo and buy the next leg's manifest.
+        if (trackedTradeLoop.autoTradeOnDock) {
+          executeTradeLoopDockedTurn(trackedTradeLoop.autoTradeToast,
+                                    trackedTradeLoop.autoTradeArmAutoRun,
+                                    "TradeLoop:AutoDock");
+        }
+      }
+    }
+  }
+} else {
+  trackedTradeLoop.lastDocked = docked;
+  trackedTradeLoop.lastDockedSystemId = (docked && currentSystem) ? currentSystem->stub.id : 0;
+  trackedTradeLoop.lastDockedStationId = docked ? dockedStationId : 0;
+}
+
 // Objective HUD overlay (tracked mission summary)
 if (objectiveHudEnabled) {
   const bool showTimeTrialObjective = timeTrialWindow.hudEnabled && timeTrialWindow.hasCourse &&
@@ -19940,6 +22945,46 @@ if (objectiveHudEnabled) {
     if (timeTrialWindow.phase == game::TimeTrialPhase::Finished) {
       ImGui::SameLine();
       if (ImGui::SmallButton("Restart")) timeTrialWindow.armFromCourse(timeTrialWindow.course);
+    }
+
+    if (currentSystem) {
+      const auto localSnap = snapshotSystemConditions(*currentSystem);
+      if (localSnap.event.active) {
+        ImGui::Separator();
+        const double remDays = std::max(0.0, localSnap.event.endDay - timeDays);
+        const int remHours = (int)std::ceil(remDays * 24.0);
+        if (remHours < 48) {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %dh)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              remHours);
+        } else {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %.0fd)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              std::ceil(remDays));
+        }
+      }
+    }
+
+    if (currentSystem) {
+      const auto localSnap = snapshotSystemConditions(*currentSystem);
+      if (localSnap.event.active) {
+        ImGui::Separator();
+        const double remDays = std::max(0.0, localSnap.event.endDay - timeDays);
+        const int remHours = (int)std::ceil(remDays * 24.0);
+        if (remHours < 48) {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %dh)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              remHours);
+        } else {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %.0fd)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              std::ceil(remDays));
+        }
+      }
     }
 
     ImGui::End();
@@ -20198,6 +23243,326 @@ if (objectiveHudEnabled) {
       ImGui::TextDisabled("No route plotted (use Plot mission or Ship/Status).");
     }
 
+
+    // Space loop guidance (flying state)
+    ImGui::Separator();
+    ImGui::TextDisabled("Space loop");
+
+    // Local helpers for quick actions.
+    auto setTargetQuick = [&](const TargetKind k, const std::size_t idx) {
+      target.kind = k;
+      target.index = idx;
+    };
+
+    auto startScanQuick = [&](const TargetKind k, const std::size_t idx) {
+      if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+        toast(toasts, "Scanning unavailable in supercruise/FSD.", 2.0);
+        return;
+      }
+      if (!currentSystem) {
+        toast(toasts, "No system loaded: cannot scan.", 2.0);
+        return;
+      }
+      if (idx == static_cast<std::size_t>(-1)) {
+        toast(toasts, "No valid scan target.", 2.0);
+        return;
+      }
+
+      // Resolve info from the chosen kind/index.
+      scanLockedTargetKind = k;
+      scanLockedTarget = idx;
+      scanLockedDanger = 0;
+
+      switch (k) {
+      case TargetKind::Signal: {
+        if (idx >= signals.size()) {
+          toast(toasts, "Invalid signal target.", 2.0);
+          return;
+        }
+        const auto& s = signals[idx];
+        scanLockedId = s.id;
+        scanLockedName = s.label;
+        scanLockedDanger = s.danger;
+        scanRangeKm = 120000.0;
+        scanDurationSec = 12.0;
+      } break;
+      case TargetKind::Contact: {
+        if (idx >= contacts.size()) {
+          toast(toasts, "Invalid contact target.", 2.0);
+          return;
+        }
+        const auto& c = contacts[idx];
+        scanLockedId = c.id;
+        scanLockedName = c.name;
+        scanLockedDanger = c.danger;
+        scanRangeKm = 20000.0;
+        scanDurationSec = 6.0;
+      } break;
+      case TargetKind::Station: {
+        if (!currentSystem || idx >= currentSystem->stations.size()) {
+          toast(toasts, "Invalid station target.", 2.0);
+          return;
+        }
+        const auto& st = currentSystem->stations[idx];
+        scanLockedId = st.id;
+        scanLockedName = st.name;
+        scanLockedDanger = 0;
+        scanRangeKm = 60000.0;
+        scanDurationSec = 10.0;
+      } break;
+      default:
+        toast(toasts, "That target type cannot be scanned.", 2.0);
+        return;
+      }
+
+      scanTimerSec = 0.0;
+      scanning = true;
+
+      toast(toasts, std::string("Scan started: ") + scanLockedName, 1.6);
+    };
+
+        auto requestDockingQuick = [&](const std::size_t stationIdx) {
+      if (!currentSystem || stationIdx >= currentSystem->stations.size()) return;
+
+      const auto& st = currentSystem->stations[stationIdx];
+      const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+      const double dist = (ship.positionKm() - stPos).length();
+
+      auto& cs = clearances[st.id];
+      const bool hadValid = sim::dockingClearanceValid(cs, timeDays);
+
+      const auto out =
+          requestDockingClearanceCommon(st, dist, /*autoMode=*/false, /*allowToast=*/true, "ObjectiveHUD");
+      if (!out.access.allowed()) {
+        audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
+        return;
+      }
+
+      const auto dec = out.decision;
+
+      if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
+        std::string msg = "Docking clearance already granted.";
+        if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+        toast(toasts, msg, 1.8);
+        audio.play(game::AudioEngine::Sfx::UiConfirm, 0.7f, 0.0f);
+        return;
+      }
+
+      if (dec.status == sim::DockingClearanceStatus::Granted) {
+        std::string msg = "Docking clearance GRANTED.";
+        if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+        toast(toasts, msg, 2.4);
+        audio.play(game::AudioEngine::Sfx::UiConfirm, 0.9f, 0.0f);
+      } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
+        toast(toasts, "Out of comms range for clearance.", 2.2);
+        audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
+      } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
+        toast(toasts, "Clearance channel busy. Try again soon.", 2.2);
+        audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
+      } else {
+        toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
+        audio.play(game::AudioEngine::Sfx::UiError, 0.9f, 0.0f);
+      }
+    };
+
+    auto engageDockingComputerQuick = [&]() {
+      if (autopilot) {
+        toast(toasts, "Docking computer already engaged.", 1.6);
+        return;
+      }
+      if (docked) {
+        toast(toasts, "Already docked.", 1.6);
+        return;
+      }
+      if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+        toast(toasts, "Docking computer unavailable in supercruise/FSD.", 2.0);
+        return;
+      }
+      if (target.kind != TargetKind::Station) {
+        toast(toasts, "Target a station to engage the docking computer.", 2.0);
+        return;
+      }
+      autopilot = true;
+      dockingComputer.reset();
+      toast(toasts, "Docking computer engaged.", 1.6);
+      game::hubPushEvent(integrationHubWindow, game::GameEvent{"DockingComputerEngaged", game::EventAttrs{{"source", "ObjectiveHUD"}}});
+    };
+
+    // Resolve an in-system mission objective we can point at / interact with.
+    std::size_t missionSignalIdx = static_cast<std::size_t>(-1);
+    std::size_t missionContactIdx = static_cast<std::size_t>(-1);
+    std::size_t missionStationIdx = static_cast<std::size_t>(-1);
+    bool missionObjectiveIsScan = false;
+
+    if (tracked && currentSystem && destSys != 0 && destSys == currentSystem->stub.id) {
+      if (tracked->type == sim::MissionType::Salvage && !tracked->scanned) {
+        for (std::size_t i = 0; i < signals.size(); ++i) {
+          if (signals[i].id == tracked->targetNpcId) {
+            missionSignalIdx = i;
+            missionObjectiveIsScan = true;
+            break;
+          }
+        }
+      } else if (tracked->type == sim::MissionType::BountyScan && !tracked->scanned) {
+        for (std::size_t i = 0; i < contacts.size(); ++i) {
+          if (contacts[i].id == tracked->targetNpcId) {
+            missionContactIdx = i;
+            missionObjectiveIsScan = true;
+            break;
+          }
+        }
+      } else if (destSt != 0) {
+        for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+          if (currentSystem->stations[i].id == destSt) {
+            missionStationIdx = i;
+            break;
+          }
+        }
+      }
+    }
+
+    const bool haveRoute = !navRoute.empty();
+    const bool haveNextHop = haveRoute && (navRouteHop + 1 < navRoute.size());
+    const sim::SystemId nextHop = haveNextHop ? navRoute[navRouteHop + 1] : 0;
+
+    // Waypoint readout
+    if (tracked && destSys != 0) {
+      const std::string sysName = uiSystemNameById(destSys);
+      if (destSt != 0) {
+        ImGui::Text("Waypoint: %s / %s", sysName.c_str(), uiStationNameById(destSys, destSt).c_str());
+      } else {
+        ImGui::Text("Waypoint: %s", sysName.c_str());
+      }
+    } else if (haveNextHop) {
+      ImGui::Text("Waypoint: %s", uiSystemNameById(nextHop).c_str());
+    } else if (currentSystem && target.kind != TargetKind::None) {
+      ImGui::Text("Waypoint: current target");
+    } else {
+      ImGui::TextDisabled("Waypoint: (none)");
+    }
+
+    // "Go here next": one-click state machine (jump → supercruise → approach → request → dock / scan).
+    const char* goLabel = "Go here next";
+    if (ImGui::Button(goLabel, ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+      if (docked) {
+        toast(toasts, "Undock first.", 1.8);
+      } else if (fsdState != FsdState::Idle) {
+        toast(toasts, "FSD busy.", 1.4);
+      } else if (tracked && currentSystem && destSys != 0 && destSys != currentSystem->stub.id) {
+        // Ensure nav route is plotted to the mission system; then jump the next hop.
+        if (navRoute.empty() || navRoute.back() != destSys) {
+          plotRouteToSystem(destSys, true);
+        }
+        if (!navRoute.empty() && navRoute.back() == destSys && navRouteHop + 1 < navRoute.size()) {
+          startFsdJumpTo(navRoute[navRouteHop + 1]);
+        } else {
+          toast(toasts, "No route available to mission system.", 2.2);
+        }
+      } else if (currentSystem && missionSignalIdx != static_cast<std::size_t>(-1)) {
+        // Mission salvage site: target + scan.
+        setTargetQuick(TargetKind::Signal, missionSignalIdx);
+        startScanQuick(TargetKind::Signal, missionSignalIdx);
+      } else if (currentSystem && missionContactIdx != static_cast<std::size_t>(-1)) {
+        // Mission bounty target: target + scan.
+        setTargetQuick(TargetKind::Contact, missionContactIdx);
+        startScanQuick(TargetKind::Contact, missionContactIdx);
+      } else if (currentSystem && missionStationIdx != static_cast<std::size_t>(-1)) {
+        // Station objective: supercruise → approach → request → dock.
+        setTargetQuick(TargetKind::Station, missionStationIdx);
+        const auto& st = currentSystem->stations[missionStationIdx];
+        const double distKm = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
+
+        const double superEngageKm = std::max(st.commsRangeKm * 4.0, 180000.0);
+        const double approachEngageKm = std::max(st.commsRangeKm * 1.15, 45000.0);
+
+        const auto it = clearances.find(st.id);
+        const bool clearanceOk = it != clearances.end() && sim::dockingClearanceValid(it->second, timeDays);
+
+        if (supercruiseState != SupercruiseState::Idle) {
+          uiToggleSupercruise(); // requests drop / cancel charging
+        } else if (distKm > superEngageKm) {
+          uiToggleSupercruise(); // engage supercruise toward target
+        } else if (!clearanceOk && distKm > approachEngageKm) {
+          // Use nav assist to "go here next" toward comms range.
+          autopilot = false;
+          dockingComputer.reset();
+          navAssist.engageApproach(std::max(st.commsRangeKm * 0.25, st.radiusKm * 1.1));
+          toast(toasts, "Nav assist: Approach", 1.6);
+        } else if (!clearanceOk) {
+          requestDockingQuick(missionStationIdx);
+        } else {
+          engageDockingComputerQuick();
+        }
+      } else if (haveNextHop) {
+        // No mission waypoint: follow plotted route.
+        startFsdJumpTo(nextHop);
+      } else {
+        toast(toasts, "No waypoint available. Plot a route or track a mission.", 2.4);
+      }
+    }
+
+    // Detailed in-system flow (supercruise → approach → docking request → docking)
+    if (currentSystem && missionStationIdx != static_cast<std::size_t>(-1)) {
+      const auto& st = currentSystem->stations[missionStationIdx];
+      const double distKm = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
+
+      const auto it = clearances.find(st.id);
+      const bool clearanceOk = it != clearances.end() && sim::dockingClearanceValid(it->second, timeDays);
+
+      ImGui::Spacing();
+      ImGui::TextDisabled("Docking flow");
+      ImGui::BulletText("%s Supercruise (far travel)", (distKm > st.commsRangeKm * 4.0) ? "→" : "✓");
+      ImGui::BulletText("%s Approach (within comms)", (distKm > st.commsRangeKm) ? "→" : "✓");
+      ImGui::BulletText("%s Docking request", clearanceOk ? "✓" : "→");
+      ImGui::BulletText("%s Docking", docked ? "✓" : "→");
+
+      ImGui::Spacing();
+      if (ImGui::SmallButton("Engage/Drop Supercruise")) {
+        setTargetQuick(TargetKind::Station, missionStationIdx);
+        uiToggleSupercruise();
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Approach")) {
+        setTargetQuick(TargetKind::Station, missionStationIdx);
+        autopilot = false;
+        dockingComputer.reset();
+        navAssist.engageApproach(std::max(st.commsRangeKm * 0.25, st.radiusKm * 1.1));
+        toast(toasts, "Nav assist: Approach", 1.6);
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Request")) {
+        requestDockingQuick(missionStationIdx);
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Dock")) {
+        setTargetQuick(TargetKind::Station, missionStationIdx);
+        engageDockingComputerQuick();
+      }
+    }
+
+    // Scanner guidance to mission targets
+    if (currentSystem && missionObjectiveIsScan) {
+      if (missionSignalIdx != static_cast<std::size_t>(-1)) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("Scanner");
+        ImGui::Text("Mission site: %s", signals[missionSignalIdx].label.c_str());
+        if (ImGui::SmallButton("Target site")) setTargetQuick(TargetKind::Signal, missionSignalIdx);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Scan site")) startScanQuick(TargetKind::Signal, missionSignalIdx);
+      } else if (missionContactIdx != static_cast<std::size_t>(-1)) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("Scanner");
+        ImGui::Text("Bounty target: %s", contacts[missionContactIdx].name.c_str());
+        if (ImGui::SmallButton("Target")) setTargetQuick(TargetKind::Contact, missionContactIdx);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Scan")) startScanQuick(TargetKind::Contact, missionContactIdx);
+      } else {
+        ImGui::Spacing();
+        ImGui::TextDisabled("Scanner");
+        ImGui::TextWrapped("Mission scan target not currently detected. Open the System Scanner and look for a mission-tagged target.");
+      }
+    }
+
     ImGui::Separator();
     ImGui::TextDisabled("Quick actions");
 
@@ -20239,9 +23604,417 @@ if (objectiveHudEnabled) {
 
     ImGui::End();
     if (hudLayoutEditMode) ImGui::PopStyleVar();
+  } else {
+    // Fallback: always-visible objective tracker (even with no active missions).
+    const auto& wLay = hudLayout.widget(ui::HudWidgetId::Objective);
+    const float uiScale = std::max(0.50f, wLay.scale);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize |
+      ImGuiWindowFlags_NoFocusOnAppearing;
+    const float pad = 10.0f * uiScale;
+
+    ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? 0.55f : 0.22f);
+    hudSetNextWindowPosFromLayout(ui::HudWidgetId::Objective, pad, pad);
+
+    if (hudLayoutEditMode) {
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    }
+
+    ImGui::Begin("Objective HUD##objective", nullptr, flags);
+    ImGui::SetWindowFontScale(uiScale);
+
+    if (hudLayoutEditMode) {
+      hudCaptureWindowPosToLayout(ui::HudWidgetId::Objective, pad, pad);
+    }
+
+    ImGui::Text("Objective");
+    ImGui::Separator();
+
+    if (currentSystem) {
+      const auto localSnap = snapshotSystemConditions(*currentSystem);
+      if (localSnap.event.active) {
+        const double remDays = std::max(0.0, localSnap.event.endDay - timeDays);
+        const int remHours = (int)std::ceil(remDays * 24.0);
+        if (remHours < 48) {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %dh)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              remHours);
+        } else {
+          ImGui::TextDisabled("Local event: %s (%.0f%%, %.0fd)",
+                              systemEventKindLabel(localSnap.event.kind),
+                              std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                              std::ceil(remDays));
+        }
+        ImGui::Spacing();
+      }
+    }
+
+        if (tracked) {
+          ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 320.0f * uiScale);
+          ImGui::TextWrapped("%s", uiDescribeMission(*tracked).c_str());
+          ImGui::PopTextWrapPos();
+
+          const auto dest = uiMissionNextStop(*tracked);
+          const sim::SystemId destSys = dest.first;
+          const sim::StationId destSt = dest.second;
+
+          if (destSys != 0) {
+            const std::string sysName = uiSystemNameById(destSys);
+            if (destSt != 0) {
+              ImGui::TextDisabled("Next: %s / %s", sysName.c_str(), uiStationNameById(destSys, destSt).c_str());
+            } else {
+              ImGui::TextDisabled("Next: %s", sysName.c_str());
+            }
+          }
+        } else if (trackedTradeLoop.active) {
+          const sim::TradeLoopLeg* leg = currentTradeLoopLeg();
+          if (leg) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 320.0f * uiScale);
+            ImGui::TextWrapped("Trade loop — leg %d / %d", trackedTradeLoop.legIndex + 1, (int)trackedTradeLoop.loop.legs.size());
+            ImGui::PopTextWrapPos();
+
+            ImGui::TextDisabled("Loop profit: +%.0f cr", trackedTradeLoop.loop.totalNetProfitCr);
+            ImGui::TextDisabled("Next: %s / %s", leg->toSystemName.c_str(), leg->toStationName.c_str());
+            ImGui::TextDisabled("Leg profit: +%.0f cr (buy %.0f / sell %.0f)",
+                                leg->manifest.netProfitCr, leg->manifest.netBuyCr, leg->manifest.netSellCr);
+
+            if (ImGui::SmallButton("Sync nav")) {
+              if (plotRouteToSystem(leg->toSystem)) {
+                pendingArrivalTargetStationId = leg->toStation;
+                toast(toasts, "Route plotted.", 2.0);
+              } else {
+                toast(toasts, "No route found.", 3.0);
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Auto-run leg")) {
+              hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Stop")) {
+              trackedTradeLoop.active = false;
+            }
+
+            const int showLines = (int)std::min<std::size_t>(3, leg->manifest.lines.size());
+            if (showLines > 0) {
+              ImGui::TextDisabled("Suggested cargo:");
+              for (int i = 0; i < showLines; ++i) {
+                const auto& line = leg->manifest.lines[(std::size_t)i];
+                ImGui::BulletText("%s  x%.0f  (profit +%.0f)",
+                                  econ::commodityDef(line.commodity).code, line.units, line.netProfitCr);
+              }
+            }
+
+            // Dockside automation (sell inbound + buy outbound) for tracked loops.
+            // Manual buttons are available whenever you're docked at the expected loop station.
+            if (docked && currentSystem && dockedStationId != 0) {
+              const bool atExpected = (leg->fromSystem == currentSystem->stub.id && leg->fromStation == dockedStationId);
+              ImGui::Spacing();
+              ImGui::TextDisabled("Dockside automation");
+              if (!atExpected) {
+                ImGui::TextDisabled("Dock at the loop station to execute trades.");
+              } else {
+                if (ImGui::SmallButton("Sell+Buy")) {
+                  executeTradeLoopDockedTurn(/*showToast=*/true, /*plotAndAutoRun=*/false, "TradeLoop:HUD");
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Sell+Buy + Auto-run")) {
+                  executeTradeLoopDockedTurn(/*showToast=*/true, /*plotAndAutoRun=*/true, "TradeLoop:HUD");
+                }
+
+                ImGui::Checkbox("Auto trade on dock", &trackedTradeLoop.autoTradeOnDock);
+                ImGui::SameLine();
+                ImGui::Checkbox("Auto-run", &trackedTradeLoop.autoTradeArmAutoRun);
+                ImGui::SameLine();
+                ImGui::Checkbox("Toast", &trackedTradeLoop.autoTradeToast);
+              }
+
+              // Show the last execution result for quick sanity checks.
+              if (trackedTradeLoop.lastTradeStationId == dockedStationId &&
+                  std::abs(trackedTradeLoop.lastTradeTimeDays - timeDays) < 0.02) {
+                ImGui::TextDisabled("Last: sold +%.0f, bought -%.0f, net %+.0f", trackedTradeLoop.lastTradeSoldCr,
+                                    trackedTradeLoop.lastTradeBoughtCr, trackedTradeLoop.lastTradeCreditsDelta);
+              }
+            }
+          } else {
+            ImGui::TextDisabled("No active missions.");
+          }
+        } else {
+          ImGui::TextDisabled("No active missions.");
+        }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Navigation");
+
+    const bool haveRoute = !navRoute.empty();
+    const bool haveNextHop = haveRoute && (navRouteHop + 1 < navRoute.size());
+    const sim::SystemId nextHop = haveNextHop ? navRoute[navRouteHop + 1] : 0;
+
+    if (haveRoute) {
+      ImGui::Text("Route hops: %d / %d", (int)navRouteHop, (int)std::max<std::size_t>(1, navRoute.size() - 1));
+      if (haveNextHop) {
+        ImGui::Text("Next jump: %s", uiSystemNameById(nextHop).c_str());
+        if (ImGui::SmallButton("Jump next hop")) {
+          startFsdJumpTo(nextHop);
+        }
+      } else {
+        ImGui::TextDisabled("Route complete.");
+      }
+    } else {
+      ImGui::TextDisabled("No route plotted.");
+    }
+
+    if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+      const auto& st = currentSystem->stations[target.index];
+      const double distKm = (sim::stationPosKm(st, timeDays) - ship.positionKm()).length();
+
+      const auto it = clearances.find(st.id);
+      const bool clearanceOk = it != clearances.end() && sim::dockingClearanceValid(it->second, timeDays);
+
+      ImGui::Spacing();
+      ImGui::Text("Target station: %s", st.name.c_str());
+      ImGui::TextDisabled("Distance: %.0f km", distKm);
+
+            const DockingAccessCheck access = dockingAccessCheck(st);
+      const bool inComms = distKm <= st.commsRangeKm;
+
+      if (access.blocked && !access.bribeActive) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                           "Docking denied: %s",
+                           dockingAccessReasonShort(access).c_str());
+
+        const double bribeCost = dockingBribeCostCr(st, access);
+        const double bountyFeeRate = dockingRemoteSettlementFeeRate(st, access);
+        const double bountyTotal = std::ceil(access.bountyCr * (1.0 + bountyFeeRate));
+
+        if (access.byBounty) {
+          if (!inComms) ImGui::BeginDisabled();
+          if (ImGui::SmallButton(("Settle bounty (" + std::to_string((int)bountyTotal) + " cr)").c_str())) {
+            payBountyRemotely(st, "ObjectiveHUD");
+          }
+          if (!inComms) ImGui::EndDisabled();
+          ImGui::SameLine();
+        }
+
+        if (!inComms) ImGui::BeginDisabled();
+        if (ImGui::SmallButton(("Buy temporary clearance (" + std::to_string((int)bribeCost) + " cr)").c_str())) {
+          buyDockingBribe(st, "ObjectiveHUD");
+        }
+        if (!inComms) ImGui::EndDisabled();
+      } else if (access.bribeActive && access.blocked) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Temporary clearance active (%.0fs)", access.bribeLeftSec);
+      }
+
+      if (!clearanceOk) {
+        const bool disableRequest = (access.blocked && !access.bribeActive);
+        if (disableRequest) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Request docking clearance")) {
+          requestDockingQuick(target.index);
+        }
+        if (disableRequest) ImGui::EndDisabled();
+      } else {
+        ImGui::TextDisabled("Docking clearance: granted");
+      }
+
+      if (ImGui::SmallButton("Docking computer")) {
+        if (docked) {
+          toast(toasts, "Already docked.", 1.6);
+        } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+          toast(toasts, "Docking computer unavailable in supercruise/FSD.", 2.0);
+        } else {
+          autopilot = true;
+          dockingComputer.reset();
+          toast(toasts, "Docking computer engaged.", 1.6);
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Supercruise")) {
+        uiToggleSupercruise();
+      }
+    } else if (target.kind == TargetKind::None) {
+      ImGui::TextDisabled("Tip: target a station/signal, or plot a route.");
+    } else {
+      ImGui::TextDisabled("Tip: use \"Go here next\" in the mission objective window for guided steps.");
+    }
+
+    ImGui::End();
+
+    if (hudLayoutEditMode) {
+      ImGui::PopStyleVar();
+    }
   }
 }
 }
+
+
+// Mini objective tracker (always visible even if the full Objective HUD widget is disabled)
+if (!objectiveHudEnabled && !docked) {
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize |
+    ImGuiWindowFlags_NoFocusOnAppearing;
+
+  const float pad = 10.0f * dpiScale;
+  ImGui::SetNextWindowBgAlpha(0.18f);
+  ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
+
+  ImGui::Begin("Objective Tracker##mini", nullptr, flags);
+  ImGui::SetWindowFontScale(0.9f);
+
+  sim::Mission* trackedMini = nullptr;
+  if (trackedMissionId != 0) {
+    for (auto& m : missions) {
+      if (m.id == trackedMissionId && m.active) {
+        trackedMini = &m;
+        break;
+      }
+    }
+  }
+  if (!trackedMini) {
+    for (auto& m : missions) {
+      if (m.active) {
+        trackedMini = &m;
+        break;
+      }
+    }
+  }
+
+  const bool haveRoute = !navRoute.empty();
+  const bool haveNextHop = haveRoute && (navRouteHop + 1 < navRoute.size());
+  const sim::SystemId nextHop = haveNextHop ? navRoute[navRouteHop + 1] : 0;
+
+  if (trackedMini) {
+    const auto dest = uiMissionNextStop(*trackedMini);
+    const sim::SystemId destSys = dest.first;
+    const sim::StationId destSt = dest.second;
+    if (destSys != 0) {
+      const std::string sysName = uiSystemNameById(destSys);
+      if (destSt != 0) {
+        ImGui::Text("Objective: %s / %s", sysName.c_str(), uiStationNameById(destSys, destSt).c_str());
+      } else {
+        ImGui::Text("Objective: %s", sysName.c_str());
+      }
+    } else {
+      ImGui::Text("Objective: mission");
+    }
+  } else if (trackedTradeLoop.active) {
+    const sim::TradeLoopLeg* leg = currentTradeLoopLeg();
+    if (leg) {
+      ImGui::Text("Objective: Trade loop — %s / %s", leg->toSystemName.c_str(), leg->toStationName.c_str());
+    } else {
+      ImGui::TextDisabled("Objective: (none)");
+    }
+  } else if (haveNextHop) {
+    ImGui::Text("Objective: %s", uiSystemNameById(nextHop).c_str());
+  } else {
+    ImGui::TextDisabled("Objective: (none)");
+  }
+
+  if (currentSystem) {
+    const auto localSnap = snapshotSystemConditions(*currentSystem);
+    if (localSnap.event.active) {
+      const double remDays = std::max(0.0, localSnap.event.endDay - timeDays);
+      const int remHours = (int)std::ceil(remDays * 24.0);
+      if (remHours < 48) {
+        ImGui::TextDisabled("Event: %s (%.0f%%, %dh)",
+                            systemEventKindLabel(localSnap.event.kind),
+                            std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                            remHours);
+      } else {
+        ImGui::TextDisabled("Event: %s (%.0f%%, %.0fd)",
+                            systemEventKindLabel(localSnap.event.kind),
+                            std::clamp(localSnap.event.severity01, 0.0, 1.0) * 100.0,
+                            std::ceil(remDays));
+      }
+    }
+  }
+
+  if (haveNextHop) {
+    ImGui::TextDisabled("Next hop: %s", uiSystemNameById(nextHop).c_str());
+    if (ImGui::SmallButton("Go")) {
+      startFsdJumpTo(nextHop);
+    }
+  } else if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+    const auto& st = currentSystem->stations[target.index];
+    const auto it = clearances.find(st.id);
+    const bool clearanceOk = it != clearances.end() && sim::dockingClearanceValid(it->second, timeDays);
+
+    if (!clearanceOk) {
+      ImGui::TextDisabled("Docking: request clearance");
+
+      const DockingAccessCheck access = dockingAccessCheck(st);
+      if (access.blocked && !access.bribeActive) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Denied: %s", dockingAccessReasonShort(access).c_str());
+        if (access.byBounty) {
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Pay")) payBountyRemotely(st, "MiniObjective");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Bribe")) buyDockingBribe(st, "MiniObjective");
+
+        ImGui::BeginDisabled();
+      } else if (access.bribeActive && access.blocked) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Clearance override active (%.0fs)", access.bribeLeftSec);
+      }
+
+      if (ImGui::SmallButton("Request")) {
+        const double dist = (ship.positionKm() - sim::stationPosKm(st, timeDays)).length();
+        auto& cs = clearances[st.id];
+        const bool hadValid = sim::dockingClearanceValid(cs, timeDays);
+
+        const auto out =
+          requestDockingClearanceCommon(st, dist, /*autoMode=*/false, /*allowToast=*/true, "MiniObjective");
+        if (!out.access.allowed()) {
+          audio.play(game::AudioEngine::Sfx::UiError, 0.8f, 0.0f);
+        } else {
+          const auto dec = out.decision;
+          if (hadValid && dec.status == sim::DockingClearanceStatus::Granted) {
+            std::string msg = "Docking clearance already granted.";
+            if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+            toast(toasts, msg, 1.8);
+          } else if (dec.status == sim::DockingClearanceStatus::Granted) {
+            std::string msg = "Docking clearance GRANTED.";
+            if (cs.assignedPad != 0) msg += " Pad " + std::to_string(cs.assignedPad) + ".";
+            toast(toasts, msg, 2.6);
+          } else if (dec.status == sim::DockingClearanceStatus::OutOfRange) {
+            toast(toasts, "Out of comms range for clearance.", 2.2);
+          } else if (dec.status == sim::DockingClearanceStatus::Throttled) {
+            toast(toasts, "Clearance channel busy. Try again soon.", 2.2);
+          } else {
+            toast(toasts, "Docking clearance DENIED. (traffic)", 2.2);
+          }
+        }
+      }
+
+      if (access.blocked && !access.bribeActive) {
+        ImGui::EndDisabled();
+      }
+    } else {
+      ImGui::TextDisabled("Docking: ready");
+      if (ImGui::SmallButton("Dock")) {
+        autopilot = true;
+        dockingComputer.reset();
+        toast(toasts, "Docking computer engaged.", 1.6);
+      }
+    }
+  } else if (trackedTradeLoop.active) {
+    const sim::TradeLoopLeg* leg = currentTradeLoopLeg();
+    if (leg) {
+      ImGui::TextDisabled("Trade loop: sync nav");
+      if (ImGui::SmallButton("Nav")) {
+        hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
+      }
+    } else {
+      ImGui::TextDisabled("Tip: plot a route or track a mission.");
+    }
+  } else {
+    ImGui::TextDisabled("Tip: plot a route or track a mission.");
+  }
+
+  ImGui::End();
+}
+
 
 // Traffic escort HUD (ambient contract)
 if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
@@ -20377,7 +24150,58 @@ if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruise
   }
   ImGui::SameLine();
   ImGui::TextDisabled("[%s]", game::chordLabel(controls.actions.navAssistFollow).c_str());
+  
+// Field Ops HUD (compact always-on overlay)
+if (fieldOps.hudVisible && fieldOps.mode != FieldOpsMode::Off && showHUD && !docked && !showMainMenu) {
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + 135.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+  ImGui::SetNextWindowBgAlpha(0.55f);
+
+  const auto flags =
+    ImGuiWindowFlags_NoDecoration |
+    ImGuiWindowFlags_NoDocking |
+    ImGuiWindowFlags_AlwaysAutoResize |
+    ImGuiWindowFlags_NoSavedSettings |
+    ImGuiWindowFlags_NoFocusOnAppearing |
+    ImGuiWindowFlags_NoNav;
+
+  if (ImGui::Begin("Field Ops HUD##field_ops_hud", nullptr, flags)) {
+    ImGui::TextUnformatted("Field Ops");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", fieldOpsModeLabel(fieldOps.mode));
+
+    if (fieldOps.paused) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "PAUSED");
+    }
+
+    if (!fieldOps.targetLabel.empty()) {
+      ImGui::Text("Target: %s", fieldOps.targetLabel.c_str());
+    } else {
+      ImGui::TextDisabled("Target: (none)");
+    }
+
+    if (!fieldOps.pauseReason.empty()) {
+      ImGui::TextDisabled("%s", fieldOps.pauseReason.c_str());
+    }
+
+    if (ImGui::SmallButton("Stop")) {
+      fieldOpsStop("Field Ops: OFF");
+    }
+
+    if (fieldOps.mode == FieldOpsMode::SalvageSweep && fieldOps.targetId != 0) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Skip")) {
+        fieldOpsSkipTarget();
+      }
+    }
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("Action Wheel: page 3");
+  }
   ImGui::End();
+}
+ImGui::End();
 }
 
 // Pirate demand HUD (threat/tribute)
@@ -20529,6 +24353,112 @@ if (hudThreatOverlayEnabled && pirateDemand.active && pirateDemand.requiredValue
   }
   ImGui::End();
   if (hudLayoutEditMode) ImGui::PopStyleVar();
+}
+
+
+// Authority demand HUD (scan/bribe/bounty).
+// Uses the same Threat HUD slot as pirate tribute, but only shows when pirates aren't currently extorting you.
+{
+  const bool pirateThreatShowing =
+      (hudThreatOverlayEnabled && pirateDemand.active && pirateDemand.requiredValueCr > 0.0
+       && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
+
+  if (hudThreatOverlayEnabled && !pirateThreatShowing
+      && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
+
+    const bool bribeActive = (bribeOffer.active && timeDays < bribeOffer.untilDays);
+    const bool bountyActive = (policeDemand.active && timeDays < policeDemand.untilDays && getBounty(policeDemand.factionId) > 1e-6);
+
+    if (bribeActive || bountyActive) {
+      ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                          | ImGuiWindowFlags_AlwaysAutoResize
+                          | ImGuiWindowFlags_NoFocusOnAppearing
+                          | ImGuiWindowFlags_NoNav
+                          | ImGuiWindowFlags_NoSavedSettings;
+
+      auto& wLay = hudLayout.widget(ui::HudWidgetId::Threat);
+      const float uiScale = std::max(0.50f, wLay.scale);
+
+      ImGui::SetNextWindowBgAlpha(hudLayoutEditMode ? hudOverlayBgAlphaEdit : hudOverlayBgAlpha);
+      hudSetNextWindowPosFromLayout(ui::HudWidgetId::Threat);
+      if (hudLayoutEditMode) {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+      }
+      ImGui::Begin("Threat HUD##authority_demand", nullptr, flags);
+      ImGui::SetWindowFontScale(uiScale);
+      if (hudLayoutEditMode) {
+        hudCaptureWindowPosToLayout(ui::HudWidgetId::Threat);
+      }
+
+      ImGui::Text("Authority");
+      ImGui::Separator();
+
+      if (bribeActive) {
+        const std::string src = bribeOffer.sourceName.empty() ? std::string("Authorities") : bribeOffer.sourceName;
+        const double leftSec = std::max(0.0, (bribeOffer.untilDays - timeDays) * 86400.0);
+        const double totalSec = std::max(0.001, (bribeOffer.untilDays - bribeOffer.startDays) * 86400.0);
+        const float t = (float)std::clamp(1.0 - (leftSec / totalSec), 0.0, 1.0);
+
+        ImGui::TextWrapped("%s offers a discreet resolution.", src.c_str());
+        if (!bribeOffer.detail.empty()) {
+          ImGui::TextDisabled("Detected: %s", bribeOffer.detail.c_str());
+        }
+
+        ImGui::Text("Bribe: %.0f cr", bribeOffer.amountCr);
+        ImGui::SameLine();
+        ImGui::TextDisabled("Comply fine: %.0f cr", bribeOffer.fineCr);
+
+        ImGui::ProgressBar(t, ImVec2(240.0f * uiScale, 0.0f));
+        ImGui::TextDisabled("Time remaining: %.0f s", leftSec);
+
+        const bool canBribe = (credits + 1e-6 >= bribeOffer.amountCr);
+        std::string bribeLbl = "Pay bribe [" + game::chordLabel(controls.actions.bribe) + "]";
+        std::string complyLbl = "Comply [" + game::chordLabel(controls.actions.complyOrSubmit) + "]";
+
+        ImGui::BeginDisabled(!canBribe);
+        if (ImGui::Button(bribeLbl.c_str())) {
+          doAuthorityBribe("ThreatHUD", /*requireNoUiCapture=*/false);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (ImGui::Button(complyLbl.c_str())) {
+          doAuthorityComplyOrSubmit("ThreatHUD", /*requireNoUiCapture=*/false);
+        }
+
+        if (!canBribe) {
+          ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1.0f), "Insufficient credits for bribe.");
+        } else {
+          ImGui::TextDisabled("Tip: bribe avoids confiscation and a formal bounty, but increases local alert.");
+        }
+      } else {
+        const std::string src = policeDemand.sourceName.empty() ? std::string("Authorities") : policeDemand.sourceName;
+        const double owed = std::max(0.0, getBounty(policeDemand.factionId));
+        const double leftSec = std::max(0.0, (policeDemand.untilDays - timeDays) * 86400.0);
+        const double totalSec = std::max(0.001, (policeDemand.untilDays - policeDemand.startDays) * 86400.0);
+        const float t = (float)std::clamp(1.0 - (leftSec / totalSec), 0.0, 1.0);
+
+        ImGui::TextWrapped("%s demands submission for an outstanding bounty.", src.c_str());
+        ImGui::Text("Bounty: %.0f cr", owed);
+        ImGui::TextDisabled("Available credits: %.0f cr", credits);
+
+        ImGui::ProgressBar(t, ImVec2(240.0f * uiScale, 0.0f));
+        ImGui::TextDisabled("Time remaining: %.0f s", leftSec);
+
+        std::string submitLbl = "Submit / pay [" + game::chordLabel(controls.actions.complyOrSubmit) + "]";
+        if (ImGui::Button(submitLbl.c_str())) {
+          doAuthorityComplyOrSubmit("ThreatHUD", /*requireNoUiCapture=*/false);
+        }
+
+        if (credits + 1e-6 < owed) {
+          ImGui::TextDisabled("Partial payment accepted, but enforcement will escalate immediately.");
+        }
+      }
+
+      ImGui::End();
+      if (hudLayoutEditMode) ImGui::PopStyleVar();
+    }
+  }
 }
 
 
@@ -24306,6 +28236,99 @@ if (showScanner) {
 
   ImGui::Separator();
 
+  // Tracked mission guidance
+  {
+    sim::Mission* tracked = nullptr;
+    if (trackedMissionId != 0) {
+      for (auto& m : missions) {
+        if (m.id == trackedMissionId && m.active) {
+          tracked = &m;
+          break;
+        }
+      }
+    }
+    if (!tracked) {
+      for (auto& m : missions) {
+        if (m.active) {
+          tracked = &m;
+          break;
+        }
+      }
+    }
+
+    if (tracked) {
+      const auto dest = uiMissionNextStop(*tracked);
+      const sim::SystemId destSys = dest.first;
+      const sim::StationId destSt = dest.second;
+
+      ImGui::TextDisabled("Tracked mission guidance");
+      ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420.0f * uiScale);
+      ImGui::TextWrapped("%s", uiDescribeMission(*tracked).c_str());
+      ImGui::PopTextWrapPos();
+
+      if (destSys != 0) {
+        const std::string sysName = uiSystemNameById(destSys);
+        if (destSt != 0) {
+          ImGui::TextDisabled("Next stop: %s / %s", sysName.c_str(), uiStationNameById(destSys, destSt).c_str());
+        } else {
+          ImGui::TextDisabled("Next stop: %s", sysName.c_str());
+        }
+      }
+
+      // In-system target shortcuts (target + scan / target + dock)
+      if (destSys != 0 && destSys == currentSystem->stub.id) {
+        if (tracked->type == sim::MissionType::Salvage && !tracked->scanned) {
+          std::size_t idx = static_cast<std::size_t>(-1);
+          for (std::size_t i = 0; i < signals.size(); ++i) {
+            if (signals[i].id == tracked->targetNpcId) { idx = i; break; }
+          }
+          if (idx != static_cast<std::size_t>(-1)) {
+            ImGui::Text("Mission site: %s", signals[idx].label.c_str());
+            if (ImGui::SmallButton("Target site")) { target.kind = TargetKind::Signal; target.index = idx; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Scan site")) { uiStartScan(TargetKind::Signal, idx); }
+          } else {
+            ImGui::TextDisabled("Mission site not detected (check Signals tab).");
+          }
+        } else if (tracked->type == sim::MissionType::BountyScan && !tracked->scanned) {
+          std::size_t idx = static_cast<std::size_t>(-1);
+          for (std::size_t i = 0; i < contacts.size(); ++i) {
+            if (contacts[i].id == tracked->targetNpcId) { idx = i; break; }
+          }
+          if (idx != static_cast<std::size_t>(-1)) {
+            ImGui::Text("Target: %s", contacts[idx].name.c_str());
+            if (ImGui::SmallButton("Target")) { target.kind = TargetKind::Contact; target.index = idx; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Scan")) { uiStartScan(TargetKind::Contact, idx); }
+          } else {
+            ImGui::TextDisabled("Bounty target not in contacts (check Contacts tab).");
+          }
+        } else if (destSt != 0) {
+          std::size_t stIdx = static_cast<std::size_t>(-1);
+          for (std::size_t i = 0; i < currentSystem->stations.size(); ++i) {
+            if (currentSystem->stations[i].id == destSt) { stIdx = i; break; }
+          }
+          if (stIdx != static_cast<std::size_t>(-1)) {
+            ImGui::Text("Destination station: %s", currentSystem->stations[stIdx].name.c_str());
+            if (ImGui::SmallButton("Target station")) { target.kind = TargetKind::Station; target.index = stIdx; }
+          }
+        }
+      } else if (destSys != 0 && destSys != currentSystem->stub.id) {
+        if (ImGui::SmallButton("Plot route")) {
+          plotRouteToSystem(destSys, true);
+        }
+        if (!navRoute.empty() && navRoute.back() == destSys && navRouteHop + 1 < navRoute.size()) {
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Jump next hop")) {
+            startFsdJumpTo(navRoute[navRouteHop + 1]);
+          }
+        }
+      }
+
+      ImGui::Separator();
+    }
+  }
+
   // Survey status
   int scannedPlanets = 0;
   for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
@@ -25781,7 +29804,8 @@ if (showScanner) {
             }
             ImGui::EndTabItem();
           }
-          ImGui::EndTabBar();
+          missionsTabRequest = -1;
+        ImGui::EndTabBar();
         }
 
         ImGui::EndChild();
@@ -25807,6 +29831,10 @@ if (showScanner) {
         const double feeEff = effectiveFeeRate(station);
         double cargoKgNow = cargoMassKg(cargo);
 
+        if (focusMarketDetailsWindow) {
+          ImGui::SetNextWindowFocus();
+          focusMarketDetailsWindow = false;
+        }
         ImGui::Begin("Market Details");
         ImGui::Text("Credits: %.2f", credits);
 
@@ -25823,6 +29851,12 @@ if (showScanner) {
 
         // Simple docked services
         if (canTrade) {
+          ImGui::SeparatorText("Docked Services");
+          if (marketDetailsJumpTarget == MarketDetailsJumpTarget::Services) {
+            ImGui::SetScrollHereY(0.0f);
+            marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
+          }
+
           const double hullMissing = std::max(0.0, playerHullMax - playerHull);
           const double repairBase = hullMissing * 12.0;
           const double repairCost = repairBase * (1.0 + feeEff);
@@ -26248,8 +30282,11 @@ if (showScanner) {
 
           // Shipyard upgrades
           if (station.type == econ::StationType::Shipyard) {
-            ImGui::Separator();
-            ImGui::Text("Shipyard Upgrades");
+            ImGui::SeparatorText("Shipyard Upgrades");
+            if (marketDetailsJumpTarget == MarketDetailsJumpTarget::Shipyard) {
+              ImGui::SetScrollHereY(0.0f);
+              marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
+            }
 
             const sim::ShipyardPriceModel shipyardModel{feeEff, rep};
 
@@ -26292,7 +30329,8 @@ if (showScanner) {
                 const int nextMk = (q.nextMk > 0) ? q.nextMk : (smuggleHoldMk + 1);
                 std::string label = std::string("Smuggling compartments Mk") + std::to_string(nextMk);
 
-                ImGui::BeginDisabled(!q.ok || credits + 1e-6 < q.costCr);
+                const bool unlocked = (nextMk <= (int)progression.unlockedSmuggleHoldMk);
+                ImGui::BeginDisabled(!q.ok || !unlocked || credits + 1e-6 < q.costCr);
                 if (ImGui::Button(label.c_str())) {
                   if (sim::applySmuggleHoldUpgrade(credits, smuggleHoldMk, q)) {
                     toast(toasts, "Hidden compartments installed.", 2.0);
@@ -26301,6 +30339,13 @@ if (showScanner) {
                   }
                 }
                 ImGui::EndDisabled();
+                if (!unlocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                  ImGui::BeginTooltip();
+                  ImGui::Text("Locked: reach credits high-water >= %.0f OR rep high-water >= %.0f.",
+                              unlockSmuggleHoldMk[nextMk].creditsHighWaterCr,
+                              unlockSmuggleHoldMk[nextMk].repHighWater);
+                  ImGui::EndTooltip();
+                }
 
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%.0f cr) Reduce cargo scan chance for contraband.", q.costCr);
@@ -26316,7 +30361,8 @@ if (showScanner) {
                 const int nextMk = (q.nextMk > 0) ? q.nextMk : (fuelScoopMk + 1);
                 std::string label = std::string("Fuel scoop Mk") + std::to_string(nextMk);
 
-                ImGui::BeginDisabled(!q.ok || credits + 1e-6 < q.costCr);
+                const bool unlocked = (nextMk <= (int)progression.unlockedFuelScoopMk);
+                ImGui::BeginDisabled(!q.ok || !unlocked || credits + 1e-6 < q.costCr);
                 if (ImGui::Button(label.c_str())) {
                   if (sim::applyFuelScoopUpgrade(credits, fuelScoopMk, q)) {
                     fuelScoopDeployed = false;
@@ -26326,6 +30372,13 @@ if (showScanner) {
                   }
                 }
                 ImGui::EndDisabled();
+                if (!unlocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                  ImGui::BeginTooltip();
+                  ImGui::Text("Locked: reach credits high-water >= %.0f OR rep high-water >= %.0f.",
+                              unlockFuelScoopMk[nextMk].creditsHighWaterCr,
+                              unlockFuelScoopMk[nextMk].repHighWater);
+                  ImGui::EndTooltip();
+                }
 
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%.0f cr) Enables refuelling near the system star.", q.costCr);
@@ -26376,10 +30429,36 @@ if (showScanner) {
 
               if (ImGui::BeginCombo("Hull class", kHullDefs[hullChoice].name)) {
                 for (int i = 0; i < (int)(sizeof(kHullDefs) / sizeof(kHullDefs[0])); ++i) {
+                  const ShipHullClass hc = (ShipHullClass)i;
+                  const bool unlocked = progression.isHullUnlocked(hc);
                   const bool selected = (hullChoice == i);
-                  if (ImGui::Selectable(kHullDefs[i].name, selected)) {
-                    hullChoice = i;
+
+                  std::string label = kHullDefs[i].name;
+                  if (!unlocked) label += " (locked)";
+
+                  if (!unlocked) ImGui::BeginDisabled(true);
+                  if (ImGui::Selectable(label.c_str(), selected)) {
+                    if (unlocked) hullChoice = i;
                   }
+                  if (!unlocked) {
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                      ImGui::BeginTooltip();
+                      if (hc == ShipHullClass::Hauler) {
+                        ImGui::Text("Locked: reach credits high-water >= %.0f OR rep high-water >= %.0f.",
+                                    unlockHaulerHull.creditsHighWaterCr,
+                                    unlockHaulerHull.repHighWater);
+                      } else if (hc == ShipHullClass::Fighter) {
+                        ImGui::Text("Locked: reach credits high-water >= %.0f OR rep high-water >= %.0f.",
+                                    unlockFighterHull.creditsHighWaterCr,
+                                    unlockFighterHull.repHighWater);
+                      } else {
+                        ImGui::TextUnformatted("Locked.");
+                      }
+                      ImGui::EndTooltip();
+                    }
+                    ImGui::EndDisabled();
+                  }
+
                   if (selected) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
@@ -26455,9 +30534,26 @@ if (showScanner) {
                 if (ImGui::BeginCombo(comboId.c_str(), defs[choice[slot]].name)) {
                   for (int mk = 1; mk <= 3; ++mk) {
                     const bool selected = (choice[slot] == mk);
-                    if (ImGui::Selectable(defs[mk].name, selected)) {
-                      choice[slot] = mk;
+                    const bool unlocked = (mk <= (int)progression.unlockedCoreMk);
+
+                    std::string mkLabel = defs[mk].name;
+                    if (!unlocked) mkLabel += " (locked)";
+
+                    if (!unlocked) ImGui::BeginDisabled(true);
+                    if (ImGui::Selectable(mkLabel.c_str(), selected)) {
+                      if (unlocked) choice[slot] = mk;
                     }
+                    if (!unlocked) {
+                      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Locked: reach credits high-water >= %.0f OR rep high-water >= %.0f.",
+                                    unlockCoreMk[mk].creditsHighWaterCr,
+                                    unlockCoreMk[mk].repHighWater);
+                        ImGui::EndTooltip();
+                      }
+                      ImGui::EndDisabled();
+                    }
+
                     if (selected) ImGui::SetItemDefaultFocus();
                   }
                   ImGui::EndCombo();
@@ -26535,12 +30631,34 @@ if (showScanner) {
 
                 if (ImGui::BeginCombo(label, weaponDef((WeaponType)choice).name)) {
                   for (int i = 0; i < (int)(sizeof(kWeaponDefs) / sizeof(kWeaponDefs[0])); ++i) {
-                    const bool selected = (choice == i);
-                    if (ImGui::Selectable(kWeaponDefs[i].name, selected)) {
-                      choice = i;
-                    }
-                    if (selected) ImGui::SetItemDefaultFocus();
-                  }
+  const bool selected = (choice == i);
+  const WeaponType wt = (WeaponType)i;
+  const bool unlocked = progression.isWeaponUnlocked(wt);
+  std::string name = kWeaponDefs[i].name;
+  if (!unlocked) name += " (locked)";
+
+  ImGui::BeginDisabled(!unlocked);
+  if (ImGui::Selectable(name.c_str(), selected)) {
+    if (unlocked) choice = i;
+  }
+  if (!unlocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    const UnlockReq& req = unlockWeapon[(std::size_t)i];
+    const float p = unlockReqProgress(req);
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted("Locked weapon");
+    if (req.creditsHighWaterCr > 0.0) {
+      ImGui::Text("Unlock: reach %.0f cr high-water", req.creditsHighWaterCr);
+    }
+    if (req.repHighWater > 0.0) {
+      ImGui::Text("   or reach %.1f rep high-water", req.repHighWater);
+    }
+    ImGui::ProgressBar(p, ImVec2(180.0f, 0.0f), "progress");
+    ImGui::EndTooltip();
+  }
+  ImGui::EndDisabled();
+
+  if (selected) ImGui::SetItemDefaultFocus();
+}
                   ImGui::EndCombo();
                 }
 
@@ -26553,7 +30671,7 @@ if (showScanner) {
                   cost = pq.finalCostCr;
                 }
                 ImGui::SameLine();
-                ImGui::BeginDisabled(newW == wVar);
+                ImGui::BeginDisabled(newW == wVar || !progression.isWeaponUnlocked(newW));
                 if (ImGui::SmallButton((std::string("Buy##") + label).c_str())) {
                   if (credits + 1e-6 >= cost) {
                     credits -= cost;
@@ -26570,6 +30688,23 @@ if (showScanner) {
                   }
                 }
                 ImGui::EndDisabled();
+
+if (!progression.isWeaponUnlocked(newW) && newW != wVar &&
+    ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+  const UnlockReq& req = unlockWeapon[(std::size_t)newW];
+  const float p = unlockReqProgress(req);
+  ImGui::BeginTooltip();
+  ImGui::TextUnformatted("Weapon locked");
+  if (req.creditsHighWaterCr > 0.0) {
+    ImGui::Text("Unlock: reach %.0f cr high-water", req.creditsHighWaterCr);
+  }
+  if (req.repHighWater > 0.0) {
+    ImGui::Text("   or reach %.1f rep high-water", req.repHighWater);
+  }
+  ImGui::ProgressBar(p, ImVec2(180.0f, 0.0f), "progress");
+  ImGui::EndTooltip();
+}
+
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%.0f cr)", cost);
                 if (newW != wVar && pq.tradeInCr > 1e-3) {
@@ -26776,8 +30911,12 @@ if (canTrade) {
 
         // Warehouse / station storage
         {
-          ImGui::Separator();
-          ImGui::Text("Warehouse (station storage)");
+          ImGui::SeparatorText("Warehouse");
+          if (marketDetailsJumpTarget == MarketDetailsJumpTarget::Warehouse) {
+            ImGui::SetScrollHereY(0.0f);
+            marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
+          }
+          ImGui::TextDisabled("Station storage");
 
           // Accrue fees for this station's entry (if it exists) before displaying numbers.
           if (auto* e = sim::findStorage(stationStorage, station.id)) {
@@ -26927,6 +31066,12 @@ if (canTrade) {
 
             ImGui::EndTable();
           }
+        }
+
+        ImGui::SeparatorText("Market");
+        if (marketDetailsJumpTarget == MarketDetailsJumpTarget::Market) {
+          ImGui::SetScrollHereY(0.0f);
+          marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
         }
 
         static int selectedCommodity = 0;
@@ -27235,519 +31380,588 @@ if (canTrade) {
       if (!currentSystem) {
         ImGui::TextDisabled("No current system.");
       } else {
-        // Choose a 'from' station: prefer docked station; otherwise use the currently targeted station.
+        // Choose a 'from' station: prefer docked, otherwise prefer current galaxy selection.
         sim::StationId fromStationId = 0;
-        if (docked && dockedStationId != 0) {
+        if (docked) {
           fromStationId = dockedStationId;
-        } else if (target.kind == TargetKind::Station && target.index >= 0 && (std::size_t)target.index < currentSystem->stations.size()) {
-          fromStationId = currentSystem->stations[(std::size_t)target.index].id;
+        } else if (galaxySelectedSystem != 0) {
+          if (galaxySelectedStation != 0) {
+            fromStationId = galaxySelectedStation;
+          } else {
+            if (sim::System* sys = universe.systemById(galaxySelectedSystem)) {
+              if (!sys->stations.empty()) {
+                fromStationId = sys->stations[0].id;
+              }
+            }
+          }
         }
 
         if (fromStationId == 0) {
-          ImGui::TextDisabled("Dock at (or target) a station to see suggested trade routes.");
+          ImGui::TextDisabled("Pick a station on the Galaxy Map (or dock) to scan trade.");
         } else {
           const sim::Station* fromSt = nullptr;
-          for (const auto& st : currentSystem->stations) {
-            if (st.id == fromStationId) {
-              fromSt = &st;
-              break;
+          if (docked && dockedStationId == fromStationId) {
+            if (sim::Station* st = currentSystemStationById(fromStationId)) {
+              fromSt = st;
+            }
+          }
+          if (!fromSt) {
+            for (auto& sys : universe.systems) {
+              for (auto& st : sys.stations) {
+                if (st.id == fromStationId) {
+                  fromSt = &st;
+                  break;
+                }
+              }
+              if (fromSt) break;
             }
           }
 
           if (!fromSt) {
-            ImGui::TextDisabled("Station not found in current system.");
+            ImGui::TextDisabled("Station not found.");
           } else {
-            const bool fromDocked = docked && (dockedStationId == fromStationId);
-            const double feeEff = effectiveFeeRate(*fromSt);
-            ImGui::Text("From: %s%s", fromSt->name.c_str(), fromDocked ? " (docked)" : "");
-            ImGui::TextDisabled("Fees (rep-adjusted): %.1f%%", feeEff * 100.0);
+            ImGui::Text("From: %s (%s)", fromSt->name.c_str(), uiSystemNameById(fromSt->systemId).c_str());
 
-            float radiusLy = (float)tradeSearchRadiusLy;
-            if (ImGui::SliderFloat("Search radius (ly)", &radiusLy, 80.0f, 500.0f, "%.0f")) {
-              tradeSearchRadiusLy = (double)radiusLy;
-              tradeIdeasDayStamp = -1; // force refresh
-              tradeMixDayStamp = -1;
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh")) {
-              tradeIdeasDayStamp = -1;
-              tradeMixDayStamp = -1;
-            }
+            econ::StationEconomy fromEcon;
+            if (!universe.tryGetStationEconomy(fromStationId, fromEcon)) {
+              ImGui::TextDisabled("No market data for this station.");
+            } else {
+              const int dayStamp = (int)std::floor(timeDays);
+              const double jr = std::max(1e-6, fsdCurrentRangeLy());
+              const double usedKg = cargoMassKg(cargo);
+              const double freeKg = std::max(0.0, cargoCapacityKg - usedKg);
 
-            {
-              bool useFree = tradeUseFreeHold;
-              if (ImGui::Checkbox("Use free hold", &useFree)) {
-                tradeUseFreeHold = useFree;
+              const double feeEff = effectiveFeeRate(*fromSt);
+          ImGui::TextDisabled("Hold: %.0f / %.0f kg used (%.0f kg free)  |  Credits: %.0f cr", usedKg, cargoCapacityKg, freeKg, credits);
+
+
+              // Common scan settings
+              float radiusLy = (float)tradeSearchRadiusLy;
+              if (ImGui::SliderFloat("Search radius (ly)", &radiusLy, 10.0f, 250.0f, "%.0f")) {
+                tradeSearchRadiusLy = (double)radiusLy;
                 tradeIdeasDayStamp = -1;
                 tradeMixDayStamp = -1;
+                tradeLoopsDayStamp = -1;
               }
               ImGui::SameLine();
-              bool includeSame = tradeIncludeSameSystem;
-              if (ImGui::Checkbox("Include same system", &includeSame)) {
-                tradeIncludeSameSystem = includeSame;
+              if (ImGui::SmallButton("Refresh")) {
                 tradeIdeasDayStamp = -1;
                 tradeMixDayStamp = -1;
+                tradeLoopsDayStamp = -1;
               }
-              ImGui::SameLine();
-              bool useManifest = tradeUseManifest;
-              if (ImGui::Checkbox("Cargo mix", &useManifest)) {
-                tradeUseManifest = useManifest;
+
+              bool useFreeHold = tradeUseFreeHold;
+              if (ImGui::Checkbox("Use free hold only", &useFreeHold)) {
+                tradeUseFreeHold = useFreeHold;
                 tradeIdeasDayStamp = -1;
                 tradeMixDayStamp = -1;
+                tradeLoopsDayStamp = -1;
               }
 
-              float minProfit = (float)tradeMinNetProfit;
-              if (ImGui::SliderFloat("Min net profit / trip", &minProfit, 0.0f, 25000.0f, "%.0f")) {
-                tradeMinNetProfit = (double)minProfit;
+              bool includeSameSystem = tradeIncludeSameSystem;
+              if (ImGui::Checkbox("Include same system", &includeSameSystem)) {
+                tradeIncludeSameSystem = includeSameSystem;
                 tradeIdeasDayStamp = -1;
                 tradeMixDayStamp = -1;
+                tradeLoopsDayStamp = -1;
               }
 
-              if (tradeUseManifest) {
-                float stepKg = (float)tradeMixStepKg;
-                if (ImGui::SliderFloat("Mix step (kg)", &stepKg, 0.2f, 5.0f, "%.1f")) {
-                  tradeMixStepKg = std::max(0.05, (double)stepKg);
-                  tradeMixDayStamp = -1;
-                }
-                ImGui::SameLine();
-                bool impact = tradeMixSimulateImpact;
-                if (ImGui::Checkbox("Price impact", &impact)) {
-                  tradeMixSimulateImpact = impact;
-                  tradeMixDayStamp = -1;
-                }
+              ImGui::Separator();
 
-                ImGui::SameLine();
-                bool beam = tradeMixBeamSearch;
-                if (ImGui::Checkbox("Beam search", &beam)) {
-                  tradeMixBeamSearch = beam;
-                  tradeMixDayStamp = -1;
-                }
-                if (ImGui::IsItemHovered()) {
-                  ImGui::SetTooltip("Beam search keeps multiple partial cargo mixes to avoid myopic choices (especially with credit limits). Slower than greedy.");
-                }
+              if (ImGui::BeginTabBar("TradeTabs")) {
+                // -----------------------------------------------------------------
+                // IDEAS TAB (single commodity)
+                if (ImGui::BeginTabItem("Ideas")) {
+                  tradeHelperTab = 0;
 
-                if (tradeMixBeamSearch) {
-                  int bw = std::max(1, tradeMixBeamWidth);
-                  if (ImGui::SliderInt("Beam width", &bw, 1, 64)) {
-                    tradeMixBeamWidth = bw;
-                    tradeMixDayStamp = -1;
-                  }
-                }
-
-                int linesShown = std::max(1, tradeMixLinesShown);
-                if (ImGui::SliderInt("Lines shown", &linesShown, 1, 6)) {
-                  tradeMixLinesShown = linesShown;
-                }
-              } else {
-                int perStation = std::max(1, tradeIdeasPerStation);
-                if (ImGui::SliderInt("Ideas / station", &perStation, 1, 3)) {
-                  tradeIdeasPerStation = perStation;
-                  tradeIdeasDayStamp = -1;
-                }
-
-	                // ImGui combo preview strings must be null-terminated. Some helpers return
-	                // std::string_view, so keep a local std::string buffer here.
-	                std::string curFilterStr = "Any";
-	                if (tradeCommodityFilter >= 0) {
-	                  const auto id = static_cast<econ::CommodityId>(tradeCommodityFilter);
-	                  curFilterStr = std::string(econ::commodityCode(id));
-	                }
-
-	                if (ImGui::BeginCombo("Commodity filter", curFilterStr.c_str())) {
-                  const bool anySelected = tradeCommodityFilter < 0;
-                  if (ImGui::Selectable("Any", anySelected)) {
-                    tradeCommodityFilter = -1;
+                  float minProfit = (float)tradeMinNetProfit;
+                  if (ImGui::SliderFloat("Min net profit / trip", &minProfit, 0.0f, 25000.0f, "%.0f")) {
+                    tradeMinNetProfit = (double)minProfit;
                     tradeIdeasDayStamp = -1;
                   }
-                  if (anySelected) ImGui::SetItemDefaultFocus();
 
-                  for (std::size_t ci = 0; ci < econ::kCommodityCount; ++ci) {
-                    const auto id = (econ::CommodityId)ci;
-                    const bool selected = tradeCommodityFilter == (int)ci;
-                    std::string label = std::string(econ::commodityCode(id)) + " - " + econ::commodityDef(id).name;
-                    if (ImGui::Selectable(label.c_str(), selected)) {
-                      tradeCommodityFilter = (int)ci;
-                      tradeIdeasDayStamp = -1;
-                    }
-                    if (selected) ImGui::SetItemDefaultFocus();
+                  int ips = tradeIdeasPerStation;
+                  if (ImGui::SliderInt("Ideas / station", &ips, 1, 5)) {
+                    tradeIdeasPerStation = ips;
+                    tradeIdeasDayStamp = -1;
                   }
 
-                  ImGui::EndCombo();
-                }
-              }
-            }
-
-            const int dayStamp = (int)std::floor(timeDays);
-
-            if (!tradeUseManifest) {
-              if (tradeFromStationId != fromStationId || tradeIdeasDayStamp != dayStamp) {
-                tradeIdeas.clear();
-                tradeFromStationId = fromStationId;
-                tradeIdeasDayStamp = dayStamp;
-
-                sim::TradeScanParams scan;
-                scan.radiusLy = tradeSearchRadiusLy;
-                scan.maxSystems = 256;
-                scan.maxResults = 12;
-                scan.perStationLimit = (std::size_t)tradeIdeasPerStation;
-
-                scan.cargoCapacityKg = cargoCapacityKg;
-                scan.cargoUsedKg = cargoMassKg(cargo);
-                scan.useFreeHold = tradeUseFreeHold;
-
-                scan.bidAskSpread = 0.10;
-                scan.minNetProfit = tradeMinNetProfit;
-                scan.includeSameSystem = tradeIncludeSameSystem;
-
-                if (tradeCommodityFilter >= 0) {
-                  scan.commodityFilterEnabled = true;
-	                  // Clamp before casting so we never end up with an invalid enum value even if
-	                  // the UI state gets corrupted.
-	                  const int idx = core::clamp(tradeCommodityFilter, 0, (int)econ::kCommodityCount - 1);
-	                  scan.commodityFilter = static_cast<econ::CommodityId>(idx);
-                }
-
-                const auto results = sim::scanTradeOpportunities(universe,
-                                                                 currentSystem->stub,
-                                                                 *fromSt,
-                                                                 timeDays,
-                                                                 scan,
-                                                                 effectiveFeeRate);
-
-                for (const auto& r : results) {
-                  TradeIdea t;
-                  t.toSystem = r.toSystem;
-                  t.toStation = r.toStation;
-                  t.toSystemName = r.toSystemName;
-                  t.toStationName = r.toStationName;
-                  t.commodity = r.commodity;
-                  t.buyPrice = r.buyPrice;
-        t.sellPrice = r.sellPrice;
-        t.unitsFrom = r.unitsFrom;
-        t.unitsToSpace = r.unitsToSpace;
-        t.unitsPossible = r.unitsPossible;
-        t.unitMassKg = r.unitMassKg;
-        t.netProfitPerUnit = r.netProfitPerUnit;
-        t.netProfitTotal = r.netProfitTotal;
-        t.profitPerKg = (r.unitMassKg > 0.0) ? (r.netProfitPerUnit / r.unitMassKg) : 0.0;
-        t.distanceLy = r.distanceLy;
-                  tradeIdeas.push_back(std::move(t));
-                }
-              }
-            } else {
-              if (tradeMixFromStationId != fromStationId || tradeMixDayStamp != dayStamp) {
-                tradeMixIdeas.clear();
-                tradeMixFromStationId = fromStationId;
-                tradeMixDayStamp = dayStamp;
-
-                sim::TradeManifestScanParams scan;
-                scan.radiusLy = tradeSearchRadiusLy;
-                scan.maxSystems = 256;
-                scan.maxResults = 12;
-
-                scan.cargoCapacityKg = cargoCapacityKg;
-                scan.cargoUsedKg = cargoMassKg(cargo);
-                scan.useFreeHold = tradeUseFreeHold;
-
-                scan.bidAskSpread = 0.10;
-
-                scan.stepKg = tradeMixStepKg;
-                scan.maxBuyCreditsCr = 0.0; // display mode: ignore player credits
-                scan.simulatePriceImpact = tradeMixSimulateImpact;
-
-                scan.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch
-                                                 : econ::CargoManifestPlanner::Greedy;
-                scan.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
-
-                scan.minNetProfit = tradeMinNetProfit;
-                scan.includeSameSystem = tradeIncludeSameSystem;
-
-                tradeMixIdeas = sim::scanTradeManifests(universe,
-                                                        currentSystem->stub,
-                                                        *fromSt,
-                                                        timeDays,
-                                                        scan,
-                                                        effectiveFeeRate);
-              }
-            }
-
-            const double jr = std::max(1e-6, fsdCurrentRangeLy());
-            const double usedKg = cargoMassKg(cargo);
-            const double freeKg = std::max(0.0, cargoCapacityKg - usedKg);
-
-            if (!tradeUseManifest) {
-              if (tradeUseFreeHold) {
-                ImGui::TextDisabled("Top trades (net, using free hold: %.0f kg free)", freeKg);
-              } else {
-                ImGui::TextDisabled("Top trades (net, using full hold: %.0f kg)", cargoCapacityKg);
-              }
-
-              if (tradeIdeas.empty()) {
-                ImGui::TextDisabled("No profitable trades found in the selected radius.");
-                ImGui::TextDisabled("Tip: expand the radius or wait a day for prices to move.");
-              } else {
-                ImGui::TextDisabled("Profit assumes a full fill and current prices. Use 'Fill' docked to buy.");
-
-                if (ImGui::BeginTable("trade_table", 6,
-                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                          ImGuiTableFlags_ScrollY,
-                                      ImVec2(0, 260))) {
-                  ImGui::TableSetupColumn("To");
-                  ImGui::TableSetupColumn("Commodity");
-                  ImGui::TableSetupColumn("Buy");
-                  ImGui::TableSetupColumn("Sell");
-                  ImGui::TableSetupColumn("Net profit");
-                  ImGui::TableSetupColumn("Actions");
-                  ImGui::TableHeadersRow();
-
-                  for (std::size_t i = 0; i < tradeIdeas.size(); ++i) {
-                    const auto& t = tradeIdeas[i];
-
-                    ImGui::TableNextRow();
-
-                    ImGui::TableSetColumnIndex(0);
-                    std::string toLabel = t.toSystemName + " / " + t.toStationName;
-                    ImGui::TextUnformatted(toLabel.c_str());
-                    const double jumps = t.distanceLy / jr;
-                    ImGui::TextDisabled("%.1f ly (%.1f jumps)", t.distanceLy, jumps);
-
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::Text("%s", econ::commodityDef(t.commodity).name);
-                    ImGui::TextDisabled("%s", econ::commodityDef(t.commodity).code);
-
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%.1f", t.buyPrice);
-                    ImGui::TextDisabled("x%.1f", t.unitsPossible);
-
-                    ImGui::TableSetColumnIndex(3);
-                    ImGui::Text("%.1f", t.sellPrice);
-
-                    ImGui::TableSetColumnIndex(4);
-                    ImGui::Text("+%.0f", t.netProfitTotal);
-                    ImGui::TextDisabled("+%.1f/kg", t.profitPerKg);
-
-                    ImGui::TableSetColumnIndex(5);
-                    ImGui::PushID((int)i);
-
-                    if (ImGui::SmallButton("Plot")) {
-                      plotRouteToSystem(t.toSystem);
+                  // Commodity filter
+                  {
+                    std::vector<const char*> items;
+                    items.reserve((std::size_t)econ::commodityCount() + 1);
+                    items.push_back("All commodities");
+                    for (int i = 0; i < econ::commodityCount(); ++i) {
+                      items.push_back(econ::commodityDef((econ::Commodity)i).code);
                     }
-
-                    if (fromDocked) {
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Fill")) {
-                        // Buy enough of the commodity to fill the hold (or free hold), limited by inventory & credits.
-                        auto& fromEcon = universe.stationEconomy(*fromSt, timeDays);
-
-                        const double unitMass = std::max(1e-6, econ::commodityDef(t.commodity).massKg);
-                        const double freeNowKg = std::max(0.0, cargoCapacityKg - cargoMassKg(cargo));
-                        const double maxUnitsHold = freeNowKg / unitMass;
-
-                        // unitsPossible already accounts for fees/spread and station caps, but may exceed free hold.
-                        const double unitsToBuy = std::min({t.unitsPossible, maxUnitsHold, fromEcon.inventory[(std::size_t)t.commodity]});
-
-                        const auto tr = econ::buy(fromEcon,
-                                                  fromSt->economyModel,
-                                                  t.commodity,
-                                                  unitsToBuy,
-                                                  credits,
-                                                  0.10,
-                                                  feeEff);
-
-                        if (tr.ok && tr.unitsDelta > 1e-9) {
-                          cargo[(std::size_t)t.commodity] += tr.unitsDelta;
-	                          std::string msg = "Bought ";
-	                          msg += std::to_string((int)std::round(tr.unitsDelta));
-	                          msg += " ";
-	                          msg += econ::commodityDef(t.commodity).name;
-	                          msg += " (";
-	                          msg += std::to_string((int)std::round(-tr.creditsDelta));
-	                          msg += " cr)";
-	                          toast(toasts, msg);
-                          tradeIdeasDayStamp = -1;
-                          tradeMixDayStamp = -1;
-                        } else {
-                          toast(toasts, std::string("Can't buy: ") + (tr.reason ? tr.reason : "unknown"), 2.0);
-                        }
-                      }
-                    }
-
-                    ImGui::PopID();
+                    ImGui::Combo("Filter", &tradeCommodityFilterIdx, items.data(), (int)items.size());
                   }
 
-                  ImGui::EndTable();
-                }
-              }
-            } else {
-              const double capShownKg = tradeUseFreeHold ? freeKg : cargoCapacityKg;
+                  // Scan if needed
+                  if (tradeFromStationId != fromStationId || tradeIdeasDayStamp != dayStamp) {
+                    tradeFromStationId = fromStationId;
+                    tradeIdeasDayStamp = dayStamp;
+                    tradeIdeas.clear();
 
-              ImGui::TextDisabled("Top cargo mixes (net, step=%.1f kg, impact=%s)", tradeMixStepKg,
-                                  tradeMixSimulateImpact ? "yes" : "no");
+                    sim::TradeScanParams scan;
+                    scan.maxStations = 128;
+                    scan.maxIdeasPerStation = (std::size_t)tradeIdeasPerStation;
+                    scan.includeSameSystem = tradeIncludeSameSystem;
+                    scan.minNetProfitCr = tradeMinNetProfit;
+                    scan.commodityFilter = (tradeCommodityFilterIdx <= 0) ? std::optional<econ::Commodity>{}
+                                                                          : std::optional<econ::Commodity>{(econ::Commodity)(tradeCommodityFilterIdx - 1)};
 
-              if (tradeMixIdeas.empty()) {
-                ImGui::TextDisabled("No profitable cargo mixes found in the selected radius.");
-                ImGui::TextDisabled("Tip: expand the radius or wait a day for prices to move.");
-              } else {
-                ImGui::TextDisabled("Profit assumes a full fill and current prices. Use 'Fill mix' docked to buy.");
+                    scan.cargoCapacityKg = cargoCapacityKg;
+                    scan.cargoUsedKg = usedKg;
+                    scan.useFreeHold = tradeUseFreeHold;
+                    scan.bidAskSpread = 0.10;
+                    scan.fromFeeRate = feeEff;
 
-                if (ImGui::BeginTable("trade_mix_table", 5,
-                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                          ImGuiTableFlags_ScrollY,
-                                      ImVec2(0, 260))) {
-                  ImGui::TableSetupColumn("To");
-                  ImGui::TableSetupColumn("Mix");
-                  ImGui::TableSetupColumn("Fill");
-                  ImGui::TableSetupColumn("Net profit");
-                  ImGui::TableSetupColumn("Actions");
-                  ImGui::TableHeadersRow();
+                    tradeIdeas = sim::scanTradeOpportunities(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
+                                                            scan, effectiveFeeRate);
+                  }
 
-                  for (std::size_t i = 0; i < tradeMixIdeas.size(); ++i) {
-                    const auto& t = tradeMixIdeas[i];
+                  if (tradeIdeas.empty()) {
+                    ImGui::TextDisabled("No trade ideas found.");
+                  } else {
+                    if (ImGui::BeginTable("trade_ideas", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                      ImGui::TableSetupColumn("To station");
+                      ImGui::TableSetupColumn("Commodity");
+                      ImGui::TableSetupColumn("Units");
+                      ImGui::TableSetupColumn("Buy (avg)");
+                      ImGui::TableSetupColumn("Sell (avg)");
+                      ImGui::TableSetupColumn("Net profit");
+                      ImGui::TableSetupColumn("Actions");
+                      ImGui::TableHeadersRow();
 
-                    ImGui::TableNextRow();
+                      for (std::size_t i = 0; i < tradeIdeas.size(); ++i) {
+                        const auto& idea = tradeIdeas[i];
+                        ImGui::PushID((int)i);
 
-                    ImGui::TableSetColumnIndex(0);
-                    std::string toLabel = t.toSystemName + " / " + t.toStationName;
-                    ImGui::TextUnformatted(toLabel.c_str());
-                    const double jumps = t.distanceLy / jr;
-                    ImGui::TextDisabled("%.1f ly (%.1f jumps)", t.distanceLy, jumps);
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(idea.toStationName.c_str());
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", idea.toSystemName.c_str());
 
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::BeginGroup();
-                    const int take = std::min<int>(std::max(1, tradeMixLinesShown), (int)t.lines.size());
-                    for (int li = 0; li < take; ++li) {
-                      const auto& ln = t.lines[(std::size_t)li];
-                      ImGui::Text("%s  %.1fu", econ::commodityDef(ln.commodity).code, ln.units);
-                      ImGui::TextDisabled("+%.0f (%.0f/kg)", ln.netProfitCr, ln.netProfitPerKg);
-                    }
-                    if ((int)t.lines.size() > take) {
-                      ImGui::TextDisabled("... +%d more", (int)t.lines.size() - take);
-                    }
-                    ImGui::EndGroup();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(econ::commodityDef(idea.commodity).code);
 
-                    if (ImGui::IsItemHovered()) {
-                      ImGui::BeginTooltip();
-                      ImGui::TextUnformatted("Manifest details:");
-                      ImGui::Separator();
-                      for (const auto& ln : t.lines) {
-                        ImGui::Text("%s  units=%.2f  mass=%.1fkg  net=%.0f",
-                                    econ::commodityDef(ln.commodity).code,
-                                    ln.units,
-                                    ln.massKg,
-                                    ln.netProfitCr);
-                        ImGui::TextDisabled("  buy=%.1f  sell=%.1f  net/kg=%.0f",
-                                            ln.avgNetBuyPrice,
-                                            ln.avgNetSellPrice,
-                                            ln.netProfitPerKg);
-                      }
-                      ImGui::EndTooltip();
-                    }
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.0f", idea.unitsPossible);
 
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%.0f / %.0f kg", t.cargoFilledKg, capShownKg);
-                    ImGui::TextDisabled("buy %.0f", t.netBuyCr);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.0f", idea.avgBuyUnitPriceCr);
 
-                    ImGui::TableSetColumnIndex(3);
-                    const double tripPerKg = (t.cargoFilledKg > 1e-6) ? (t.netProfitCr / t.cargoFilledKg) : 0.0;
-                    ImGui::Text("+%.0f", t.netProfitCr);
-                    ImGui::TextDisabled("+%.0f/kg", tripPerKg);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.0f", idea.avgSellUnitPriceCr);
 
-                    ImGui::TableSetColumnIndex(4);
-                    ImGui::PushID((int)i);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.0f", idea.netProfitCr);
 
-                    if (ImGui::SmallButton("Plot")) {
-                      plotRouteToSystem(t.toSystem);
-                    }
-
-                    if (fromDocked) {
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Fill mix")) {
-                        auto& fromEcon = universe.stationEconomy(*fromSt, timeDays);
-
-                        const auto& toSys = universe.getSystem(t.toSystem);
-                        const sim::Station* toStPtr = nullptr;
-                        for (const auto& st : toSys.stations) {
-                          if (st.id == t.toStation) {
-                            toStPtr = &st;
-                            break;
-                          }
-                        }
-
-                        if (!toStPtr) {
-                          toast(toasts, "Destination station not found.");
-                        } else {
-                          auto& toEcon = universe.stationEconomy(*toStPtr, timeDays);
-
-                          const double freeNowKg = std::max(0.0, cargoCapacityKg - cargoMassKg(cargo));
-                          econ::CargoManifestParams mp;
-                          mp.cargoCapacityKg = freeNowKg;
-                          mp.bidAskSpread = 0.10;
-                          mp.fromFeeRate = feeEff;
-                          mp.toFeeRate = effectiveFeeRate(*toStPtr);
-                          mp.stepKg = tradeMixStepKg;
-                          mp.maxBuyCreditsCr = credits;
-                          mp.simulatePriceImpact = tradeMixSimulateImpact;
-                          mp.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch
-                                                   : econ::CargoManifestPlanner::Greedy;
-                          mp.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
-
-                          const auto plan = econ::bestManifestForCargo(fromEcon,
-                                                                       fromSt->economyModel,
-                                                                       toEcon,
-                                                                       toStPtr->economyModel,
-                                                                       mp);
-
-                          if (plan.lines.empty()) {
-                            toast(toasts, "No profitable cargo mix available to buy right now.");
-                          } else {
-                            double boughtKg = 0.0;
-                            double spentCr = 0.0;
-
-                            for (const auto& ln : plan.lines) {
-                              const double unitMass = std::max(1e-6, econ::commodityDef(ln.commodity).massKg);
-                              const double freeKgNow = std::max(0.0, cargoCapacityKg - cargoMassKg(cargo));
-                              if (freeKgNow <= 1e-6) break;
-
-                              const double maxUnitsHold = freeKgNow / unitMass;
-                              const double unitsToBuy = std::min(ln.units, maxUnitsHold);
-                              if (unitsToBuy <= 1e-9) continue;
-
-                              const auto tr = econ::buy(fromEcon,
-                                                        fromSt->economyModel,
-                                                        ln.commodity,
-                                                        unitsToBuy,
-                                                        credits,
-                                                        0.10,
-                                                        feeEff);
-
-                              if (tr.ok && tr.unitsDelta > 1e-9) {
-                                cargo[(std::size_t)ln.commodity] += tr.unitsDelta;
-                                boughtKg += tr.unitsDelta * unitMass;
-                                spentCr += -tr.creditsDelta;
-                              }
-                            }
-
-                            if (boughtKg > 1e-6) {
-                              toast(toasts, ("Bought mix (" + std::to_string((int)std::round(boughtKg)) + " kg, " +
-                                             std::to_string((int)std::round(spentCr)) + " cr)"));
+                        ImGui::TableNextColumn();
+                        if (ImGui::SmallButton("Fill")) {
+                          if (auto* econ = universe.stationEconomyById(fromStationId)) {
+                            const double maxUnits = idea.unitsPossible;
+                            const double bought = buyCommodityIntoCargoHold(*econ, cargo, cargoCapacityKg, credits,
+                                                                          idea.commodity, maxUnits, feeEff);
+                            if (bought > 0) {
                               tradeIdeasDayStamp = -1;
                               tradeMixDayStamp = -1;
-                            } else {
-                              toast(toasts, "Couldn't buy any of the suggested mix (no credits / no stock / no hold).");
+                              tradeLoopsDayStamp = -1;
                             }
                           }
                         }
-                      }
-                    }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Plot")) {
+                          if (plotRouteToSystem(idea.toSystemId)) {
+                            pendingArrivalTargetStationId = idea.toStationId;
+                            toast(toasts, "Route plotted.", 2.0);
+                          } else {
+                            toast(toasts, "No route found.", 3.0);
+                          }
+                        }
 
-                    ImGui::PopID();
+                        ImGui::PopID();
+                      }
+
+                      ImGui::EndTable();
+                    }
                   }
 
-                  ImGui::EndTable();
+                  ImGui::EndTabItem();
                 }
+
+                // -----------------------------------------------------------------
+                // CARGO MIX TAB (manifest)
+                if (ImGui::BeginTabItem("Cargo Mix")) {
+                  tradeHelperTab = 1;
+
+                  float minProfit = (float)tradeMinNetProfit;
+                  if (ImGui::SliderFloat("Min net profit / trip", &minProfit, 0.0f, 25000.0f, "%.0f")) {
+                    tradeMinNetProfit = (double)minProfit;
+                    tradeMixDayStamp = -1;
+                  }
+
+                  float stepKg = (float)tradeMixStepKg;
+                  if (ImGui::SliderFloat("Step (kg)", &stepKg, 0.2f, 5.0f, "%.1f")) {
+                    tradeMixStepKg = (double)stepKg;
+                    tradeMixDayStamp = -1;
+                  }
+
+                  bool simImpact = tradeMixSimulateImpact;
+                  if (ImGui::Checkbox("Price impact", &simImpact)) {
+                    tradeMixSimulateImpact = simImpact;
+                    tradeMixDayStamp = -1;
+                  }
+
+                  bool beam = tradeMixBeamSearch;
+                  if (ImGui::Checkbox("Beam search", &beam)) {
+                    tradeMixBeamSearch = beam;
+                    tradeMixDayStamp = -1;
+                  }
+                  if (tradeMixBeamSearch) {
+                    int bw = tradeMixBeamWidth;
+                    if (ImGui::SliderInt("Beam width", &bw, 4, 64)) {
+                      tradeMixBeamWidth = bw;
+                      tradeMixDayStamp = -1;
+                    }
+                  }
+
+                  int linesShown = tradeMixLinesShown;
+                  if (ImGui::SliderInt("Lines shown", &linesShown, 1, 8)) {
+                    tradeMixLinesShown = linesShown;
+                  }
+
+                  // Scan if needed
+                  if (tradeMixFromStationId != fromStationId || tradeMixDayStamp != dayStamp) {
+                    tradeMixFromStationId = fromStationId;
+                    tradeMixDayStamp = dayStamp;
+                    tradeMixIdeas.clear();
+
+                    sim::TradeManifestScanParams scan;
+                    scan.maxStations = 96;
+                    scan.includeSameSystem = tradeIncludeSameSystem;
+                    scan.minNetProfitCr = tradeMinNetProfit;
+                    scan.cargoCapacityKg = cargoCapacityKg;
+                    scan.cargoUsedKg = usedKg;
+                    scan.useFreeHold = tradeUseFreeHold;
+                    scan.bidAskSpread = 0.10;
+                    scan.fromFeeRate = feeEff;
+
+                    scan.manifest.stepKg = tradeMixStepKg;
+                    scan.manifest.maxBuyCreditsCr = 0.0; // display mode: ignore credits
+                    scan.manifest.simulatePriceImpact = tradeMixSimulateImpact;
+                    scan.manifest.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch : econ::CargoManifestPlanner::Greedy;
+                    scan.manifest.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
+
+                    tradeMixIdeas = sim::scanTradeManifests(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
+                                                            scan, effectiveFeeRate);
+                  }
+
+                  if (tradeMixIdeas.empty()) {
+                    ImGui::TextDisabled("No cargo mix ideas found.");
+                  } else {
+                    for (std::size_t i = 0; i < tradeMixIdeas.size(); ++i) {
+                      const auto& idea = tradeMixIdeas[i];
+                      ImGui::PushID((int)i);
+
+                      if (ImGui::CollapsingHeader(
+                            (std::string(idea.toStationName) + " (" + idea.toSystemName + ")").c_str(),
+                            ImGuiTreeNodeFlags_DefaultOpen)) {
+
+                        ImGui::TextDisabled("Distance: %.0f ly (%.0f jumps at %.0f ly range)",
+                                            idea.distanceLy, std::ceil(idea.distanceLy / jr), jr);
+                        ImGui::TextDisabled("Net profit: %.0f cr | Buy: %.0f cr | Sell: %.0f cr",
+                                            idea.plan.netProfitCr, idea.plan.netBuyCr, idea.plan.netSellCr);
+
+                        const auto showLines = (int)std::min<std::size_t>((std::size_t)tradeMixLinesShown, idea.plan.lines.size());
+                        if (showLines > 0) {
+                          if (ImGui::BeginTable("mix_lines", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                            ImGui::TableSetupColumn("Commodity");
+                            ImGui::TableSetupColumn("Units");
+                            ImGui::TableSetupColumn("Buy");
+                            ImGui::TableSetupColumn("Sell");
+                            ImGui::TableSetupColumn("Profit");
+                            ImGui::TableHeadersRow();
+
+                            for (int li = 0; li < showLines; ++li) {
+                              const auto& line = idea.plan.lines[(std::size_t)li];
+                              ImGui::TableNextRow();
+                              ImGui::TableNextColumn();
+                              ImGui::TextUnformatted(econ::commodityDef(line.commodity).code);
+                              ImGui::TableNextColumn();
+                              ImGui::Text("%.0f", line.units);
+                              ImGui::TableNextColumn();
+                              ImGui::Text("%.0f", line.avgBuyUnitPriceCr);
+                              ImGui::TableNextColumn();
+                              ImGui::Text("%.0f", line.avgSellUnitPriceCr);
+                              ImGui::TableNextColumn();
+                              ImGui::Text("%.0f", line.netProfitCr);
+                            }
+
+                            ImGui::EndTable();
+                          }
+                        }
+
+                        if (ImGui::SmallButton("Fill mix")) {
+                          if (auto* econ = universe.stationEconomyById(fromStationId)) {
+                            double boughtAny = 0.0;
+                            for (const auto& line : idea.plan.lines) {
+                              const double wanted = line.units;
+                              if (wanted <= 0) continue;
+                              boughtAny += buyCommodityIntoCargoHold(*econ, cargo, cargoCapacityKg, credits,
+                                                                    line.commodity, wanted, feeEff);
+                            }
+                            if (boughtAny > 0.0) {
+                              tradeIdeasDayStamp = -1;
+                              tradeMixDayStamp = -1;
+                              tradeLoopsDayStamp = -1;
+                            }
+                          }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Plot")) {
+                          if (plotRouteToSystem(idea.toSystemId)) {
+                            pendingArrivalTargetStationId = idea.toStationId;
+                            toast(toasts, "Route plotted.", 2.0);
+                          } else {
+                            toast(toasts, "No route found.", 3.0);
+                      }
+
+                      ImGui::PopID();
+                    }
+                  }
+
+                  ImGui::EndTabItem();
+                }
+
+                // -----------------------------------------------------------------
+                // LOOPS TAB (multi-leg closed loops)
+                if (ImGui::BeginTabItem("Loops")) {
+                  const bool entering = (tradeHelperTab != 2);
+                  tradeHelperTab = 2;
+
+                  ImGui::TextDisabled("Closed loops start and end at the selected station.");
+
+                  bool loopsDirty = false;
+
+                  int legs = tradeLoopLegs;
+                  if (ImGui::SliderInt("Legs", &legs, 2, 3)) {
+                    tradeLoopLegs = legs;
+                    loopsDirty = true;
+                  }
+
+                  float minLeg = (float)tradeLoopMinLegProfit;
+                  if (ImGui::SliderFloat("Min profit / leg", &minLeg, 0.0f, 40000.0f, "%.0f")) {
+                    tradeLoopMinLegProfit = (double)minLeg;
+                    loopsDirty = true;
+                  }
+
+                  float minLoop = (float)tradeLoopMinLoopProfit;
+                  if (ImGui::SliderFloat("Min profit / loop", &minLoop, 0.0f, 120000.0f, "%.0f")) {
+                    tradeLoopMinLoopProfit = (double)minLoop;
+                    loopsDirty = true;
+                  }
+
+                  int maxLeg = tradeLoopMaxLegCandidates;
+                  if (ImGui::SliderInt("Max leg candidates", &maxLeg, 4, 32)) {
+                    tradeLoopMaxLegCandidates = maxLeg;
+                    loopsDirty = true;
+                  }
+
+                  int maxRes = tradeLoopMaxResults;
+                  if (ImGui::SliderInt("Max results", &maxRes, 4, 24)) {
+                    tradeLoopMaxResults = maxRes;
+                    loopsDirty = true;
+                  }
+
+                  bool limitCredits = tradeLoopUseCreditsLimit;
+                  if (ImGui::Checkbox("Limit by current credits", &limitCredits)) {
+                    tradeLoopUseCreditsLimit = limitCredits;
+                    loopsDirty = true;
+                  }
+
+                  float lstep = (float)tradeLoopStepKg;
+                  if (ImGui::SliderFloat("Manifest step (kg)", &lstep, 0.2f, 5.0f, "%.1f")) {
+                    tradeLoopStepKg = (double)lstep;
+                    loopsDirty = true;
+                  }
+
+                  bool limact = tradeLoopSimulateImpact;
+                  if (ImGui::Checkbox("Price impact", &limact)) {
+                    tradeLoopSimulateImpact = limact;
+                    loopsDirty = true;
+                  }
+
+                  bool lbeam = tradeLoopBeamSearch;
+                  if (ImGui::Checkbox("Beam search", &lbeam)) {
+                    tradeLoopBeamSearch = lbeam;
+                    loopsDirty = true;
+                  }
+                  if (tradeLoopBeamSearch) {
+                    int bw = tradeLoopBeamWidth;
+                    if (ImGui::SliderInt("Beam width", &bw, 4, 64)) {
+                      tradeLoopBeamWidth = bw;
+                      loopsDirty = true;
+                    }
+                  }
+
+                  if (loopsDirty) {
+                    tradeLoopsDayStamp = -1;
+                    tradeLoops.clear();
+                  }
+
+                  const bool loopsStale =
+                    (tradeLoopsFromStationId != fromStationId) || (tradeLoopsDayStamp != dayStamp);
+
+                  ImGui::Separator();
+                  if (loopsStale) {
+                    ImGui::TextDisabled("Loops are stale. Compute to refresh.");
+                  }
+
+                  // Auto-compute on tab entry (but don't auto-recompute while dragging settings).
+                  const bool shouldAutoCompute = entering && loopsStale;
+
+                  if (ImGui::SmallButton(loopsStale ? "Compute loops" : "Recompute loops") || shouldAutoCompute) {
+                    tradeLoopsFromStationId = fromStationId;
+                    tradeLoopsDayStamp = dayStamp;
+                    tradeLoops.clear();
+
+                    sim::TradeLoopScanParams scan;
+                    scan.legs = (std::size_t)std::clamp(tradeLoopLegs, 2, 3);
+                    scan.maxLegCandidates = (std::size_t)std::max(2, tradeLoopMaxLegCandidates);
+                    scan.maxResults = (std::size_t)std::max(1, tradeLoopMaxResults);
+                    scan.maxStations = 160;
+                    scan.includeSameSystem = tradeIncludeSameSystem;
+                    scan.minLegProfitCr = tradeLoopMinLegProfit;
+                    scan.minLoopProfitCr = tradeLoopMinLoopProfit;
+
+                    scan.manifest.bidAskSpread = 0.10;
+                    scan.manifest.cargoCapacityKg = cargoCapacityKg;
+                    scan.manifest.cargoUsedKg = usedKg;
+                    scan.manifest.useFreeHold = tradeUseFreeHold;
+                    scan.manifest.stepKg = tradeLoopStepKg;
+                    scan.manifest.maxBuyCreditsCr = tradeLoopUseCreditsLimit ? credits : 0.0;
+                    scan.manifest.simulatePriceImpact = tradeLoopSimulateImpact;
+                    scan.manifest.planner = tradeLoopBeamSearch ? econ::CargoManifestPlanner::BeamSearch : econ::CargoManifestPlanner::Greedy;
+                    scan.manifest.beamWidth = (std::size_t)std::max(1, tradeLoopBeamWidth);
+
+                    tradeLoops = sim::scanTradeLoops(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
+                                                    scan, effectiveFeeRate);
+                  }
+
+                  ImGui::Separator();
+
+                  if (tradeLoops.empty()) {
+                    ImGui::TextDisabled("No profitable loops found for current filters.");
+                  } else {
+                    for (std::size_t i = 0; i < tradeLoops.size(); ++i) {
+                      const auto& loop = tradeLoops[i];
+                      ImGui::PushID((int)i);
+
+                      const double distLy = loop.totalDistanceLy;
+                      const double profitCr = loop.totalNetProfitCr;
+                      const double perLy = (distLy > 1e-6) ? (profitCr / distLy) : 0.0;
+
+                      std::string header = "Loop: +" + std::to_string((long long)std::llround(profitCr)) + " cr";
+                      header += "  |  " + std::to_string(loop.legs.size()) + " legs";
+                      header += "  |  " + std::to_string((long long)std::llround(distLy)) + " ly";
+                      header += "  |  " + std::to_string((long long)std::llround(perLy)) + " cr/ly";
+
+                      const bool open = ImGui::CollapsingHeader(header.c_str());
+
+                      ImGui::SameLine();
+                      if (ImGui::SmallButton("Track")) {
+                        trackedTradeLoop.active = true;
+                        trackedTradeLoop.loop = loop;
+                        trackedTradeLoop.legIndex = 0;
+                        trackedTradeLoop.originStationId = fromStationId;
+                        trackedTradeLoop.lastDocked = false;
+                        trackedTradeLoop.lastDockedSystemId = 0;
+                        trackedTradeLoop.lastDockedStationId = 0;
+
+                        // Clear last execution telemetry so the HUD doesn't show stale results.
+                        trackedTradeLoop.lastTradeTimeDays = 0.0;
+                        trackedTradeLoop.lastTradeStationId = 0;
+                        trackedTradeLoop.lastTradeCreditsDelta = 0.0;
+                        trackedTradeLoop.lastTradeSoldCr = 0.0;
+                        trackedTradeLoop.lastTradeBoughtCr = 0.0;
+
+                        toast(toasts, "Tracking trade loop (see Objective Tracker).", 3.0);
+                      }
+
+                      ImGui::SameLine();
+                      if (ImGui::SmallButton("Go first leg")) {
+                        if (!loop.legs.empty()) {
+                          const auto& leg0 = loop.legs[0];
+                          hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg0.toSystem, leg0.toStation, true));
+                        }
+                      }
+
+                      if (open) {
+                        ImGui::Indent();
+                        ImGui::TextDisabled("Loop total profit: +%.0f cr", profitCr);
+
+                        for (std::size_t li = 0; li < loop.legs.size(); ++li) {
+                          const auto& leg = loop.legs[li];
+                          ImGui::Separator();
+                          ImGui::Text("Leg %d/%d: %s -> %s",
+                                      (int)li + 1, (int)loop.legs.size(),
+                                      leg.fromStationName.c_str(), leg.toStationName.c_str());
+                          ImGui::TextDisabled("%s  →  %s  |  %.0f ly (%.0f jumps)",
+                                              leg.fromSystemName.c_str(), leg.toSystemName.c_str(),
+                                              leg.distanceLy, std::ceil(leg.distanceLy / jr));
+                          ImGui::TextDisabled("Profit: +%.0f cr | Buy: %.0f cr | Sell: %.0f cr",
+                                              leg.manifest.netProfitCr, leg.manifest.netBuyCr, leg.manifest.netSellCr);
+
+                          const int showLines = (int)std::min<std::size_t>((std::size_t)4, leg.manifest.lines.size());
+                          if (showLines > 0) {
+                            if (ImGui::BeginTable("loop_leg_lines", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                              ImGui::TableSetupColumn("Commodity");
+                              ImGui::TableSetupColumn("Units");
+                              ImGui::TableSetupColumn("Buy");
+                              ImGui::TableSetupColumn("Sell");
+                              ImGui::TableSetupColumn("Profit");
+                              ImGui::TableHeadersRow();
+
+                              for (int lni = 0; lni < showLines; ++lni) {
+                                const auto& line = leg.manifest.lines[(std::size_t)lni];
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn();
+                                ImGui::TextUnformatted(econ::commodityDef(line.commodity).code);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%.0f", line.units);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%.0f", line.avgBuyUnitPriceCr);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%.0f", line.avgSellUnitPriceCr);
+                                ImGui::TableNextColumn();
+                                ImGui::Text("%.0f", line.netProfitCr);
+                              }
+
+                              ImGui::EndTable();
+                            }
+                          }
+
+                          if (ImGui::SmallButton("Go to leg dest")) {
+                            hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg.toSystem, leg.toStation, true));
+                          }
+                        }
+
+                        ImGui::Unindent();
+                      }
+
+                      ImGui::PopID();
+                    }
+                  }
+
+                  ImGui::EndTabItem();
+                }
+
+                ImGui::EndTabBar();
               }
             }
-
           }
         }
       }
@@ -27755,7 +31969,12 @@ if (canTrade) {
       ImGui::End();
     }
 
+
     if (showMissions) {
+      if (focusMissionsWindow) {
+        ImGui::SetNextWindowFocus();
+        focusMissionsWindow = false;
+      }
       ImGui::Begin("Missions");
 
       auto stationNameById = [&](sim::SystemId sysId, sim::StationId stId) -> std::string {
@@ -27833,11 +32052,20 @@ if (canTrade) {
             out = "Mission";
             break;
         }
+
+        if (m.priority) {
+          out = "PRIORITY: " + out;
+        }
         return out;
       };
 
       if (ImGui::BeginTabBar("missions_tabs")) {
-        if (ImGui::BeginTabItem("Active")) {
+        const bool wantActive = (missionsTabRequest == 0);
+        const bool wantBoard = (missionsTabRequest == 1);
+        const ImGuiTabItemFlags activeFlags = wantActive ? ImGuiTabItemFlags_SetSelected : 0;
+        const ImGuiTabItemFlags boardFlags = wantBoard ? ImGuiTabItemFlags_SetSelected : 0;
+
+        if (ImGui::BeginTabItem("Active", nullptr, activeFlags)) {
           if (missions.empty()) {
             ImGui::TextDisabled("No missions accepted.");
           }
@@ -28000,7 +32228,7 @@ if (canTrade) {
           ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Mission Board")) {
+        if (ImGui::BeginTabItem("Mission Board", nullptr, boardFlags)) {
           if (!docked || dockedStationId == 0) {
             ImGui::TextDisabled("Dock at a station to browse missions.");
             ImGui::EndTabItem();
@@ -30390,6 +34618,509 @@ if (showContacts) {
       ImGui::End();
     }
 
+    // ---- Progression (unlocks + feedback) ----
+    if (showProgressionWindow) {
+      ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Progression", &showProgressionWindow)) {
+        ImGui::TextUnformatted("Unlock ship hulls and modules by reaching milestones.");
+        ImGui::TextDisabled("Milestones use high-water marks (they never decrease when you spend or lose rep).");
+        ImGui::Separator();
+
+        ImGui::Text("Credits: %.0f cr", credits);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(high-water: %.0f cr)", progression.creditsHighWaterCr);
+
+        ImGui::Text("Reputation (best): %.1f", progression.repHighWater);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(max positive rep with any faction)");
+
+        ImGui::Separator();
+
+        // Guidance / goal selection -------------------------------------------------
+        if (ImGui::CollapsingHeader("Guidance", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Checkbox("Show Next Unlock HUD", &progGuide.goalHud);
+
+          const ProgressionGoal resolved = resolveGoal();
+          ImGui::SameLine();
+          ImGui::TextDisabled("Current: %s", (resolved != ProgressionGoal::None) ? goalName(resolved) : "All milestones complete");
+
+          if (ImGui::BeginCombo("Goal", goalName(progGuide.goal))) {
+            auto selectableGoal = [&](ProgressionGoal g) {
+              const bool selected = (progGuide.goal == g);
+              if (ImGui::Selectable(goalName(g), selected)) {
+                progGuide.goal = g;
+                progGuide.lastResolvedGoal = ProgressionGoal::None;
+              }
+              if (selected) ImGui::SetItemDefaultFocus();
+            };
+
+            selectableGoal(ProgressionGoal::Auto);
+            selectableGoal(ProgressionGoal::None);
+            ImGui::Separator();
+            for (ProgressionGoal g : progressionGoalList) {
+              selectableGoal(g);
+            }
+            ImGui::EndCombo();
+          }
+
+          if (resolved == ProgressionGoal::None) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "All progression milestones complete.");
+          } else {
+            const UnlockReq req = goalReq(resolved);
+            const float p = unlockReqProgress(req);
+
+            ImGui::Text("Target: %s", goalName(resolved));
+            ImGui::SameLine();
+            if (isGoalUnlocked(resolved)) {
+              ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Unlocked");
+            } else {
+              ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Locked");
+            }
+
+            ImGui::TextDisabled("Requirement: credits HW >= %.0f OR rep >= %.0f",
+                                req.creditsHighWaterCr, req.repHighWater);
+
+            char pb[32];
+            std::snprintf(pb, sizeof(pb), "%d%%", (int)std::lround(p * 100.0f));
+            ImGui::ProgressBar(p, ImVec2(-FLT_MIN, 0.0f), pb);
+
+            ImGui::TextDisabled("Credits HW: %.0f   Rep best: %.1f",
+                                progression.creditsHighWaterCr,
+                                progression.repHighWater);
+          }
+
+          ImGui::SeparatorText("Timeline");
+          ImGui::Checkbox("Record timeline", &progGuide.timelineRecord);
+          ImGui::SameLine();
+          if (ImGui::Button("Clear timeline")) {
+            progGuide.clearTimeline();
+          }
+
+          ImGui::SetNextItemWidth(140.0f);
+          ImGui::DragFloat("Sample period##prog", &progGuide.timelineSamplePeriodSec, 0.05f, 0.20f, 5.00f, "%.2fs");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(120.0f);
+          ImGui::DragInt("Max##prog", &progGuide.timelineMaxSamples, 1.0f, 64, 2048);
+
+          if (progGuide.timelineCount < 2 || progGuide.timelineCredits.empty()) {
+            ImGui::TextDisabled("Timeline: waiting for samples.");
+          } else {
+            const int count = progGuide.timelineCount;
+            const int maxN = (int)progGuide.timelineCredits.size();
+            const int offset = (count >= maxN) ? progGuide.timelineHead : 0;
+
+            ImGui::PlotLines("Credits (cash)", progGuide.timelineCredits.data(), count, offset, nullptr,
+                             FLT_MAX, FLT_MAX, ImVec2(0.0f, 70.0f));
+            ImGui::PlotLines("Credits HW", progGuide.timelineCreditsHighWater.data(), count, offset, nullptr,
+                             FLT_MAX, FLT_MAX, ImVec2(0.0f, 55.0f));
+            ImGui::PlotLines("Rep HW", progGuide.timelineRepHighWater.data(), count, offset, nullptr,
+                             FLT_MAX, FLT_MAX, ImVec2(0.0f, 55.0f));
+            ImGui::PlotLines("Goal progress", progGuide.timelineGoalProgress.data(), count, offset, nullptr,
+                             0.0f, 1.0f, ImVec2(0.0f, 55.0f));
+          }
+        }
+
+        ImGui::Separator();
+
+        ImGui::TextUnformatted("Feedback");
+        ImGui::Checkbox("Credit change toasts", &progFeed.creditToasts);
+        ImGui::SameLine();
+        ImGui::Checkbox("Reputation change toasts", &progFeed.repToasts);
+        ImGui::SameLine();
+        ImGui::Checkbox("Unlock toasts", &progFeed.unlockToasts);
+
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Event Feed (session)", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Checkbox("Record feed history", &progFeed.feedHistory);
+          ImGui::SameLine();
+          if (ImGui::Button("Clear feed")) {
+            progFeed.feed.clear();
+            progFeed.sessionCreditsIn = 0.0;
+            progFeed.sessionCreditsOut = 0.0;
+            progFeed.sessionRepNet.clear();
+            progFeed.sessionUnlockCount = 0;
+            toast(toasts, "Progression feed cleared.", 1.2);
+          }
+
+          ImGui::Checkbox("Show HUD overlay", &progFeed.feedHud);
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(110.0f);
+          ImGui::DragInt("Lines##feed", &progFeed.feedHudMaxLines, 0.1f, 1, 10);
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(110.0f);
+          ImGui::DragFloat("TTL##feed", &progFeed.feedHudTtlSec, 0.1f, 1.0f, 20.0f, "%.1fs");
+
+          ImGui::Checkbox("Credits##feed", &progFeed.feedCredits);
+          ImGui::SameLine();
+          ImGui::Checkbox("Reputation##feed", &progFeed.feedRep);
+          ImGui::SameLine();
+          ImGui::Checkbox("Unlocks##feed", &progFeed.feedUnlocks);
+
+          ImGui::Spacing();
+          const double net = progFeed.sessionCreditsIn - progFeed.sessionCreditsOut;
+          ImGui::Text("Session credits: +%.0f / -%.0f (net %.0f)", progFeed.sessionCreditsIn, progFeed.sessionCreditsOut, net);
+          ImGui::Text("Session unlocks: %u", (unsigned)progFeed.sessionUnlockCount);
+
+          // Session rep summary.
+          if (progFeed.sessionRepNet.empty()) {
+            ImGui::TextDisabled("Session rep: none.");
+          } else {
+            std::vector<std::pair<core::u32, double>> repRows;
+            repRows.reserve(progFeed.sessionRepNet.size());
+            for (const auto& kv : progFeed.sessionRepNet) repRows.emplace_back(kv.first, kv.second);
+            std::sort(repRows.begin(), repRows.end(), [](const auto& a, const auto& b) {
+              return std::abs(a.second) > std::abs(b.second);
+            });
+
+            ImGui::TextUnformatted("Session rep (top)");
+            const int maxShow = std::min<int>((int)repRows.size(), 3);
+            for (int i = 0; i < maxShow; ++i) {
+              const auto fid = repRows[(std::size_t)i].first;
+              const double d = repRows[(std::size_t)i].second;
+              const char sign = (d >= 0.0) ? '+' : '-';
+              ImGui::BulletText("%c%.1f (%s)", sign, std::abs(d), factionName(fid).c_str());
+            }
+          }
+
+          ImGui::Spacing();
+          ImGui::TextUnformatted("Recent events");
+          if (progFeed.feed.empty()) {
+            ImGui::TextDisabled("No events yet.");
+          } else {
+            auto fmtSimTimeLocal = [&](double tDays) -> std::string {
+              const long long totalSec = (long long)std::llround(tDays * 86400.0);
+              const long long day = totalSec / 86400;
+              const int secInDay = (int)(totalSec - day * 86400);
+              const int hh = secInDay / 3600;
+              const int mm = (secInDay / 60) % 60;
+              const int ss = secInDay % 60;
+              char buf[64];
+              if (day > 0) {
+                std::snprintf(buf, sizeof(buf), "D%lld %02d:%02d:%02d", day, hh, mm, ss);
+              } else {
+                std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mm, ss);
+              }
+              return std::string(buf);
+            };
+
+            ImGui::BeginChild("##prog_feed_child", ImVec2(0.0f, 170.0f), true);
+            if (ImGui::BeginTable("##prog_feed_tbl", 2,
+                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY
+                                  | ImGuiTableFlags_SizingStretchProp)) {
+              ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+              ImGui::TableSetupColumn("Event", ImGuiTableColumnFlags_WidthStretch);
+              ImGui::TableHeadersRow();
+
+              const int maxRows = 80;
+              int shown = 0;
+              for (int i = 0; i < (int)progFeed.feed.size() && shown < maxRows; ++i) {
+                const auto& e = progFeed.feed[(std::size_t)i];
+                if (e.kind == ProgressionFeedbackState::FeedKind::Credits && !progFeed.feedCredits) continue;
+                if (e.kind == ProgressionFeedbackState::FeedKind::Rep && !progFeed.feedRep) continue;
+                if (e.kind == ProgressionFeedbackState::FeedKind::Unlock && !progFeed.feedUnlocks) continue;
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextDisabled("%s", fmtSimTimeLocal(e.timeDays).c_str());
+
+                ImGui::TableSetColumnIndex(1);
+                if (e.kind == ProgressionFeedbackState::FeedKind::Credits) {
+                  const ImVec4 c = (e.creditsDelta >= 0) ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+                  if (e.creditsDelta >= 0) ImGui::TextColored(c, "Credits +%lld cr", e.creditsDelta);
+                  else ImGui::TextColored(c, "Credits %lld cr", e.creditsDelta);
+                } else if (e.kind == ProgressionFeedbackState::FeedKind::Rep) {
+                  const ImVec4 c = (e.repDelta >= 0.0) ? ImVec4(0.6f, 0.85f, 1.0f, 1.0f) : ImVec4(1.0f, 0.6f, 0.4f, 1.0f);
+                  const char sign = (e.repDelta >= 0.0) ? '+' : '-';
+                  ImGui::TextColored(c, "Rep %c%.1f (%s)", sign, std::abs(e.repDelta), factionName(e.factionId).c_str());
+                } else {
+                  ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.4f, 1.0f), "Unlocked: %s", e.text.c_str());
+                }
+                ++shown;
+              }
+
+              ImGui::EndTable();
+            }
+            ImGui::EndChild();
+          }
+        }
+
+        ImGui::Separator();
+
+        auto reqLabel = [&](const UnlockReq& req) -> std::string {
+          char buf[128];
+          std::snprintf(buf, sizeof(buf), "cr >= %.0f OR rep >= %.0f",
+                        req.creditsHighWaterCr,
+                        req.repHighWater);
+          return std::string(buf);
+        };
+
+        auto reqProgress = [&](const UnlockReq& req) -> float {
+          const double crPct = (req.creditsHighWaterCr > 0.0) ? (progression.creditsHighWaterCr / req.creditsHighWaterCr) : 1.0;
+          const double repPct = (req.repHighWater > 0.0) ? (progression.repHighWater / req.repHighWater) : 1.0;
+          const double p = std::max(crPct, repPct);
+          return (float)std::clamp(p, 0.0, 1.0);
+        };
+
+        if (ImGui::BeginTable("##prog_unlocks", 3,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
+          ImGui::TableSetupColumn("Unlock", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+          ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Milestone", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+          ImGui::TableHeadersRow();
+
+          auto row = [&](const char* name, bool unlocked, const UnlockReq& req) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(name);
+
+            ImGui::TableSetColumnIndex(1);
+            if (unlocked) {
+              ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Unlocked");
+            } else {
+              ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Locked");
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextDisabled("%s", reqLabel(req).c_str());
+            const float p = reqProgress(req);
+            char pb[32];
+            std::snprintf(pb, sizeof(pb), "%d%%", (int)std::lround(p * 100.0f));
+            ImGui::ProgressBar(p, ImVec2(-FLT_MIN, 0.0f), pb);
+          };
+
+          row("Hauler hull", progression.isHullUnlocked(ShipHullClass::Hauler), unlockHaulerHull);
+          row("Fighter hull", progression.isHullUnlocked(ShipHullClass::Fighter), unlockFighterHull);
+
+          row("Core modules Mk2", (int)progression.unlockedCoreMk >= 2, unlockCoreMk[2]);
+          row("Core modules Mk3", (int)progression.unlockedCoreMk >= 3, unlockCoreMk[3]);
+
+row("Weapon: Pulse Laser", progression.isWeaponUnlocked(WeaponType::PulseLaser),
+    unlockWeapon[(int)WeaponType::PulseLaser]);
+row("Weapon: Mining Laser", progression.isWeaponUnlocked(WeaponType::MiningLaser),
+    unlockWeapon[(int)WeaponType::MiningLaser]);
+row("Weapon: Railgun", progression.isWeaponUnlocked(WeaponType::Railgun),
+    unlockWeapon[(int)WeaponType::Railgun]);
+row("Weapon: Homing Missile", progression.isWeaponUnlocked(WeaponType::HomingMissile),
+    unlockWeapon[(int)WeaponType::HomingMissile]);
+row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissile),
+    unlockWeapon[(int)WeaponType::RadarMissile]);
+
+          row("Smuggle hold Mk1", (int)progression.unlockedSmuggleHoldMk >= 1, unlockSmuggleHoldMk[1]);
+          row("Smuggle hold Mk2", (int)progression.unlockedSmuggleHoldMk >= 2, unlockSmuggleHoldMk[2]);
+          row("Smuggle hold Mk3", (int)progression.unlockedSmuggleHoldMk >= 3, unlockSmuggleHoldMk[3]);
+
+          row("Fuel scoop Mk1", (int)progression.unlockedFuelScoopMk >= 1, unlockFuelScoopMk[1]);
+          row("Fuel scoop Mk2", (int)progression.unlockedFuelScoopMk >= 2, unlockFuelScoopMk[2]);
+          row("Fuel scoop Mk3", (int)progression.unlockedFuelScoopMk >= 3, unlockFuelScoopMk[3]);
+
+          ImGui::EndTable();
+        }
+
+        ImGui::Separator();
+
+        ImGui::TextUnformatted("Recent unlocks");
+        if (progFeed.recentUnlocks.empty()) {
+          ImGui::TextDisabled("None yet.");
+        } else {
+          const int maxShow = std::min<int>((int)progFeed.recentUnlocks.size(), 12);
+          for (int i = 0; i < maxShow; ++i) {
+            ImGui::BulletText("%s", progFeed.recentUnlocks[(std::size_t)i].c_str());
+          }
+        }
+      }
+      ImGui::End();
+    }
+
+    if (showFactionsWindow) {
+      ImGui::SetNextWindowSize(ImVec2(680, 520), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("Factions / Standing", &showFactionsWindow)) {
+        ImGui::TextDisabled("Docking access prototype:");
+        ImGui::BulletText("Denied if rep <= %.0f or bounty > %.0f cr.", kDockDenyRep, kDockDenyBountyMinCr);
+        ImGui::BulletText("Rep slightly affects clearance grant probability.");
+        ImGui::BulletText("In comms range you can settle bounties remotely (fee) or buy temporary clearance.");
+
+        // Target station quick actions (works even if the Objective HUD is disabled).
+        if (currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
+          ImGui::Separator();
+          const auto& st = currentSystem->stations[target.index];
+          const double distKm = (ship.positionKm() - sim::stationPosKm(st, timeDays)).length();
+          const DockingAccessCheck access = dockingAccessCheck(st);
+          const bool inComms = distKm <= st.commsRangeKm;
+
+          ImGui::Text("Target: %s", st.name.c_str());
+          ImGui::SameLine();
+          ImGui::TextDisabled("(%.1f km)", distKm);
+
+          if (access.blocked && !access.bribeActive) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                               "Docking denied: %s",
+                               dockingAccessReasonShort(access).c_str());
+
+            const double bribeCost = dockingBribeCostCr(st, access);
+            const double bountyFeeRate = dockingRemoteSettlementFeeRate(st, access);
+            const double bountyTotal = std::ceil(access.bountyCr * (1.0 + bountyFeeRate));
+
+            if (access.byBounty) {
+              if (!inComms) ImGui::BeginDisabled();
+              if (ImGui::SmallButton(("Settle bounty (" + std::to_string((int)bountyTotal) + " cr)").c_str())) {
+                payBountyRemotely(st, "FactionsWindow");
+              }
+              if (!inComms) ImGui::EndDisabled();
+              ImGui::SameLine();
+            }
+
+            if (!inComms) ImGui::BeginDisabled();
+            if (ImGui::SmallButton(("Buy temporary clearance (" + std::to_string((int)bribeCost) + " cr)").c_str())) {
+              buyDockingBribe(st, "FactionsWindow");
+            }
+            if (!inComms) ImGui::EndDisabled();
+          } else if (access.bribeActive && access.blocked) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Temporary clearance active (%.0fs)", access.bribeLeftSec);
+          } else {
+            ImGui::TextDisabled("Docking access: OK");
+          }
+        }
+
+        ImGui::Separator();
+
+        static char factionFilter[64] = "";
+        ImGui::InputTextWithHint("##FactionFilter", "Filter by faction name...", factionFilter, sizeof(factionFilter));
+
+        enum class SortKey : int { Name = 0, Rep, Bounty, Fine, Voucher };
+        static int sortKeyInt = 0;
+        static bool sortDesc = true;
+        const char* sortLabels[] = {"Name", "Rep", "Bounty", "Fine", "Voucher"};
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::Combo("Sort", &sortKeyInt, sortLabels, IM_ARRAYSIZE(sortLabels));
+        ImGui::SameLine();
+        ImGui::Checkbox("Desc", &sortDesc);
+
+        struct Row {
+          core::u32 factionId{0};
+          std::string name;
+          double rep{0.0};
+          double bounty{0.0};
+          double fine{0.0};
+          double voucher{0.0};
+        };
+
+        std::vector<core::u32> ids;
+        ids.reserve(universe.factions().size() + 8);
+
+        auto pushUnique = [&](core::u32 id) {
+          if (std::find(ids.begin(), ids.end(), id) != ids.end()) return;
+          ids.push_back(id);
+        };
+
+        pushUnique(0);
+        for (const auto& f : universe.factions()) pushUnique(f.id);
+        for (const auto& [fid, _] : repByFaction) pushUnique(fid);
+        for (const auto& [fid, _] : lawLedger) pushUnique(fid);
+        for (const auto& [fid, _] : fineLedger) pushUnique(fid);
+        for (const auto& [fid, _] : voucherLedger) pushUnique(fid);
+
+        auto toLowerInPlace = [&](std::string& s) {
+          for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
+        };
+
+        std::string filterLower = factionFilter;
+        toLowerInPlace(filterLower);
+
+        std::vector<Row> rows;
+        rows.reserve(ids.size());
+        for (core::u32 fid : ids) {
+          Row r{};
+          r.factionId = fid;
+          r.name = (fid == 0) ? std::string("Independent") : factionName(fid);
+          r.rep = getRep(fid);
+          r.bounty = getBounty(fid);
+          r.fine = getFine(fid);
+          r.voucher = getVoucher(fid);
+          rows.push_back(std::move(r));
+        }
+
+        const SortKey sortKey = (SortKey)sortKeyInt;
+        std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+          auto cmp = [&](auto aa, auto bb) { return sortDesc ? (aa > bb) : (aa < bb); };
+          switch (sortKey) {
+            case SortKey::Rep: return cmp(a.rep, b.rep);
+            case SortKey::Bounty: return cmp(a.bounty, b.bounty);
+            case SortKey::Fine: return cmp(a.fine, b.fine);
+            case SortKey::Voucher: return cmp(a.voucher, b.voucher);
+            case SortKey::Name:
+            default: return sortDesc ? (a.name > b.name) : (a.name < b.name);
+          }
+        });
+
+        const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuter |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+        const float rowH = ImGui::GetTextLineHeightWithSpacing();
+
+        if (ImGui::BeginTable("##FactionsTable", 7, flags, ImVec2(0.0f, rowH * 14.0f))) {
+          ImGui::TableSetupScrollFreeze(0, 1);
+          ImGui::TableSetupColumn("Faction");
+          ImGui::TableSetupColumn("Rep", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+          ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Bounty", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Fine", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Voucher", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Docking", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+          ImGui::TableHeadersRow();
+
+          for (const auto& r : rows) {
+            // Filter
+            if (!filterLower.empty()) {
+              std::string nameLower = r.name;
+              toLowerInPlace(nameLower);
+              if (nameLower.find(filterLower) == std::string::npos) continue;
+            }
+
+            const char* status = "Neutral";
+            if (r.rep >= 15.0) status = "Allied";
+            else if (r.rep >= 5.0) status = "Friendly";
+            else if (r.rep <= kDockDenyRep) status = "Hostile";
+            else if (r.rep <= -5.0) status = "Unfriendly";
+
+            const bool dockingDenied = (r.rep <= kDockDenyRep) || (r.bounty > kDockDenyBountyMinCr);
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(r.name.c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            if (r.rep < 0.0) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "%.1f", r.rep);
+            else if (r.rep > 0.0) ImGui::TextColored(ImVec4(0.55f, 1.0f, 0.55f, 1.0f), "%.1f", r.rep);
+            else ImGui::Text("%.1f", r.rep);
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(status);
+
+            ImGui::TableSetColumnIndex(3);
+            if (r.bounty > 0.5) ImGui::Text("%d", (int)std::llround(r.bounty));
+            else ImGui::TextDisabled("-");
+
+            ImGui::TableSetColumnIndex(4);
+            if (r.fine > 0.5) ImGui::Text("%d", (int)std::llround(r.fine));
+            else ImGui::TextDisabled("-");
+
+            ImGui::TableSetColumnIndex(5);
+            if (r.voucher > 0.5) ImGui::Text("%d", (int)std::llround(r.voucher));
+            else ImGui::TextDisabled("-");
+
+            ImGui::TableSetColumnIndex(6);
+            if (dockingDenied) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "DENIED");
+            else ImGui::TextColored(ImVec4(0.55f, 1.0f, 0.55f, 1.0f), "OK");
+          }
+
+          ImGui::EndTable();
+        }
+      }
+      ImGui::End();
+    }
+
+
+
     // ---- Notifications (toast history) ----
     if (showNotifications) {
       ImGui::SetNextWindowSize(ImVec2(820, 420), ImGuiCond_FirstUseEver);
@@ -32202,6 +36933,50 @@ if (showContacts) {
       addItem("Set time scale: 60x", "Time", std::string(), 40, [&]() { timeScale = 60.0; paused = false; });
       addItem("Set time scale: 600x", "Time", std::string(), 40, [&]() { timeScale = 600.0; paused = false; });
 
+
+// Field Ops
+addItem("Field Ops: Salvage Sweep",
+        std::string("Field Ops • ") + onOff(fieldOps.mode == FieldOpsMode::SalvageSweep),
+        std::string(), 65,
+        [&]() { toggleFieldOpsSalvageSweep(); });
+
+addItem("Field Ops: Rescue Assist",
+        std::string("Field Ops • ") + onOff(fieldOps.mode == FieldOpsMode::RescueAssist),
+        std::string(), 65,
+        [&]() { toggleFieldOpsRescueAssist(); });
+
+addItem("Field Ops: Stop",
+        std::string("Field Ops • ") + fieldOpsModeLabel(fieldOps.mode),
+        std::string(), 62,
+        [&]() {
+          if (fieldOps.mode != FieldOpsMode::Off) fieldOpsStop("Field Ops: OFF");
+          else toast(toasts, "Field Ops already off.", 1.4);
+        });
+
+addItem("Field Ops: Skip salvage target",
+        fieldOps.targetLabel.empty() ? std::string("Salvage Sweep") : fieldOps.targetLabel,
+        std::string(), 55,
+        [&]() { fieldOpsSkipTarget(); });
+
+addItem("Field Ops: Toggle HUD overlay",
+        std::string("Field Ops HUD • ") + onOff(fieldOps.hudVisible),
+        std::string(), 52,
+        [&]() { fieldOps.hudVisible = !fieldOps.hudVisible; });
+
+addItem("Field Ops: Pause on hostiles",
+        std::string("Safety • ") + onOff(fieldOps.pauseOnHostiles),
+        std::string(), 50,
+        [&]() { fieldOps.pauseOnHostiles = !fieldOps.pauseOnHostiles; });
+
+addItem("Field Ops: Auto deploy scoop",
+        std::string("Salvage • ") + onOff(fieldOps.autoDeployCargoScoop),
+        std::string(), 45,
+        [&]() { fieldOps.autoDeployCargoScoop = !fieldOps.autoDeployCargoScoop; });
+
+addItem("Field Ops: Auto scan distress",
+        std::string("Rescue • ") + onOff(fieldOps.autoScanDistress),
+        std::string(), 45,
+        [&]() { fieldOps.autoScanDistress = !fieldOps.autoScanDistress; });
       // Missions (quick tracking)
       if (trackedMissionId != 0) {
         addItem("Untrack current mission", "Missions", std::string(), 55, [&]() {
@@ -32352,7 +37127,7 @@ draw_command_palette:
       //   Page 2: Context actions (Navigation while in flight, Station while docked)
 
       const bool stationContext = docked;
-      const int pageCount = 2;
+      const int pageCount = 3;
       if (actionWheel.page < 0) actionWheel.page = 0;
       if (actionWheel.page >= pageCount) actionWheel.page = 0;
 
@@ -32362,8 +37137,12 @@ draw_command_palette:
         actionWheel.page = (actionWheel.page + dir + pageCount) % pageCount;
       }
 
-      const bool windowsPage = (actionWheel.page == 0);
-      const char* pageName = windowsPage ? "Windows" : (stationContext ? "Station" : "Navigation");
+const bool windowsPage = (actionWheel.page == 0);
+const bool contextPage = (actionWheel.page == 1);
+const bool fieldOpsPage = (actionWheel.page == 2);
+const char* pageName =
+  windowsPage ? "Windows" :
+  (contextPage ? (stationContext ? "Station" : "Navigation") : "Field Ops");
 
       actionWheelItems.clear();
       actionWheelItems.reserve(8);
@@ -32421,7 +37200,7 @@ draw_command_palette:
                 [&]() { toggleWindow("Trade"); });
         addItem("Guide", windowOpenState(showGuide), game::chordLabel(controls.actions.toggleGuide), true,
                 [&]() { toggleWindow("Guide"); });
-      } else {
+      } else if (contextPage) {
         if (stationContext) {
           addItem("Undock", "Leave station", game::chordLabel(controls.actions.dockOrUndock), true,
                   [&]() { pushChord(controls.actions.dockOrUndock); });
@@ -32461,7 +37240,55 @@ draw_command_palette:
           addItem("Tactical", (showTacticalOverlay ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleTacticalOverlay), canAct,
                   [&]() { pushChord(controls.actions.toggleTacticalOverlay); });
         }
-      }
+} else if (fieldOpsPage) {
+  const bool canAct = (!docked) && (fsdState == FsdState::Idle) && (supercruiseState == SupercruiseState::Idle) && currentSystem;
+
+  auto onOffStr = [&](bool v) { return v ? "ON" : "OFF"; };
+
+  const bool salvageEnabled = canAct || (fieldOps.mode == FieldOpsMode::SalvageSweep);
+  const bool rescueEnabled  = canAct || (fieldOps.mode == FieldOpsMode::RescueAssist);
+
+  addItem("Salvage Sweep",
+          std::string("Field Ops • ") + onOffStr(fieldOps.mode == FieldOpsMode::SalvageSweep),
+          std::string(), salvageEnabled,
+          [&]() { toggleFieldOpsSalvageSweep(); });
+
+  addItem("Rescue Assist",
+          std::string("Field Ops • ") + onOffStr(fieldOps.mode == FieldOpsMode::RescueAssist),
+          std::string(), rescueEnabled,
+          [&]() { toggleFieldOpsRescueAssist(); });
+
+  addItem("Stop Field Ops",
+          std::string("Field Ops • ") + fieldOpsModeLabel(fieldOps.mode),
+          std::string(), fieldOps.mode != FieldOpsMode::Off,
+          [&]() { fieldOpsStop("Field Ops: OFF"); });
+
+  const bool canSkip = (fieldOps.mode == FieldOpsMode::SalvageSweep) && (fieldOps.targetId != 0);
+  addItem("Skip Target",
+          fieldOps.targetLabel.empty() ? std::string("Salvage Sweep") : fieldOps.targetLabel,
+          std::string(), canSkip,
+          [&]() { fieldOpsSkipTarget(); });
+
+  addItem("HUD Overlay",
+          std::string("Field Ops HUD • ") + onOffStr(fieldOps.hudVisible),
+          std::string(), true,
+          [&]() { fieldOps.hudVisible = !fieldOps.hudVisible; });
+
+  addItem("Pause on Hostiles",
+          std::string("Safety • ") + onOffStr(fieldOps.pauseOnHostiles),
+          std::string(), true,
+          [&]() { fieldOps.pauseOnHostiles = !fieldOps.pauseOnHostiles; });
+
+  addItem("Auto Scoop",
+          std::string("Salvage • ") + onOffStr(fieldOps.autoDeployCargoScoop),
+          std::string(), true,
+          [&]() { fieldOps.autoDeployCargoScoop = !fieldOps.autoDeployCargoScoop; });
+
+  addItem("Auto Scan",
+          std::string("Rescue • ") + onOffStr(fieldOps.autoScanDistress),
+          std::string(), true,
+          [&]() { fieldOps.autoScanDistress = !fieldOps.autoScanDistress; });
+}
 
       const int clickConfirm = game::drawActionWheelOverlay(actionWheel, actionWheelItems, pageName, actionWheel.page, pageCount);
 
@@ -32558,6 +37385,1531 @@ draw_command_palette:
       // Restore default light so next frame's world render is correct even if
       // something draws before the per-frame setLightPos call.
       meshRenderer.setLightPos(0.0f, 0.0f, 0.0f);
+    }
+
+    // ------------------------------------------------------------------
+    // Insurance / Rebuy overlay (Ship Destroyed)
+    // ------------------------------------------------------------------
+    if (deathRebuy.active) {
+      ImGuiViewport* vp = ImGui::GetMainViewport();
+      ImGui::SetNextWindowPos(vp->Pos);
+      ImGui::SetNextWindowSize(vp->Size);
+      ImGui::SetNextWindowBgAlpha(0.96f);
+      ImGui::SetNextWindowFocus();
+
+      const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                                     ImGuiWindowFlags_NoSavedSettings;
+
+      if (ImGui::Begin("Insurance Claim##DeathRebuyOverlay", nullptr, flags)) {
+        const float maxWidth = std::max(320.0f, vp->Size.x - 40.0f);
+        const float menuWidth = std::min(960.0f, maxWidth);
+
+        // Roughly center the panel.
+        ImGui::SetCursorPosX((vp->Size.x - menuWidth) * 0.5f);
+        ImGui::SetCursorPosY(std::max(20.0f, (vp->Size.y - 680.0f) * 0.3f));
+
+        ImGui::BeginChild("InsuranceInner##DeathRebuyOverlay", {menuWidth, 0}, true, ImGuiWindowFlags_NoScrollbar);
+
+        ig::pushBoldFont();
+        ImGui::TextUnformatted("Ship Destroyed");
+        ig::popBoldFont();
+
+        ImGui::Spacing();
+        ImGui::TextWrapped(
+          "Your ship was destroyed. Choose how insurance rebuilds your ship. "
+          "Cargo is lost, and you will respawn docked.");
+        ImGui::Spacing();
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Text("Credits: %.0f cr", deathRebuy.creditsBefore);
+        ImGui::SameLine();
+        ImGui::Text("|  Insurance Debt: %.0f cr", deathRebuy.debtBefore);
+
+        sim::InsurancePolicy pol{};
+
+        struct Preview {
+          sim::RebuyOutcome out{};
+          sim::PlayerShipEconomyState shipAfter{};
+          double creditsAfter = 0.0;
+          double debtAfter = 0.0;
+        };
+
+        std::array<Preview, 3> previews{};
+        for (int i = 0; i < 3; ++i) {
+          previews[i].shipAfter = deathRebuy.options[(std::size_t)i];
+          previews[i].creditsAfter = deathRebuy.creditsBefore;
+          previews[i].debtAfter = deathRebuy.debtBefore;
+          previews[i].out = sim::applyRebuyOnDeath(pol, previews[i].shipAfter, previews[i].creditsAfter, previews[i].debtAfter);
+        }
+
+        auto shipSummary = [&](const sim::PlayerShipEconomyState& s) -> std::string {
+          const char* hull = sim::hullDef(s.shipHullClass).name;
+
+          const int thrMk = std::clamp(s.thrusterMk, 1, (int)sim::kThrusters.size() - 1);
+          const int shdMk = std::clamp(s.shieldMk, 1, (int)sim::kShields.size() - 1);
+          const int distMk = std::clamp(s.distributorMk, 1, (int)sim::kDistributors.size() - 1);
+
+          const char* thr = sim::kThrusters[(std::size_t)thrMk].name;
+          const char* shd = sim::kShields[(std::size_t)shdMk].name;
+          const char* dist = sim::kDistributors[(std::size_t)distMk].name;
+
+          const char* p = sim::weaponDef(s.weaponPrimary).name;
+          const char* sec = sim::weaponDef(s.weaponSecondary).name;
+
+          return fmt::format("{} | {}, {}, {} | {} + {}", hull, thr, shd, dist, p, sec);
+        };
+
+        auto statusLabel = [&](const Preview& p) -> const char* {
+          if (p.out.shipReset) return "RESET";
+          if (p.out.loanTakenCr > 0.0) return "LOAN";
+          return "PAID";
+        };
+
+        const char* optionNames[3] = {"Full Rebuy", "Budget Rebuy", "Loaner Scout"};
+        const char* optionHints[3] = {
+          "Restore your ship as-is (most expensive).",
+          "Downgrade core modules and remove premium utilities (cheaper).",
+          "Start over in a basic Scout (usually the cheapest).",
+        };
+
+        ImGui::Spacing();
+        ig::pushBoldFont();
+        ImGui::TextUnformatted("Rebuy Options");
+        ig::popBoldFont();
+
+        if (ImGui::BeginTable("##RebuyOptionsTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                        ImGuiTableFlags_SizingStretchProp)) {
+          ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+          ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+          ImGui::TableSetupColumn("Ship (after claim)");
+          ImGui::TableSetupColumn("Rebuy", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Loan", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Credits", ImGuiTableColumnFlags_WidthFixed, 95.0f);
+          ImGui::TableSetupColumn("Debt", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+          ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+          ImGui::TableHeadersRow();
+
+          for (int i = 0; i < 3; ++i) {
+            const auto& p = previews[(std::size_t)i];
+
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::RadioButton(fmt::format("##rebuy{}", i).c_str(), &deathRebuy.selectedOption, i);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(optionNames[i]);
+            if (ImGui::IsItemHovered()) {
+              ImGui::SetTooltip("%s", optionHints[i]);
+            }
+
+            ImGui::TableNextColumn();
+            const std::string s = shipSummary(p.shipAfter);
+            ImGui::TextUnformatted(s.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", p.out.rebuyCostCr);
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", p.out.loanTakenCr);
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", p.creditsAfter);
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", p.debtAfter);
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(statusLabel(p));
+          }
+
+          ImGui::EndTable();
+        }
+
+        ImGui::Spacing();
+        ig::pushBoldFont();
+        ImGui::TextUnformatted("Respawn Location");
+        ig::popBoldFont();
+
+        const bool hasLastDock = (deathRebuy.lastDockedSystem != 0 && deathRebuy.lastDockedStation != 0);
+        std::string lastDockLabel = "Last docked: (unknown)";
+        if (hasLastDock) {
+          const auto& sys = universe.getSystem(deathRebuy.lastDockedSystem);
+          lastDockLabel = fmt::format(
+            "Last docked: {} / {}", sys.stub.name, stationNameById(sys, deathRebuy.lastDockedStation));
+        }
+
+        if (!hasLastDock) ImGui::BeginDisabled();
+        ImGui::RadioButton(lastDockLabel.c_str(), &deathRebuy.respawnChoice, 0);
+        if (!hasLastDock) ImGui::EndDisabled();
+
+        sim::StationId nearestStationId = deathRebuy.nearestStationAtDeath;
+        if (nearestStationId == 0 && currentSystem && !currentSystem->stations.empty()) {
+          nearestStationId = currentSystem->stations.front().id;
+        }
+
+        const bool hasNearest = (nearestStationId != 0 && currentSystem);
+        std::string nearestLabel = "Nearest station: (unknown)";
+        if (hasNearest) {
+          nearestLabel = fmt::format("Nearest station: {}", stationNameById(*currentSystem, nearestStationId));
+        }
+
+        if (!hasNearest) ImGui::BeginDisabled();
+        ImGui::RadioButton(nearestLabel.c_str(), &deathRebuy.respawnChoice, 1);
+        if (!hasNearest) ImGui::EndDisabled();
+
+        ImGui::Spacing();
+        ImGui::Checkbox("Open station services after respawn", &deathRebuy.openStationMenuAfterRespawn);
+        ImGui::Checkbox("Auto-rebuy next time (skip this screen)", &autoRebuyOnDeath);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Selected option summary.
+        const Preview& sel = previews[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
+        ImGui::Text("Selected: %s", optionNames[std::clamp(deathRebuy.selectedOption, 0, 2)]);
+        ImGui::Text("Rebuy cost: %.0f cr | Paid: %.0f cr | Loan: %.0f cr",
+                    sel.out.rebuyCostCr, sel.out.paidCr, sel.out.loanTakenCr);
+
+        ImGui::Spacing();
+
+        const float buttonW = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Button("Confirm Rebuy & Respawn", {buttonW, 0})) {
+          // Apply chosen rebuy for real.
+          credits = deathRebuy.creditsBefore;
+          insuranceDebtCr = deathRebuy.debtBefore;
+
+          sim::PlayerShipEconomyState chosenShip = deathRebuy.options[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
+          const auto outcome = sim::applyRebuyOnDeath(pol, chosenShip, credits, insuranceDebtCr);
+
+          shipHullClass = chosenShip.shipHullClass;
+          thrusterMk = chosenShip.thrusterMk;
+          shieldMk = chosenShip.shieldMk;
+          distributorMk = chosenShip.distributorMk;
+          weaponPrimary = chosenShip.weaponPrimary;
+          weaponSecondary = chosenShip.weaponSecondary;
+          smuggleHoldMk = chosenShip.smuggleHoldMk;
+          fuelScoopMk = chosenShip.fuelScoopMk;
+          cargoCapacityKg = chosenShip.cargoCapacityKg;
+          fuelMax = chosenShip.fuelMax;
+          passengerSeats = chosenShip.passengerSeats;
+          fsdRangeLy = chosenShip.fsdRangeLy;
+          recalcPlayerStats();
+
+          // Reset ship state.
+          playerHull = playerHullMax;
+          playerShield = playerShieldMax * 0.6;
+          cargo.fill(0.0);
+          fuel = fuelMax;
+          scanning = false;
+          scanProgressSec = 0.0;
+          heat = 0.0;
+          heatImpulse = 0.0;
+
+          incomingMissileToastCooldownUntilDays = timeDays + (8.0 / 86400.0);
+          miningToastPendingUnits.fill(0.0);
+          miningToastLastDays.fill(-9999.0);
+          dockingDeniedToastCooldownUntilDays.clear();
+
+          // Determine respawn location.
+          sim::SystemId respawnSystemId = deathRebuy.systemAtDeath;
+          sim::StationId respawnStationId = nearestStationId;
+
+          if (deathRebuy.respawnChoice == 0 && hasLastDock) {
+            respawnSystemId = deathRebuy.lastDockedSystem;
+            respawnStationId = deathRebuy.lastDockedStation;
+          }
+
+          if (respawnSystemId == 0 && currentSystem) {
+            respawnSystemId = currentSystem->stub.id;
+          }
+          if (respawnSystemId != 0 && respawnStationId == 0) {
+            const auto& sys = universe.getSystem(respawnSystemId);
+            if (!sys.stations.empty()) respawnStationId = sys.stations.front().id;
+          }
+
+          if (respawnSystemId != 0 && respawnStationId != 0) {
+            respawnDockedAtStation(respawnSystemId, respawnStationId);
+          }
+
+          if (deathRebuy.openStationMenuAfterRespawn) {
+            showStationMenu = true;
+            stationMenuPage = StationMenuPage::Root;
+          }
+
+          paused = false;
+          deathRebuy.active = false;
+
+          if (outcome.shipReset) {
+            toast(toasts, "Insurance claim processed: bankrupt reset (loaner ship issued).", 4.0);
+          } else if (outcome.loanTakenCr > 0.0) {
+            toast(toasts, "Insurance claim processed: loan taken.", 3.0);
+          } else {
+            toast(toasts, "Insurance claim processed.", 3.0);
+          }
+        }
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("Main Menu", {buttonW, 0})) {
+          // Hand control back to the main menu (player can load a save or start fresh).
+          deathRebuy.active = false;
+          showMainMenu = true;
+          mainMenuPage = MainMenuPage::Root;
+          paused = true;
+        }
+
+        if (ImGui::Button("Quit Game", {buttonW, 0})) {
+          quit = true;
+        }
+
+        ImGui::EndChild();
+      }
+      ImGui::End();
+    }
+
+    // ------------------------------------------------------------------
+    // Main Menu overlay
+    // ------------------------------------------------------------------
+    if (showMainMenu) {
+      // Make sure slot metadata is fresh.
+      if (saveSlotMetaDirty) {
+        refreshSaveSlotMetaNow();
+      }
+
+      ImGuiViewport* vp = ImGui::GetMainViewport();
+      ImGui::SetNextWindowPos(vp->Pos);
+      ImGui::SetNextWindowSize(vp->Size);
+      ImGui::SetNextWindowBgAlpha(0.94f);
+      ImGui::SetNextWindowFocus();
+
+      const ImGuiWindowFlags flags =
+          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
+
+      if (ImGui::Begin("Main Menu##MainMenuOverlay", nullptr, flags)) {
+        const float menuWidth = 520.0f;
+        const float contentHeightGuess = 420.0f;
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const ImVec2 startPos = ImVec2(std::max(0.0f, (avail.x - menuWidth) * 0.5f),
+                                       std::max(0.0f, (avail.y - contentHeightGuess) * 0.5f));
+        ImGui::SetCursorPos(startPos);
+
+        ImGui::BeginChild("##MainMenuInner", ImVec2(menuWidth, 0.0f), false);
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("StellarForge");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (!mainMenuStatus.empty() && timeRealSec < mainMenuStatusHideAtRealSec) {
+          ImGui::TextWrapped("%s", mainMenuStatus.c_str());
+          ImGui::Spacing();
+        }
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(18.0f, 12.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 12.0f));
+
+        auto bigButton = [&](const char* label) -> bool {
+          return ImGui::Button(label, ImVec2(-1.0f, 0.0f));
+        };
+
+        if (mainMenuPage == MainMenuPage::Root) {
+          if (bigButton("New Game")) {
+            mainMenuPage = MainMenuPage::NewGame;
+          }
+
+          // Continue loads the most recently modified save among quicksave + slots.
+          {
+            const auto mostRecent = findMostRecentSavePath();
+            const bool hasSave = mostRecent.has_value();
+            if (!hasSave) ImGui::BeginDisabled();
+            if (bigButton("Continue")) {
+              if (mostRecent && loadGameFromPath(*mostRecent)) {
+                toast(toasts, "Loaded " + mostRecent->string(), 2.5);
+                mainMenuPrevPaused = false;
+                showMainMenu = false;
+                mainMenuPage = MainMenuPage::Root;
+                paused = false;
+              } else {
+                setMainMenuStatus("Failed to load latest save.", 3.0);
+              }
+            }
+            if (!hasSave) ImGui::EndDisabled();
+          }
+
+          if (bigButton("Load Game")) {
+            mainMenuPage = MainMenuPage::LoadGame;
+          }
+          if (bigButton("Options")) {
+            mainMenuPage = MainMenuPage::Options;
+          }
+          if (bigButton("Quit")) {
+            running = false;
+          }
+
+          ImGui::Spacing();
+          ImGui::Separator();
+          ImGui::Spacing();
+          if (ImGui::Button("Return to Game", ImVec2(-1.0f, 0.0f))) {
+            showMainMenu = false;
+          }
+        } else if (mainMenuPage == MainMenuPage::NewGame) {
+          ImGui::TextUnformatted("New Game");
+          ImGui::Spacing();
+
+          ImGui::Checkbox("Use random seed", &mainMenuUseRandomSeed);
+
+          if (mainMenuUseRandomSeed) {
+            ImGui::BeginDisabled();
+          }
+          ImGui::InputScalar("Seed", ImGuiDataType_U64, &mainMenuSeed);
+          if (mainMenuUseRandomSeed) {
+            ImGui::EndDisabled();
+          }
+
+          if (ImGui::Button("Randomize", ImVec2(-1.0f, 0.0f))) {
+            mainMenuSeed = randomSeedU64();
+            mainMenuUseRandomSeed = false;
+          }
+
+          if (ImGui::Button("Start", ImVec2(-1.0f, 0.0f))) {
+            const core::u64 chosenSeed = mainMenuUseRandomSeed ? randomSeedU64() : mainMenuSeed;
+            startNewGameWithSeed(chosenSeed);
+            toast(toasts, "New game started (seed " + std::to_string((unsigned long long)chosenSeed) + ")", 2.5);
+            mainMenuPrevPaused = false;
+            showMainMenu = false;
+            mainMenuPage = MainMenuPage::Root;
+          }
+
+          if (ImGui::Button("Back", ImVec2(-1.0f, 0.0f))) {
+            mainMenuPage = MainMenuPage::Root;
+          }
+        } else if (mainMenuPage == MainMenuPage::LoadGame) {
+          ImGui::TextUnformatted("Load Game (Slots)");
+          ImGui::Spacing();
+
+          if (ImGui::BeginTable("##SaveSlots", 4,
+                                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                                    ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Summary", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Delete", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < kSaveSlotCount; ++i) {
+              const auto& meta = saveSlotMeta[(std::size_t)i];
+
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::Text(" %d", i + 1);
+
+              ImGui::TableSetColumnIndex(1);
+              ImGui::TextWrapped("%s", formatSaveSummary(meta).c_str());
+
+              ImGui::TableSetColumnIndex(2);
+              ImGui::PushID(i);
+              if (!meta.exists) ImGui::BeginDisabled();
+              if (ImGui::SmallButton("Load")) {
+                if (loadGameFromPath(saveSlotPath(i))) {
+                  toast(toasts, "Loaded " + saveSlotPath(i).string(), 2.5);
+                  mainMenuPrevPaused = false;
+                  showMainMenu = false;
+                  mainMenuPage = MainMenuPage::Root;
+                  paused = false;
+                } else {
+                  setMainMenuStatus("Failed to load slot " + std::to_string(i + 1) + ".", 3.0);
+                }
+              }
+              if (!meta.exists) ImGui::EndDisabled();
+              ImGui::PopID();
+
+              ImGui::TableSetColumnIndex(3);
+              ImGui::PushID(i);
+              if (!meta.exists) ImGui::BeginDisabled();
+              if (ImGui::SmallButton("Del")) {
+                mainMenuDeleteSlot = i;
+                ImGui::OpenPopup("Delete Save Slot?");
+              }
+              if (!meta.exists) ImGui::EndDisabled();
+              ImGui::PopID();
+            }
+
+            ImGui::EndTable();
+          }
+
+          ImGui::Spacing();
+          if (ImGui::Button("Back", ImVec2(-1.0f, 0.0f))) {
+            mainMenuPage = MainMenuPage::Root;
+          }
+
+          // Confirmation modal
+          if (ImGui::BeginPopupModal("Delete Save Slot?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Delete slot %d? This cannot be undone.", mainMenuDeleteSlot + 1);
+            ImGui::Spacing();
+
+            if (ImGui::Button("Delete", ImVec2(120.0f, 0.0f))) {
+              std::error_code ec;
+              std::filesystem::remove(saveSlotPath(mainMenuDeleteSlot), ec);
+              saveSlotMetaDirty = true;
+              setMainMenuStatus("Deleted slot " + std::to_string(mainMenuDeleteSlot + 1) + ".", 2.5);
+              mainMenuDeleteSlot = -1;
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+              mainMenuDeleteSlot = -1;
+              ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+          }
+        } else if (mainMenuPage == MainMenuPage::Options) {
+          ImGui::TextUnformatted("Options");
+          ImGui::Spacing();
+
+          ImGui::Checkbox("Auto-save UI settings on exit", &uiSettingsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save controls on exit", &controlsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save VFX settings on exit", &vfxSettingsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save HUD settings on exit", &hudSettingsAutoSaveOnExit);
+
+          ImGui::Spacing();
+          ImGui::Separator();
+          ImGui::Spacing();
+
+          if (ImGui::Button("Open Controls Window", ImVec2(-1.0f, 0.0f))) {
+            controlsWindow.open = true;
+          }
+          if (ImGui::Button("Open Audio Settings", ImVec2(-1.0f, 0.0f))) {
+            showAudioSettingsWindow = true;
+          }
+          if (ImGui::Button("Open UI Settings", ImVec2(-1.0f, 0.0f))) {
+            showUiSettingsWindow = true;
+          }
+
+          ImGui::Spacing();
+          if (ImGui::Button("Back", ImVec2(-1.0f, 0.0f))) {
+            mainMenuPage = MainMenuPage::Root;
+          }
+        }
+
+        ImGui::PopStyleVar(2);
+        ImGui::EndChild();
+      }
+      ImGui::End();
+    }
+
+
+    // ------------------------------------------------------------------
+    // Docked Station Menu overlay
+    // ------------------------------------------------------------------
+    if (!docked) {
+      showStationMenu = false;
+      stationMenuPage = StationMenuPage::Root;
+    }
+
+    if (showStationMenu && docked && !showMainMenu && !showPauseMenu) {
+      ImGuiViewport* vp = ImGui::GetMainViewport();
+      ImGui::SetNextWindowPos(vp->Pos);
+      ImGui::SetNextWindowSize(vp->Size);
+      ImGui::SetNextWindowBgAlpha(0.92f);
+
+      ImGuiWindowFlags overlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize
+        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
+
+      ImGui::Begin("Station Menu##overlay", nullptr, overlayFlags);
+
+      const float panelW = std::min(920.0f, vp->Size.x * 0.78f);
+      const float panelH = std::min(680.0f, vp->Size.y * 0.86f);
+      ImGui::SetCursorPos(ImVec2((vp->Size.x - panelW) * 0.5f, (vp->Size.y - panelH) * 0.5f));
+
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 18.0f));
+      ImGui::BeginChild("StationMenuPanel", ImVec2(panelW, panelH), true, ImGuiWindowFlags_NoScrollbar);
+      ImGui::PopStyleVar();
+
+      // Resolve docked station + its index.
+      const sim::Station* dockSt = nullptr;
+      int dockStIndex = -1;
+      if (currentSystem && dockedStationId != 0) {
+        for (size_t si = 0; si < currentSystem->stations.size(); ++si) {
+          const auto& st = currentSystem->stations[si];
+          if (st.id == dockedStationId) {
+            dockSt = &st;
+            dockStIndex = (int)si;
+            break;
+          }
+        }
+      }
+
+      const char* stationNameC = dockSt ? dockSt->name.c_str() : "Unknown Station";
+      ImGui::Text("Docked at %s", stationNameC);
+      if (dockSt) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", stationTypeName(dockSt->type));
+      }
+
+      ImGui::TextDisabled("Credits: %.0f cr   |   Cargo: %.0f / %.0f kg   |   Fuel: %.1f / %.1f",
+                          credits, cargoMassKg(cargo), cargoCapacityKg, fuel, fuelMax);
+
+      if (!dockSt) {
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "Error: couldn't resolve docked station.");
+      }
+
+      ImGui::Separator();
+
+      // Helper: simulate a key chord press (for actions like Undock).
+      auto pushChordEvent = [&](const game::KeyChord& chord) {
+        if (!chord.bound()) return;
+        SDL_Event ev{};
+        ev.type = SDL_KEYDOWN;
+        ev.key.keysym.scancode = chord.scancode;
+        ev.key.keysym.mod = chord.mods;
+        ev.key.repeat = 0;
+        SDL_PushEvent(&ev);
+      };
+
+      // Helper: open Market Details at a specific section.
+      auto openMarketAt = [&](MarketDetailsJumpTarget jump) {
+        if (dockStIndex >= 0) selectedStationIndex = dockStIndex;
+        showEconomy = true;
+        focusMarketDetailsWindow = true;
+        marketDetailsJumpTarget = jump;
+        showStationMenu = false;
+        stationMenuPage = StationMenuPage::Root;
+      };
+
+      // Helper: open Missions window at a specific tab.
+      auto openMissionsAt = [&](int tab) {
+        showMissions = true;
+        focusMissionsWindow = true;
+        missionsTabRequest = tab;
+        showStationMenu = false;
+        stationMenuPage = StationMenuPage::Root;
+      };
+
+      // Layout: left nav, right content.
+      const float navW = 232.0f;
+      ImGui::BeginChild("StationMenuNav", ImVec2(navW, 0.0f), true);
+
+      auto navSelect = [&](const char* label, StationMenuPage page, bool enabled = true) {
+        if (!enabled) ImGui::BeginDisabled();
+        const bool selected = (stationMenuPage == page);
+        if (ImGui::Selectable(label, selected)) stationMenuPage = page;
+        if (!enabled) ImGui::EndDisabled();
+      };
+
+      navSelect("Home", StationMenuPage::Root, true);
+      navSelect("Mission Board", StationMenuPage::MissionBoard, true);
+      navSelect("Market / Trade", StationMenuPage::MarketTrade, true);
+      const bool hasShipyard = dockSt && (dockSt->type == econ::StationType::Shipyard);
+      navSelect("Shipyard / Upgrades", StationMenuPage::Shipyard, hasShipyard);
+      navSelect("Storage / Warehouse", StationMenuPage::Warehouse, true);
+      navSelect("Repair / Refuel / Restock", StationMenuPage::Services, true);
+
+      ImGui::Separator();
+      const std::string undockLabel = std::string("Undock (") + game::chordLabel(controls.actions.dockOrUndock) + ")";
+      if (ImGui::Selectable(undockLabel.c_str(), stationMenuPage == StationMenuPage::ConfirmUndock)) {
+        stationMenuPage = StationMenuPage::ConfirmUndock;
+      }
+      if (ImGui::Selectable("Close")) {
+        showStationMenu = false;
+        stationMenuPage = StationMenuPage::Root;
+      }
+
+      ImGui::Separator();
+      ImGui::Checkbox("Auto-open on docking", &stationMenuAutoOpenOnDock);
+
+      ImGui::EndChild();
+      ImGui::SameLine();
+
+      ImGui::BeginChild("StationMenuContent", ImVec2(0.0f, 0.0f), true);
+
+      auto bigButton = [&](const char* label) -> bool {
+        return ImGui::Button(label, ImVec2(-1.0f, 0.0f));
+      };
+
+      if (stationMenuPage != StationMenuPage::Root) {
+        if (ImGui::SmallButton("< Back")) stationMenuPage = StationMenuPage::Root;
+        ImGui::Separator();
+      }
+
+      switch (stationMenuPage) {
+        case StationMenuPage::Root: {
+          ImGui::TextDisabled("Station Services");
+          if (bigButton("Mission Board")) stationMenuPage = StationMenuPage::MissionBoard;
+          if (bigButton("Market / Trade")) stationMenuPage = StationMenuPage::MarketTrade;
+          if (bigButton("Shipyard / Upgrades")) stationMenuPage = StationMenuPage::Shipyard;
+          if (bigButton("Storage / Warehouse")) stationMenuPage = StationMenuPage::Warehouse;
+          if (bigButton("Repair / Refuel / Restock ammo")) stationMenuPage = StationMenuPage::Services;
+
+          ImGui::Separator();
+          if (bigButton("Undock")) stationMenuPage = StationMenuPage::ConfirmUndock;
+
+          break;
+        }
+
+        case StationMenuPage::MissionBoard: {
+          ImGui::Text("Mission Board");
+          ImGui::TextDisabled("Browse and accept contracts while docked.");
+          ImGui::Separator();
+
+          if (bigButton("Open Missions Window (Mission Board)")) openMissionsAt(1);
+          if (ImGui::Button("Open Missions Window (Active)")) openMissionsAt(0);
+
+          break;
+        }
+
+        case StationMenuPage::MarketTrade: {
+          ImGui::Text("Market / Trade");
+          ImGui::TextDisabled("Buy/sell cargo and plan trade runs.");
+          ImGui::Separator();
+
+          if (bigButton("Open Market Details")) openMarketAt(MarketDetailsJumpTarget::Market);
+          if (ImGui::Button("Open Trade Planner")) {
+            tradePlannerWindow.open = true;
+            showStationMenu = false;
+            stationMenuPage = StationMenuPage::Root;
+          }
+          if (ImGui::Button("Open Market Dashboard")) {
+            marketDashboardWindow.open = true;
+            showStationMenu = false;
+            stationMenuPage = StationMenuPage::Root;
+          }
+          if (ImGui::Button("Open Trade Finder")) {
+            showTrade = true;
+            showStationMenu = false;
+            stationMenuPage = StationMenuPage::Root;
+          }
+
+          break;
+        }
+
+        case StationMenuPage::Shipyard: {
+          ImGui::Text("Shipyard / Upgrades");
+          if (!hasShipyard) {
+            ImGui::TextDisabled("This station does not have a shipyard.");
+          } else {
+            ImGui::TextDisabled("Upgrade hull, modules and weapons.");
+            ImGui::Separator();
+            if (bigButton("Open Shipyard (Market Details)")) openMarketAt(MarketDetailsJumpTarget::Shipyard);
+            if (ImGui::Button("Open Hangar / Livery")) {
+              showHangar = true;
+              showStationMenu = false;
+              stationMenuPage = StationMenuPage::Root;
+            }
+          }
+          break;
+        }
+
+        case StationMenuPage::Warehouse: {
+          ImGui::Text("Storage / Warehouse");
+          ImGui::TextDisabled("Station storage and storage fees.");
+          ImGui::Separator();
+
+          if (bigButton("Open Warehouse (Market Details)")) openMarketAt(MarketDetailsJumpTarget::Warehouse);
+
+          if (dockSt) {
+            const auto* entry = sim::findStorage(stationStorage, dockedStationId);
+            if (entry) {
+              const double rep = getRep(dockSt->factionId);
+              const double storedKg = sim::storageMassKg(*entry);
+              const double dailyFee = sim::estimateStorageDailyFeeCr(*entry, rep);
+              const double dueNow = std::max(0.0, entry->feesDueCr);
+              const double nextFeeInDays = std::max(0.0, entry->nextFeeTimeDays - timeDays);
+
+              ImGui::Separator();
+              ImGui::TextDisabled("Stored mass: %.0f kg", storedKg);
+              ImGui::TextDisabled("Estimated daily fee: %.0f cr/day", dailyFee);
+              ImGui::TextDisabled("Fees due now: %.0f cr   (next fee in %.1f days)", dueNow, nextFeeInDays);
+
+              if (ImGui::Button("Pay fees")) {
+                const auto r = sim::payStorageFees(stationStorage, *dockSt, timeDays, rep, credits, 1e30);
+                if (r.ok) {
+                  sim::pruneEmptyStorage(stationStorage);
+                  if (r.creditsPaid > 0.0) {
+                    toast(toasts, "Storage fees paid.", 2.0);
+                  } else {
+                    toast(toasts, "No storage fees due.", 1.8);
+                  }
+                } else {
+                  toast(toasts, r.msg.c_str(), 2.5);
+                }
+              }
+            } else {
+              ImGui::TextDisabled("No storage rented at this station yet.");
+            }
+          }
+
+          break;
+        }
+
+        case StationMenuPage::Services: {
+          ImGui::Text("Repair / Refuel / Restock");
+          ImGui::TextDisabled("Quick services while docked.");
+          ImGui::Separator();
+
+          // If you want the full, detailed flows (including trading), jump to the Market Details services section.
+          if (ImGui::Button("Open Services (Market Details)")) {
+            openMarketAt(MarketDetailsJumpTarget::Services);
+          }
+
+          if (!dockSt) break;
+          if (paused) {
+            ImGui::TextDisabled("Unpause to use services.");
+            break;
+          }
+
+          const sim::Station& station = *dockSt;
+          auto& stEcon = universe.stationEconomy(station, timeDays);
+          const double rep = getRep(station.factionId);
+          const double feeEff = effectiveFeeRate(station);
+
+          // --- Repair & Refuel (mirrors Market Details' docked services) ---
+          const double hullMissing = std::max(0.0, playerHullMax - playerHull);
+          const double repairCost = (hullMissing * 12.0) * (1.0 + feeEff);
+
+          ImGui::BeginDisabled(hullMissing <= 0.001);
+          if (ImGui::Button("Repair hull")) {
+            if (credits >= repairCost) {
+              credits -= repairCost;
+              playerHull = playerHullMax;
+              toast(toasts, "Repaired.", 1.8);
+            } else {
+              toast(toasts, "Not enough credits to repair.", 1.8);
+            }
+          }
+          ImGui::EndDisabled();
+          ImGui::SameLine();
+          ImGui::TextDisabled("(%.0f cr)", repairCost);
+
+          const double fuelMissing = std::max(0.0, fuelMax - fuel);
+          const auto fuelQuote = econ::quote(stEcon, station.economyModel, econ::CommodityId::Fuel, 0.10);
+          const double fuelAsk = std::max(0.0, fuelQuote.ask);
+          const double fuelAvail = std::max(0.0, fuelQuote.inventory);
+          const double fuelToBuy = std::min(fuelMissing, fuelAvail);
+          const double fuelCost = fuelToBuy * fuelAsk * (1.0 + feeEff);
+
+          ImGui::BeginDisabled(fuelToBuy <= 0.0001);
+          if (ImGui::Button("Refuel")) {
+            if (credits >= fuelCost) {
+              credits -= fuelCost;
+              fuel += fuelToBuy;
+              econ::takeInventory(stEcon, econ::CommodityId::Fuel, fuelToBuy, true);
+              toast(toasts, "Refueled.", 1.8);
+            } else {
+              toast(toasts, "Not enough credits to refuel.", 1.8);
+            }
+          }
+          ImGui::EndDisabled();
+          ImGui::SameLine();
+          ImGui::TextDisabled("(%.2f fuel, %.0f cr)", fuelToBuy, fuelCost);
+
+          // --- Countermeasures ---
+          {
+            ImGui::Separator();
+            ImGui::Text("Countermeasures");
+            const sim::CountermeasureCaps cap = sim::countermeasureCapsForHull(shipHullClass);
+
+            const int wantFlares = std::clamp(cmFlares, 0, cap.flares);
+            const int wantChaff = std::clamp(cmChaff, 0, cap.chaff);
+            const int wantHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
+
+            cmFlares = wantFlares;
+            cmChaff = wantChaff;
+            cmHeatSinks = wantHeatSinks;
+
+            ImGui::TextDisabled("Flares %d/%d   Chaff %d/%d   Heat sinks %d/%d",
+                               wantFlares, cap.flares,
+                               wantChaff, cap.chaff,
+                               wantHeatSinks, cap.heatSinks);
+
+            const double priceMult = (1.0 + feeEff);
+            const double flareUnit = 85.0;
+            const double chaffUnit = 95.0;
+            const double heatSinkUnit = 360.0;
+
+            const int needF = std::max(0, cap.flares - wantFlares);
+            const int needC = std::max(0, cap.chaff - wantChaff);
+            const int needH = std::max(0, cap.heatSinks - wantHeatSinks);
+
+            const double costF = needF * flareUnit * priceMult;
+            const double costC = needC * chaffUnit * priceMult;
+            const double costH = needH * heatSinkUnit * priceMult;
+            const double costAll = costF + costC + costH;
+
+            ImGui::BeginDisabled(needF + needC + needH <= 0);
+            if (ImGui::Button("Restock all")) {
+              if (credits >= costAll) {
+                credits -= costAll;
+                cmFlares = cap.flares;
+                cmChaff = cap.chaff;
+                cmHeatSinks = cap.heatSinks;
+                toast(toasts, "Countermeasures restocked.", 2.0);
+              } else {
+                toast(toasts, "Not enough credits to restock countermeasures.", 2.0);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f cr)", costAll);
+          }
+
+          // --- Ordnance ---
+          {
+            ImGui::Separator();
+            ImGui::Text("Ordnance");
+            syncWeaponAmmo();
+
+            auto drawOrdnanceSlot = [&](const char* slotName, const char* btnLabel, WeaponType wt, core::u8& ammo) {
+              const int maxAmmo = sim::weaponAmmoMax(wt, shipHullClass);
+              if (maxAmmo <= 0) return;
+
+              const int have = std::clamp((int)ammo, 0, maxAmmo);
+              ammo = (core::u8)have;
+              const int need = maxAmmo - have;
+              const double unitEff = sim::weaponAmmoUnitPriceCr(wt) * (1.0 + feeEff);
+              const double cost = (double)need * unitEff;
+
+              ImGui::TextDisabled("%s: %s  %d/%d", slotName, weaponDef(wt).name, have, maxAmmo);
+              ImGui::SameLine();
+              ImGui::BeginDisabled(need <= 0);
+              if (ImGui::SmallButton(btnLabel)) {
+                if (credits >= cost) {
+                  credits -= cost;
+                  ammo = (core::u8)maxAmmo;
+                  toast(toasts, (std::string(slotName) + " rearmed.").c_str(), 1.5);
+                } else {
+                  toast(toasts, "Not enough credits.", 1.6);
+                }
+              }
+              ImGui::EndDisabled();
+              ImGui::SameLine();
+              ImGui::TextDisabled("(%d, %.0f cr)", need, cost);
+            };
+
+            // Primary
+            drawOrdnanceSlot("Primary", "Rearm primary", weaponPrimary, weaponAmmoPrimary);
+            // Secondary
+            drawOrdnanceSlot("Secondary", "Rearm secondary", weaponSecondary, weaponAmmoSecondary);
+
+            // Rearm all
+            const int needP = sim::weaponAmmoMax(weaponPrimary, shipHullClass) - (int)weaponAmmoPrimary;
+            const int needS = sim::weaponAmmoMax(weaponSecondary, shipHullClass) - (int)weaponAmmoSecondary;
+            const double costP = std::max(0, needP) * sim::weaponAmmoUnitPriceCr(weaponPrimary) * (1.0 + feeEff);
+            const double costS = std::max(0, needS) * sim::weaponAmmoUnitPriceCr(weaponSecondary) * (1.0 + feeEff);
+            const double costAll = costP + costS;
+            ImGui::BeginDisabled((needP + needS) <= 0);
+            if (ImGui::Button("Rearm all")) {
+              if (credits >= costAll) {
+                credits -= costAll;
+                weaponAmmoPrimary = (core::u8)sim::weaponAmmoMax(weaponPrimary, shipHullClass);
+                weaponAmmoSecondary = (core::u8)sim::weaponAmmoMax(weaponSecondary, shipHullClass);
+                toast(toasts, "Ordnance rearmed.", 1.8);
+              } else {
+                toast(toasts, "Not enough credits.", 1.6);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f cr)", costAll);
+          }
+
+          break;
+        }
+
+        case StationMenuPage::ConfirmUndock: {
+          ImGui::Text("Undock");
+          ImGui::TextWrapped("Leaving the station will return you to flight mode.");
+          ImGui::Separator();
+
+          if (bigButton("Undock now")) {
+            pushChordEvent(controls.actions.dockOrUndock);
+            showStationMenu = false;
+            stationMenuPage = StationMenuPage::Root;
+          }
+          if (ImGui::Button("Cancel")) {
+            stationMenuPage = StationMenuPage::Root;
+          }
+          break;
+        }
+
+        default: {
+          stationMenuPage = StationMenuPage::Root;
+          break;
+        }
+      }
+
+      ImGui::EndChild(); // StationMenuContent
+      ImGui::EndChild(); // StationMenuPanel
+      ImGui::End(); // overlay
+    }
+
+    // ------------------------------------------------------------------
+    // Pause Menu overlay
+    // ------------------------------------------------------------------
+    if (showPauseMenu && !showMainMenu) {
+      ImGuiViewport* vp = ImGui::GetMainViewport();
+      ImGui::SetNextWindowPos(vp->Pos);
+      ImGui::SetNextWindowSize(vp->Size);
+      ImGui::SetNextWindowBgAlpha(0.70f);
+      ImGui::SetNextWindowFocus();
+
+      const ImGuiWindowFlags flags =
+          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
+
+      if (ImGui::Begin("Paused##PauseMenuOverlay", nullptr, flags)) {
+        const float menuWidth = 520.0f;
+        const float contentHeightGuess = 420.0f;
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const ImVec2 startPos = ImVec2(std::max(0.0f, (avail.x - menuWidth) * 0.5f),
+                                       std::max(0.0f, (avail.y - contentHeightGuess) * 0.5f));
+        ImGui::SetCursorPos(startPos);
+
+        ImGui::BeginChild("##PauseMenuInner", ImVec2(menuWidth, 0.0f), true);
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Paused");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(ESC to resume)");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (!pauseMenuStatus.empty() && timeRealSec < pauseMenuStatusHideAtRealSec) {
+          ImGui::TextWrapped("%s", pauseMenuStatus.c_str());
+          ImGui::Spacing();
+        }
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(18.0f, 12.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 12.0f));
+
+        auto bigButton = [&](const char* label) -> bool {
+          return ImGui::Button(label, ImVec2(-1.0f, 0.0f));
+        };
+
+        if (pauseMenuPage == PauseMenuPage::Root) {
+          if (bigButton("Resume")) {
+            showPauseMenu = false;
+          }
+          if (bigButton("Options")) {
+            pauseMenuPage = PauseMenuPage::Options;
+          }
+          if (bigButton("Save / Load")) {
+            pauseMenuPage = PauseMenuPage::SaveLoad;
+            saveSlotMetaDirty = true;
+          }
+          if (bigButton("Quit to Menu")) {
+            pauseMenuWantsQuitToMenuConfirm = true;
+            ImGui::OpenPopup("Quit to Menu?");
+          }
+        } else if (pauseMenuPage == PauseMenuPage::Options) {
+          ImGui::TextUnformatted("Options");
+          ImGui::Spacing();
+
+          ImGui::Checkbox("Auto-save UI settings on exit", &uiSettingsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save controls on exit", &controlsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save VFX settings on exit", &vfxSettingsAutoSaveOnExit);
+          ImGui::Checkbox("Auto-save HUD settings on exit", &hudSettingsAutoSaveOnExit);
+
+          ImGui::Spacing();
+          ImGui::Separator();
+          ImGui::Spacing();
+
+          if (ImGui::Button("Open Controls Window", ImVec2(-1.0f, 0.0f))) {
+            controlsWindow.open = true;
+          }
+          if (ImGui::Button("Open Audio Settings", ImVec2(-1.0f, 0.0f))) {
+            showAudioSettingsWindow = true;
+          }
+          if (ImGui::Button("Open UI Settings", ImVec2(-1.0f, 0.0f))) {
+            showUiSettingsWindow = true;
+          }
+
+          ImGui::Spacing();
+          if (ImGui::Button("Back", ImVec2(-1.0f, 0.0f))) {
+            pauseMenuPage = PauseMenuPage::Root;
+          }
+        } else if (pauseMenuPage == PauseMenuPage::SaveLoad) {
+          ImGui::TextUnformatted("Save / Load");
+          ImGui::Spacing();
+
+          if (ImGui::Button("Quick Save", ImVec2(-1.0f, 0.0f))) {
+            if (saveGameToPath(std::filesystem::path(savePath))) {
+              toast(toasts, "Saved to " + savePath, 2.5);
+              saveSlotMetaDirty = true;
+              setPauseMenuStatus("Quick saved.", 2.5);
+            } else {
+              toast(toasts, "Failed to save to " + savePath, 2.5);
+              setPauseMenuStatus("Quick save failed.", 3.0);
+            }
+          }
+          if (ImGui::Button("Quick Load", ImVec2(-1.0f, 0.0f))) {
+            if (loadGameFromPath(std::filesystem::path(savePath))) {
+              toast(toasts, "Loaded " + savePath, 2.5);
+              pauseMenuPrevPaused = false;
+              showPauseMenu = false;
+              paused = false;
+            } else {
+              toast(toasts, "Failed to load " + savePath, 2.5);
+              setPauseMenuStatus("Quick load failed.", 3.0);
+            }
+          }
+
+          ImGui::Spacing();
+          ImGui::Separator();
+          ImGui::Spacing();
+
+          if (saveSlotMetaDirty) {
+            refreshSaveSlotMetaNow();
+            saveSlotMetaDirty = false;
+          }
+
+          if (ImGui::BeginTable("##PauseSaveSlots", 5,
+                                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                                    ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Summary", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Save", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Delete", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < kSaveSlotCount; ++i) {
+              const auto& meta = saveSlotMeta[(std::size_t)i];
+
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::Text(" %d", i + 1);
+
+              ImGui::TableSetColumnIndex(1);
+              ImGui::TextWrapped("%s", formatSaveSummary(meta).c_str());
+
+              ImGui::TableSetColumnIndex(2);
+              ImGui::PushID(i * 100 + 1);
+              if (ImGui::SmallButton("Save")) {
+                if (saveGameToPath(saveSlotPath(i))) {
+                  toast(toasts, "Saved " + saveSlotPath(i).string(), 2.5);
+                  saveSlotMetaDirty = true;
+                  setPauseMenuStatus("Saved slot " + std::to_string(i + 1) + ".", 2.5);
+                } else {
+                  setPauseMenuStatus("Failed to save slot " + std::to_string(i + 1) + ".", 3.0);
+                }
+              }
+              ImGui::PopID();
+
+              ImGui::TableSetColumnIndex(3);
+              ImGui::PushID(i * 100 + 2);
+              if (!meta.exists) ImGui::BeginDisabled();
+              if (ImGui::SmallButton("Load")) {
+                if (loadGameFromPath(saveSlotPath(i))) {
+                  toast(toasts, "Loaded " + saveSlotPath(i).string(), 2.5);
+                  pauseMenuPrevPaused = false;
+                  showPauseMenu = false;
+                  paused = false;
+                } else {
+                  setPauseMenuStatus("Failed to load slot " + std::to_string(i + 1) + ".", 3.0);
+                }
+              }
+              if (!meta.exists) ImGui::EndDisabled();
+              ImGui::PopID();
+
+              ImGui::TableSetColumnIndex(4);
+              ImGui::PushID(i * 100 + 3);
+              if (!meta.exists) ImGui::BeginDisabled();
+              if (ImGui::SmallButton("Del")) {
+                pauseMenuDeleteSlot = i;
+                ImGui::OpenPopup("Delete Save Slot?##Pause");
+              }
+              if (!meta.exists) ImGui::EndDisabled();
+              ImGui::PopID();
+            }
+
+            ImGui::EndTable();
+          }
+
+          ImGui::Spacing();
+          if (ImGui::Button("Back", ImVec2(-1.0f, 0.0f))) {
+            pauseMenuPage = PauseMenuPage::Root;
+          }
+
+          // Confirmation modal
+          if (ImGui::BeginPopupModal("Delete Save Slot?##Pause", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Delete slot %d? This cannot be undone.", pauseMenuDeleteSlot + 1);
+            ImGui::Spacing();
+
+            if (ImGui::Button("Delete", ImVec2(120.0f, 0.0f))) {
+              std::error_code ec;
+              std::filesystem::remove(saveSlotPath(pauseMenuDeleteSlot), ec);
+              saveSlotMetaDirty = true;
+              setPauseMenuStatus("Deleted slot " + std::to_string(pauseMenuDeleteSlot + 1) + ".", 2.5);
+              pauseMenuDeleteSlot = -1;
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+              pauseMenuDeleteSlot = -1;
+              ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+          }
+        }
+
+        // Quit confirmation modal
+        if (ImGui::BeginPopupModal("Quit to Menu?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+          ImGui::TextUnformatted("Quit to the main menu?");
+          ImGui::TextUnformatted("Your current session will remain loaded in memory.");
+          ImGui::Spacing();
+
+          if (ImGui::Button("Quit to Menu", ImVec2(160.0f, 0.0f))) {
+            // Restore underlying paused state before letting the main menu take control.
+            paused = pauseMenuPrevPaused;
+            showPauseMenu = false;
+            showMainMenu = true;
+            mainMenuPage = MainMenuPage::Root;
+            pauseMenuWantsQuitToMenuConfirm = false;
+            ImGui::CloseCurrentPopup();
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+            pauseMenuWantsQuitToMenuConfirm = false;
+            ImGui::CloseCurrentPopup();
+          }
+          ImGui::EndPopup();
+        }
+
+        ImGui::PopStyleVar(2);
+        ImGui::EndChild();
+      }
+      ImGui::End();
+    }
+
+    // --- Progression feedback + unlock evaluation ---------------------------------
+    {
+      const bool canToast = (timeRealSec >= progFeed.suppressToastsUntilRealSec);
+
+      // Credits delta accumulation (aggregated to avoid spam).
+      const double deltaCr = credits - progFeed.lastCreditsSample;
+      if (std::abs(deltaCr) > 1e-6) {
+        progFeed.creditsAccum += deltaCr;
+        progFeed.lastCreditsSample = credits;
+        progFeed.creditsLastChangeRealSec = timeRealSec;
+      
+        if (deltaCr > 0.0) progFeed.sessionCreditsIn += deltaCr;
+        else progFeed.sessionCreditsOut += -deltaCr;
+      }
+
+      // Update high-water marks.
+      progression.creditsHighWaterCr = std::max(progression.creditsHighWaterCr, credits);
+      {
+        double repMax = 0.0;
+        for (const auto& kv : repByFaction) repMax = std::max(repMax, kv.second);
+        progression.repHighWater = std::max(progression.repHighWater, repMax);
+      }
+
+      // Resolve the current goal BEFORE applying new unlocks this frame, so we can
+      // emit a clean "goal achieved" toast exactly when the milestone flips.
+      const ProgressionGoal goalBefore = resolveGoal();
+      const bool goalBeforeWasLocked =
+          (goalBefore != ProgressionGoal::None) && !isGoalUnlocked(goalBefore);
+
+      // Never allow "locked but equipped" states.
+      progression.unlockHull(shipHullClass);
+      {
+        const int coreMkEquipped = std::max(thrusterMk, std::max(shieldMk, distributorMk));
+        const int coreMkUnlocked = std::max((int)progression.unlockedCoreMk, coreMkEquipped);
+        progression.unlockedCoreMk = static_cast<core::u8>(std::clamp(coreMkUnlocked, 1, 3));
+      }
+      progression.unlockedSmuggleHoldMk = static_cast<core::u8>(
+          std::clamp(std::max((int)progression.unlockedSmuggleHoldMk, smuggleHoldMk), 0, 3));
+      progression.unlockedFuelScoopMk = static_cast<core::u8>(
+          std::clamp(std::max((int)progression.unlockedFuelScoopMk, fuelScoopMk), 0, 3));
+progression.unlockedWeaponMask |= kStarterWeaponMask;
+progression.unlockWeapon(weaponPrimary);
+progression.unlockWeapon(weaponSecondary);
+
+
+      auto meets = [&](const UnlockReq& req) -> bool {
+        return (progression.creditsHighWaterCr >= req.creditsHighWaterCr) ||
+               (progression.repHighWater >= req.repHighWater);
+      };
+
+      std::vector<std::string> unlockedNow;
+
+      // Hull unlocks.
+      if (!progression.isHullUnlocked(ShipHullClass::Hauler) && meets(unlockHaulerHull)) {
+        progression.unlockHull(ShipHullClass::Hauler);
+        unlockedNow.emplace_back("Hauler hull");
+      }
+      if (!progression.isHullUnlocked(ShipHullClass::Fighter) && meets(unlockFighterHull)) {
+        progression.unlockHull(ShipHullClass::Fighter);
+        unlockedNow.emplace_back("Fighter hull");
+      }
+
+      // Core module tier unlocks.
+      for (int mk = 2; mk <= 3; ++mk) {
+        if ((int)progression.unlockedCoreMk < mk && meets(unlockCoreMk[mk])) {
+          progression.unlockedCoreMk = (core::u8)mk;
+          unlockedNow.emplace_back(std::string("Core modules Mk") + std::to_string(mk));
+        }
+      }
+
+      // Optional module unlocks.
+      for (int mk = 1; mk <= 3; ++mk) {
+        if ((int)progression.unlockedSmuggleHoldMk < mk && meets(unlockSmuggleHoldMk[mk])) {
+          progression.unlockedSmuggleHoldMk = (core::u8)mk;
+          unlockedNow.emplace_back(std::string("Smuggle hold Mk") + std::to_string(mk));
+        }
+      }
+      for (int mk = 1; mk <= 3; ++mk) {
+        if ((int)progression.unlockedFuelScoopMk < mk && meets(unlockFuelScoopMk[mk])) {
+          progression.unlockedFuelScoopMk = (core::u8)mk;
+          unlockedNow.emplace_back(std::string("Fuel scoop Mk") + std::to_string(mk));
+        }
+      }
+
+// Weapon unlocks (license gating for advanced weapons).
+for (int i = 0; i < (int)std::size(kWeaponDefs); ++i) {
+  const WeaponType wt = (WeaponType)i;
+  const UnlockReq& req = unlockWeapon[(std::size_t)i];
+  const bool isFree = (req.creditsHighWaterCr <= 0.0 && req.repHighWater <= 0.0);
+  if (isFree) {
+    // Starter weapons should always remain available.
+    progression.unlockWeapon(wt);
+    continue;
+  }
+  if (!progression.isWeaponUnlocked(wt) && meets(req)) {
+    progression.unlockWeapon(wt);
+    unlockedNow.emplace_back(std::string("Weapon: ") + weaponDef(wt).name);
+  }
+}
+
+
+      if (!unlockedNow.empty()) {
+        for (const auto& u : unlockedNow) {
+          progFeed.recentUnlocks.push_front(u);
+        }
+        while (progFeed.recentUnlocks.size() > 24) progFeed.recentUnlocks.pop_back();
+
+        progFeed.sessionUnlockCount += (core::u32)unlockedNow.size();
+
+        if (canToast && progFeed.feedHistory && progFeed.feedUnlocks) {
+          for (const auto& u : unlockedNow) {
+            ProgressionFeedbackState::FeedEvent e{};
+            e.kind = ProgressionFeedbackState::FeedKind::Unlock;
+            e.timeRealSec = timeRealSec;
+            e.timeDays = timeDays;
+            e.text = u;
+            progFeed.pushFeedEvent(std::move(e));
+          }
+        }
+
+        if (progFeed.unlockToasts && canToast) {
+          std::string msg = "Unlocked:";
+          const int showN = std::min<int>((int)unlockedNow.size(), 3);
+          for (int i = 0; i < showN; ++i) {
+            msg += "\n - " + unlockedNow[i];
+          }
+          if ((int)unlockedNow.size() > showN) {
+            msg += "\n ...and " + std::to_string((int)unlockedNow.size() - showN) + " more";
+          }
+          toast(toasts, msg, 2.8);
+        }
+      }
+
+      // Flush credit delta feedback after a short idle window.
+      if (canToast &&
+          std::abs(progFeed.creditsAccum) >= progFeed.creditsMinAbsToast &&
+          (timeRealSec - progFeed.creditsLastChangeRealSec) >= progFeed.creditsQuietDelaySec) {
+        const long long di = (long long)std::llround(progFeed.creditsAccum);
+
+        if (progFeed.feedHistory && progFeed.feedCredits) {
+          ProgressionFeedbackState::FeedEvent e{};
+          e.kind = ProgressionFeedbackState::FeedKind::Credits;
+          e.timeRealSec = timeRealSec;
+          e.timeDays = timeDays;
+          e.creditsDelta = di;
+          progFeed.pushFeedEvent(std::move(e));
+        }
+
+        if (progFeed.creditToasts) {
+          char buf[160];
+          if (di >= 0) {
+            std::snprintf(buf, sizeof(buf), "Credits [color #66ff88]+%lld cr[/color]", di);
+          } else {
+            std::snprintf(buf, sizeof(buf), "Credits [color #ff6666]%lld cr[/color]", di);
+          }
+          toast(toasts, std::string(buf), 2.2);
+        }
+
+        progFeed.creditsAccum = 0.0;
+      }      // Flush rep delta feedback after a short idle window.
+      if (canToast && !progFeed.repAccum.empty() &&
+          (timeRealSec - progFeed.repLastChangeRealSec) >= progFeed.repQuietDelaySec) {
+        std::vector<std::pair<core::u32, double>> deltas;
+        deltas.reserve(progFeed.repAccum.size());
+        for (const auto& kv : progFeed.repAccum) {
+          if (std::abs(kv.second) >= progFeed.repMinAbsToast) deltas.emplace_back(kv.first, kv.second);
+        }
+
+        std::sort(deltas.begin(), deltas.end(),
+                  [](const auto& a, const auto& b) { return std::abs(a.second) > std::abs(b.second); });
+
+        if (progFeed.feedHistory && progFeed.feedRep) {
+          for (const auto& d : deltas) {
+            ProgressionFeedbackState::FeedEvent e{};
+            e.kind = ProgressionFeedbackState::FeedKind::Rep;
+            e.timeRealSec = timeRealSec;
+            e.timeDays = timeDays;
+            e.factionId = d.first;
+            e.repDelta = d.second;
+            progFeed.pushFeedEvent(std::move(e));
+          }
+        }
+
+        if (progFeed.repToasts && !deltas.empty()) {
+          const int maxToasts = 3;
+          const int n = std::min<int>((int)deltas.size(), maxToasts);
+          for (int i = 0; i < n; ++i) {
+            const auto fid = deltas[i].first;
+            const double delta = deltas[i].second;
+
+            char buf[256];
+            const char sign = (delta >= 0.0) ? '+' : '-';
+            std::snprintf(buf, sizeof(buf), "Rep %c%.1f (%s)", sign, std::abs(delta),
+                          factionName(fid).c_str());
+            toast(toasts, std::string(buf), 2.4);
+          }
+          if ((int)deltas.size() > maxToasts) {
+            toast(toasts, "Reputation updated.", 2.0);
+          }
+        }
+
+        progFeed.repAccum.clear();
+      }
+      // Goal achieved toast (only when the tracked milestone flips this frame).
+      if (canToast && goalBeforeWasLocked && goalBefore != ProgressionGoal::None &&
+          isGoalUnlocked(goalBefore)) {
+        toast(toasts, std::string("Goal achieved: ") + goalName(goalBefore), 2.6);
+      }
+
+      // Timeline sampling (uses real seconds so it stays stable across sim speed).
+      if (progGuide.timelineRecord) {
+        const double period = std::max(0.05, progGuide.timelineSamplePeriodSec);
+        if (timeRealSec >= progGuide.timelineNextSampleRealSec) {
+          const ProgressionGoal g = resolveGoal();
+          const float gp = (g == ProgressionGoal::None) ? 1.0f : goalProgress(g);
+          progGuide.pushTimeline((float)credits,
+                                 (float)progression.creditsHighWaterCr,
+                                 (float)progression.repHighWater,
+                                 gp);
+          progGuide.timelineNextSampleRealSec = timeRealSec + period;
+        }
+      }
+
+    }
+
+
+
+    // --- Progression feed HUD overlay (recent credits / rep / unlocks) ---
+    if (progFeed.feedHud && progFeed.feedHistory && !showMainMenu && !showPauseMenu && !showStationMenu) {
+      const int maxLines = std::clamp(progFeed.feedHudMaxLines, 1, 10);
+      const double ttlSec = std::clamp(progFeed.feedHudTtlSec, 0.5, 30.0);
+
+      int eligible = 0;
+      for (const auto& e : progFeed.feed) {
+        if ((timeRealSec - e.timeRealSec) > ttlSec) break; // newest-first
+        if (e.kind == ProgressionFeedbackState::FeedKind::Credits && !progFeed.feedCredits) continue;
+        if (e.kind == ProgressionFeedbackState::FeedKind::Rep && !progFeed.feedRep) continue;
+        if (e.kind == ProgressionFeedbackState::FeedKind::Unlock && !progFeed.feedUnlocks) continue;
+        ++eligible;
+        if (eligible >= 1) break;
+      }
+
+      if (eligible > 0) {
+        ImGui::SetNextWindowBgAlpha(0.25f);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs
+                                     | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings
+                                     | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+        if (ImGui::Begin("##prog_feed_hud", nullptr, flags)) {
+          int shown = 0;
+          for (const auto& e : progFeed.feed) {
+            const double age = timeRealSec - e.timeRealSec;
+            if (age > ttlSec) break;
+
+            if (e.kind == ProgressionFeedbackState::FeedKind::Credits && !progFeed.feedCredits) continue;
+            if (e.kind == ProgressionFeedbackState::FeedKind::Rep && !progFeed.feedRep) continue;
+            if (e.kind == ProgressionFeedbackState::FeedKind::Unlock && !progFeed.feedUnlocks) continue;
+
+            const float a = (float)std::clamp(1.0 - (age / ttlSec), 0.0, 1.0);
+
+            if (e.kind == ProgressionFeedbackState::FeedKind::Credits) {
+              const bool pos = (e.creditsDelta >= 0);
+              ImVec4 c = pos ? ImVec4(0.4f, 1.0f, 0.4f, a) : ImVec4(1.0f, 0.4f, 0.4f, a);
+              if (pos) ImGui::TextColored(c, "Credits +%lld", e.creditsDelta);
+              else ImGui::TextColored(c, "Credits %lld", e.creditsDelta);
+            } else if (e.kind == ProgressionFeedbackState::FeedKind::Rep) {
+              const bool pos = (e.repDelta >= 0.0);
+              ImVec4 c = pos ? ImVec4(0.6f, 0.85f, 1.0f, a) : ImVec4(1.0f, 0.6f, 0.4f, a);
+              const char sign = pos ? '+' : '-';
+              ImGui::TextColored(c, "Rep %c%.1f (%s)", sign, std::abs(e.repDelta), factionName(e.factionId).c_str());
+            } else {
+              ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.4f, a), "Unlocked: %s", e.text.c_str());
+            }
+
+            if (++shown >= maxLines) break;
+          }
+        }
+        ImGui::End();
+      }
+    }
+
+    // --- Next unlock HUD (progression goal) ---
+    if (progGuide.goalHud && !showMainMenu && !showPauseMenu && !showStationMenu) {
+      const ProgressionGoal g = resolveGoal();
+      if (g != ProgressionGoal::None) {
+        const UnlockReq req = goalReq(g);
+        const float p = unlockReqProgress(req);
+
+        const float pad = 12.0f * dpiScale;
+        float y = pad;
+
+        // Keep clear of the mini objective tracker (also top-left) when it's visible.
+        if (!objectiveHudEnabled && !docked) {
+          y += 110.0f * dpiScale;
+        }
+
+        ImGui::SetNextWindowBgAlpha(0.20f);
+        ImGui::SetNextWindowPos(ImVec2(pad, y), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                                     | ImGuiWindowFlags_NoInputs
+                                     | ImGuiWindowFlags_AlwaysAutoResize
+                                     | ImGuiWindowFlags_NoSavedSettings
+                                     | ImGuiWindowFlags_NoFocusOnAppearing
+                                     | ImGuiWindowFlags_NoNav;
+
+        if (ImGui::Begin("Next Unlock##prog_goal", nullptr, flags)) {
+          ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.4f, 1.0f), "Next Unlock");
+          ImGui::TextUnformatted(goalName(g));
+          ImGui::TextDisabled("Need: cr HW >= %.0f OR rep >= %.0f", req.creditsHighWaterCr, req.repHighWater);
+
+          char pb[32];
+          std::snprintf(pb, sizeof(pb), "%d%%", (int)std::lround(p * 100.0f));
+          ImGui::ProgressBar(p, ImVec2(260.0f * dpiScale, 0.0f), pb);
+
+          ImGui::TextDisabled("Credits HW: %.0f   Rep best: %.1f",
+                              progression.creditsHighWaterCr,
+                              progression.repHighWater);
+        }
+        ImGui::End();
+      }
     }
 
     STELLAR_PROFILE_SCOPE("Present");

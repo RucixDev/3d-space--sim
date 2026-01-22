@@ -51,6 +51,35 @@ struct CommsOverlayState {
   double activeUntilSec{0.0};
 };
 
+
+
+// Optional: actionable "live" security demands (authority scans / bounty submission).
+// This bridges Comms messages back into the moment-to-moment gameplay without turning the
+// sim::Comms layer into a quest scripting system.
+struct SecurityDemandUi {
+  enum class Kind : core::u8 { None = 0, BribeOffer, BountyDemand };
+  Kind kind{Kind::None};
+
+  core::u32 factionId{0};
+  std::string authorityName;
+  std::string detail;
+
+  // Kind::BribeOffer
+  double bribeCr{0.0};
+  double fineCr{0.0};
+
+  // Kind::BountyDemand
+  double bountyCr{0.0};
+
+  // Timing (seconds)
+  double secondsLeft{0.0};
+  double secondsTotal{0.0};
+
+  // Capability flags for UI disable/tooltip.
+  bool canPay{false};
+  bool actionAllowed{true};
+};
+
 struct CommsWindowContext {
   sim::Universe* universe{nullptr};
   const sim::StarSystem* currentSystem{nullptr};
@@ -71,6 +100,16 @@ struct CommsWindowContext {
   // These hooks let the Comms UI bridge into the mission tracker and nav/autopilot.
   std::function<void(core::u64 missionId)> trackMission;
   std::function<void(core::u64 missionId, bool armAutoRun)> syncNavToMission;
+
+  // Optional: make Security transmissions actionable (pay bribe / comply / submit bounty).
+  // When provided, the Comms UI can surface live response buttons on the selected message.
+  std::function<SecurityDemandUi(const sim::CommsMessage& selected)> querySecurityDemand;
+  std::function<void()> actSecurityBribe;
+  std::function<void()> actSecurityComplyOrSubmit;
+
+  // Hotkey display strings (e.g. "C", "I"). Purely cosmetic.
+  std::string securityBribeChord;
+  std::string securityComplyChord;
 };
 
 void enqueueCommsOverlay(CommsOverlayState& ov, core::u64 messageId);

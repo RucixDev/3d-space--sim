@@ -8,6 +8,8 @@
 #include "stellar/proc/NameGenerator.h"
 #include "stellar/proc/SystemGenerator.h"
 #include "stellar/econ/Economy.h"
+#include "stellar/sim/SystemConditions.h"
+
 
 #include <algorithm>
 #include <cmath>
@@ -94,6 +96,27 @@ void Universe::resetCacheStats() {
   sectorCache_.resetStats();
   systemCache_.resetStats();
   stationEconomyCache_.resetStats();
+}
+
+
+void Universe::setSystemSecurityDeltaMap(const std::unordered_map<SystemId, SystemSecurityDeltaState>* deltas) {
+  systemSecurityDeltaMap_ = deltas;
+}
+
+void Universe::setSystemSecurityDynamicsParams(const SystemSecurityDynamicsParams& params) {
+  systemSecurityDynParams_ = params;
+}
+
+void Universe::setSystemEventParams(const SystemEventParams& params) {
+  systemEventParams_ = params;
+}
+
+void Universe::setSystemEventEconomyParams(const SystemEventEconomyParams& params) {
+  systemEventEconomyParams_ = params;
+}
+
+void Universe::setEnableSystemEventEconomy(bool enable) {
+  enableSystemEventEconomy_ = enable;
 }
 
 
@@ -501,8 +524,60 @@ econ::StationEconomyState& Universe::stationEconomy(const Station& station, doub
     st = &stationEconomyCache_.put(station.id, std::move(init));
   }
 
-  core::SplitMix64 rng(core::hashCombine(seed_, static_cast<core::u64>(station.id)));
-  econ::updateEconomyTo(*st, station.economyModel, timeDays, rng);
+  // Fast path: no event-economy layering.
+  if (!enableSystemEventEconomy_ || station.systemId == 0 || systemEventParams_.cycleDays <= 1e-9) {
+    core::SplitMix64 rng(core::hashCombine(seed_, static_cast<core::u64>(station.id)));
+    econ::updateEconomyTo(*st, station.economyModel, timeDays, rng);
+    return *st;
+  }
+
+  // Layer system-security-driven events into station economies as additional per-day
+  // inventory pressure without mutating the StationEconomyModel.
+  const StarSystem& sys = getSystem(station.systemId);
+
+  const SystemSecurityDeltaState* delta = nullptr;
+  if (systemSecurityDeltaMap_) {
+    auto it = systemSecurityDeltaMap_->find(station.systemId);
+    if (it != systemSecurityDeltaMap_->end()) {
+      delta = &it->second;
+    }
+  }
+
+  const double cycleDays = std::max(0.25, systemEventParams_.cycleDays);
+
+  while (st->lastUpdateDay + 1e-9 < timeDays) {
+    const double t0 = st->lastUpdateDay;
+
+    // Advance to the end of the current event cycle (or to timeDays).
+    const double cycleStart = std::floor(t0 / cycleDays) * cycleDays;
+    const double cycleEnd = cycleStart + cycleDays;
+    const double t1 = std::min(timeDays, cycleEnd);
+
+    // Snapshot conditions at the mid-point (event is constant within a cycle).
+    const double tMid = 0.5 * (t0 + t1);
+    const SystemConditionsSnapshot snap = snapshotSystemConditions(
+      seed_, sys, tMid, delta, systemSecurityDynParams_, systemEventParams_);
+
+    const SystemEvent& ev = snap.event;
+
+    // Apply any one-time economy shock at the start of an event.
+    if (ev.active && std::abs(t0 - ev.startDay) < 1e-6) {
+      applySystemEventInventoryShock(*st, station.economyModel, ev, systemEventEconomyParams_);
+    }
+
+    const std::array<double, econ::kCommodityCount> extraNet =
+      systemEventExtraNetPerDay(station.economyModel, ev, systemEventEconomyParams_);
+
+    core::SplitMix64 rng(core::hashCombine(seed_, static_cast<core::u64>(station.id)));
+    econ::updateEconomyToWithExtraNet(*st, station.economyModel, t1, rng, &extraNet);
+
+    // Paranoia: ensure forward progress even with extreme floating-point edge cases.
+    if (st->lastUpdateDay <= t0 + 1e-12) {
+      st->lastUpdateDay = t1;
+      break;
+    }
+  }
+
   return *st;
 }
 

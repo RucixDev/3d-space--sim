@@ -52,7 +52,7 @@ static const char* sortKeyName(SystemConditionsWindowState::SortKey k) {
 void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemConditionsWindowContext& ctx) {
   if (!st.open) return;
 
-  if (!ImGui::Begin("System Conditions", &st.open)) {
+  if (!ImGui::Begin("GalNet", &st.open)) {
     ImGui::End();
     return;
   }
@@ -101,6 +101,54 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
   }
   ImGui::Text("Effective: security %.2f  piracy %.2f  traffic %.2f",
               snap.effective.security01, snap.effective.piracy01, snap.effective.traffic01);
+
+  ImGui::Separator();
+
+  // --- GalNet bulletins ---
+  if (ImGui::CollapsingHeader("GalNet bulletins", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ctx.postGalNetBulletin) {
+      ImGui::TextDisabled("Manual bulletin");
+      if (snap.event.active) {
+        if (ImGui::Button("Post bulletin for current system")) {
+          ctx.postGalNetBulletin(ctx.currentSystem->stub.id, /*showOverlay=*/true, /*showToast=*/true);
+        }
+      } else {
+        ImGui::TextDisabled("No active event in the current system.");
+      }
+    } else {
+      ImGui::TextDisabled("Bulletin publishing is unavailable in this build context.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Auto-broadcast");
+    ImGui::Checkbox("Auto-broadcast local system events", &st.galNetAutoBroadcastLocal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Overlay##galnet_local_overlay", &st.galNetLocalShowOverlay);
+    ImGui::SameLine();
+    ImGui::Checkbox("Toast##galnet_local_toast", &st.galNetLocalShowToast);
+
+    ImGui::Checkbox("Auto-broadcast watched systems", &st.galNetAutoBroadcastWatched);
+    ImGui::SameLine();
+    ImGui::Checkbox("Overlay##galnet_watch_overlay", &st.galNetWatchedShowOverlay);
+    ImGui::SameLine();
+    ImGui::Checkbox("Toast##galnet_watch_toast", &st.galNetWatchedShowToast);
+
+    ImGui::Checkbox("Broadcast event ends", &st.galNetBroadcastEventEnds);
+
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SliderFloat("Min severity (auto)", &st.galNetMinSeverity, 0.0f, 1.0f, "%.2f");
+
+    if (ctx.watchSystems) {
+      ImGui::Text("Watchlist: %d systems", (int)ctx.watchSystems->size());
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Clear watchlist")) {
+        ctx.watchSystems->clear();
+        if (ctx.toast) ctx.toast("Cleared watchlist.", 1.6);
+      }
+    } else {
+      ImGui::TextDisabled("Watchlist: unavailable");
+    }
+  }
 
   ImGui::Separator();
 
@@ -217,7 +265,7 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
       ImGuiTableFlags_ScrollY |
       ImGuiTableFlags_Resizable;
 
-  if (ImGui::BeginTable("##sys_conditions", 10, flags, ImVec2(0.0f, 360.0f))) {
+  if (ImGui::BeginTable("##sys_conditions", 12, flags, ImVec2(0.0f, 360.0f))) {
     ImGui::TableSetupColumn("System", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("Dist", ImGuiTableColumnFlags_WidthFixed, 55.0f);
     ImGui::TableSetupColumn("Faction", ImGuiTableColumnFlags_WidthStretch);
@@ -226,6 +274,8 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
     ImGui::TableSetupColumn("Sec", ImGuiTableColumnFlags_WidthFixed, 45.0f);
     ImGui::TableSetupColumn("Pir", ImGuiTableColumnFlags_WidthFixed, 45.0f);
     ImGui::TableSetupColumn("Trf", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+    ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+    ImGui::TableSetupColumn("Bulletin", ImGuiTableColumnFlags_WidthFixed, 62.0f);
     ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthFixed, 44.0f);
     ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, 55.0f);
     ImGui::TableHeadersRow();
@@ -278,6 +328,54 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
 
       ImGui::TableSetColumnIndex(8);
       {
+        if (!ctx.watchSystems) {
+          ImGui::TextDisabled("—");
+        } else {
+          auto& watch = *ctx.watchSystems;
+          const bool watched = std::binary_search(watch.begin(), watch.end(), r.id);
+          bool v = watched;
+          const std::string label = "##watch_" + std::to_string((unsigned long long)r.id);
+          if (ImGui::Checkbox(label.c_str(), &v)) {
+            if (v) {
+              // Add.
+              if (watch.size() >= 64) {
+                if (ctx.toast) ctx.toast("Watchlist is full (max 64).", 2.0);
+              } else {
+                watch.push_back(r.id);
+                std::sort(watch.begin(), watch.end());
+                watch.erase(std::unique(watch.begin(), watch.end()), watch.end());
+                if (ctx.toast) ctx.toast(std::string("Watching ") + sys.stub.name + ".", 1.4);
+                // If the system is currently experiencing an event, drop an immediate bulletin so
+                // the player gets the full context right away.
+                if (ctx.postGalNetBulletin && r.event.active) {
+                  ctx.postGalNetBulletin(r.id, /*showOverlay=*/false, /*showToast=*/false);
+                }
+              }
+            } else {
+              // Remove.
+              watch.erase(std::remove(watch.begin(), watch.end(), r.id), watch.end());
+              if (ctx.toast) ctx.toast(std::string("Unwatched ") + sys.stub.name + ".", 1.4);
+            }
+          }
+          if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Watch system for GalNet bulletins.");
+          }
+        }
+      }
+
+      ImGui::TableSetColumnIndex(9);
+      {
+        const bool enabled = (bool)ctx.postGalNetBulletin && r.event.active;
+        if (!enabled) ImGui::BeginDisabled();
+        const std::string label = "Post##" + std::to_string((unsigned long long)r.id);
+        if (ImGui::SmallButton(label.c_str())) {
+          if (ctx.postGalNetBulletin) ctx.postGalNetBulletin(r.id, /*showOverlay=*/true, /*showToast=*/true);
+        }
+        if (!enabled) ImGui::EndDisabled();
+      }
+
+      ImGui::TableSetColumnIndex(10);
+      {
         const bool enabled = (bool)ctx.plotRouteToSystem;
         if (!enabled) ImGui::BeginDisabled();
         const std::string label = "Plot##" + std::to_string((unsigned long long)r.id);
@@ -288,7 +386,7 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
         if (!enabled) ImGui::EndDisabled();
       }
 
-      ImGui::TableSetColumnIndex(9);
+      ImGui::TableSetColumnIndex(11);
       {
         const bool enabled = (bool)ctx.targetSystem;
         if (!enabled) ImGui::BeginDisabled();
