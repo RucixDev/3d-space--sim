@@ -99,6 +99,7 @@ struct ActionBinds {
   KeyChord fsdJump;
   KeyChord scannerAction;
   KeyChord sensorPing;
+  KeyChord toggleSilentRunning;
 
   KeyChord requestDockingClearance;
   KeyChord dockOrUndock;
@@ -312,6 +313,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.fsdJump = {SDL_SCANCODE_J, KMOD_NONE};
   c.actions.scannerAction = {SDL_SCANCODE_K, KMOD_NONE};
   c.actions.sensorPing = {SDL_SCANCODE_O, KMOD_CTRL};
+  c.actions.toggleSilentRunning = {SDL_SCANCODE_X, KMOD_CTRL};
 
   c.actions.requestDockingClearance = {SDL_SCANCODE_L, KMOD_NONE};
   c.actions.dockOrUndock = {SDL_SCANCODE_G, KMOD_NONE};
@@ -411,6 +413,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "FsdJump", a.fsdJump);
   saveKeyChord(f, "ScannerAction", a.scannerAction);
   saveKeyChord(f, "SensorPing", a.sensorPing);
+  saveKeyChord(f, "ToggleSilentRunning", a.toggleSilentRunning);
   saveKeyChord(f, "RequestClearance", a.requestDockingClearance);
   saveKeyChord(f, "DockOrUndock", a.dockOrUndock);
   saveKeyChord(f, "CycleTargets", a.cycleTargets);
@@ -484,6 +487,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("FsdJump", &a.fsdJump);
     addB("ScannerAction", &a.scannerAction);
     addB("SensorPing", &a.sensorPing);
+    addB("ToggleSilentRunning", &a.toggleSilentRunning);
     addB("RequestClearance", &a.requestDockingClearance);
     addB("DockOrUndock", &a.dockOrUndock);
     addB("CycleTargets", &a.cycleTargets);

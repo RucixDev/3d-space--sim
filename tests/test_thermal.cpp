@@ -107,5 +107,44 @@ int test_thermal() {
     }
   }
 
+  // Silent running: adds baseline heat and reduces cooling.
+  {
+    ThermalInputs in{};
+    in.dtReal = 1.0;
+    in.docked = false;
+    in.silentRunning = true;
+    in.heatCoolRate = 10.0;
+
+    ThermalParams p{};
+    p.baseCoolUndocked = 10.0;
+    p.referenceCoolRate = 10.0;
+    p.silentCoolMult = 0.25;
+    p.heatPerSilentSec = 5.0;
+
+    // Disable other continuous heating sources for this test.
+    p.heatPerBoostSec = 0.0;
+    p.heatPerSupercruiseSec = 0.0;
+    p.heatPerFsdChargeSec = 0.0;
+    p.heatPerFsdJumpSec = 0.0;
+
+    const auto r = stepThermal(/*heat*/50.0, in, p);
+    const double expected = 50.0 + (5.0 - (10.0 * 0.25)) * 1.0;
+    if (!nearly(r.heat, expected)) {
+      std::cerr << "[test_thermal] silent running mismatch. got=" << r.heat
+                << " expected=" << expected << "\n";
+      ++fails;
+    }
+    if (!nearly(r.heatInRate, 5.0)) {
+      std::cerr << "[test_thermal] silent running heatInRate mismatch. got=" << r.heatInRate
+                << " expected=5.0\n";
+      ++fails;
+    }
+    if (!nearly(r.coolRate, 2.5)) {
+      std::cerr << "[test_thermal] silent running coolRate mismatch. got=" << r.coolRate
+                << " expected=2.5\n";
+      ++fails;
+    }
+  }
+
   return fails;
 }

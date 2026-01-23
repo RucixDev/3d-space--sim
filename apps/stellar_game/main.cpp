@@ -75,10 +75,12 @@
 #include "stellar/sim/MissionBriefing.h"
 #include "stellar/sim/Mission.h"
 #include "stellar/sim/Contraband.h"
+#include "stellar/sim/BlackMarket.h"
 #include "stellar/sim/CargoJettisonPlanner.h"
 #include "stellar/sim/Law.h"
 #include "stellar/sim/PoliceScan.h"
 #include "stellar/sim/LawLedger.h"
+#include "stellar/sim/StationSecurity.h"
 #include "stellar/sim/NpcCombatAI.h"
 #include "stellar/sim/Extortion.h"
 #include "stellar/sim/Distress.h"
@@ -90,13 +92,18 @@
 #include "stellar/sim/Warehouse.h"
 #include "stellar/sim/IndustryService.h"
 #include "stellar/sim/ShipyardService.h"
+#include "stellar/sim/StationServices.h"
+#include "stellar/sim/ShipScan.h"
 #include "stellar/sim/TradeScanner.h"
 #include "stellar/sim/TradeLoopScanner.h"
 #include "stellar/sim/Ship.h"
 #include "stellar/sim/ShipLoadout.h"
+#include "stellar/sim/CountermeasureLoadout.h"
 #include "stellar/sim/Combat.h"
 #include "stellar/sim/Countermeasures.h"
 #include "stellar/sim/MissileDefense.h"
+#include "stellar/sim/SensorModel.h"
+#include "stellar/sim/ElectronicWarfare.h"
 #include "stellar/sim/Ballistics.h"
 #include "stellar/sim/PowerDistributor.h"
 #include "stellar/sim/FlightController.h"
@@ -214,6 +221,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -738,6 +746,18 @@ static const char* contactRoleName(ContactRole r) {
   }
 }
 
+static const char* scanThreatBandName(double threat01) {
+  const double t = std::clamp(threat01, 0.0, 1.0);
+  if (t < 0.25) return "Low";
+  if (t < 0.55) return "Medium";
+  if (t < 0.80) return "High";
+  return "Extreme";
+}
+
+static int pct01(double v01) {
+  return (int)std::llround(std::clamp(v01, 0.0, 1.0) * 100.0);
+}
+
 struct Contact {
   core::u64 id{0};
   std::string name;
@@ -852,6 +872,14 @@ struct Contact {
   // so interdictions can happen even though the full combat sim is paused.
   bool supercruiseShadow{false};
   math::Vec3d shadowOffsetLocalKm{0,0,0};
+  // --- Electronic warfare (radar jamming) ---
+  // Normalized jammer power term (0 = none). Higher values suppress the
+  // player's sensor power and generate radar "ghost" noise blips.
+  double jammerPower{0.0};
+
+
+  // --- Sensors (player radar detection model) ---
+  sim::SensorTrack sensorTrack{};
 
   double fireCooldown{0.0}; // simulated seconds
   bool alive{true};
@@ -2670,37 +2698,16 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
 
   // Player countermeasures are modeled as a small number of "bursts".
   // (A single burst spawns several decoys but consumes 1 ammo.)
-  struct CountermeasureCaps {
-    int flares{0};
-    int chaff{0};
-    int heatSinks{0};
-  };
-
-  auto countermeasureCapsForHull = [&](ShipHullClass h) -> CountermeasureCaps {
-    switch (h) {
-      case ShipHullClass::Scout:   return {6, 4, 1};
-      case ShipHullClass::Hauler:  return {8, 6, 2};
-      case ShipHullClass::Fighter: return {10, 8, 2};
-    }
-    return {6, 4, 1};
-  };
-
-  int cmFlares = countermeasureCapsForHull(shipHullClass).flares;
-  int cmChaff = countermeasureCapsForHull(shipHullClass).chaff;
-  int cmHeatSinks = countermeasureCapsForHull(shipHullClass).heatSinks;
+  int cmFlares = sim::countermeasureCapsForHull(shipHullClass).flares;
+  int cmChaff = sim::countermeasureCapsForHull(shipHullClass).chaff;
+  int cmHeatSinks = sim::countermeasureCapsForHull(shipHullClass).heatSinks;
 
   auto clampCountermeasureAmmo = [&]() {
-    const auto cap = countermeasureCapsForHull(shipHullClass);
-    cmFlares = std::clamp(cmFlares, 0, cap.flares);
-    cmChaff = std::clamp(cmChaff, 0, cap.chaff);
-    cmHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
+    sim::clampCountermeasureAmmo(cmFlares, cmChaff, cmHeatSinks, shipHullClass);
   };
 
   auto restockCountermeasureAmmo = [&]() {
-    const auto cap = countermeasureCapsForHull(shipHullClass);
-    cmFlares = cap.flares;
-    cmChaff = cap.chaff;
-    cmHeatSinks = cap.heatSinks;
+    sim::restockCountermeasureAmmo(cmFlares, cmChaff, cmHeatSinks, shipHullClass);
   };
 
   auto normalizeWeaponAmmo = [&](core::u8& ammo, WeaponType wt, ShipHullClass hullClass) {
@@ -2819,6 +2826,10 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   // Per-frame accumulator for instantaneous heat spikes (weapons, emergency drops, etc).
   // This is consumed by the ThermalSystem step.
   double heatImpulse = 0.0;
+
+  // Silent running: closes radiators to reduce sensor signature.
+  // Tradeoff: shields forced offline and cooling is greatly reduced.
+  bool silentRunning = false;
 
   // Missions + reputation
   core::u64 nextMissionId = 1;
@@ -3519,6 +3530,15 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   sim::StationId dockedStationId = 0;
   std::unordered_map<sim::StationId, ClearanceState> clearances;
 
+  // Station security / traffic control state (per station).
+  //
+  // Tracks warnings/fines/bounties for:
+  //  - no-fire zone weapon discharge
+  //  - speeding in the approach envelope
+  //  - mail-slot trespass without clearance
+  sim::StationSecurityParams stationSecurityParams{};
+  std::unordered_map<sim::StationId, sim::StationSecurityState> stationSecurity;
+
   // Contacts (pirates etc.)
   std::vector<Contact> contacts;
 
@@ -3763,7 +3783,8 @@ enum class StationMenuPage {
   Shipyard = 3,
   Warehouse = 4,
   Services = 5,
-  ConfirmUndock = 6,
+  BlackMarket = 6,
+  ConfirmUndock = 7,
 };
 
 bool showStationMenu = false;
@@ -3791,6 +3812,26 @@ bool focusMissionsWindow = false;
   bool showShipHud = true;
   double radarRangeKm = 220000.0;
   int radarMaxBlips = 72;
+
+  // Sensor model (HUD radar): detection strength + identification hysteresis.
+  sim::SensorParams sensorParams{};
+  sim::SensorTrackParams sensorTrackParams{};
+
+  // Active sensor ping (Ctrl+O by default): brief range/sensitivity boost + sweep ring on radar.
+  double sensorPingStartRealSec = -1e9;
+  double sensorPingActiveUntilRealSec = -1e9;
+  double sensorPingCooldownUntilRealSec = 0.0;
+  double sensorPingDurationSec = 1.25;
+  double sensorPingCooldownSec = 6.0;
+  double sensorPingPowerBoost = 2.5;
+
+  // Electronic warfare (HUD radar): nearby jammers can suppress sensor power and
+  // generate false returns (ghost blips).
+  bool radarEnableEw = true;
+  bool radarShowEwGhosts = true;
+  sim::EwJammerParams ewJammerParams{};
+  sim::EwGhostParams ewGhostParams{};
+
 
   // Ship HUD: procedural instrument cluster (seeded layout + simple telemetry).
   int shipHudDetailLevel = 2; // 0=minimal .. 3=max
@@ -4291,6 +4332,14 @@ bool focusMissionsWindow = false;
   double scanProgressSec = 0.0;
   double scanDurationSec = 4.0;
   double scanRangeKm = 80000.0;
+
+  // Scan intel cache (in-session).
+  struct ContactScanIntel {
+    double timeDays{0.0};
+    double identifiedUntilDays{0.0};
+    sim::ShipScanReport report{};
+  };
+  std::unordered_map<core::u64, ContactScanIntel> contactScanIntelById;
 
   // Target
   Target target{};
@@ -5506,20 +5555,16 @@ auto lawForFaction = [&](core::u32 factionId) -> sim::LawProfile {
   return prof;
 };
 
-// Apply confiscation + fine + reputation/bounty/alert effects when contraband is enforced.
-// `scannedIllegal` is what security saw during the scan (used for messaging + smuggle mission attribution).
-auto enforceContraband = [&](core::u32 jurisdiction,
-                             const std::string& sourceName,
-                             double illegalValueCr,
-                             const std::string& detail,
-                             const std::array<double, econ::kCommodityCount>& scannedIllegal) {
+// Apply the reputation / fines / alert side-effects of a contraband enforcement event.
+// This is separated from the confiscation math so other systems (eg black market stings)
+// can reuse the same consequences without double-applying confiscation.
+auto applyContrabandEnforcementSideEffects = [&](core::u32 jurisdiction,
+                                                const sim::LawProfile& law,
+                                                const sim::ContrabandEnforcementResult& res,
+                                                const std::string& sourceName,
+                                                const std::string& detail,
+                                                const std::array<double, econ::kCommodityCount>& scannedIllegal) {
   if (jurisdiction == 0) return;
-
-  const sim::LawProfile law = lawForFaction(jurisdiction);
-
-  const auto res = sim::enforceContraband(law, credits, cargo, scannedIllegal, illegalValueCr);
-  credits = res.creditsAfter;
-  cargo = res.cargoAfter;
 
   // Rep / fines
   addRep(jurisdiction, res.repPenalty);
@@ -5542,9 +5587,15 @@ auto enforceContraband = [&](core::u32 jurisdiction,
   // Raise local security alert (affects patrol spawn rate / response).
   policeHeat = std::clamp(policeHeat + res.policeHeatDelta, 0.0, 6.0);
 
-  std::string msg = "Contraband detected! Confiscated: "
-                    + (detail.empty() ? std::string("illegal cargo") : detail)
-                    + ". Fine: " + std::to_string((int)std::round(res.fineCr)) + " cr";
+  std::string msg;
+  if (!sourceName.empty()) {
+    msg += sourceName;
+    msg += ": ";
+  }
+
+  msg += "Contraband detected! Confiscated: "
+         + (detail.empty() ? std::string("illegal cargo") : detail)
+         + ". Fine: " + std::to_string((int)std::round(res.fineCr)) + " cr";
 
   if (res.unpaidCr > 1e-6) {
     msg += " (unpaid: " + std::to_string((int)std::round(res.unpaidCr))
@@ -5572,6 +5623,49 @@ auto enforceContraband = [&](core::u32 jurisdiction,
   if (failedSmuggle > 0) {
     toast(toasts, "Smuggle mission failed: contraband confiscated.", 3.2);
   }
+};
+
+// Apply confiscation + fine + reputation/bounty/alert effects when contraband is enforced.
+// `scannedIllegal` is what security saw during the scan (used for messaging + smuggle mission attribution).
+auto enforceContraband = [&](core::u32 jurisdiction,
+                             const std::string& sourceName,
+                             double illegalValueCr,
+                             const std::string& detail,
+                             const std::array<double, econ::kCommodityCount>& scannedIllegal) {
+  if (jurisdiction == 0) return;
+
+  const sim::LawProfile law = lawForFaction(jurisdiction);
+
+  const auto res = sim::enforceContraband(law, credits, cargo, scannedIllegal, illegalValueCr);
+  credits = res.creditsAfter;
+  cargo = res.cargoAfter;
+
+  applyContrabandEnforcementSideEffects(jurisdiction, law, res, sourceName, detail, scannedIllegal);
+};
+
+// Soft consequences for successful black market deals (even when not stung).
+// This keeps contraband trading from being pure upside while still letting "good fences" feel worthwhile.
+auto applyBlackMarketDealSideEffects = [&](core::u32 jurisdiction,
+                                           const sim::BlackMarketProfile& bm,
+                                           double dealValueCr,
+                                           double units) {
+  if (jurisdiction == 0) return;
+
+  const double risk = std::clamp(bm.risk01, 0.0, 1.0);
+
+  // Heat rises with risk and deal size, but is bounded.
+  const double heatDelta = std::clamp(0.05 + 0.25 * risk
+                                        + std::min(0.65, dealValueCr / 25000.0)
+                                        + std::min(0.25, units * 0.003),
+                                      0.02,
+                                      1.15);
+  policeHeat = std::clamp(policeHeat + heatDelta, 0.0, 6.0);
+
+  // Small rep bleed; harsher in high-risk jurisdictions.
+  const double repPenalty = -std::clamp(0.05 + 0.35 * risk + std::min(1.35, dealValueCr / 85000.0),
+                                       0.05,
+                                       2.0);
+  addRep(jurisdiction, repPenalty);
 };
 
 // Scan/discovery keys (player-local)
@@ -6295,6 +6389,10 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     }
 
     // Consume fuel on charge complete (so you can still cancel cleanly).
+    if (silentRunning) {
+      silentRunning = false;
+      toast(toasts, "Silent running disengaged for FSD jump.", 1.8);
+    }
     fsdTargetSystem = destId;
     fsdJumpDistanceLy = distLy;
     fsdFuelCost = fuelCost;
@@ -8515,7 +8613,7 @@ progression.unlockWeapon(weaponSecondary);
         st.active = true;
 
         const double dt = std::clamp(dtReal, 0.0, 0.25);
-        const double lockTimeSec = 1.25;
+        const double lockTimeBaseSec = 1.25;
         const double decayTimeSec = 0.75;
         const double lockConeCos = 0.995; // tight forward cone
         const double lockRangeKm = wd.rangeKm;
@@ -8558,6 +8656,30 @@ progression.unlockWeapon(weaponSecondary);
             st.targetIndex = candIdx;
             st.progress = 0.0;
           }
+          // Lock time scales with target "signature": bigger / faster / actively firing targets lock faster.
+          // Your own sensor emissions also matter: ping helps, silent running hurts.
+          double lockTimeSec = lockTimeBaseSec;
+          {
+            const auto& c = contacts[candIdx];
+            double hullSig = 1.0;
+            if (c.shipHullClass == ShipHullClass::Scout) hullSig = 0.92;
+            else if (c.shipHullClass == ShipHullClass::Fighter) hullSig = 1.05;
+            else if (c.shipHullClass == ShipHullClass::Hauler) hullSig = 1.20;
+
+            const double spd01 = std::clamp(c.ship.velocityKmS().length() / 220.0, 0.0, 1.0);
+            const double speedFactor = 0.65 + 0.55 * spd01;
+            const double fireFactor = (c.fireCooldown > 0.0) ? 1.25 : 1.0;
+
+            double sig = hullSig * speedFactor * fireFactor;
+            sig = std::clamp(sig, 0.35, 2.25);
+
+            lockTimeSec /= sig;
+
+            const bool pingActiveNow = (timeRealSec < sensorPingActiveUntilRealSec);
+            if (pingActiveNow) lockTimeSec *= 0.78;
+            if (silentRunning) lockTimeSec *= 1.30;
+          }
+
           st.progress = std::min(1.0, st.progress + dt / lockTimeSec);
         } else {
           st.progress = std::max(0.0, st.progress - dt / decayTimeSec);
@@ -8690,6 +8812,8 @@ progression.unlockWeapon(weaponSecondary);
     };
 
     // Events
+    bool playerFiredWeaponThisFrame = false;
+
     SDL_Event event;
     {
       STELLAR_PROFILE_SCOPE("InputEvents");
@@ -8884,6 +9008,55 @@ progression.unlockWeapon(weaponSecondary);
                 std::string("Tactical overlay ") + (showTacticalOverlay ? "ON" : "OFF") + " (" +
                   game::chordLabel(controls.actions.toggleTacticalOverlay) + ")",
                 1.6);
+        }
+
+        if (key(controls.actions.sensorPing) && !io.WantCaptureKeyboard) {
+          if (docked) {
+            toast(toasts, "Sensor ping unavailable while docked.", 1.6);
+          } else if (timeRealSec >= sensorPingCooldownUntilRealSec) {
+            sensorPingStartRealSec = timeRealSec;
+            sensorPingActiveUntilRealSec = timeRealSec + sensorPingDurationSec;
+            sensorPingCooldownUntilRealSec = timeRealSec + sensorPingCooldownSec;
+
+            toast(toasts,
+                  std::string("Sensor ping emitted (") + game::chordLabel(controls.actions.sensorPing) + ")",
+                  1.6);
+
+            game::hubPushEvent(
+              integrationHubWindow,
+              game::GameEvent{timeRealSec,
+                             timeDays,
+                             game::GameEventKind::Gameplay,
+                             "SensorPing",
+                             "Ping emitted",
+                             true,
+                             ship.positionKm()});
+          } else {
+            toast(toasts, "Sensor ping cooling down.", 1.4);
+          }
+        }
+
+        if (key(controls.actions.toggleSilentRunning) && !io.WantCaptureKeyboard) {
+          if (docked) {
+            toast(toasts, "Silent running unavailable while docked.", 1.8);
+          } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+            toast(toasts, "Silent running unavailable in supercruise / hyperspace.", 2.0);
+          } else {
+            silentRunning = !silentRunning;
+            if (silentRunning) {
+              // Force shields offline immediately (risk vs reward).
+              playerShield = 0.0;
+              toast(toasts,
+                    std::string("SILENT RUNNING engaged (shields offline) [") +
+                      game::chordLabel(controls.actions.toggleSilentRunning) + "]",
+                    2.2);
+            } else {
+              toast(toasts,
+                    std::string("Silent running disengaged [") +
+                      game::chordLabel(controls.actions.toggleSilentRunning) + "]",
+                    1.8);
+            }
+          }
         }
 
         if (key(controls.actions.pause) && !io.WantCaptureKeyboard) paused = !paused;
@@ -10084,6 +10257,7 @@ progression.unlockWeapon(weaponSecondary);
             );
 
             if (fr.fired) {
+              playerFiredWeaponThisFrame = true;
               distributorState.wep = std::max(0.0, distributorState.wep - capCost);
               // NOTE: cooldown is in *sim* seconds, so it naturally scales with timeScale.
               cd = fr.newCooldownSimSec;
@@ -10155,6 +10329,8 @@ progression.unlockWeapon(weaponSecondary);
                       mh.baseUnits = a.baseUnits;
                       mh.remainingUnits = a.remainingUnits;
                       mh.fractureAlreadyTriggered = a.fractureTriggered;
+                      // Seam-aware yield: direction from asteroid center to hit point (optional).
+                      mh.hitDirUnit = (fr.hitPointKm - a.posKm).normalized();
 
                       const auto r = sim::computeMiningHit(mh);
 
@@ -10821,6 +10997,12 @@ if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone |
 	                                   /*regenMul=*/0.84,
 	                                   /*accelMul=*/0.70,
 	                                   /*aiSkill=*/0.55);
+
+            // Some pirates run a jammer to make the approach feel tense.
+            if (rng.nextUnit() < 0.65) {
+              p.jammerPower = rng.range(1.0, 2.0);
+            }
+
 	            p.hostileToPlayer = true;
 	            p.supercruiseShadow = true;
 	            // Keep them behind you so they can pressure an interdiction.
@@ -12064,6 +12246,16 @@ auto spawnPiratePack = [&](int maxCount) -> int {
                             /*regenMul=*/leader ? 0.70 : 0.63,
                             /*accelMul=*/leader ? 0.72 : 0.70,
                             /*aiSkill=*/leader ? 0.68 : 0.55);
+
+    // A portion of pirate packs field low-grade jammers that interfere with your radar.
+    if (leader) {
+      if (rng.nextUnit() < 0.80) {
+        p.jammerPower = rng.range(1.2, 2.2);
+      }
+    } else if (rng.nextUnit() < 0.22) {
+      p.jammerPower = rng.range(0.5, 1.1);
+    }
+
 
     // Pirates like to keep weapons hot.
     p.pips = {1, 3, 2};
@@ -13757,7 +13949,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   // - If you are WANTED with the station's faction, the station will also chip at you near the no-fire zone.
   for (const auto& st : currentSystem->stations) {
     const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
-    const double zoneKm = st.radiusKm * 25.0;
+	    const double zoneKm = sim::stationNoFireZoneRadiusKm(st, stationSecurityParams);
     const double distShip = (ship.positionKm() - stPos).length();
 
     // Only if player is nearby.
@@ -13785,6 +13977,159 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        applyDamage(1.5 * dtSim, playerShield, playerHull);
 	      }
 	    }
+  }
+
+  // Station security / traffic control:
+  // - No-fire zone weapons discharge
+  // - Speeding within approach envelope
+  // - Mail-slot trespass without clearance
+  for (const auto& st : currentSystem->stations) {
+    if (st.factionId == 0) continue; // no jurisdiction
+
+    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+    const math::Vec3d stV = currentSystem->v0;
+    const math::Quatd stQ = stationOrient(st, stPos, timeDays);
+
+    bool hasClearance = false;
+    if (auto it = clearances.find(st.id); it != clearances.end()) {
+      hasClearance = sim::isClearanceValid(it->second, timeDays);
+    }
+
+    sim::StationSecurityState& sec = stationSecurity[st.id];
+    const sim::LawProfile law = lawForFaction(st.factionId);
+
+    const auto evOpt = sim::updateStationSecurity(
+      sec,
+      stationSecurityParams,
+      st,
+      law,
+      stPos,
+      stV,
+      stQ,
+      ship.positionKm(),
+      ship.velocityKmS(),
+      hasClearance,
+      docked,
+      playerFiredWeaponThisFrame,
+      timeDays,
+      dtSim
+    );
+
+    if (!evOpt.has_value()) continue;
+    const sim::StationOffenseEvent& ev = *evOpt;
+
+    // Helper: send a diegetic port-authority transmission.
+    const std::string sourceName = (st.name.empty() ? std::string("Port Authority") : (st.name + " Port Authority"));
+    auto portComms = [&](const std::string& subject, const std::string& body, bool showOverlay) {
+      sim::CommsMessage msg{};
+      msg.timeDays = timeDays;
+      msg.source = sourceName;
+      msg.channel = (core::i32)sim::CommsChannel::Security;
+      msg.subject = subject;
+      msg.body = body;
+      msg.stationId = st.id;
+      msg.factionId = st.factionId;
+      pushTransmission(std::move(msg), showOverlay);
+    };
+
+    auto revokeClearance = [&]() {
+      auto it = clearances.find(st.id);
+      if (it == clearances.end()) return;
+      auto& cs = it->second;
+      cs.assignedPad = 0;
+      cs.validUntilDays = -1e9;
+      cs.status = (core::u8)sim::DockingClearanceStatus::Denied;
+      cs.cooldownUntilDays = std::max(cs.cooldownUntilDays, timeDays + (120.0 / 86400.0));
+    };
+
+    auto offenseLabel = [&]() -> std::string {
+      switch (ev.kind) {
+        case sim::StationOffenseKind::WeaponDischarge: return "No-Fire Zone";
+        case sim::StationOffenseKind::Speeding:        return "Speeding";
+        case sim::StationOffenseKind::Trespass:        return "Mail Slot Trespass";
+        default:                                      return "Station Violation";
+      }
+    };
+
+    if (ev.action == sim::StationOffenseAction::Warning) {
+      std::string body;
+      if (ev.kind == sim::StationOffenseKind::WeaponDischarge) {
+        body = "Cease fire immediately. Weapons discharge is prohibited within the station no-fire zone.";
+      } else if (ev.kind == sim::StationOffenseKind::Speeding) {
+        body = fmt::format(
+          "Reduce speed. Limit {:.2f} km/s (your speed {:.2f} km/s).",
+          ev.speedLimitKmS,
+          ev.measuredSpeedKmS
+        );
+      } else if (ev.kind == sim::StationOffenseKind::Trespass) {
+        body = "Docking clearance required. Leave the docking corridor immediately or you will be fined.";
+      } else {
+        body = "Station regulations violated. Comply immediately.";
+      }
+
+      portComms(offenseLabel(), body, /*showOverlay=*/true);
+      toast(toasts, sourceName + ": " + offenseLabel(), 2.8);
+
+      game::hubPushEvent(
+        integrationHubWindow,
+        game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay, "StationSecurityWarning", offenseLabel(), true, ship.positionKm(), (core::u64)st.id, 0}
+      );
+    } else if (ev.action == sim::StationOffenseAction::Fine) {
+      // Outstanding fines (minor offenses) rather than an immediate bounty.
+      addRep(st.factionId, ev.repPenalty);
+
+      const double graceDays = std::clamp(
+        2.0 + 1.1 * law.corruption - 1.3 * (law.scanStrictness - 1.0),
+        0.75,
+        4.0
+      );
+      addFine(st.factionId, ev.fineCr, timeDays + graceDays);
+
+      // Heightened attention for a short window.
+      policeHeat = std::clamp(policeHeat + 0.18, 0.0, 6.0);
+      policeAlertUntilDays = std::max(policeAlertUntilDays, timeDays + (45.0 / 86400.0));
+      encounterDirector.nextPoliceSpawnDays = std::min(encounterDirector.nextPoliceSpawnDays, timeDays + (12.0 / 86400.0));
+
+      std::string body = fmt::format(
+        "Fine issued for {}: {:.0f} cr (due in {}). Rep {:.0f}.",
+        offenseLabel(),
+        std::round(ev.fineCr),
+        fmtDueIn(getFineDueDay(st.factionId)),
+        std::round(ev.repPenalty)
+      );
+      portComms(offenseLabel() + " - Fine", body, /*showOverlay=*/true);
+      toast(toasts, sourceName + ": " + body, 4.0);
+
+      if (ev.kind == sim::StationOffenseKind::WeaponDischarge || ev.kind == sim::StationOffenseKind::Trespass) {
+        revokeClearance();
+      }
+
+      game::hubPushEvent(
+        integrationHubWindow,
+        game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay, "StationSecurityFine", body, true, ship.positionKm(), (core::u64)st.id, 0}
+      );
+    } else if (ev.action == sim::StationOffenseAction::Bounty) {
+      const std::string reason = offenseLabel();
+      commitCrime(st.factionId, ev.bountyCr, ev.repPenalty, reason, /*showToast=*/false);
+
+      std::string body = fmt::format(
+        "Bounty issued for repeated {}: {:.0f} cr. Rep {:.0f}.",
+        offenseLabel(),
+        std::round(ev.bountyCr),
+        std::round(ev.repPenalty)
+      );
+      portComms(offenseLabel() + " - Bounty", body, /*showOverlay=*/true);
+      toast(toasts, sourceName + ": " + body, 4.2);
+
+      if (ev.kind == sim::StationOffenseKind::WeaponDischarge || ev.kind == sim::StationOffenseKind::Trespass) {
+        revokeClearance();
+      }
+
+      game::hubPushEvent(
+        integrationHubWindow,
+        game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay, "StationSecurityBounty", body, true, ship.positionKm(), (core::u64)st.id, 0}
+      );
+    }
   }
 }
 
@@ -14207,7 +14552,28 @@ auto spawnPolicePack = [&](int maxCount) -> int {
             const bool contrabandPort = (nearStation ? hasIllegalCargoForStation(*nearest) : false);
             const bool contrabandAny = (contraband || contrabandPort);
 
-            const double ratePerSec = sim::cargoScanStartRatePerSec(contrabandAny, law, smuggleHoldMk);
+            double ratePerSec = sim::cargoScanStartRatePerSec(contrabandAny, law, smuggleHoldMk);
+
+            // Scan acquisition depends on how "loud" the ship is: heat, speed, hull class,
+            // and explicit sensor emissions (ping). Silent running can help you avoid
+            // getting a clean scan lock, but it will also drive your heat up over time.
+            const bool pingActiveNow = (timeRealSec < sensorPingActiveUntilRealSec);
+            const double spdKmS = ship.velocityKmS().length();
+            const double spd01 = std::clamp(spdKmS / 220.0, 0.0, 1.0);
+            const double heat01 = std::clamp(heat / 100.0, 0.0, 1.5);
+
+            double hullSig = 1.0;
+            if (shipHullClass == ShipHullClass::Scout) hullSig = 0.90;
+            else if (shipHullClass == ShipHullClass::Fighter) hullSig = 1.05;
+            else if (shipHullClass == ShipHullClass::Hauler) hullSig = 1.18;
+
+            const double speedFactor = 0.65 + 0.55 * spd01;
+            const double heatFactor = 0.65 + 0.85 * heat01;
+            double sig = hullSig * speedFactor * heatFactor;
+            if (pingActiveNow) sig *= 1.35;
+            if (silentRunning) sig *= 0.55;
+
+            ratePerSec *= std::clamp(sig, 0.25, 2.5);
             const double p = 1.0 - std::exp(-ratePerSec * dtReal);
 
             bool start = rng.nextUnit() < p;
@@ -14224,6 +14590,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
               // Duration depends on whether you're carrying contraband (for *this port*) and your smuggle hold grade.
               cargoScanDurationSec = sim::cargoScanDurationSecStation(contrabandPort, smuggleHoldMk);
+              if (silentRunning) cargoScanDurationSec *= 1.25;
 
               cargoScanRangeKm = nearest->commsRangeKm;
               toast(toasts, "Incoming cargo scan: " + nearest->name, 2.0);
@@ -14247,6 +14614,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                   cargoScanProgressSec = 0.0;
 
                   cargoScanDurationSec = sim::cargoScanDurationSecPolice(smuggleHoldMk);
+                  if (silentRunning) cargoScanDurationSec *= 1.25;
                   cargoScanRangeKm = scanRange;
 
                   toast(toasts, "Police cargo scan: " + c.name, 2.0);
@@ -14356,6 +14724,118 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              continue;
 	            }
 
+            // Build + store a scan report for general gameplay/UI (not just mission checklists).
+            {
+              sim::ShipScanInput in{};
+              in.targetId = c.id;
+              in.hullClass = (sim::ShipHullClass)c.hullClass;
+              in.thrusterMk = c.thrusterMk;
+              in.shieldMk = c.shieldMk;
+              in.distributorMk = c.distributorMk;
+              in.weapon = c.weapon;
+              in.hullFrac = c.hullFrac;
+              in.shieldFrac = c.shieldFrac;
+              in.aiSkill01 = c.aiSkill;
+              in.jammerPower = c.jammerPower;
+              in.cargoCommodity = c.tradeCommodity;
+              in.cargoUnits = c.tradeUnits;
+              in.cargoValueCr = c.cargoValueCr;
+              in.scanStrength01 = std::clamp(c.sensorTrack.strength01 + 0.15, 0.0, 1.0);
+
+              const sim::ShipScanReport rep = sim::computeShipScanReport(universe.seed(), in);
+
+              ContactScanIntel intel{};
+              intel.timeDays = timeDays;
+              // Scans grant a short "ID memory" so the contact stays named even if it slips back
+              // under the SensorModel identify threshold.
+              intel.identifiedUntilDays = timeDays + 0.25; // ~6 hours
+              intel.report = rep;
+              contactScanIntelById[c.id] = std::move(intel);
+
+              // Prune occasionally to avoid unbounded growth in long sessions.
+              if (contactScanIntelById.size() > 512) {
+                const double pruneBefore = timeDays - 8.0;
+                for (auto it = contactScanIntelById.begin(); it != contactScanIntelById.end();) {
+                  if (it->second.timeDays < pruneBefore && it->second.identifiedUntilDays < timeDays) {
+                    it = contactScanIntelById.erase(it);
+                  } else {
+                    ++it;
+                  }
+                }
+              }
+
+              // Scanning is an active identification action: mark this contact as identified now.
+              c.sensorTrack.identified = true;
+
+              // Post a detailed report to Comms (persistent via SaveGame).
+              if (currentSystem) {
+                sim::CommsMessage msg{};
+                msg.timeDays = timeDays;
+                msg.systemId = currentSystem->stub.id;
+                msg.channel = sim::CommsChannel::Custom;
+                msg.from = "Ship Scanner";
+                msg.subject = std::string("Scan report: ") + c.name;
+
+                std::string body;
+                body += "Quality: " + std::to_string(pct01(rep.quality01)) + "%\n";
+                body += std::string("Threat: ") + scanThreatBandName(rep.threat01) + " (" + std::to_string(pct01(rep.threat01)) + "%)\n";
+
+                body += rep.hullKnown
+                          ? (std::string("Hull: ") + sim::shipHullClassName(rep.hullClass) + "\n")
+                          : std::string("Hull: unknown\n");
+                body += rep.weaponKnown
+                          ? (std::string("Weapon: ") + sim::weaponDef(rep.weapon).name + "\n")
+                          : std::string("Weapon: unknown\n");
+
+                if (rep.healthKnown) {
+                  body += std::string("Condition: hull ") + std::to_string(pct01(rep.hullFrac)) +
+                          "% | shield " + std::to_string(pct01(rep.shieldFrac)) + "%\n";
+                }
+
+                if (rep.cargoDetected) {
+                  if (rep.cargoKnown) {
+                    const int est = (int)std::llround(rep.cargoValueEstCr);
+                    const int mn = (int)std::llround(rep.cargoValueMinCr);
+                    const int mx = (int)std::llround(rep.cargoValueMaxCr);
+
+                    body += "Cargo est: ~" + std::to_string(est) + " cr (" + std::to_string(mn) + ".." + std::to_string(mx) + ")\n";
+
+                    if (rep.cargoCommodityKnown) {
+                      body += std::string("Cargo: ") + econ::commodityDef(rep.cargoCommodity).name;
+                      if (rep.cargoUnitsKnown) {
+                        body += " ~" + std::to_string((int)std::llround(rep.cargoUnitsEst)) + "u";
+                      }
+                      body += "\n";
+                    }
+                  } else {
+                    body += "Cargo: detected (low confidence)\n";
+                  }
+                } else {
+                  body += "Cargo: none detected\n";
+                }
+
+                if (rep.jammerDetected) {
+                  body += std::string("EW: jammer detected (est ") + std::to_string(pct01(rep.jammerStrength01)) + "%)\n";
+                } else if (rep.jammerSuspected) {
+                  body += "EW: possible jamming\n";
+                }
+
+                if (c.role == ContactRole::Trader && currentSystem && c.tradeUnits > 0.0) {
+                  const std::string fromName = (c.homeStationIndex < currentSystem->stations.size())
+                                                 ? currentSystem->stations[c.homeStationIndex].name
+                                                 : std::string("Station");
+                  const std::string toName = (c.tradeDestStationIndex < currentSystem->stations.size())
+                                               ? currentSystem->stations[c.tradeDestStationIndex].name
+                                               : std::string("Station");
+                  body += std::string("Route: ") + fromName + " -> " + toName + "\n";
+                }
+
+                msg.body = std::move(body);
+                pushTransmission(std::move(msg), /*showOverlay=*/true);
+              }
+            }
+
+
             // Complete bounty-scan missions via the shared mission logic (keeps prototype + tests consistent).
             sim::SaveGame tmp{};
             tmp.credits = credits;
@@ -14454,7 +14934,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               }
 
               const std::string pfx = anyPriority ? std::string("PRIORITY ") : std::string();
-              toast(toasts, pfx + "Mission complete: bounty scan uploaded! +" + std::to_string((int)std::round(res.rewardCr)) + " cr", 3.0);
               game::hubPushEvent(integrationHubWindow,
                                  game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Gameplay,
                                                "MissionComplete",
@@ -14463,11 +14942,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                                true, ship.positionKm(), (core::u64)c.id,
                                                (core::u64)currentSystem->stub.id});
 
-              scanning = false;
-              scanProgressSec = 0.0;
-              scanLockedId = 0;
-              scanLabel.clear();
-              scanLockedTarget = Target{};
+              completeScan(pfx + "Mission complete: bounty scan uploaded! +" + std::to_string((int)std::round(res.rewardCr)) + " cr", 3.0);
             } else {
               // Trader scans reveal cargo + route, enabling piracy/protection gameplay loops.
               if (c.role == ContactRole::Trader && c.tradeUnits > 0.0 && currentSystem) {
@@ -14488,7 +14963,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                                fromName + " -> " + toName + "   est " + std::to_string(valueCr) + " cr",
                              3.2);
               } else {
-                completeScan("Scan complete.", 1.6);
+                completeScan("Scan report logged.", 1.8);
               }
             }
           }
@@ -14841,6 +15316,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              msg += " | remaining ~" + std::to_string(rem) + "/" + std::to_string(cap) + "u";
 	              msg += " | field ";
 	              msg += sim::resourceFieldKindName(fk);
+	              msg += " | seam poles marked";
 	              if (a.volatilePocket) msg += " | WARNING: volatile seams";
 	              toast(toasts, msg, 3.6);
 	            } else {
@@ -15524,6 +16000,12 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                                          1,
 	                                          1,
 	                                          1,
+
+	                  // Some ambush pirates carry a jammer to muddy radar returns.
+	                  if (rng.nextUnit() < 0.30) {
+	                    p.jammerPower = rng.range(0.7, 1.4);
+	                  }
+
 	                                          w,
 	                                          /*hullMul=*/0.95,
 	                                          /*shieldMul=*/0.67,
@@ -15601,11 +16083,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
       }
 
+      // Silent running is only valid in normal space while undocked.
+      if (silentRunning && (docked ||
+                            supercruiseState != SupercruiseState::Idle ||
+                            fsdState != FsdState::Idle)) {
+        silentRunning = false;
+        toast(toasts, "Silent running disengaged.", 1.4);
+      }
+
       // --- Heat model (real-time) ---
       {
         sim::ThermalInputs tin{};
         tin.dtReal = dtReal;
         tin.docked = docked;
+        tin.silentRunning = silentRunning;
         tin.supercruiseActive = (supercruiseState == SupercruiseState::Active);
         if (fsdState == FsdState::Charging) tin.fsd = sim::ThermalFsdState::Charging;
         else if (fsdState == FsdState::Jumping) tin.fsd = sim::ThermalFsdState::Jumping;
@@ -16424,8 +16915,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       weaponPrimaryCooldown = std::max(0.0, weaponPrimaryCooldown - dtSim);
       weaponSecondaryCooldown = std::max(0.0, weaponSecondaryCooldown - dtSim);
 
-      // Shield regen (slow)
-      if (!paused && playerHull > 0.0 && playerShield < playerShieldMax) {
+      // Shield regen (slow) + silent running shield suppression
+      if (silentRunning) {
+        // Silent running forces shields offline.
+        playerShield = 0.0;
+      } else if (!paused && playerHull > 0.0 && playerShield < playerShieldMax) {
         const double regenMul = sim::shieldRegenMultiplierFromPips(distributorPips.sys);
         const double desiredRegen = playerShieldRegenPerSimMin * regenMul * (dtSim / 60.0);
 
@@ -18101,6 +18595,41 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        rockInstances.push_back(inst);
 	      }
 	    }
+	    // Mining seam markers: when targeting a prospected asteroid, highlight its seam poles
+	    // so the player can "read" the seam bonus (see sim::miningSeamDir / computeMiningHit).
+	    if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+	      const auto& a = asteroids[target.index];
+	      if (a.remainingUnits > 1e-3) {
+	        const bool prospected = (scannedKeys.find(scanKeyAsteroid(a.id)) != scannedKeys.end());
+	        if (prospected) {
+	          sim::ResourceFieldKind fk = sim::ResourceFieldKind::OreBelt;
+	          auto itF = resourceFieldIndexById.find(a.fieldId);
+	          if (itF != resourceFieldIndexById.end() && itF->second < resourceFieldSites.size()) {
+	            fk = resourceFieldSites[itF->second].kind;
+	          }
+	    
+	          const math::Vec3d seamDir = sim::miningSeamDir(universe.seed(), a.id, fk);
+	          if (seamDir.lengthSq() > 1e-12) {
+	            const double poleDistKm = a.radiusKm * 1.06;
+	            const math::Vec3d p0 = a.posKm + seamDir * poleDistKm;
+	            const math::Vec3d p1 = a.posKm - seamDir * poleDistKm;
+	    
+	            const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
+	            const double mk = std::max(0.035, 0.085 * s);
+	            const float r = 0.20f, g = 1.00f, b = 0.35f;
+	            cubes.push_back(makeInst(toRenderPosU(p0),
+	                                     {mk, mk, mk},
+	                                     math::Quatd::identity(),
+	                                     r,g,b));
+	            cubes.push_back(makeInst(toRenderPosU(p1),
+	                                     {mk, mk, mk},
+	                                     math::Quatd::identity(),
+	                                     r,g,b));
+	          }
+	        }
+	      }
+	    }
+	    
 
 
 
@@ -21978,6 +22507,14 @@ if (showRadarHud && currentSystem) {
     const double maxKm = 1200000.0;
     ImGui::DragScalar("Range (km)", ImGuiDataType_Double, &radarRangeKm, 5000.0, &minKm, &maxKm, "%.0f");
     ImGui::SliderInt("Max blips", &radarMaxBlips, 16, 160);
+    ImGui::Separator();
+    ImGui::TextDisabled("Electronic Warfare");
+    ImGui::Checkbox("Enable jamming", &radarEnableEw);
+    ImGui::Checkbox("Show ghost returns", &radarShowEwGhosts);
+    if (radarEnableEw) {
+      ImGui::SliderInt("Ghost cap", &ewGhostParams.maxBlips, 0, 48);
+    }
+
     ImGui::EndPopup();
   }
 
@@ -21988,6 +22525,11 @@ if (showRadarHud && currentSystem) {
   const ImVec2 p1(p0.x + canvasSize.x, p0.y + canvasSize.y);
   const ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
 
+  const bool pingActive = (timeRealSec < sensorPingActiveUntilRealSec);
+  const double pingFrac = pingActive
+                          ? std::clamp((timeRealSec - sensorPingStartRealSec) / std::max(0.001, sensorPingDurationSec), 0.0, 1.0)
+                          : 0.0;
+
   // Background + rings
   draw->AddCircleFilled(c, rad, hudU32(hudColorBackground, (120.0f/255.0f)));
   draw->AddCircle(c, rad, hudU32(hudColorGrid, (160.0f/255.0f)), 0, 1.2f * std::max(0.75f, uiScale));
@@ -21995,6 +22537,13 @@ if (showRadarHud && currentSystem) {
   draw->AddCircle(c, rad * 0.25f, hudU32(hudColorGrid, (50.0f/255.0f)), 0, 1.0f);
   draw->AddLine(ImVec2(c.x - rad, c.y), ImVec2(c.x + rad, c.y), hudU32(hudColorGrid, (70.0f/255.0f)), 1.0f * std::max(0.75f, uiScale));
   draw->AddLine(ImVec2(c.x, c.y - rad), ImVec2(c.x, c.y + rad), hudU32(hudColorGrid, (70.0f/255.0f)), 1.0f * std::max(0.75f, uiScale));
+
+  // Sensor ping sweep ring.
+  if (pingActive) {
+    const float rr = rad * (float)pingFrac;
+    const float a = 0.65f * (1.0f - (float)pingFrac);
+    draw->AddCircle(c, rr, hudU32(hudColorAccent, a), 0, 2.0f * std::max(0.75f, uiScale));
+  }
 
   // Ship marker (always centered)
   draw->AddTriangleFilled(ImVec2(c.x, c.y - 6 * uiScale),
@@ -22007,11 +22556,27 @@ if (showRadarHud && currentSystem) {
                     IM_COL32(20, 20, 20, 220),
                     1.0f * std::max(0.75f, uiScale));
 
-  // Range label
+  // Range label + ping status
   {
     const std::string rTxt = std::to_string((int)std::round(radarRangeKm)) + " km";
     draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p1.y - 18.0f * uiScale),
                   hudU32(hudColorText, (170.0f/255.0f)), rTxt.c_str());
+
+    if (pingActive) {
+      draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p0.y + 6.0f * uiScale),
+                    hudU32(hudColorAccent, (210.0f/255.0f)),
+                    "PING");
+    } else if (timeRealSec >= sensorPingCooldownUntilRealSec) {
+      draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p0.y + 6.0f * uiScale),
+                    hudU32(hudColorText, (150.0f/255.0f)),
+                    "PING READY");
+    }
+
+    if (silentRunning) {
+      draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p0.y + 22.0f * uiScale),
+                    hudU32(hudColorDanger, (220.0f/255.0f)),
+                    "SILENT");
+    }
   }
 
   struct Blip {
@@ -22020,6 +22585,10 @@ if (showRadarHud && currentSystem) {
     math::Vec3d posKm{0,0,0};
     double distKm{0.0};
     bool force{false};
+
+    // Sensor model (primarily for contacts): strength in [0,1] + identification state.
+    double sensorStrength01{1.0};
+    bool sensorIdentified{true};
   };
 
   const math::Vec3d shipPos = ship.positionKm();
@@ -22027,13 +22596,128 @@ if (showRadarHud && currentSystem) {
   const double rangeKm = std::max(1.0, radarRangeKm);
   const float s = (float)(rad / rangeKm);
 
+  // --- Sensor model: update per-contact tracks before assembling blips ---
+  // Tune half-range based on the HUD range slider so the edge of the radar tends
+  // to be a low-confidence region (ghosts) rather than fully-identified targets.
+  sensorParams.halfRangeKm = std::max(500.0, rangeKm * 0.50);
+  sensorParams.occlusionAtten = 0.10;
+
+  // A short active ping boosts sensor power for a moment (and draws a sweep ring).
+  double sensorPower = pingActive ? sensorPingPowerBoost : 1.0;
+  if (silentRunning) sensorPower *= 0.80;
+
+  struct Occluder {
+    math::Vec3d cKm{0,0,0};
+    double rKm{0.0};
+  };
+  std::vector<Occluder> occluders;
+  occluders.reserve(currentSystem->planets.size() + currentSystem->stations.size());
+
+  for (const auto& st : currentSystem->stations) {
+    const math::Vec3d pKm = sim::stationPosKm(st, timeDays);
+    const double rKm = std::max(1.0, st.radiusKm) * 1.15;
+    occluders.push_back(Occluder{pKm, rKm});
+  }
+  for (const auto& pl : currentSystem->planets) {
+    const math::Vec3d pKm = sim::orbitPosition3DAU(pl.orbit, timeDays) * kAU_KM;
+    const double rKm = std::max(1.0, pl.radiusEarth * kEARTH_RADIUS_KM);
+    occluders.push_back(Occluder{pKm, rKm});
+  }
+
+  auto isOccluded = [&](const math::Vec3d& aKm, const math::Vec3d& bKm) -> bool {
+    for (const auto& o : occluders) {
+      // If either endpoint is *inside* the occluder, skip it (prevents "always occluded"
+      // while docked / inside an atmosphere sphere).
+      if ((aKm - o.cKm).length() < o.rKm * 0.98) continue;
+      if ((bKm - o.cKm).length() < o.rKm * 0.98) continue;
+
+      if (sim::segmentHitsSphereKm(aKm, bKm, o.cKm, o.rKm)) return true;
+    }
+    return false;
+  };
+
+
+  // --- Electronic warfare: aggregate jammer field and suppress sensor power ---
+  //
+  // Nearby NPC jammers reduce radar effectiveness and can generate ghost returns
+  // (handled later when assembling blips).
+  double ewJamming01 = 0.0;
+  if (radarEnableEw) {
+    ewJammerParams.halfRangeKm = std::clamp(ewJammerParams.halfRangeKm, 20000.0, 500000.0);
+    ewJammerParams.suppressionGain = std::clamp(ewJammerParams.suppressionGain, 0.0, 6.0);
+    ewJammerParams.pingJammingMult = std::clamp(ewJammerParams.pingJammingMult, 0.0, 1.0);
+
+    double jamSnr = 0.0;
+    for (const auto& ctc : contacts) {
+      if (!ctc.alive) continue;
+      if (ctc.jammerPower <= 0.0) continue;
+
+      const math::Vec3d pKm = ctc.ship.positionKm();
+      const double distKm = (pKm - shipPos).length();
+      const bool occ = isOccluded(shipPos, pKm);
+      double snr = sim::computeJammingSnr(distKm, ctc.jammerPower, ewJammerParams);
+      if (occ) snr *= 0.20;
+      jamSnr += snr;
+    }
+
+    ewJamming01 = sim::jamming01FromSnr(jamSnr);
+    sensorPower = sim::applyJammingToSensorPower(sensorPower, ewJamming01, pingActive, ewJammerParams);
+
+    // HUD hint when jammed.
+    if (ewJamming01 > 0.05) {
+      const int pct = (int)std::llround(ewJamming01 * 100.0);
+      const std::string jTxt = std::string("JAM ") + std::to_string(pct) + "%";
+      draw->AddText(ImVec2(p0.x + 6.0f * uiScale, p0.y + 22.0f * uiScale),
+                    hudU32(hudColorAccent, (170.0f/255.0f)),
+                    jTxt.c_str());
+    }
+  }
+
+  auto contactSignature = [&](const Contact& ctc) -> double {
+    double sig = 1.0;
+    switch (ctc.hullClass) {
+      case sim::ShipHullClass::Scout: sig = 0.75; break;
+      case sim::ShipHullClass::Fighter: sig = 0.95; break;
+      case sim::ShipHullClass::Hauler: sig = 1.30; break;
+      default: sig = 1.0; break;
+    }
+
+    // Speed factor: thrust/thermal bloom makes you easier to spot.
+    const double v = ctc.ship.velocityKmS().length();
+    sig *= 1.0 + 0.35 * std::clamp(v / 0.55, 0.0, 1.0);
+
+    // Recent weapon discharge spikes signature a bit (leveraging existing cooldown state).
+    if (ctc.fireCooldown > 0.0) {
+      sig *= 1.0 + 0.25 * std::clamp(ctc.fireCooldown / 1.0, 0.0, 1.0);
+    }
+    return sig;
+  };
+
+  std::vector<sim::SensorTrackResult> contactSense;
+  contactSense.resize(contacts.size());
+  for (std::size_t i = 0; i < contacts.size(); ++i) {
+    if (!contacts[i].alive) continue;
+
+    const math::Vec3d pKm = contacts[i].ship.positionKm();
+    const double distKm = (pKm - shipPos).length();
+    const bool occ = isOccluded(shipPos, pKm);
+    const double sig = contactSignature(contacts[i]);
+    const double meas = sim::computeSensorStrength01(distKm, sig, sensorPower, occ, sensorParams);
+    contactSense[i] = sim::updateSensorTrack(contacts[i].sensorTrack, dtReal, meas, sensorTrackParams);
+  }
+
   std::vector<Blip> blips;
   blips.reserve(256);
 
-  auto addBlip = [&](TargetKind kind, std::size_t index, const math::Vec3d& posKm, bool force) {
+  auto addBlip = [&](TargetKind kind,
+                     std::size_t index,
+                     const math::Vec3d& posKm,
+                     bool force,
+                     double sensorStrength01 = 1.0,
+                     bool sensorIdentified = true) {
     const double d = (posKm - shipPos).length();
     if (force || d <= rangeKm) {
-      blips.push_back(Blip{kind, index, posKm, d, force});
+      blips.push_back(Blip{kind, index, posKm, d, force, sensorStrength01, sensorIdentified});
     }
   };
 
@@ -22044,7 +22728,13 @@ if (showRadarHud && currentSystem) {
     } else if (target.kind == TargetKind::Planet && target.index < currentSystem->planets.size()) {
       addBlip(TargetKind::Planet, target.index, sim::orbitPosition3DAU(currentSystem->planets[target.index].orbit, timeDays) * kAU_KM, true);
     } else if (target.kind == TargetKind::Contact && target.index < contacts.size() && contacts[target.index].alive) {
-      addBlip(TargetKind::Contact, target.index, contacts[target.index].ship.positionKm(), true);
+      const auto& sr = contactSense[target.index];
+      bool memIdent = false;
+      {
+        const auto it = contactScanIntelById.find(contacts[target.index].id);
+        if (it != contactScanIntelById.end()) memIdent = timeDays < it->second.identifiedUntilDays;
+      }
+      addBlip(TargetKind::Contact, target.index, contacts[target.index].ship.positionKm(), true, sr.strength01, sr.identified || memIdent);
     } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
       addBlip(TargetKind::Signal, target.index, signals[target.index].posKm, true);
     } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
@@ -22054,11 +22744,23 @@ if (showRadarHud && currentSystem) {
     }
   }
 
-  // Contacts
+  // Contacts (sensor filtered)
   for (std::size_t i = 0; i < contacts.size(); ++i) {
     const auto& ctc = contacts[i];
     if (!ctc.alive) continue;
-    addBlip(TargetKind::Contact, i, ctc.ship.positionKm(), false);
+
+    // Avoid a duplicate blip when this is the current target (it was already force-added).
+    if (target.kind == TargetKind::Contact && target.index == i) continue;
+
+    const auto& sr = contactSense[i];
+    if (!sr.visible) continue;
+
+    bool memIdent = false;
+    {
+      const auto it = contactScanIntelById.find(ctc.id);
+      if (it != contactScanIntelById.end()) memIdent = timeDays < it->second.identifiedUntilDays;
+    }
+    addBlip(TargetKind::Contact, i, ctc.ship.positionKm(), false, sr.strength01, sr.identified || memIdent);
   }
 
   // Signals, floating cargo, asteroids
@@ -22072,6 +22774,31 @@ if (showRadarHud && currentSystem) {
   }
   for (std::size_t i = 0; i < currentSystem->planets.size(); ++i) {
     addBlip(TargetKind::Planet, i, sim::orbitPosition3DAU(currentSystem->planets[i].orbit, timeDays) * kAU_KM, false);
+  }
+
+
+  // EW ghost returns (noise blips).
+  if (radarEnableEw && radarShowEwGhosts && ewJamming01 > 0.10) {
+    sim::EwGhostParams gp = ewGhostParams;
+    gp.maxBlips = std::clamp(gp.maxBlips, 0, 80);
+    gp.minStrength01 = std::clamp(gp.minStrength01, 0.0, 1.0);
+    gp.maxStrength01 = std::clamp(gp.maxStrength01, 0.0, 1.0);
+    gp.reseedHz = std::clamp(gp.reseedHz, 0.02, 2.0);
+    gp.driftKmPerSec = std::max(0.0, gp.driftKmPerSec);
+
+    const int budget = std::max(0, radarMaxBlips - (int)blips.size());
+    gp.maxBlips = std::min(gp.maxBlips, budget);
+    if (gp.maxBlips > 0) {
+      const core::u64 gSeed = core::hashCombine(
+        core::hashCombine(universe.seed(), currentSystem ? currentSystem->stub.id : 0),
+        core::fnv1a64("radar_ghosts"));
+      const auto ghosts = sim::generateGhostBlips(gSeed, timeRealSec, rangeKm, ewJamming01, gp);
+      for (const auto& g : ghosts) {
+        const math::Vec3d local{g.xKm, 0.0, g.zKm};
+        const math::Vec3d wpos = shipPos + ship.orientation().rotate(local);
+        addBlip(TargetKind::None, (std::size_t)g.id, wpos, false, g.strength01, false);
+      }
+    }
   }
 
   // Sort by (force, distance) and cap count.
@@ -22108,6 +22835,12 @@ if (showRadarHud && currentSystem) {
     core::u64 iSeed = 0;
     float iconSz = (b.force ? 22.0f : 16.0f) * uiScale;
     switch (b.kind) {
+      case TargetKind::None: {
+        iKind = render::SpriteKind::Signal;
+        iSeed = core::hashCombine(core::fnv1a64("ew_ghost"), (core::u64)b.index);
+        iconSz = (b.force ? 20.0f : 13.0f) * uiScale;
+      } break;
+
       case TargetKind::Station: {
         const auto& st = currentSystem->stations[b.index];
         iKind = render::SpriteKind::Station;
@@ -22121,9 +22854,10 @@ if (showRadarHud && currentSystem) {
       } break;
       case TargetKind::Contact: {
         const auto& ctc = contacts[b.index];
-        iKind = render::SpriteKind::Ship;
-        iSeed = core::hashCombine(core::fnv1a64("ship"), ctc.id);
-        iconSz = (b.force ? 22.0f : 16.0f) * uiScale;
+        const bool identified = b.sensorIdentified || b.force;
+        iKind = identified ? render::SpriteKind::Ship : render::SpriteKind::Signal;
+        iSeed = core::hashCombine(core::fnv1a64(identified ? "ship" : "unknown_contact"), ctc.id);
+        iconSz = (b.force ? 22.0f : (identified ? 16.0f : 14.0f)) * uiScale;
       } break;
       case TargetKind::Cargo: {
         const auto& pod = floatingCargo[b.index];
@@ -22170,7 +22904,15 @@ if (showRadarHud && currentSystem) {
       } else if (b.kind == TargetKind::Contact && b.index < contacts.size()) {
         ImGui::SameLine();
         const auto& ctc = contacts[b.index];
-        ImGui::Text("%s [%s]", ctc.name.c_str(), contactRoleName(ctc.role));
+        if (b.sensorIdentified || b.force) {
+          ImGui::Text("%s [%s]", ctc.name.c_str(), contactRoleName(ctc.role));
+        } else {
+          ImGui::Text("Unknown contact");
+        }
+      } else if (b.kind == TargetKind::None) {
+        ImGui::SameLine();
+        ImGui::Text("Noise return");
+
       } else if (b.kind == TargetKind::Signal && b.index < signals.size()) {
         ImGui::SameLine();
         ImGui::Text("%s Signal", signalTypeName(signals[b.index].type));
@@ -22186,7 +22928,53 @@ if (showRadarHud && currentSystem) {
         ImGui::Text("Asteroid [%s]", def.name);
       }
 
-      ImGui::TextDisabled("Dist %.0f km | RelY %.0f km", b.distKm, local.y);
+      if (b.kind == TargetKind::Contact) {
+        ImGui::TextDisabled("Signal %d%% | Dist %.0f km | RelY %.0f km",
+                            (int)std::round(b.sensorStrength01 * 100.0),
+                            b.distKm,
+                            local.y);
+      } else {
+        ImGui::TextDisabled("Dist %.0f km | RelY %.0f km", b.distKm, local.y);
+      }
+
+      // If we have an active-scan report for this contact, show a short summary.
+      if (b.kind == TargetKind::Contact && b.index < contacts.size()) {
+        const auto& ctc = contacts[b.index];
+        const auto it = contactScanIntelById.find(ctc.id);
+        if (it != contactScanIntelById.end()) {
+          const auto& rep = it->second.report;
+          ImGui::Separator();
+          ImGui::TextDisabled("Scan report (Q %d%%)", pct01(rep.quality01));
+          ImGui::Text("Threat: %s (%d%%)", scanThreatBandName(rep.threat01), pct01(rep.threat01));
+          if (rep.hullKnown) ImGui::Text("Hull: %s", sim::shipHullClassName(rep.hullClass));
+          if (rep.weaponKnown) ImGui::Text("Weapon: %s", sim::weaponDef(rep.weapon).name);
+
+          if (rep.cargoDetected) {
+            if (rep.cargoKnown) {
+              ImGui::Text("Cargo: ~%d cr", (int)std::llround(rep.cargoValueEstCr));
+              ImGui::TextDisabled("%d..%d cr", (int)std::llround(rep.cargoValueMinCr), (int)std::llround(rep.cargoValueMaxCr));
+              if (rep.cargoCommodityKnown) {
+                if (rep.cargoUnitsKnown) {
+                  ImGui::Text("%s ~%du", econ::commodityDef(rep.cargoCommodity).name, (int)std::llround(rep.cargoUnitsEst));
+                } else {
+                  ImGui::Text("%s", econ::commodityDef(rep.cargoCommodity).name);
+                }
+              }
+            } else {
+              ImGui::TextDisabled("Cargo detected (low confidence)");
+            }
+          } else {
+            ImGui::TextDisabled("Cargo: none detected");
+          }
+
+          if (rep.jammerDetected) {
+            ImGui::Text("EW: jammer detected (%d%%)", pct01(rep.jammerStrength01));
+          } else if (rep.jammerSuspected) {
+            ImGui::TextDisabled("EW: possible jamming");
+          }
+        }
+      }
+
       ImGui::EndTooltip();
     }
 
@@ -22199,9 +22987,21 @@ if (showRadarHud && currentSystem) {
     // Draw icon (atlas-batched)
     const auto uv = hudAtlas.get(iKind, iSeed);
     const auto& tex = hudAtlas.texture();
+    float alpha01 = b.force ? 1.0f : (215.0f/255.0f);
+    if (b.kind == TargetKind::Contact) {
+      alpha01 *= (float)(0.35 + 0.65 * std::clamp(b.sensorStrength01, 0.0, 1.0));
+      if (!b.sensorIdentified) alpha01 *= 0.85f;
+    }
+    if (b.kind == TargetKind::None) {
+      alpha01 *= (float)(0.12 + 0.88 * std::clamp(b.sensorStrength01, 0.0, 1.0));
+      alpha01 *= 0.75f;
+    }
+
+    alpha01 = std::clamp(alpha01, 0.05f, 1.0f);
+
     const ImU32 tint = hudTintRadarIcons
-        ? hudU32(hudColorText, b.force ? 1.0f : (215.0f/255.0f))
-        : (b.force ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 215));
+        ? hudU32(hudColorText, alpha01)
+        : IM_COL32(255, 255, 255, (int)std::round(255.0f * alpha01));
     draw->AddImage((ImTextureID)(intptr_t)tex.handle(), b0, b1,
                    ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1),
                    tint);
@@ -22598,7 +23398,24 @@ auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const
 
   // Use the same spread as the Market UI for consistency.
   const double kSpread = 0.10;
-  const double kBlackMarketMult = 1.35;
+
+  // Black market profile for this station/day (used for illegal buys/sells).
+  const sim::LawProfile stLaw = lawForFaction(st->factionId);
+  const sim::SystemSecurityProfile sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+  const sim::BlackMarketProfile bm = sim::blackMarketProfile(universe.seed(),
+                                                             currentSystem->stub.id,
+                                                             *st,
+                                                             sec,
+                                                             stLaw,
+                                                             timeDays,
+                                                             getRep(st->factionId));
+
+  // Precompute mid prices from the official market so fines/quotes scale with local conditions.
+  std::array<double, econ::kCommodityCount> midOverride{};
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    const auto cid = (econ::CommodityId)i;
+    midOverride[i] = econ::quote(stEcon, st->economyModel, cid, kSpread).mid;
+  }
 
   const double creditsBefore = credits;
   double soldCr = 0.0;
@@ -22631,22 +23448,51 @@ auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const
     const bool illegalHere = isIllegalCommodityAtStation(*st, cid);
 
     if (illegalHere) {
-      // Black market sell: add to inventory (clamped) and pay a premium.
-      const auto q = econ::quote(stEcon, st->economyModel, cid, kSpread);
-      const double moved = econ::addInventory(stEcon, st->economyModel, cid, want);
-      if (moved <= 1e-9) {
+      if (!bm.available) {
+        illegalSkips++;
+        continue;
+      }
+
+      const double beforeU = std::max(0.0, cargo[ci]);
+      const double beforeCredits = credits;
+
+      const auto r = sim::sellToBlackMarket(universe.seed(),
+                                            rng.nextU64(),
+                                            *st,
+                                            bm,
+                                            stLaw,
+                                            heat,
+                                            cid,
+                                            want,
+                                            kSpread,
+                                            &midOverride,
+                                            credits,
+                                            cargo);
+
+      if (!r.ok) {
         sellFailures++;
         continue;
       }
-      const double payout = q.bid * moved * kBlackMarketMult;
-      credits += payout;
+
+      if (r.stung) {
+        // Enforcement already applied to credits/cargo by sellToBlackMarket().
+        applyContrabandEnforcementSideEffects(st->factionId,
+                                              stLaw,
+                                              r.enforcement,
+                                              "Port security (sting)",
+                                              /*detail=*/"",
+                                              r.scan.scannedIllegalUnits);
+        usedKg = cargoMassKg(cargo);
+        sellFailures++;
+        continue;
+      }
+
+      const double moved = std::max(0.0, beforeU - cargo[ci]);
+      const double payout = std::max(0.0, credits - beforeCredits);
       soldCr += payout;
-      cargo[ci] = std::max(0.0, cargo[ci] - moved);
       usedKg = std::max(0.0, usedKg - moved * def.massKg);
 
-      // Risk cost: heat + minor rep hit.
-      policeHeat = std::clamp(policeHeat + std::min(0.75, 0.10 + moved * 0.01), 0.0, 6.0);
-      addRep(st->factionId, -std::min(1.2, moved * 0.02));
+      applyBlackMarketDealSideEffects(st->factionId, bm, payout, moved);
 
       soldLines++;
       continue;
@@ -22695,14 +23541,68 @@ auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const
     const auto def = econ::commodityDef(cid);
     if (def.massKg <= 1e-9) continue;
 
-    const bool illegalHere = isIllegalCommodityAtStation(*st, cid);
-    if (illegalHere) {
-      illegalSkips++;
-      continue; // no legal buy path (black market buy not supported)
-    }
-
     const double want = std::max(0.0, line.units);
     if (want <= 1e-9) continue;
+
+    const bool illegalHere = isIllegalCommodityAtStation(*st, cid);
+    if (illegalHere) {
+      if (!bm.available) {
+        illegalSkips++;
+        continue;
+      }
+
+      const double availKg = std::max(0.0, capKg - usedKg);
+      const double maxByMass = (availKg > 0.0) ? (availKg / def.massKg) : 0.0;
+      const double tryU = std::min(want, maxByMass);
+      if (tryU <= 1e-9) {
+        buyFailures++;
+        continue;
+      }
+
+      const double beforeU = std::max(0.0, cargo[ci]);
+      const double beforeCredits = credits;
+
+      const auto r = sim::buyFromBlackMarket(universe.seed(),
+                                             rng.nextU64(),
+                                             *st,
+                                             bm,
+                                             stLaw,
+                                             heat,
+                                             cid,
+                                             tryU,
+                                             kSpread,
+                                             &midOverride,
+                                             credits,
+                                             cargo);
+
+      if (!r.ok) {
+        buyFailures++;
+        continue;
+      }
+
+      if (r.stung) {
+        applyContrabandEnforcementSideEffects(st->factionId,
+                                              stLaw,
+                                              r.enforcement,
+                                              "Port security (sting)",
+                                              /*detail=*/"",
+                                              r.scan.scannedIllegalUnits);
+        usedKg = cargoMassKg(cargo);
+        buyFailures++;
+        continue;
+      }
+
+      const double moved = std::max(0.0, cargo[ci] - beforeU);
+      const double spent = std::max(0.0, beforeCredits - credits);
+      boughtCr += spent;
+      usedKg = std::min(capKg, usedKg + moved * def.massKg);
+
+      applyBlackMarketDealSideEffects(st->factionId, bm, spent, moved);
+
+      boughtLines++;
+      continue;
+    }
+
 
     const auto q = econ::quote(stEcon, st->economyModel, cid, kSpread);
 
@@ -22749,7 +23649,7 @@ auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const
              " cr, bought -" + std::to_string((long long)std::llround(boughtCr)) +
              " cr (net " + std::string(delta >= 0.0 ? "+" : "") +
              std::to_string((long long)std::llround(delta)) + " cr)";
-      if (illegalSkips > 0) msg += " — skipped illegal buys";
+      if (illegalSkips > 0) msg += " — skipped illegal trades";
     }
     toast(toasts, msg, 3.2);
   }
@@ -25586,7 +26486,7 @@ if (showShip) {
   ImGui::Text("Fuel: %.1f | Ship heat: %.0f", fuel, heat);
 
   {
-    const auto cap = countermeasureCapsForHull(shipHullClass);
+    const auto cap = sim::countermeasureCapsForHull(shipHullClass);
     ImGui::Text("Countermeasures: Flares %d/%d | Chaff %d/%d | Heat sinks %d/%d",
                 cmFlares, cap.flares,
                 cmChaff, cap.chaff,
@@ -29587,8 +30487,52 @@ if (showScanner) {
         } else if (target.kind == TargetKind::Contact && target.index < contacts.size()) {
           const auto& ctc = contacts[target.index];
           const core::u64 cSeed = core::hashCombine(core::fnv1a64("ship"), ctc.id);
-          showTargetHeader(ctc.name + " [" + contactRoleName(ctc.role) + "]", render::SpriteKind::Ship, cSeed, ImVec4(1,1,1,1));
+
+          const auto itIntel = contactScanIntelById.find(ctc.id);
+          const bool scanIdent = (itIntel != contactScanIntelById.end() && timeDays < itIntel->second.identifiedUntilDays);
+          const bool identified = ctc.sensorTrack.identified || scanIdent;
+
+          const std::string title = identified
+                ? (ctc.name + " [" + contactRoleName(ctc.role) + "]")
+                : std::string("Unknown contact");
+
+          showTargetHeader(title, render::SpriteKind::Ship, cSeed, ImVec4(1,1,1,1));
           ImGui::TextDisabled("Distance: %.0f km", (ctc.ship.positionKm() - ship.positionKm()).length());
+
+          if (itIntel != contactScanIntelById.end()) {
+            const auto& rep = itIntel->second.report;
+            ImGui::Spacing();
+            ImGui::TextDisabled("Scan report (Q %d%%)", pct01(rep.quality01));
+            ImGui::Text("Threat: %s (%d%%)", scanThreatBandName(rep.threat01), pct01(rep.threat01));
+            if (rep.hullKnown) ImGui::TextDisabled("Hull: %s", sim::shipHullClassName(rep.hullClass));
+            if (rep.weaponKnown) ImGui::TextDisabled("Weapon: %s", sim::weaponDef(rep.weapon).name);
+
+            if (rep.cargoDetected) {
+              if (rep.cargoKnown) {
+                ImGui::TextDisabled("Cargo: ~%d cr", (int)std::llround(rep.cargoValueEstCr));
+                ImGui::TextDisabled("      %d..%d cr", (int)std::llround(rep.cargoValueMinCr), (int)std::llround(rep.cargoValueMaxCr));
+                if (rep.cargoCommodityKnown) {
+                  if (rep.cargoUnitsKnown) {
+                    ImGui::TextDisabled("      %s ~%du", econ::commodityDef(rep.cargoCommodity).name, (int)std::llround(rep.cargoUnitsEst));
+                  } else {
+                    ImGui::TextDisabled("      %s", econ::commodityDef(rep.cargoCommodity).name);
+                  }
+                }
+              } else {
+                ImGui::TextDisabled("Cargo: detected (low confidence)");
+              }
+            } else {
+              ImGui::TextDisabled("Cargo: none detected");
+            }
+
+            if (rep.jammerDetected) {
+              ImGui::TextDisabled("EW: jammer detected (%d%%)", pct01(rep.jammerStrength01));
+            } else if (rep.jammerSuspected) {
+              ImGui::TextDisabled("EW: possible jamming");
+            }
+          } else if (!identified) {
+            ImGui::TextDisabled("Tip: scan to identify + profile this contact.");
+          }
         } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
           const auto& ssrc = signals[target.index];
           const core::u64 sSeed = core::hashCombine(core::hashCombine(core::fnv1a64("signal"), ssrc.id), (core::u64)(int)ssrc.type);
@@ -29827,7 +30771,6 @@ if (showScanner) {
       if (!currentSystem->stations.empty()) {
         const auto& station = currentSystem->stations[(std::size_t)selectedStationIndex];
         auto& stEcon = universe.stationEconomy(station, timeDays);
-        const double rep = getRep(station.factionId);
         const double feeEff = effectiveFeeRate(station);
         double cargoKgNow = cargoMassKg(cargo);
 
@@ -29857,149 +30800,257 @@ if (showScanner) {
             marketDetailsJumpTarget = MarketDetailsJumpTarget::None;
           }
 
-          const double hullMissing = std::max(0.0, playerHullMax - playerHull);
-          const double repairBase = hullMissing * 12.0;
-          const double repairCost = repairBase * (1.0 + feeEff);
+          const sim::StationServicePriceModel svcPm{feeEff, 0.10};
 
-          if (ImGui::Button("Repair hull")) {
-            if (hullMissing <= 0.01) {
-              toast(toasts, "Hull already full.", 2.0);
-            } else if (credits >= repairCost) {
-              credits -= repairCost;
-              playerHull = playerHullMax;
-              toast(toasts, "Ship repaired.", 2.0);
-            } else {
-              toast(toasts, "Not enough credits for repair.", 2.0);
-            }
-          }
-          ImGui::SameLine();
-          ImGui::TextDisabled("(%.0f cr)", repairCost);
+          // Hull repair (consumes Metals + Machinery from station economy)
+          {
+            const auto qRepair = sim::quoteHullRepairToFull(
+              stEcon, station.economyModel, playerHull, playerHullMax, svcPm, credits
+            );
 
-          // Refuel service: buys Fuel commodity into the ship tank.
-          const auto fuelQuote = econ::quote(stEcon, station.economyModel, econ::CommodityId::Fuel, 0.10);
-          const double fuelNeed = std::max(0.0, fuelMax - fuel);
-          const double fuelAvail = std::max(0.0, fuelQuote.inventory);
-          const double fuelBuy = std::min(fuelNeed, fuelAvail);
-          const double fuelCost = fuelBuy * fuelQuote.ask * (1.0 + feeEff);
+            ImGui::BeginDisabled(!qRepair.ok);
+            if (ImGui::Button("Repair hull")) {
+              const auto r = sim::applyHullRepairToFull(
+                stEcon, station.economyModel, credits, playerHull, playerHullMax, svcPm
+              );
 
-          if (ImGui::Button("Refuel")) {
-            if (fuelNeed <= 0.01) {
-              toast(toasts, "Fuel tank already full.", 2.0);
-            } else if (fuelBuy <= 0.01) {
-              toast(toasts, "Station is out of fuel.", 2.0);
-            } else if (credits >= fuelCost) {
-              // Take fuel from the station's commodity inventory (clamped). We charge for the
-              // amount actually transferred (useful if inventories are changing due to NPC traffic).
-              const double taken = econ::takeInventory(stEcon, station.economyModel, econ::CommodityId::Fuel, fuelBuy);
-              if (taken <= 0.01) {
-                toast(toasts, "Station is out of fuel.", 2.0);
+              if (r.ok) {
+                const double stillMissing = std::max(0.0, playerHullMax - playerHull);
+                if (stillMissing > 0.05) {
+                  toast(toasts, "Hull partially repaired (" + std::to_string((int)std::round(r.hullRepaired)) + ").", 2.0);
+                } else {
+                  toast(toasts, "Hull repaired.", 2.0);
+                }
+              } else if (r.reason && std::string_view(r.reason) == "no_need") {
+                toast(toasts, "Hull already full.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "out_of_stock") {
+                toast(toasts, "Station is out of repair parts.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "need_credits") {
+                toast(toasts, "Not enough credits for repair.", 2.0);
               } else {
-                const double cost = taken * fuelQuote.ask * (1.0 + feeEff);
-                credits -= cost;
-                fuel += taken;
-                toast(toasts, "Refueled.", 2.0);
+                toast(toasts, "Repair unavailable.", 2.0);
               }
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (qRepair.ok) {
+              ImGui::TextDisabled("(+%.1f hull, %.0f cr)%s%s",
+                                 qRepair.hullToRepair,
+                                 qRepair.costCr,
+                                 qRepair.limitedByStock ? " [stock]" : "",
+                                 qRepair.limitedByCredits ? " [credits]" : "");
             } else {
-              toast(toasts, "Not enough credits to refuel.", 2.0);
+              const double missing = std::max(0.0, playerHullMax - playerHull);
+              if (missing <= 0.05) {
+                ImGui::TextDisabled("(full)");
+              } else if (qRepair.reason && std::string_view(qRepair.reason) == "out_of_stock") {
+                ImGui::TextDisabled("(out of stock)");
+              } else if (qRepair.reason && std::string_view(qRepair.reason) == "need_credits") {
+                ImGui::TextDisabled("(need credits)");
+              } else {
+                ImGui::TextDisabled("(need %.1f hull)", missing);
+              }
             }
           }
-          ImGui::SameLine();
-          ImGui::TextDisabled("(%.1f units, %.0f cr)", fuelBuy, fuelCost);
 
-          // Countermeasures restock service.
+          // Refuel service (consumes Fuel from station economy)
+          {
+            const auto qRefuel = sim::quoteRefuelToFull(
+              stEcon, station.economyModel, fuel, fuelMax, svcPm, credits
+            );
+
+            ImGui::BeginDisabled(!qRefuel.ok);
+            if (ImGui::Button("Refuel")) {
+              const auto r = sim::applyRefuelToFull(
+                stEcon, station.economyModel, credits, fuel, fuelMax, svcPm
+              );
+
+              if (r.ok) {
+                const double stillNeed = std::max(0.0, fuelMax - fuel);
+                if (stillNeed > 0.05) {
+                  toast(toasts, "Refueled partially (" + std::to_string((int)std::round(r.fuelBought)) + ").", 2.0);
+                } else {
+                  toast(toasts, "Refueled.", 2.0);
+                }
+              } else if (r.reason && std::string_view(r.reason) == "no_need") {
+                toast(toasts, "Fuel tank already full.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "out_of_stock") {
+                toast(toasts, "Station is out of fuel.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "need_credits") {
+                toast(toasts, "Not enough credits to refuel.", 2.0);
+              } else {
+                toast(toasts, "Refuel unavailable.", 2.0);
+              }
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (qRefuel.ok) {
+              ImGui::TextDisabled("(+%.1f units, %.0f cr)%s%s",
+                                 qRefuel.fuelToBuy,
+                                 qRefuel.costCr,
+                                 qRefuel.limitedByStock ? " [stock]" : "",
+                                 qRefuel.limitedByCredits ? " [credits]" : "");
+            } else {
+              const double need = std::max(0.0, fuelMax - fuel);
+              if (need <= 0.05) {
+                ImGui::TextDisabled("(full)");
+              } else if (qRefuel.reason && std::string_view(qRefuel.reason) == "out_of_stock") {
+                ImGui::TextDisabled("(out of stock)");
+              } else if (qRefuel.reason && std::string_view(qRefuel.reason) == "need_credits") {
+                ImGui::TextDisabled("(need credits)");
+              } else {
+                ImGui::TextDisabled("(need %.1f units)", need);
+              }
+            }
+          }
+
+          // Countermeasures restock service (consumes station commodities)
           {
             ImGui::Separator();
             ImGui::Text("Countermeasures");
 
-            const auto cap = countermeasureCapsForHull(shipHullClass);
-            const int wantFlares = std::clamp(cmFlares, 0, cap.flares);
-            const int wantChaff = std::clamp(cmChaff, 0, cap.chaff);
-            const int wantHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
-
-            // Keep state clamped even if a save was edited.
-            cmFlares = wantFlares;
-            cmChaff = wantChaff;
-            cmHeatSinks = wantHeatSinks;
+            const auto cap = sim::countermeasureCapsForHull(shipHullClass);
+            sim::clampCountermeasureAmmo(cmFlares, cmChaff, cmHeatSinks, shipHullClass);
 
             ImGui::TextDisabled("Flares %d/%d   Chaff %d/%d   Heat sinks %d/%d",
-                               wantFlares, cap.flares,
-                               wantChaff, cap.chaff,
-                               wantHeatSinks, cap.heatSinks);
+                               cmFlares, cap.flares,
+                               cmChaff, cap.chaff,
+                               cmHeatSinks, cap.heatSinks);
 
-            const double priceMult = (1.0 + feeEff);
-            const double flareUnit = 85.0;
-            const double chaffUnit = 95.0;
-            const double heatSinkUnit = 360.0;
+            const auto qAll = sim::quoteCountermeasureRestockAll(
+              stEcon, station.economyModel,
+              shipHullClass,
+              cmFlares, cmChaff, cmHeatSinks,
+              svcPm, credits
+            );
 
-            const int needF = std::max(0, cap.flares - wantFlares);
-            const int needC = std::max(0, cap.chaff - wantChaff);
-            const int needH = std::max(0, cap.heatSinks - wantHeatSinks);
-
-            const double costF = needF * flareUnit * priceMult;
-            const double costC = needC * chaffUnit * priceMult;
-            const double costH = needH * heatSinkUnit * priceMult;
-            const double costAll = costF + costC + costH;
-
-            ImGui::BeginDisabled(needF + needC + needH <= 0);
+            ImGui::BeginDisabled(!qAll.ok);
             if (ImGui::Button("Restock all")) {
-              if (credits >= costAll) {
-                credits -= costAll;
-                cmFlares = cap.flares;
-                cmChaff = cap.chaff;
-                cmHeatSinks = cap.heatSinks;
-                toast(toasts, "Countermeasures restocked.", 2.0);
-              } else {
+              const auto r = sim::applyCountermeasureRestockAll(
+                stEcon, station.economyModel,
+                credits,
+                shipHullClass,
+                cmFlares, cmChaff, cmHeatSinks,
+                svcPm
+              );
+
+              if (r.ok) {
+                toast(toasts,
+                      "Countermeasures restocked: +" + std::to_string(r.flaresBought) + "F +" +
+                        std::to_string(r.chaffBought) + "C +" + std::to_string(r.heatSinksBought) + "H",
+                      2.0);
+              } else if (r.reason && std::string_view(r.reason) == "no_need") {
+                toast(toasts, "Countermeasures already full.", 1.8);
+              } else if (r.reason && std::string_view(r.reason) == "out_of_stock") {
+                toast(toasts, "Station is out of countermeasure supplies.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "need_credits") {
                 toast(toasts, "Not enough credits to restock countermeasures.", 2.0);
+              } else {
+                toast(toasts, "Restock unavailable.", 2.0);
               }
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("(%.0f cr)", costAll);
+            if (qAll.ok) {
+              ImGui::TextDisabled("(+%dF +%dC +%dH, %.0f cr)%s%s",
+                                 qAll.buyFlares,
+                                 qAll.buyChaff,
+                                 qAll.buyHeatSinks,
+                                 qAll.costCr,
+                                 qAll.limitedByStock ? " [stock]" : "",
+                                 qAll.limitedByCredits ? " [credits]" : "");
+            } else {
+              if (qAll.reason && std::string_view(qAll.reason) == "no_need") {
+                ImGui::TextDisabled("(full)");
+              } else if (qAll.reason && std::string_view(qAll.reason) == "out_of_stock") {
+                ImGui::TextDisabled("(out of stock)");
+              } else if (qAll.reason && std::string_view(qAll.reason) == "need_credits") {
+                ImGui::TextDisabled("(need credits)");
+              } else {
+                ImGui::TextDisabled("(unavailable)");
+              }
+            }
 
-            // Individual restock buttons (useful when saving credits).
-            ImGui::BeginDisabled(needF <= 0);
+            // Individual restock buttons (useful when saving credits / stock is scarce).
+            const auto qF = sim::quoteCountermeasureRestockFlaresToCap(
+              stEcon, station.economyModel, shipHullClass, cmFlares, svcPm, credits
+            );
+            ImGui::BeginDisabled(!qF.ok);
             if (ImGui::SmallButton("Restock flares")) {
-              if (credits >= costF) {
-                credits -= costF;
-                cmFlares = cap.flares;
-                toast(toasts, "Flares restocked.", 1.8);
-              } else {
-                toast(toasts, "Not enough credits.", 1.6);
-              }
+              const auto r = sim::applyCountermeasureRestockFlaresToCap(
+                stEcon, station.economyModel, credits, shipHullClass, cmFlares, svcPm
+              );
+              if (r.ok) toast(toasts, "Flares restocked (+" + std::to_string(r.flaresBought) + ").", 1.8);
+              else toast(toasts, "Unable to restock flares.", 1.6);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("(%d, %.0f cr)", needF, costF);
+            if (qF.ok) {
+              ImGui::TextDisabled("(+%d, %.0f cr)", qF.buyFlares, qF.costCr);
+            } else if (qF.reason && std::string_view(qF.reason) == "no_need") {
+              ImGui::TextDisabled("(full)");
+            } else if (qF.reason && std::string_view(qF.reason) == "out_of_stock") {
+              ImGui::TextDisabled("(out of stock)");
+            } else if (qF.reason && std::string_view(qF.reason) == "need_credits") {
+              ImGui::TextDisabled("(need credits)");
+            } else {
+              ImGui::TextDisabled("(unavailable)");
+            }
 
-            ImGui::BeginDisabled(needC <= 0);
+            const auto qC = sim::quoteCountermeasureRestockChaffToCap(
+              stEcon, station.economyModel, shipHullClass, cmChaff, svcPm, credits
+            );
+            ImGui::BeginDisabled(!qC.ok);
             if (ImGui::SmallButton("Restock chaff")) {
-              if (credits >= costC) {
-                credits -= costC;
-                cmChaff = cap.chaff;
-                toast(toasts, "Chaff restocked.", 1.8);
-              } else {
-                toast(toasts, "Not enough credits.", 1.6);
-              }
+              const auto r = sim::applyCountermeasureRestockChaffToCap(
+                stEcon, station.economyModel, credits, shipHullClass, cmChaff, svcPm
+              );
+              if (r.ok) toast(toasts, "Chaff restocked (+" + std::to_string(r.chaffBought) + ").", 1.8);
+              else toast(toasts, "Unable to restock chaff.", 1.6);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("(%d, %.0f cr)", needC, costC);
+            if (qC.ok) {
+              ImGui::TextDisabled("(+%d, %.0f cr)", qC.buyChaff, qC.costCr);
+            } else if (qC.reason && std::string_view(qC.reason) == "no_need") {
+              ImGui::TextDisabled("(full)");
+            } else if (qC.reason && std::string_view(qC.reason) == "out_of_stock") {
+              ImGui::TextDisabled("(out of stock)");
+            } else if (qC.reason && std::string_view(qC.reason) == "need_credits") {
+              ImGui::TextDisabled("(need credits)");
+            } else {
+              ImGui::TextDisabled("(unavailable)");
+            }
 
-            ImGui::BeginDisabled(needH <= 0);
+            const auto qH = sim::quoteCountermeasureRestockHeatSinksToCap(
+              stEcon, station.economyModel, shipHullClass, cmHeatSinks, svcPm, credits
+            );
+            ImGui::BeginDisabled(!qH.ok);
             if (ImGui::SmallButton("Restock heat sinks")) {
-              if (credits >= costH) {
-                credits -= costH;
-                cmHeatSinks = cap.heatSinks;
-                toast(toasts, "Heat sinks restocked.", 1.8);
-              } else {
-                toast(toasts, "Not enough credits.", 1.6);
-              }
+              const auto r = sim::applyCountermeasureRestockHeatSinksToCap(
+                stEcon, station.economyModel, credits, shipHullClass, cmHeatSinks, svcPm
+              );
+              if (r.ok) toast(toasts, "Heat sinks restocked (+" + std::to_string(r.heatSinksBought) + ").", 1.8);
+              else toast(toasts, "Unable to restock heat sinks.", 1.6);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("(%d, %.0f cr)", needH, costH);
+            if (qH.ok) {
+              ImGui::TextDisabled("(+%d, %.0f cr)", qH.buyHeatSinks, qH.costCr);
+            } else if (qH.reason && std::string_view(qH.reason) == "no_need") {
+              ImGui::TextDisabled("(full)");
+            } else if (qH.reason && std::string_view(qH.reason) == "out_of_stock") {
+              ImGui::TextDisabled("(out of stock)");
+            } else if (qH.reason && std::string_view(qH.reason) == "need_credits") {
+              ImGui::TextDisabled("(need credits)");
+            } else {
+              ImGui::TextDisabled("(unavailable)");
+            }
           }
 
+          // Ordnance / missile rearm service (consumes station commodities)
           {
             ImGui::Separator();
             ImGui::Text("Ordnance");
@@ -30011,32 +31062,47 @@ if (showScanner) {
 
               const int have = std::clamp((int)ammo, 0, maxAmmo);
               ammo = (core::u8)have;
-              const int need = maxAmmo - have;
-              const double unitEff = sim::weaponAmmoUnitPriceCr(wt) * (1.0 + feeEff);
-              const double cost = (double)need * unitEff;
+
+              const auto qSlot = sim::quoteOrdnanceRearmToFull(
+                stEcon, station.economyModel, shipHullClass, wt, ammo, svcPm, credits
+              );
 
               ImGui::TextDisabled("%s: %s  %d/%d", slotName, weaponDef(wt).name, have, maxAmmo);
               ImGui::SameLine();
-              ImGui::BeginDisabled(need <= 0);
+              ImGui::BeginDisabled(!qSlot.ok);
               if (ImGui::SmallButton(btnLabel)) {
-                if (credits + 1e-9 >= cost) {
-                  credits -= cost;
-                  ammo = (core::u8)maxAmmo;
-                  toast(toasts, std::string(slotName) + " missiles rearmed.", 1.8);
+                const auto r = sim::applyOrdnanceRearmToFull(
+                  stEcon, station.economyModel, credits, shipHullClass, wt, ammo, svcPm
+                );
+                if (r.ok) {
+                  toast(toasts, std::string(slotName) + " missiles rearmed (+" + std::to_string(r.ammoBought) + ").", 1.8);
                 } else {
-                  toast(toasts, "Not enough credits.", 1.6);
+                  toast(toasts, "Unable to rearm missiles.", 1.6);
                 }
               }
               ImGui::EndDisabled();
               ImGui::SameLine();
-              ImGui::TextDisabled("(%d, %.0f cr)", need, cost);
+              if (qSlot.ok) {
+                ImGui::TextDisabled("(+%d, %.0f cr)%s%s",
+                                   qSlot.buyAmmo,
+                                   qSlot.costCr,
+                                   qSlot.limitedByStock ? " [stock]" : "",
+                                   qSlot.limitedByCredits ? " [credits]" : "");
+              } else {
+                if (qSlot.reason && std::string_view(qSlot.reason) == "no_need") {
+                  ImGui::TextDisabled("(full)");
+                } else if (qSlot.reason && std::string_view(qSlot.reason) == "out_of_stock") {
+                  ImGui::TextDisabled("(out of stock)");
+                } else if (qSlot.reason && std::string_view(qSlot.reason) == "need_credits") {
+                  ImGui::TextDisabled("(need credits)");
+                } else {
+                  ImGui::TextDisabled("(unavailable)");
+                }
+              }
             };
 
             const int maxP = sim::weaponAmmoMax(weaponPrimary, shipHullClass);
             const int maxS = sim::weaponAmmoMax(weaponSecondary, shipHullClass);
-            const int needP = (maxP > 0) ? (maxP - (int)std::clamp((int)weaponAmmoPrimary, 0, maxP)) : 0;
-            const int needS = (maxS > 0) ? (maxS - (int)std::clamp((int)weaponAmmoSecondary, 0, maxS)) : 0;
-            const int needAll = needP + needS;
 
             if (maxP <= 0 && maxS <= 0) {
               ImGui::TextDisabled("No ammo-based weapons installed.");
@@ -30044,22 +31110,52 @@ if (showScanner) {
               if (maxP > 0) drawOrdnanceSlot("LMB", "Rearm LMB", weaponPrimary, weaponAmmoPrimary);
               if (maxS > 0) drawOrdnanceSlot("RMB", "Rearm RMB", weaponSecondary, weaponAmmoSecondary);
 
-              const double costAll = (double)needP * sim::weaponAmmoUnitPriceCr(weaponPrimary) * (1.0 + feeEff)
-                + (double)needS * sim::weaponAmmoUnitPriceCr(weaponSecondary) * (1.0 + feeEff);
-              ImGui::BeginDisabled(needAll <= 0);
+              const auto qAll = sim::quoteOrdnanceRearmAllToFull(
+                stEcon, station.economyModel,
+                shipHullClass,
+                weaponPrimary, weaponAmmoPrimary,
+                weaponSecondary, weaponAmmoSecondary,
+                svcPm, credits
+              );
+
+              ImGui::BeginDisabled(!qAll.ok);
               if (ImGui::Button("Rearm all missiles")) {
-                if (credits + 1e-9 >= costAll) {
-                  credits -= costAll;
-                  if (maxP > 0) weaponAmmoPrimary = (core::u8)maxP;
-                  if (maxS > 0) weaponAmmoSecondary = (core::u8)maxS;
-                  toast(toasts, "All missiles rearmed.", 1.9);
+                const auto r = sim::applyOrdnanceRearmAllToFull(
+                  stEcon, station.economyModel, credits,
+                  shipHullClass,
+                  weaponPrimary, weaponAmmoPrimary,
+                  weaponSecondary, weaponAmmoSecondary,
+                  svcPm
+                );
+                if (r.ok) {
+                  toast(toasts,
+                        "Missiles rearmed: +" + std::to_string(r.primaryBought) + " (LMB) +" +
+                          std::to_string(r.secondaryBought) + " (RMB)",
+                        1.9);
                 } else {
-                  toast(toasts, "Not enough credits.", 1.6);
+                  toast(toasts, "Unable to rearm missiles.", 1.6);
                 }
               }
               ImGui::EndDisabled();
               ImGui::SameLine();
-              ImGui::TextDisabled("(%.0f cr)", costAll);
+              if (qAll.ok) {
+                ImGui::TextDisabled("(+%d +%d, %.0f cr)%s%s",
+                                   qAll.buyPrimary,
+                                   qAll.buySecondary,
+                                   qAll.costCr,
+                                   qAll.limitedByStock ? " [stock]" : "",
+                                   qAll.limitedByCredits ? " [credits]" : "");
+              } else {
+                if (qAll.reason && std::string_view(qAll.reason) == "no_need") {
+                  ImGui::TextDisabled("(full)");
+                } else if (qAll.reason && std::string_view(qAll.reason) == "out_of_stock") {
+                  ImGui::TextDisabled("(out of stock)");
+                } else if (qAll.reason && std::string_view(qAll.reason) == "need_credits") {
+                  ImGui::TextDisabled("(need credits)");
+                } else {
+                  ImGui::TextDisabled("(unavailable)");
+                }
+              }
             }
           }
 
@@ -31077,6 +32173,18 @@ if (canTrade) {
         static int selectedCommodity = 0;
         ImGui::SliderInt("Plot commodity", &selectedCommodity, 0, (int)econ::kCommodityCount - 1);
 
+
+        // Black market availability (for illegal commodities at this station).
+        sim::BlackMarketProfile bmProfile{};
+        sim::LawProfile bmLaw{};
+        double bmStingChanceNow = 0.0;
+        if (canTrade && currentSystem) {
+          bmLaw = lawForFaction(station.factionId);
+          const auto sec = sim::systemSecurityProfile(universe.seed(), *currentSystem);
+          bmProfile = sim::blackMarketProfile(universe.seed(), currentSystem->stub.id, station, sec, bmLaw, timeDays, rep);
+          bmStingChanceNow = std::clamp(bmProfile.stingChance * std::clamp(1.0 + 0.012 * heat, 1.0, 2.2), 0.0, 1.0);
+        }
+
         // Table
         if (ImGui::BeginTable("market", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
           ImGui::TableSetupColumn("Commodity");
@@ -31139,63 +32247,179 @@ if (canTrade) {
 
             ImGui::SameLine();
 
-            // Buying illegal goods isn't available on the open market; you can still *sell* them (black market).
-            ImGui::BeginDisabled(!canTrade || illegalHere);
-            if (ImGui::SmallButton("Buy")) {
-              const double buyUnits = std::max(0.0, (double)qty[i]);
-              const double addKg = buyUnits * econ::commodityDef(cid).massKg;
-              if (cargoKgNow + addKg > cargoCapacityKg + 1e-6) {
-                toast(toasts, "Cargo hold full (mass limit).", 2.0);
-              } else {
-                auto tr = econ::buy(stEcon, station.economyModel, cid, buyUnits, credits, 0.10, feeEff);
-                if (tr.ok) {
-                  cargo[i] += buyUnits;
-                  cargoKgNow += addKg;
+            // Buy / Sell
+            const bool bmEnabled = canTrade && bmProfile.available;
+            const auto bmQuote = sim::applyBlackMarketQuote(bmProfile, q);
+
+            if (!illegalHere) {
+              ImGui::BeginDisabled(!canTrade);
+              if (ImGui::SmallButton("Buy")) {
+                const double buyUnits = std::min<double>(qty[i], std::max<double>(0.0, q.inventory));
+                const double availKg = std::max(0.0, cargoCapacityKg - cargoKgNow);
+                const double maxByMass = (econ::commodityDef(cid).massKg > 1e-9) ? (availKg / econ::commodityDef(cid).massKg) : 0.0;
+                const double buyClamped = std::min(buyUnits, maxByMass);
+
+                const auto out = econ::buy(stEcon, station.economyModel, cid, buyClamped, credits, stationFeeRate);
+                if (out.boughtUnits > 1e-9) {
+                  credits = out.creditsAfter;
+                  cargo[i] += out.boughtUnits;
+                  cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + out.boughtUnits * econ::commodityDef(cid).massKg);
+                }
+              }
+              ImGui::EndDisabled();
+            } else {
+              // Illegal commodities can only be traded via the black market.
+              ImGui::BeginDisabled(!bmEnabled);
+              if (ImGui::SmallButton("Buy (BM)")) {
+                const double wantU = std::max<double>(0.0, qty[i]);
+                const double availKg = std::max(0.0, cargoCapacityKg - cargoKgNow);
+                const double maxByMass = (econ::commodityDef(cid).massKg > 1e-9) ? (availKg / econ::commodityDef(cid).massKg) : 0.0;
+                const double tryU = std::min(wantU, maxByMass);
+
+                if (tryU <= 1e-9) {
+                  toast(toasts, "Cannot buy: cargo hold full (mass limit).", 2.0);
+                } else {
+                  std::array<double, econ::kCommodityCount> midOverride{};
+                  for (std::size_t j = 0; j < econ::kCommodityCount; ++j) {
+                    const auto c2 = (econ::CommodityId)j;
+                    midOverride[j] = econ::quote(stEcon, station.economyModel, c2, 0.10).mid;
+                  }
+
+                  const double beforeCredits = credits;
+                  const double beforeU = cargo[i];
+
+                  const auto r = sim::buyFromBlackMarket(universe.seed(),
+                                                         rng.nextU64(),
+                                                         station,
+                                                         bmProfile,
+                                                         bmLaw,
+                                                         heat,
+                                                         cid,
+                                                         tryU,
+                                                         0.10,
+                                                         &midOverride,
+                                                         credits,
+                                                         cargo);
+
+                  if (!r.ok) {
+                    toast(toasts, std::string("Black market buy failed: ") + (r.reason ? r.reason : "error"), 2.2);
+                  } else if (r.stung) {
+                    toast(toasts, "Black market deal was a sting!", 2.4);
+                    applyContrabandEnforcementSideEffects(station.factionId,
+                                                          bmLaw,
+                                                          r.enforcement,
+                                                          "Port security (sting)",
+                                                          /*detail=*/"",
+                                                          r.scan.scannedIllegalUnits);
+                    cargoKgNow = cargoMassKg(cargo);
+                  } else {
+                    const double moved = std::max(0.0, cargo[i] - beforeU);
+                    const double spent = std::max(0.0, beforeCredits - credits);
+
+                    cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + moved * econ::commodityDef(cid).massKg);
+                    applyBlackMarketDealSideEffects(station.factionId, bmProfile, spent, moved);
+
+                    toast(toasts,
+                          "Bought " + std::to_string((int)std::round(moved)) + " units on the black market for "
+                            + std::to_string((int)std::round(spent)) + " cr.",
+                          2.0);
+                  }
+                }
+              }
+              ImGui::EndDisabled();
+
+              if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (!canTrade) {
+                  ImGui::SetTooltip("Dock to trade.");
+                } else if (!bmProfile.available) {
+                  ImGui::SetTooltip("No black market contact today.\nTry again tomorrow or at a rougher station.");
+                } else {
+                  ImGui::SetTooltip("BM ask %.2f | Sting %.1f%% (heat %.0f)", bmQuote.ask, bmStingChanceNow * 100.0, heat);
                 }
               }
             }
-            ImGui::EndDisabled();
 
             ImGui::SameLine();
-	            const double reserved = reservedMissionUnits[i];
-	            const double freeForSale = std::max(0.0, cargo[i] - reserved);
-	            const bool sellDisabled = (!canTrade) || (freeForSale <= 1e-6);
-	            ImGui::BeginDisabled(sellDisabled);
+
+            const double freeForSale = std::max(0.0, cargo[i] - reservedMissionUnits[i]);
+            const bool sellDisabled = !canTrade || (freeForSale <= 1e-6) || (illegalHere && !bmProfile.available);
+
+            ImGui::BeginDisabled(sellDisabled);
             const char* sellLabel = illegalHere ? "Sell (BM)" : "Sell";
             if (ImGui::SmallButton(sellLabel)) {
-	              const double sellUnitsReq = std::min<double>(qty[i], freeForSale);
-              if (sellUnitsReq > 0.0) {
+              const double sellUnits = std::min<double>(qty[i], freeForSale);
+              if (sellUnits > 1e-9) {
                 if (illegalHere) {
-                  // Black market: pay a premium, but storage capacity still applies.
-                  constexpr double kBlackMarketMult = 1.35;
-                  const double moved = econ::addInventory(stEcon, station.economyModel, cid, sellUnitsReq);
-                  if (moved > 0.0) {
-                    credits += q.bid * moved * kBlackMarketMult;
-                    cargo[i] -= moved;
-                    cargoKgNow = std::max(0.0, cargoKgNow - moved * econ::commodityDef(cid).massKg);
+                  std::array<double, econ::kCommodityCount> midOverride{};
+                  for (std::size_t j = 0; j < econ::kCommodityCount; ++j) {
+                    const auto c2 = (econ::CommodityId)j;
+                    midOverride[j] = econ::quote(stEcon, station.economyModel, c2, 0.10).mid;
+                  }
 
-                    // Dealing contraband attracts attention over time.
-                    policeHeat = std::clamp(policeHeat + std::min(0.75, 0.10 + moved * 0.01), 0.0, 6.0);
-                    addRep(station.factionId, -std::min(1.2, moved * 0.02));
+                  const double beforeCredits = credits;
+                  const double beforeU = cargo[i];
+
+                  const auto r = sim::sellToBlackMarket(universe.seed(),
+                                                       rng.nextU64(),
+                                                       station,
+                                                       bmProfile,
+                                                       bmLaw,
+                                                       heat,
+                                                       cid,
+                                                       sellUnits,
+                                                       0.10,
+                                                       &midOverride,
+                                                       credits,
+                                                       cargo);
+
+                  if (!r.ok) {
+                    toast(toasts, std::string("Black market sell failed: ") + (r.reason ? r.reason : "error"), 2.2);
+                  } else if (r.stung) {
+                    toast(toasts, "Black market deal was a sting!", 2.4);
+                    applyContrabandEnforcementSideEffects(station.factionId,
+                                                          bmLaw,
+                                                          r.enforcement,
+                                                          "Port security (sting)",
+                                                          /*detail=*/"",
+                                                          r.scan.scannedIllegalUnits);
+                    cargoKgNow = cargoMassKg(cargo);
                   } else {
-                    toast(toasts, "No space to sell (storage full).", 2.0);
+                    const double moved = std::max(0.0, beforeU - cargo[i]);
+                    const double payout = std::max(0.0, credits - beforeCredits);
+
+                    cargoKgNow = std::max(0.0, cargoKgNow - moved * econ::commodityDef(cid).massKg);
+                    applyBlackMarketDealSideEffects(station.factionId, bmProfile, payout, moved);
+
+                    toast(toasts,
+                          "Sold " + std::to_string((int)std::round(moved)) + " units on the black market for "
+                            + std::to_string((int)std::round(payout)) + " cr.",
+                          2.0);
                   }
                 } else {
-                  auto tr = econ::sell(stEcon, station.economyModel, cid, sellUnitsReq, credits, 0.10, feeEff);
-                  if (tr.ok) {
-                    cargo[i] -= sellUnitsReq;
-                    cargoKgNow = std::max(0.0, cargoKgNow - sellUnitsReq * econ::commodityDef(cid).massKg);
+                  const auto out = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, stationFeeRate);
+                  if (out.soldUnits > 1e-9) {
+                    credits = out.creditsAfter;
+                    cargo[i] = std::max(0.0, cargo[i] - out.soldUnits);
+                    cargoKgNow = std::max(0.0, cargoKgNow - out.soldUnits * econ::commodityDef(cid).massKg);
                   }
                 }
               }
             }
             ImGui::EndDisabled();
-	            if (sellDisabled && reserved > 1e-6 && cargo[i] > 1e-6
-	                && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-	              ImGui::SetTooltip("Reserved for active mission(s): %.0f units", std::min(reserved, cargo[i]));
-	            }
 
-            ImGui::PopID();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+              if (!canTrade) {
+                ImGui::SetTooltip("Dock to trade.");
+              } else if (illegalHere && !bmProfile.available) {
+                ImGui::SetTooltip("No black market contact today.\nTry again tomorrow.");
+              } else if (sellDisabled && reservedMissionUnits[i] > 1e-6) {
+                ImGui::SetTooltip("Cannot sell: reserved for active delivery/smuggle mission.");
+              } else if (illegalHere) {
+                ImGui::SetTooltip("BM bid %.2f | Sting %.1f%% (heat %.0f)", bmQuote.bid, bmStingChanceNow * 100.0, heat);
+              }
+            }
+
+ImGui::PopID();
           }
 
           ImGui::EndTable();
@@ -37239,6 +38463,13 @@ const char* pageName =
                   [&]() { pushChord(controls.actions.navAssistFollow); });
           addItem("Tactical", (showTacticalOverlay ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleTacticalOverlay), canAct,
                   [&]() { pushChord(controls.actions.toggleTacticalOverlay); });
+
+          const bool canSilent = canAct && (fsdState == FsdState::Idle) && (supercruiseState == SupercruiseState::Idle);
+          addItem("Silent Running",
+                  silentRunning ? "ENGAGED • shields offline" : "OFF",
+                  game::chordLabel(controls.actions.toggleSilentRunning),
+                  canSilent,
+                  [&]() { pushChord(controls.actions.toggleSilentRunning); });
         }
 } else if (fieldOpsPage) {
   const bool canAct = (!docked) && (fsdState == FsdState::Idle) && (supercruiseState == SupercruiseState::Idle) && currentSystem;
@@ -38009,6 +39240,7 @@ const char* pageName =
       navSelect("Shipyard / Upgrades", StationMenuPage::Shipyard, hasShipyard);
       navSelect("Storage / Warehouse", StationMenuPage::Warehouse, true);
       navSelect("Repair / Refuel / Restock", StationMenuPage::Services, true);
+      navSelect("Black Market", StationMenuPage::BlackMarket, true);
 
       ImGui::Separator();
       const std::string undockLabel = std::string("Undock (") + game::chordLabel(controls.actions.dockOrUndock) + ")";
@@ -38045,6 +39277,7 @@ const char* pageName =
           if (bigButton("Shipyard / Upgrades")) stationMenuPage = StationMenuPage::Shipyard;
           if (bigButton("Storage / Warehouse")) stationMenuPage = StationMenuPage::Warehouse;
           if (bigButton("Repair / Refuel / Restock ammo")) stationMenuPage = StationMenuPage::Services;
+          if (bigButton("Black Market")) stationMenuPage = StationMenuPage::BlackMarket;
 
           ImGui::Separator();
           if (bigButton("Undock")) stationMenuPage = StationMenuPage::ConfirmUndock;
@@ -38165,97 +39398,145 @@ const char* pageName =
 
           const sim::Station& station = *dockSt;
           auto& stEcon = universe.stationEconomy(station, timeDays);
-          const double rep = getRep(station.factionId);
           const double feeEff = effectiveFeeRate(station);
 
-          // --- Repair & Refuel (mirrors Market Details' docked services) ---
-          const double hullMissing = std::max(0.0, playerHullMax - playerHull);
-          const double repairCost = (hullMissing * 12.0) * (1.0 + feeEff);
+          // Station services are now backed by the station economy/inventory.
+          const sim::StationServicePriceModel svcPm{feeEff, 0.10};
 
-          ImGui::BeginDisabled(hullMissing <= 0.001);
-          if (ImGui::Button("Repair hull")) {
-            if (credits >= repairCost) {
-              credits -= repairCost;
-              playerHull = playerHullMax;
-              toast(toasts, "Repaired.", 1.8);
+          // --- Repair ---
+          {
+            const auto qRepair = sim::quoteHullRepairToFull(
+              stEcon, station.economyModel, playerHull, playerHullMax, svcPm, credits
+            );
+
+            ImGui::BeginDisabled(!qRepair.ok);
+            if (ImGui::Button("Repair hull")) {
+              const auto r = sim::applyHullRepairToFull(
+                stEcon, station.economyModel, credits, playerHull, playerHullMax, svcPm
+              );
+              if (r.ok) {
+                toast(toasts, "Repaired +" + std::to_string((int)std::round(r.hullRepaired)) + " hull.", 1.8);
+              } else if (r.reason && std::string_view(r.reason) == "no_need") {
+                toast(toasts, "Hull already full.", 1.8);
+              } else if (r.reason && std::string_view(r.reason) == "out_of_stock") {
+                toast(toasts, "Station is out of repair parts.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "need_credits") {
+                toast(toasts, "Not enough credits to repair.", 1.8);
+              } else {
+                toast(toasts, "Repair unavailable.", 2.0);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (qRepair.ok) {
+              ImGui::TextDisabled("(+%.1f hull, %.0f cr)%s%s",
+                                 qRepair.hullToRepair,
+                                 qRepair.costCr,
+                                 qRepair.limitedByStock ? " [stock]" : "",
+                                 qRepair.limitedByCredits ? " [credits]" : "");
             } else {
-              toast(toasts, "Not enough credits to repair.", 1.8);
+              const double missing = std::max(0.0, playerHullMax - playerHull);
+              if (missing <= 0.05) ImGui::TextDisabled("(full)");
+              else if (qRepair.reason && std::string_view(qRepair.reason) == "out_of_stock") ImGui::TextDisabled("(out of stock)");
+              else if (qRepair.reason && std::string_view(qRepair.reason) == "need_credits") ImGui::TextDisabled("(need credits)");
+              else ImGui::TextDisabled("(need %.1f hull)", missing);
             }
           }
-          ImGui::EndDisabled();
-          ImGui::SameLine();
-          ImGui::TextDisabled("(%.0f cr)", repairCost);
 
-          const double fuelMissing = std::max(0.0, fuelMax - fuel);
-          const auto fuelQuote = econ::quote(stEcon, station.economyModel, econ::CommodityId::Fuel, 0.10);
-          const double fuelAsk = std::max(0.0, fuelQuote.ask);
-          const double fuelAvail = std::max(0.0, fuelQuote.inventory);
-          const double fuelToBuy = std::min(fuelMissing, fuelAvail);
-          const double fuelCost = fuelToBuy * fuelAsk * (1.0 + feeEff);
+          // --- Refuel ---
+          {
+            const auto qRefuel = sim::quoteRefuelToFull(
+              stEcon, station.economyModel, fuel, fuelMax, svcPm, credits
+            );
 
-          ImGui::BeginDisabled(fuelToBuy <= 0.0001);
-          if (ImGui::Button("Refuel")) {
-            if (credits >= fuelCost) {
-              credits -= fuelCost;
-              fuel += fuelToBuy;
-              econ::takeInventory(stEcon, econ::CommodityId::Fuel, fuelToBuy, true);
-              toast(toasts, "Refueled.", 1.8);
+            ImGui::BeginDisabled(!qRefuel.ok);
+            if (ImGui::Button("Refuel")) {
+              const auto r = sim::applyRefuelToFull(
+                stEcon, station.economyModel, credits, fuel, fuelMax, svcPm
+              );
+              if (r.ok) {
+                toast(toasts, "Refueled +" + std::to_string((int)std::round(r.fuelBought)) + " units.", 1.8);
+              } else if (r.reason && std::string_view(r.reason) == "no_need") {
+                toast(toasts, "Fuel tank already full.", 1.8);
+              } else if (r.reason && std::string_view(r.reason) == "out_of_stock") {
+                toast(toasts, "Station is out of fuel.", 2.0);
+              } else if (r.reason && std::string_view(r.reason) == "need_credits") {
+                toast(toasts, "Not enough credits to refuel.", 1.8);
+              } else {
+                toast(toasts, "Refuel unavailable.", 2.0);
+              }
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (qRefuel.ok) {
+              ImGui::TextDisabled("(+%.1f fuel, %.0f cr)%s%s",
+                                 qRefuel.fuelToBuy,
+                                 qRefuel.costCr,
+                                 qRefuel.limitedByStock ? " [stock]" : "",
+                                 qRefuel.limitedByCredits ? " [credits]" : "");
             } else {
-              toast(toasts, "Not enough credits to refuel.", 1.8);
+              const double need = std::max(0.0, fuelMax - fuel);
+              if (need <= 0.05) ImGui::TextDisabled("(full)");
+              else if (qRefuel.reason && std::string_view(qRefuel.reason) == "out_of_stock") ImGui::TextDisabled("(out of stock)");
+              else if (qRefuel.reason && std::string_view(qRefuel.reason) == "need_credits") ImGui::TextDisabled("(need credits)");
+              else ImGui::TextDisabled("(need %.1f units)", need);
             }
           }
-          ImGui::EndDisabled();
-          ImGui::SameLine();
-          ImGui::TextDisabled("(%.2f fuel, %.0f cr)", fuelToBuy, fuelCost);
 
           // --- Countermeasures ---
           {
             ImGui::Separator();
             ImGui::Text("Countermeasures");
-            const sim::CountermeasureCaps cap = sim::countermeasureCapsForHull(shipHullClass);
 
-            const int wantFlares = std::clamp(cmFlares, 0, cap.flares);
-            const int wantChaff = std::clamp(cmChaff, 0, cap.chaff);
-            const int wantHeatSinks = std::clamp(cmHeatSinks, 0, cap.heatSinks);
-
-            cmFlares = wantFlares;
-            cmChaff = wantChaff;
-            cmHeatSinks = wantHeatSinks;
+            const auto cap = sim::countermeasureCapsForHull(shipHullClass);
+            sim::clampCountermeasureAmmo(cmFlares, cmChaff, cmHeatSinks, shipHullClass);
 
             ImGui::TextDisabled("Flares %d/%d   Chaff %d/%d   Heat sinks %d/%d",
-                               wantFlares, cap.flares,
-                               wantChaff, cap.chaff,
-                               wantHeatSinks, cap.heatSinks);
+                               cmFlares, cap.flares,
+                               cmChaff, cap.chaff,
+                               cmHeatSinks, cap.heatSinks);
 
-            const double priceMult = (1.0 + feeEff);
-            const double flareUnit = 85.0;
-            const double chaffUnit = 95.0;
-            const double heatSinkUnit = 360.0;
+            const auto qAll = sim::quoteCountermeasureRestockAll(
+              stEcon, station.economyModel,
+              shipHullClass,
+              cmFlares, cmChaff, cmHeatSinks,
+              svcPm, credits
+            );
 
-            const int needF = std::max(0, cap.flares - wantFlares);
-            const int needC = std::max(0, cap.chaff - wantChaff);
-            const int needH = std::max(0, cap.heatSinks - wantHeatSinks);
-
-            const double costF = needF * flareUnit * priceMult;
-            const double costC = needC * chaffUnit * priceMult;
-            const double costH = needH * heatSinkUnit * priceMult;
-            const double costAll = costF + costC + costH;
-
-            ImGui::BeginDisabled(needF + needC + needH <= 0);
+            ImGui::BeginDisabled(!qAll.ok);
             if (ImGui::Button("Restock all")) {
-              if (credits >= costAll) {
-                credits -= costAll;
-                cmFlares = cap.flares;
-                cmChaff = cap.chaff;
-                cmHeatSinks = cap.heatSinks;
-                toast(toasts, "Countermeasures restocked.", 2.0);
+              const auto r = sim::applyCountermeasureRestockAll(
+                stEcon, station.economyModel,
+                credits,
+                shipHullClass,
+                cmFlares, cmChaff, cmHeatSinks,
+                svcPm
+              );
+              if (r.ok) {
+                toast(toasts,
+                      "Restocked: +" + std::to_string(r.flaresBought) + "F +" +
+                        std::to_string(r.chaffBought) + "C +" + std::to_string(r.heatSinksBought) + "H",
+                      1.9);
               } else {
-                toast(toasts, "Not enough credits to restock countermeasures.", 2.0);
+                toast(toasts, "Unable to restock countermeasures.", 2.0);
               }
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::TextDisabled("(%.0f cr)", costAll);
+            if (qAll.ok) {
+              ImGui::TextDisabled("(+%dF +%dC +%dH, %.0f cr)%s%s",
+                                 qAll.buyFlares,
+                                 qAll.buyChaff,
+                                 qAll.buyHeatSinks,
+                                 qAll.costCr,
+                                 qAll.limitedByStock ? " [stock]" : "",
+                                 qAll.limitedByCredits ? " [credits]" : "");
+            } else {
+              if (qAll.reason && std::string_view(qAll.reason) == "no_need") ImGui::TextDisabled("(full)");
+              else if (qAll.reason && std::string_view(qAll.reason) == "out_of_stock") ImGui::TextDisabled("(out of stock)");
+              else if (qAll.reason && std::string_view(qAll.reason) == "need_credits") ImGui::TextDisabled("(need credits)");
+              else ImGui::TextDisabled("(unavailable)");
+            }
           }
 
           // --- Ordnance ---
@@ -38264,58 +39545,252 @@ const char* pageName =
             ImGui::Text("Ordnance");
             syncWeaponAmmo();
 
-            auto drawOrdnanceSlot = [&](const char* slotName, const char* btnLabel, WeaponType wt, core::u8& ammo) {
+            auto drawOrdnanceSlot = [&](const char* slotName, WeaponType wt, core::u8& ammo) {
               const int maxAmmo = sim::weaponAmmoMax(wt, shipHullClass);
               if (maxAmmo <= 0) return;
 
               const int have = std::clamp((int)ammo, 0, maxAmmo);
               ammo = (core::u8)have;
-              const int need = maxAmmo - have;
-              const double unitEff = sim::weaponAmmoUnitPriceCr(wt) * (1.0 + feeEff);
-              const double cost = (double)need * unitEff;
+
+              const auto qSlot = sim::quoteOrdnanceRearmToFull(
+                stEcon, station.economyModel, shipHullClass, wt, ammo, svcPm, credits
+              );
 
               ImGui::TextDisabled("%s: %s  %d/%d", slotName, weaponDef(wt).name, have, maxAmmo);
               ImGui::SameLine();
-              ImGui::BeginDisabled(need <= 0);
-              if (ImGui::SmallButton(btnLabel)) {
-                if (credits >= cost) {
-                  credits -= cost;
-                  ammo = (core::u8)maxAmmo;
-                  toast(toasts, (std::string(slotName) + " rearmed.").c_str(), 1.5);
+              ImGui::BeginDisabled(!qSlot.ok);
+              if (ImGui::SmallButton((std::string("Rearm ") + slotName).c_str())) {
+                const auto r = sim::applyOrdnanceRearmToFull(
+                  stEcon, station.economyModel, credits, shipHullClass, wt, ammo, svcPm
+                );
+                if (r.ok) toast(toasts, std::string(slotName) + " rearmed (" + std::to_string(r.ammoBought) + ").", 1.6);
+                else toast(toasts, "Unable to rearm.", 1.6);
+              }
+              ImGui::EndDisabled();
+              ImGui::SameLine();
+              if (qSlot.ok) {
+                ImGui::TextDisabled("(+%d, %.0f cr)%s%s",
+                                   qSlot.buyAmmo,
+                                   qSlot.costCr,
+                                   qSlot.limitedByStock ? " [stock]" : "",
+                                   qSlot.limitedByCredits ? " [credits]" : "");
+              } else {
+                if (qSlot.reason && std::string_view(qSlot.reason) == "no_need") ImGui::TextDisabled("(full)");
+                else if (qSlot.reason && std::string_view(qSlot.reason) == "out_of_stock") ImGui::TextDisabled("(out of stock)");
+                else if (qSlot.reason && std::string_view(qSlot.reason) == "need_credits") ImGui::TextDisabled("(need credits)");
+                else ImGui::TextDisabled("(unavailable)");
+              }
+            };
+
+            const int maxP = sim::weaponAmmoMax(weaponPrimary, shipHullClass);
+            const int maxS = sim::weaponAmmoMax(weaponSecondary, shipHullClass);
+
+            if (maxP <= 0 && maxS <= 0) {
+              ImGui::TextDisabled("No ammo-based weapons installed.");
+            } else {
+              if (maxP > 0) drawOrdnanceSlot("Primary", weaponPrimary, weaponAmmoPrimary);
+              if (maxS > 0) drawOrdnanceSlot("Secondary", weaponSecondary, weaponAmmoSecondary);
+
+              const auto qAll = sim::quoteOrdnanceRearmAllToFull(
+                stEcon, station.economyModel,
+                shipHullClass,
+                weaponPrimary, weaponAmmoPrimary,
+                weaponSecondary, weaponAmmoSecondary,
+                svcPm, credits
+              );
+
+              ImGui::BeginDisabled(!qAll.ok);
+              if (ImGui::Button("Rearm all")) {
+                const auto r = sim::applyOrdnanceRearmAllToFull(
+                  stEcon, station.economyModel, credits,
+                  shipHullClass,
+                  weaponPrimary, weaponAmmoPrimary,
+                  weaponSecondary, weaponAmmoSecondary,
+                  svcPm
+                );
+                if (r.ok) {
+                  toast(toasts,
+                        "Ordnance rearmed: +" + std::to_string(r.primaryBought) + "/" + std::to_string(r.secondaryBought),
+                        1.8);
                 } else {
-                  toast(toasts, "Not enough credits.", 1.6);
+                  toast(toasts, "Unable to rearm ordnance.", 1.8);
                 }
               }
               ImGui::EndDisabled();
               ImGui::SameLine();
-              ImGui::TextDisabled("(%d, %.0f cr)", need, cost);
-            };
-
-            // Primary
-            drawOrdnanceSlot("Primary", "Rearm primary", weaponPrimary, weaponAmmoPrimary);
-            // Secondary
-            drawOrdnanceSlot("Secondary", "Rearm secondary", weaponSecondary, weaponAmmoSecondary);
-
-            // Rearm all
-            const int needP = sim::weaponAmmoMax(weaponPrimary, shipHullClass) - (int)weaponAmmoPrimary;
-            const int needS = sim::weaponAmmoMax(weaponSecondary, shipHullClass) - (int)weaponAmmoSecondary;
-            const double costP = std::max(0, needP) * sim::weaponAmmoUnitPriceCr(weaponPrimary) * (1.0 + feeEff);
-            const double costS = std::max(0, needS) * sim::weaponAmmoUnitPriceCr(weaponSecondary) * (1.0 + feeEff);
-            const double costAll = costP + costS;
-            ImGui::BeginDisabled((needP + needS) <= 0);
-            if (ImGui::Button("Rearm all")) {
-              if (credits >= costAll) {
-                credits -= costAll;
-                weaponAmmoPrimary = (core::u8)sim::weaponAmmoMax(weaponPrimary, shipHullClass);
-                weaponAmmoSecondary = (core::u8)sim::weaponAmmoMax(weaponSecondary, shipHullClass);
-                toast(toasts, "Ordnance rearmed.", 1.8);
+              if (qAll.ok) {
+                ImGui::TextDisabled("(+%d +%d, %.0f cr)%s%s",
+                                   qAll.buyPrimary,
+                                   qAll.buySecondary,
+                                   qAll.costCr,
+                                   qAll.limitedByStock ? " [stock]" : "",
+                                   qAll.limitedByCredits ? " [credits]" : "");
               } else {
-                toast(toasts, "Not enough credits.", 1.6);
+                if (qAll.reason && std::string_view(qAll.reason) == "no_need") ImGui::TextDisabled("(full)");
+                else if (qAll.reason && std::string_view(qAll.reason) == "out_of_stock") ImGui::TextDisabled("(out of stock)");
+                else if (qAll.reason && std::string_view(qAll.reason) == "need_credits") ImGui::TextDisabled("(need credits)");
+                else ImGui::TextDisabled("(unavailable)");
               }
             }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.0f cr)", costAll);
+          }
+
+
+          break;
+        }
+
+        case StationMenuPage::BlackMarket: {
+          ImGui::SeparatorText("Black Market");
+          if (!dockSt) {
+            ImGui::TextDisabled("Not docked.");
+            break;
+          }
+
+          const sim::Station& station = *dockSt;
+          const sim::LawProfile stLaw = lawForFaction(station.factionId);
+          const sim::SystemSecurityProfile sec = currentSystem ? sim::systemSecurityProfile(universe.seed(), *currentSystem)
+                                                              : sim::SystemSecurityProfile{};
+          const double rep = getRep(station.factionId);
+          const sim::BlackMarketProfile bm = currentSystem ? sim::blackMarketProfile(universe.seed(),
+                                                                                     currentSystem->stub.id,
+                                                                                     station,
+                                                                                     sec,
+                                                                                     stLaw,
+                                                                                     timeDays,
+                                                                                     rep)
+                                                           : sim::BlackMarketProfile{};
+
+          const double stingChanceNow = std::clamp(bm.stingChance * std::clamp(1.0 + 0.012 * heat, 1.0, 2.2), 0.0, 1.0);
+
+          if (bm.available) {
+            ImGui::Text("Fence contact: AVAILABLE");
+          } else {
+            ImGui::TextDisabled("Fence contact: unavailable today");
+          }
+
+          ImGui::TextDisabled("Access %.0f%% | Risk %.0f%% | Fence cut %.0f%%", bm.access01 * 100.0, bm.risk01 * 100.0, bm.fenceCut * 100.0);
+          ImGui::TextDisabled("Bid x%.2f | Ask x%.2f | Sting %.1f%% (heat %.0f)", bm.bidMul, bm.askMul, stingChanceNow * 100.0, heat);
+
+          ImGui::Spacing();
+          if (ImGui::Button("Open Market & Trade")) {
+            stationMenuPage = StationMenuPage::MarketTrade;
+          }
+
+          // Quick fence sell: convert all contraband in hold into credits (excluding mission-reserved units).
+          ImGui::SameLine();
+          const bool canFence = bm.available;
+          ImGui::BeginDisabled(!canFence);
+          if (ImGui::Button("Sell all contraband")) {
+            auto& stEcon = universe.stationEconomy(station, timeDays);
+
+            // Reserve cargo needed for active delivery/smuggle missions.
+            std::array<double, econ::kCommodityCount> reserved{};
+            reserved.fill(0.0);
+            for (const auto& m : missions) {
+              if (m.completed || m.failed) continue;
+              if (m.type != sim::MissionType::Delivery && m.type != sim::MissionType::Smuggle) continue;
+              const std::size_t mi = (std::size_t)m.commodity;
+              if (mi >= econ::kCommodityCount) continue;
+              reserved[mi] += std::max(0.0, m.units);
+            }
+
+            // Build mid-price overrides from the official market so enforcement values scale locally.
+            std::array<double, econ::kCommodityCount> midOverride{};
+            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+              const auto cid = (econ::CommodityId)i;
+              midOverride[i] = econ::quote(stEcon, station.economyModel, cid, 0.10).mid;
+            }
+
+            double totalPayout = 0.0;
+            bool stung = false;
+
+            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+              const auto cid = (econ::CommodityId)i;
+              if (!sim::blackMarketEligibleCommodity(universe.seed(), station, cid)) continue;
+
+              const double freeUnits = std::max(0.0, cargo[i] - reserved[i]);
+              if (freeUnits <= 1e-6) continue;
+
+              const auto r = sim::sellToBlackMarket(universe.seed(),
+                                                    rng.nextU64(),
+                                                    station,
+                                                    bm,
+                                                    stLaw,
+                                                    heat,
+                                                    cid,
+                                                    freeUnits,
+                                                    0.10,
+                                                    &midOverride,
+                                                    credits,
+                                                    cargo);
+
+              if (!r.ok) continue;
+              if (r.stung) {
+                stung = true;
+                toast(toasts, "Black market deal was a sting!", 2.6);
+                applyContrabandEnforcementSideEffects(station.factionId,
+                                                      stLaw,
+                                                      r.enforcement,
+                                                      "Port security (sting)",
+                                                      /*detail=*/"",
+                                                      r.scan.scannedIllegalUnits);
+                break;
+              }
+
+              totalPayout += r.payoutCr;
+              applyBlackMarketDealSideEffects(station.factionId, bm, r.payoutCr, r.unitsSold);
+            }
+
+            if (!stung) {
+              if (totalPayout > 1e-6) {
+                toast(toasts, "Fence payout: " + std::to_string((int)std::round(totalPayout)) + " cr", 2.4);
+              } else {
+                toast(toasts, "No contraband to sell.", 1.8);
+              }
+            }
+          }
+          ImGui::EndDisabled();
+
+          if (!canFence && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (!bm.available) {
+              ImGui::SetTooltip("No fence contact today. Try again tomorrow or elsewhere.");
+            } else {
+              ImGui::SetTooltip("Fence access is blocked here.");
+            }
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Tip: black market deals are riskier when your heat is high.");
+
+          // Show a quick summary of contraband currently in the hold.
+          ImGui::SeparatorText("Contraband in hold");
+          if (ImGui::BeginTable("##bm_hold", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Commodity");
+            ImGui::TableSetupColumn("Units");
+            ImGui::TableSetupColumn("BM bid");
+            ImGui::TableSetupColumn("Est. value");
+            ImGui::TableHeadersRow();
+
+            auto& stEcon = universe.stationEconomy(station, timeDays);
+            for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+              const auto cid = (econ::CommodityId)i;
+              const double have = std::max(0.0, cargo[i]);
+              if (have <= 1e-6) continue;
+              if (!sim::blackMarketEligibleCommodity(universe.seed(), station, cid)) continue;
+
+              const auto q = econ::quote(stEcon, station.economyModel, cid, 0.10);
+              const auto bmq = sim::applyBlackMarketQuote(bm, q);
+
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::TextUnformatted(econ::commodityDef(cid).name.c_str());
+              ImGui::TableSetColumnIndex(1);
+              ImGui::Text("%.0f", have);
+              ImGui::TableSetColumnIndex(2);
+              ImGui::Text("%.2f", bmq.bid);
+              ImGui::TableSetColumnIndex(3);
+              ImGui::Text("%.0f", bmq.bid * have);
+            }
+            ImGui::EndTable();
           }
 
           break;

@@ -46,6 +46,42 @@ int test_mining() {
     CHECK(std::abs(rb.extractedUnits - 12.0) < 1e-9);
   }
 
+
+  // Seam direction should be deterministic and seam-aware mining should modulate yield.
+  {
+    const core::u64 seed = 1234u;
+    const core::u64 id = 55u;
+    const auto seam = sim::miningSeamDir(seed, id, sim::ResourceFieldKind::OreBelt);
+    CHECK(std::abs(seam.length() - 1.0) < 1e-9);
+
+    sim::MiningHitInput in{};
+    in.universeSeed = seed;
+    in.asteroidId = id;
+    in.fieldKind = sim::ResourceFieldKind::OreBelt;
+    in.distKm = 0.0;
+    in.rangeKm = 100.0;
+    in.baseUnitsPerHit = 10.0;
+    in.prospected = true;
+    in.baseUnits = 200.0;
+    in.remainingUnits = 200.0;
+
+    // Best-case: hit directly on the seam pole.
+    in.hitDirUnit = seam;
+    const auto rPole = sim::computeMiningHit(in);
+    CHECK(rPole.seamMultiplier > 1.05);
+    CHECK(rPole.extractedUnits > 12.0);
+
+    // Worst-case: hit near the seam equator (orthogonal direction).
+    // Build an orthogonal unit vector robustly.
+    math::Vec3d basis{1.0, 0.0, 0.0};
+    if (std::abs(math::dot(basis, seam)) > 0.85) basis = {0.0, 1.0, 0.0};
+    const math::Vec3d ortho = math::cross(seam, basis).normalized();
+    in.hitDirUnit = ortho;
+    const auto rEq = sim::computeMiningHit(in);
+    CHECK(rEq.seamMultiplier < 0.98);
+    CHECK(rEq.extractedUnits < rPole.extractedUnits);
+  }
+
   // Traits should be deterministic and the fracture band should be sane.
   {
     const core::u64 seed = 9999u;

@@ -392,6 +392,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("FSD Jump", a.fsdJump);
   addAction("Scanner action", a.scannerAction);
   addAction("Sensor Ping", a.sensorPing);
+  addAction("Toggle Silent Running", a.toggleSilentRunning);
   addAction("Docking clearance", a.requestDockingClearance);
   addAction("Dock/Undock", a.dockOrUndock);
   addAction("Cycle targets", a.cycleTargets);
@@ -780,6 +781,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("FSD Jump", controls.actions.fsdJump, ad.fsdJump);
     add("Scanner action", controls.actions.scannerAction, ad.scannerAction);
     add("Sensor Ping", controls.actions.sensorPing, ad.sensorPing);
+    add("Toggle Silent Running", controls.actions.toggleSilentRunning, ad.toggleSilentRunning);
 
     add("Docking clearance", controls.actions.requestDockingClearance, ad.requestDockingClearance);
     add("Dock/Undock", controls.actions.dockOrUndock, ad.dockOrUndock);

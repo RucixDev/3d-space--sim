@@ -152,6 +152,82 @@ int test_black_market() {
   // Illegal cargo should not increase after confiscation.
   CHECK(cargo[(std::size_t)illegalCid] <= cargoBeforeSting + 1e-6);
 
+
+
+  // ---------------------------------------------------------------------------
+  // Buy path (BM ask side)
+  // ---------------------------------------------------------------------------
+
+  // Successful purchase: force sting chance to 0 to make the outcome deterministic.
+  {
+    sim::BlackMarketProfile bmSafe = bmAvail;
+    bmSafe.stingChance = 0.0;
+    bmSafe.available = true;
+
+    std::array<double, econ::kCommodityCount> buyCargo{};
+    buyCargo.fill(0.0);
+    double buyCredits = 8000.0;
+
+    const double creditsBeforeBuy = buyCredits;
+    const double cargoBeforeBuy = buyCargo[(std::size_t)illegalCid];
+
+    const auto rb = sim::buyFromBlackMarket(seed,
+                                           /*eventSeed=*/123,
+                                           st,
+                                           bmSafe,
+                                           law,
+                                           /*heat=*/0.0,
+                                           illegalCid,
+                                           /*units=*/4.0,
+                                           /*bidAskSpread=*/0.10,
+                                           /*midOverride=*/nullptr,
+                                           buyCredits,
+                                           buyCargo);
+
+    CHECK(rb.ok);
+    CHECK(!rb.stung);
+    CHECK(rb.unitsBought > 0.0);
+    CHECK(rb.costCr >= 0.0);
+    CHECK(buyCredits <= creditsBeforeBuy + 1e-6);
+    CHECK(buyCargo[(std::size_t)illegalCid] >= cargoBeforeBuy + 1e-6);
+  }
+
+  // Sting purchase: set stingChance to 1 so it always stings, then ensure enforcement triggers.
+  {
+    sim::BlackMarketProfile bmAlwaysSting = bmAvail;
+    bmAlwaysSting.stingChance = 1.0;
+    bmAlwaysSting.available = true;
+
+    std::array<double, econ::kCommodityCount> buyCargo{};
+    buyCargo.fill(0.0);
+    buyCargo[(std::size_t)illegalCid] = 2.0; // already carrying something illegal
+    double buyCredits = 8000.0;
+
+    const double creditsBeforeBuy = buyCredits;
+    const double cargoBeforeBuy = buyCargo[(std::size_t)illegalCid];
+
+    const auto rb2 = sim::buyFromBlackMarket(seed,
+                                            /*eventSeed=*/777,
+                                            st,
+                                            bmAlwaysSting,
+                                            law,
+                                            /*heat=*/25.0,
+                                            illegalCid,
+                                            /*units=*/3.0,
+                                            /*bidAskSpread=*/0.10,
+                                            /*midOverride=*/nullptr,
+                                            buyCredits,
+                                            buyCargo);
+
+    CHECK(rb2.ok);
+    CHECK(rb2.stung);
+    CHECK(rb2.scan.illegalValueCr >= 0.0);
+    CHECK(rb2.enforcement.fineCr >= 0.0);
+    CHECK(buyCredits <= creditsBeforeBuy + 1e-6);
+    // After enforcement, illegal cargo should not increase.
+    CHECK(buyCargo[(std::size_t)illegalCid] <= cargoBeforeBuy + 1e-6);
+  }
+
   (void)creditsBefore;
   (void)creditsBeforeSting;
   (void)cargoBeforeSting;
