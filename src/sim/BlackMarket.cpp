@@ -262,4 +262,106 @@ BlackMarketSellResult sellToBlackMarket(core::u64 universeSeed,
   return out;
 }
 
+
+BlackMarketBuyResult buyFromBlackMarket(core::u64 universeSeed,
+                                        core::u64 eventSeed,
+                                        const Station& station,
+                                        const BlackMarketProfile& bm,
+                                        const LawProfile& law,
+                                        double playerHeat,
+                                        econ::CommodityId commodity,
+                                        double units,
+                                        double bidAskSpread,
+                                        const std::array<double, econ::kCommodityCount>* midPriceOverrideCr,
+                                        double& credits,
+                                        std::array<double, econ::kCommodityCount>& cargoUnits) {
+  BlackMarketBuyResult out{};
+  out.commodity = commodity;
+  out.intendedUnits = units;
+
+  if (units <= 1e-9) {
+    out.reason = "units<=0";
+    return out;
+  }
+  if (!bm.available) {
+    out.reason = "no_black_market";
+    return out;
+  }
+
+  const std::size_t idx = (std::size_t)commodity;
+  if (idx >= econ::kCommodityCount) {
+    out.reason = "invalid_commodity";
+    return out;
+  }
+
+  if (!blackMarketEligibleCommodity(universeSeed, station, commodity)) {
+    out.reason = "not_eligible";
+    return out;
+  }
+
+  const double creditsBefore = credits;
+
+  const double spread = std::clamp(bidAskSpread, 0.0, 0.95);
+
+  // Resolve a reference mid price.
+  double mid = econ::commodityDef(commodity).basePrice;
+  if (midPriceOverrideCr) {
+    mid = std::max(0.0, (*midPriceOverrideCr)[idx]);
+    if (mid <= 1e-9) mid = econ::commodityDef(commodity).basePrice;
+  }
+
+  const double officialAsk = mid * (1.0 + 0.5 * spread);
+  const double fenceCut = std::clamp(bm.fenceCut, 0.0, 1.0);
+
+  double unitPrice = officialAsk * std::max(0.01, bm.askMul) * (1.0 + 0.25 * fenceCut);
+  if (!(unitPrice > 1e-9) || !std::isfinite(unitPrice)) {
+    out.reason = "invalid_price";
+    return out;
+  }
+
+  // Clamp purchase to available credits. (Cargo mass limits are owned by the caller/UI.)
+  const double affordable = std::max(0.0, credits) / unitPrice;
+  const double buyUnits = std::min(std::max(0.0, units), affordable);
+
+  if (buyUnits <= 1e-9) {
+    out.reason = "need_credits";
+    return out;
+  }
+
+  out.unitsBought = buyUnits;
+  const double cost = unitPrice * buyUnits;
+
+  out.pricePerUnitCr = unitPrice;
+  out.costCr = cost;
+
+  // Roll sting using a per-commodity salted seed so buy/sell outcomes don't correlate.
+  const core::u64 salt = core::seedFromText("bm_buy");
+  out.stung = rollBlackMarketSting(core::hashCombine(eventSeed, core::hashCombine(salt, (core::u64)idx)), bm, playerHeat);
+
+  // Apply the purchase first (even on a sting). In a sting narrative, the player is
+  // assumed to complete the exchange and then enforcement moves in.
+  credits = std::max(0.0, credits) - cost;
+  cargoUnits[idx] = std::max(0.0, cargoUnits[idx]) + buyUnits;
+
+  if (out.stung) {
+    // Enforce contraband on the *full* cargo under this station's illegality mask.
+    const core::u32 mask = illegalCommodityMaskForStation(universeSeed, station.factionId, station.id, station.type);
+
+    out.scan = scanIllegalCargoMask(mask, cargoUnits, midPriceOverrideCr);
+    out.enforcement = enforceContraband(law, credits, cargoUnits, out.scan.scannedIllegalUnits, out.scan.illegalValueCr);
+
+    credits = out.enforcement.creditsAfter;
+    cargoUnits = out.enforcement.cargoAfter;
+
+    out.creditsDelta = credits - creditsBefore;
+    out.ok = true;
+    return out;
+  }
+
+  out.creditsDelta = credits - creditsBefore;
+  out.ok = true;
+  return out;
+}
+
+
 } // namespace stellar::sim

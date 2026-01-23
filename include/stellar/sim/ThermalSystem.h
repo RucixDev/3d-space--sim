@@ -43,6 +43,11 @@ struct ThermalParams {
   double heatPerFsdChargeSec{12.0};
   double heatPerFsdJumpSec{16.0};
 
+  // Silent running: radiators closed to reduce emissions, but heat builds rapidly.
+  // Applies only when undocked.
+  double silentCoolMult{0.35};      // multiplies cooling rate while silent
+  double heatPerSilentSec{6.5};     // baseline heat added per second while silent
+
   // Overheat behavior.
   double overheatStart{100.0};
 
@@ -56,6 +61,7 @@ struct ThermalInputs {
   double dtReal{0.0};
 
   bool docked{false};
+  bool silentRunning{false};
   bool supercruiseActive{false};
   ThermalFsdState fsd{ThermalFsdState::Idle};
 

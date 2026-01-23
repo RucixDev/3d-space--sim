@@ -326,6 +326,10 @@ std::string dotEscape(std::string_view s) {
 
 } // namespace
 
+std::string FrameGraph::toDot() const {
+  return toDot(DotExportOptions{});
+}
+
 std::string FrameGraph::toDot(const DotExportOptions& opt) const {
   std::ostringstream ss;
 

@@ -27,6 +27,7 @@ ThermalStepResult stepThermal(double currentHeat,
     if (in.supercruiseActive) heatIn += params.heatPerSupercruiseSec;
     if (in.fsd == ThermalFsdState::Charging) heatIn += params.heatPerFsdChargeSec;
     if (in.fsd == ThermalFsdState::Jumping) heatIn += params.heatPerFsdJumpSec;
+    if (in.silentRunning) heatIn += params.heatPerSilentSec;
     heatIn += std::max(0.0, in.externalHeatPerSec);
   }
 
@@ -34,7 +35,10 @@ ThermalStepResult stepThermal(double currentHeat,
   const double baseCool = in.docked ? params.baseCoolDocked : params.baseCoolUndocked;
   const double ref = std::max(1e-6, params.referenceCoolRate);
   const double coolStat = std::max(0.0, in.heatCoolRate);
-  const double coolRate = baseCool * (coolStat / ref);
+  double coolRate = baseCool * (coolStat / ref);
+  if (!in.docked && in.silentRunning) {
+    coolRate *= std::clamp(params.silentCoolMult, 0.0, 1.0);
+  }
 
   if (dt > 0.0) {
     heat += (heatIn - coolRate) * dt;

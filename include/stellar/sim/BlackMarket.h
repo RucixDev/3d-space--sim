@@ -151,4 +151,59 @@ BlackMarketSellResult sellToBlackMarket(core::u64 universeSeed,
                                         double& credits,
                                         std::array<double, econ::kCommodityCount>& cargoUnits);
 
+
+
+// Result of attempting to buy contraband via the black market.
+struct BlackMarketBuyResult {
+  bool ok{false};
+  bool stung{false};
+  const char* reason{nullptr};
+
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  double intendedUnits{0.0};
+  double unitsBought{0.0};
+
+  // For successful (not stung) purchases.
+  double pricePerUnitCr{0.0};
+  double costCr{0.0};
+
+  // Delta applied to credits by this attempt.
+  double creditsDelta{0.0};
+
+  // If stung, we return the underlying scan + enforcement outcome so the caller
+  // can apply rep/ledger side effects and show messaging.
+  IllegalCargoScanResult scan{};
+  ContrabandEnforcementResult enforcement{};
+};
+
+// Buy `units` of `commodity` via a station black market.
+//
+// Behavior:
+//  - Requires bm.available == true
+//  - Requires commodity to be illegal at this station
+//  - Does not modify station economy inventory (off-books)
+//  - On a sting, the player is assumed to have completed the purchase before enforcement:
+//      - credits are deducted
+//      - bought goods are added to cargo
+//      - contraband is enforced on the full cargo under the station's illegality mask (confiscation + fine)
+//
+// Pricing:
+//  - Uses midPriceOverrideCr[cid] if provided; otherwise uses commodity basePrice.
+//  - Converts mid -> ask using bidAskSpread/2, then applies bm.askMul and bm.fenceCut.
+//
+// The caller owns reputation and law-ledger application. This function only
+// mutates credits/cargo and returns the suggested penalties.
+BlackMarketBuyResult buyFromBlackMarket(core::u64 universeSeed,
+                                        core::u64 eventSeed,
+                                        const Station& station,
+                                        const BlackMarketProfile& bm,
+                                        const LawProfile& law,
+                                        double playerHeat,
+                                        econ::CommodityId commodity,
+                                        double units,
+                                        double bidAskSpread,
+                                        const std::array<double, econ::kCommodityCount>* midPriceOverrideCr,
+                                        double& credits,
+                                        std::array<double, econ::kCommodityCount>& cargoUnits);
+
 } // namespace stellar::sim

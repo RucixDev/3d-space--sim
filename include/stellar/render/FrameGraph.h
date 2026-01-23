@@ -175,7 +175,14 @@ public:
   // Returns a GraphViz DOT representation of the current graph.
   //
   // Note: For best results (lifetimes/aliasing/schedule), call compile() first.
-  std::string toDot(const DotExportOptions& opt = DotExportOptions{}) const;
+  // Export the FrameGraph as a DOT graph (GraphViz).
+  //
+  // Note: we intentionally avoid a default argument here because DotExportOptions'
+  // implicitly-generated default constructor is defined at the end of FrameGraph,
+  // and GCC rejects using it as a default argument while the enclosing class is
+  // still being parsed.
+  std::string toDot() const;
+  std::string toDot(const DotExportOptions& opt) const;
 
   // Number of physical transient allocations required for the last compile.
   int physicalTextureCount() const { return physRequired_; }

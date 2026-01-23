@@ -1,3 +1,219 @@
+## Round 139 - Silent Running (Stealth Mode) + Thermal/Sensor Tradeoffs
+
+This round adds a *high-risk / high-reward* stealth mechanic inspired by space-sim classics: **Silent Running**.
+
+### 🥷 What shipped
+
+- **New gameplay toggle: Silent Running**
+  - Default keybind: **Ctrl+X** (rebindable in Controls).
+  - Also available via **Action Wheel → Navigation → Silent Running**.
+  - While engaged:
+    - **Shields are forced offline** (and will not regenerate).
+    - Ship **cooling is heavily reduced**, and **baseline heat rises**.
+
+- **Core sim upgrade: ThermalSystem now supports silent running**
+  - Adds `ThermalInputs::silentRunning`.
+  - Adds `ThermalParams::silentCoolMult` + `ThermalParams::heatPerSilentSec`.
+  - Unit test coverage added.
+
+- **Stealth has real systemic consequences**
+  - **Radar sensor power** is reduced while silent running (you see less unless you ping).
+  - **Cargo scan acquisition** is influenced by a ship “loudness” heuristic:
+    - hull class, **speed**, **heat**, and **sensor ping** emissions
+    - silent running reduces scan lock likelihood, but rising heat can counteract it over time
+  - **Cargo scan duration** is longer while silent running (harder to hold a stable lock).
+  - **Missile lock time** now scales with target “signature” and your own emissions:
+    - ping helps locks; silent running hurts locks.
+
+- **HUD feedback**
+  - Radar shows a clear **SILENT** indicator when the mode is active.
+
+### Files changed/added
+
+- `include/stellar/sim/ThermalSystem.h`
+- `src/sim/ThermalSystem.cpp`
+- `tests/test_thermal.cpp`
+- `apps/stellar_game/ControlsConfig.h`
+- `apps/stellar_game/ControlsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+## Round 138 - Station Security / Traffic Control (No-Fire Zone + Speeding + Trespass)
+
+This round fleshes out an underdeveloped slice of "station life": approaching the mail-slot now has real consequences.
+
+### 🚨 What shipped
+
+- **New headless sim module: `sim::StationSecurity`**
+  - Deterministic, unit-testable station enforcement logic that emits at most one event per tick (priority: weapons → trespass → speeding).
+  - Implements:
+    - **No-Fire Zone**: weapon discharge inside the station’s no-fire bubble.
+    - **Traffic speed envelope**: overspeed is detected via a soft distance-based speed limit with tolerance + persistence timers.
+    - **Docking-slot trespass**: entering the mail-slot tunnel without valid clearance.
+  - Uses **cooldowns + accumulators** to avoid per-frame spam.
+  - Uses a **graduated response** model (strikes): **warning → fine → bounty**.
+  - Fine/bounty magnitudes are modulated by the station’s **law profile** (strictness/corruption/fine base).
+
+- **Gameplay integration (stellar_game)**
+  - Added station traffic enforcement to the main loop:
+    - Violations generate **diegetic Comms** warnings from "Port Authority".
+    - Fines are posted to the **Law Ledger** and apply rep penalties.
+    - Repeated/serious violations escalate to **bounties**, causing station defenses to engage as intended.
+
+- **Tests**
+  - Added `tests/test_station_security.cpp` validating:
+    - weapon discharge escalation (warning → fine → bounty)
+    - speeding persistence threshold + fine escalation
+    - docking-slot trespass detection + clearance suppression
+
+## Round 137
+
+### 🕵️ Black Market: Full Contraband Trading (Buy + Sell) + Stings
+
+- **Implemented true black-market buying** for contraband (previously only black-market selling existed, and buying was intentionally blocked).
+- **Unified black-market behavior across the game** by routing illegal trade through `sim::BlackMarket` logic instead of ad-hoc price multipliers.
+- **Black market stings are now real events**: deals can be stings, triggering contraband enforcement (confiscation + fines) based on the station’s law profile.
+- Added a new **Station Menu → Black Market** page with:
+  - live fence availability + risk indicators
+  - one-click “Sell all contraband” (excluding mission-reserved cargo)
+  - a contraband hold summary with estimated fence payouts
+- Updated the **Market UI** so illegal commodities can be **bought and sold via the black market** directly from the market table when a fence is available.
+- Updated **trade loop automation** to support **illegal outbound manifests** (black market buys) and **illegal inbound sales**, including stings.
+
+### 🧯 Refactor: Contraband Enforcement Side Effects
+
+- Extracted enforcement side effects (rep, fines/ledger, police heat/alert, smuggle mission failure attribution) into a reusable helper so multiple systems (police scans, stings) share identical consequences.
+
+## Round 136 - ShipScan: scan intel reports + identification memory
+
+This round turns the in-flight **Scan** action into a meaningful, reusable mechanic (not just a mission checkbox).
+
+### Highlights
+
+- **New `sim::ShipScan` module (headless)**
+  - Generates a deterministic-but-imperfect **scan report** from a snapshot of target state.
+  - Reports include: **threat rating**, **cargo value estimate (with error band)**, and **jammer hints**.
+  - Scan quality is driven by **sensor track strength** and is degraded by **jamming**.
+
+- **Gameplay integration**
+  - Completing a scan of a ship contact now posts a **Comms** message from **"Ship Scanner"** with a full report.
+  - Scan intel is cached (in-session) and shown in:
+    - **Radar tooltips**
+    - **System Map → Selection details**
+
+- **Identification memory**
+  - A completed scan grants a temporary **ID memory window** so a scanned contact stays named for a while even if it later drops below the passive sensor identification threshold.
+
+- **Tests**
+  - Added `tests/test_ship_scan.cpp` validating scan quality, threat ordering, cargo error-band behavior, and jammer detection gating.
+
+### Files changed/added
+
+- `include/stellar/sim/ShipScan.h`
+- `src/sim/ShipScan.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_ship_scan.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 135 - StationServices: economy-backed repair/refuel/restock
+
+This round turns the "quick docked services" (repair, refuel, countermeasures, ordnance) into **real, economy-backed
+station transactions** instead of fixed credit-only button presses.
+
+### Highlights
+
+- **New `sim::StationServices` module (headless)**
+  - Quotes and applies **hull repair**, **refuel**, **countermeasure restock**, and **missile rearm**.
+  - Services consume actual station commodities via `econ::takeInventory(...)`.
+  - Prices are based on `econ::quote(...)` (ask price) and then multiplied by the **effective station fee**.
+  - Supports **partial fills** when limited by **station stock** or **player credits**.
+  - Includes small combinatorial planners for "restock all" and "rearm all" so limited resources are spent sensibly.
+
+- **New shared `sim::CountermeasureLoadout` helpers**
+  - Centralizes the flare/chaff/heat-sink caps and provides clamp/restock helpers.
+  - Removes duplicated cap logic from the game UI.
+
+- **UI integration**
+  - Both **Market Details → Services** and **Station Menu → Services** now use the headless module.
+  - Buttons show `[stock]` / `[credits]` hints when purchases are limited.
+
+- **Tests**
+  - Added `tests/test_station_services.cpp` covering repair/refuel/restock/rearm constraints.
+
+### Files changed/added
+
+- `include/stellar/sim/CountermeasureLoadout.h`
+- `include/stellar/sim/StationServices.h`
+- `src/sim/StationServices.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_station_services.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 134 - ElectronicWarfare: radar jamming + ghost returns
+
+This round builds on the sensor/radar model by adding a light-weight **Electronic Warfare (EW)** layer.
+Some NPCs can field **low-grade radar jammers** that suppress your effective sensor power and inject
+plausible "ghost" noise returns on the HUD radar.
+
+### Highlights
+
+- **New `sim::ElectronicWarfare` module**
+  - `computeJammingSnr(...)` + `jamming01FromSnr(...)`: inverse-square jammer field mapped to [0..1] via `snr/(1+snr)`.
+  - `applyJammingToSensorPower(...)`: reduces effective sensor power (active ping partially pierces jamming).
+  - `generateGhostBlips(...)`: deterministic, drifted noise blips driven by `(seed, time, range, jamming)`.
+  - Pure/headless and unit-tested.
+
+- **Radar HUD integrates jamming**
+  - Aggregates jammer sources from nearby contacts (occluded jammers are heavily attenuated).
+  - Displays a "JAM xx%" indicator when jammed.
+  - Optional ghost returns drawn as non-selectable signal blips (alpha scales with noise strength).
+
+- **Pirate packs can include a jammer ship**
+  - Leaders are more likely to carry a jammer; occasional wing ships do as well.
+
+- **New tests**
+  - `tests/test_electronic_warfare.cpp` covers curve sanity + determinism + bounds.
+
+## Round 133 - Station services UI robustness
+
+- Fixed docked station services inventory call signature.
+- Fixed countermeasure cap mismatch between new game defaults and HUD init.
+
+## Round 132 - SensorModel: non-omniscient radar, occlusion + active ping
+
+This round targets a very visible but under-developed system in many prototypes: **perfectly omniscient radar**.
+We add a small, deterministic **sensor signal model** (range falloff + occlusion + smoothing) and wire it into the
+HUD radar so contacts can be *ghosts*, become *identified* with proximity, and pop a tactical **active ping** sweep.
+
+### Highlights
+
+- **New `sim::SensorModel` module**
+  - `computeSensorStrength01(...)`: inverse-square strength curve mapped to [0..1] via `snr/(1+snr)`
+  - `updateSensorTrack(...)`: exponential smoothing + identification hysteresis (prevents flicker)
+  - Pure/headless (no renderer dependencies), so it is easy to unit-test and reuse.
+
+- **Radar HUD is no longer omniscient for ships**
+  - Contacts are filtered through the sensor track.
+  - Unidentified contacts show as **generic signal blips** until identified.
+  - Icon alpha scales with sensor strength (low confidence feels "faint" instead of binary on/off).
+  - Planets/stations can **occlude** line-of-sight, attenuating detection.
+
+- **Implemented the existing `sensorPing` control action (default: Ctrl+O)**
+  - Emits a short active ping that boosts sensor power for a moment.
+  - Draws a sweep ring on the radar and posts an IntegrationHub event.
+
+- **Tests**
+  - Added `tests/test_sensor_model.cpp` to validate the strength curve, occlusion attenuation, smoothing half-life, and identification hysteresis.
+
+---
+
 ## Round 130 - TrafficLanes: corridor-bundled dual-carriageway lanes + geometry API
 
 This round targets a very visible but under-developed system: **in-system traffic lanes**.

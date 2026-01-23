@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stellar/core/Types.h"
+#include "stellar/math/Vec3.h"
 #include "stellar/sim/ResourceField.h"
 
 namespace stellar::sim {
@@ -20,6 +21,17 @@ MiningAsteroidTraits miningAsteroidTraits(core::u64 universeSeed,
                                          core::u64 asteroidId,
                                          ResourceFieldKind fieldKind);
 
+// Deterministic "rich seam" direction derived from (universeSeed, asteroidId, fieldKind).
+//
+// The game uses this for:
+//  - optional seam-aware yield bonuses (player skill / positioning)
+//  - HUD/world markers when an asteroid has been prospected
+//
+// The returned vector is unit-length in the system's local frame.
+math::Vec3d miningSeamDir(core::u64 universeSeed,
+                          core::u64 asteroidId,
+                          ResourceFieldKind fieldKind);
+
 // Efficiency curve for mining lasers.
 //
 // Returns a multiplier in [minEfficiency, 1]. At close range (<= fullEfficiencyFrac * rangeKm)
@@ -37,6 +49,15 @@ struct MiningHitInput {
   // Shooter -> hit distance.
   double distKm{0.0};
   double rangeKm{180000.0};
+
+  // Optional: direction from the asteroid center to the mining hit point.
+  //
+  // If non-zero and the asteroid has been prospected, computeMiningHit()
+  // applies a deterministic seam multiplier based on alignment with the
+  // asteroid's hidden "rich seam" axis.
+  //
+  // Leave as {0,0,0} to disable seam-aware yield.
+  math::Vec3d hitDirUnit{0, 0, 0};
 
   // Baseline units extracted per hit at full efficiency (before prospect bonus).
   double baseUnitsPerHit{10.0};
@@ -56,6 +77,9 @@ struct MiningHitResult {
 
   // Efficiency multiplier used for this hit.
   double efficiency{0.0};
+
+  // Extra multiplier applied from seam-aware mining (1.0 if disabled).
+  double seamMultiplier{1.0};
 
   // Traits (mirrors miningAsteroidTraits result).
   bool volatilePocket{false};

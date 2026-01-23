@@ -207,7 +207,10 @@ set(STELLAR_CORE_SOURCES
   src/sim/Ballistics.cpp
   src/sim/Combat.cpp
   src/sim/Countermeasures.cpp
+  src/sim/ShipScan.cpp
   src/sim/MissileDefense.cpp
+  src/sim/SensorModel.cpp
+  src/sim/ElectronicWarfare.cpp
   src/sim/FlightController.cpp
   src/sim/NavAssistComputer.cpp
   src/sim/SupercruiseComputer.cpp
@@ -230,6 +233,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Law.cpp
   src/sim/PoliceScan.cpp
   src/sim/LawLedger.cpp
+  src/sim/StationSecurity.cpp
   src/sim/BlackMarket.cpp
   src/sim/Extortion.cpp
   src/sim/NpcCombatAI.cpp
@@ -245,6 +249,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/IndustryScanner.cpp
   src/sim/Warehouse.cpp
   src/sim/ShipyardService.cpp
+  src/sim/StationServices.cpp
   src/sim/Insurance.cpp
   src/sim/Logbook.cpp
   src/sim/SaveGame.cpp
