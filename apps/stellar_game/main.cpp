@@ -242,6 +242,31 @@ static constexpr double kEARTH_RADIUS_KM = 6371.0;
 // The sim uses kilometers. For rendering, we scale down by this factor.
 static constexpr double kRENDER_UNIT_KM = 1.0e6; // 1 unit = 1 million km
 
+static sim::TrafficTransitTradeParams trafficTransitParamsFromCVars() {
+  // Ensure the default CVars exist even if the console window hasn't been
+  // initialized yet.
+  core::installDefaultCVars();
+
+  sim::TrafficTransitTradeParams p{};
+  const auto& cv = core::cvars();
+
+  p.model = sim::trafficTradeModelFromInt(cv.getInt("sim.traffic.model",
+                                                   static_cast<core::i64>(p.model)));
+  p.bidAskSpread = cv.getFloat("sim.traffic.bid_ask_spread", p.bidAskSpread);
+  p.minProfitPerUnitCr = cv.getFloat("sim.traffic.min_profit_per_unit", p.minProfitPerUnitCr);
+  p.distancePenaltyPerKm = cv.getFloat("sim.traffic.distance_penalty_per_km", p.distancePenaltyPerKm);
+
+  p.profitWeight = cv.getFloat("sim.traffic.profit_weight", p.profitWeight);
+  p.flowWeight = cv.getFloat("sim.traffic.flow_weight", p.flowWeight);
+
+  p.maxUnitsFracOfSrcDesired = cv.getFloat("sim.traffic.max_units_frac_src_desired", p.maxUnitsFracOfSrcDesired);
+  p.maxUnitsFracOfDstCapacity = cv.getFloat("sim.traffic.max_units_frac_dst_capacity", p.maxUnitsFracOfDstCapacity);
+  p.randomUnitsMinFrac = cv.getFloat("sim.traffic.random_units_min_frac", p.randomUnitsMinFrac);
+  p.randomUnitsMaxFrac = cv.getFloat("sim.traffic.random_units_max_frac", p.randomUnitsMaxFrac);
+
+  return p;
+}
+
 static void matToFloat(const math::Mat4d& m, float out[16]) {
   for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(m.m[i]);
 }
@@ -4874,8 +4899,10 @@ auto fieldOpsSkipTarget = [&]() {
   // Ensure the ambient traffic sim has advanced and record shipments so convoy signals
   // can reflect the actual economy nudges.
   sim::TrafficLedger& trafficLedger = trafficLedgerBySystem[sys.stub.id];
-  sim::simulateNpcTradeTrafficTransit(universe, sys, timeDays, trafficDayStampBySystem,
-                              /*kMaxBackfillDays=*/14, &trafficLedger);
+  const sim::TrafficTransitTradeParams trafficParams = trafficTransitParamsFromCVars();
+  sim::simulateNpcTradeTrafficTransitEx(universe, sys, timeDays, trafficDayStampBySystem,
+                                       trafficParams,
+                                       /*kMaxBackfillDays=*/14, &trafficLedger);
 
   std::vector<core::u64> resolved;
   resolved.reserve(resolvedSignalIds.size());
@@ -11800,10 +11827,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
         }
 
         if (allowGravity && atmosphereActive && (physicsAtmosphereAffectsNpcs || (&s == &ship))) {
-          double massKg = s.massKg();
-          if (&s == &ship) {
-            massKg += cargoMassKg(cargo);
-          }
+          double massKg = s.totalMassKg();
 
           const auto atmo = sim::sampleSystemAtmosphere(*currentSystem,
                                                         timeDays,
@@ -11857,6 +11881,10 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
       };
 
       // --- Ship physics ---
+      // Keep payload mass/handling in sync with the current cargo hold.
+      ship.setPayloadCapacityKg(cargoCapacityKg);
+      ship.setPayloadMassKg(cargoMassKg(cargo));
+
       if (!docked) {
         if (fsdState != FsdState::Idle || fsdJustArrived) {
           sim::ShipInput hold{};
@@ -12893,6 +12921,20 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
   auto stepContactShip = [&](Contact& c, double dt, sim::ShipInput in, bool allowGravity) {
     if (dt <= 0.0) return;
+
+    // Payload handling: approximate trader cargo mass so loaded haulers feel heavier.
+    if (c.role == ContactRole::Trader) {
+      c.ship.setPayloadCapacityKg(c.tradeCapacityKg);
+      double payloadKg = 0.0;
+      if (c.tradeUnits > 1e-9 && static_cast<std::size_t>(c.tradeCommodity) < econ::kCommodityCount) {
+        payloadKg = std::max(0.0, c.tradeUnits) * econ::commodityDef(c.tradeCommodity).massKg;
+      }
+      c.ship.setPayloadMassKg(payloadKg);
+    } else {
+      c.ship.setPayloadCapacityKg(0.0);
+      c.ship.setPayloadMassKg(0.0);
+    }
+
 
     const double boostFrac = in.boost ? sim::consumeBoostFraction(c.distributorState, c.distributorCfg, dt) : 0.0;
     if (boostFrac > 1e-6) {
@@ -16026,7 +16068,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        if (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle && cargoScoopDeployed) {
 	          const double kScoopRangeKm = 3500.0;
 	          const double kMaxRelSpeedKmS = 18.0;
-	          const double shipMassKg = cargoMassKg(cargo) + ship.massKg();
+	          const double shipMassKg = ship.totalMassKg();
 	          (void)shipMassKg; // reserved for future handling
 	
 	          const math::Vec3d shipPos = ship.positionKm();
@@ -16216,8 +16258,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       // --- Background NPC trade traffic (market nudging) ---
       if (currentSystem) {
         auto& trafficLedger = trafficLedgerBySystem[currentSystem->stub.id];
-        sim::simulateNpcTradeTrafficTransit(universe, *currentSystem, timeDays, trafficDayStampBySystem,
-                                     /*kMaxBackfillDays=*/14, &trafficLedger);
+        const sim::TrafficTransitTradeParams trafficParams = trafficTransitParamsFromCVars();
+        sim::simulateNpcTradeTrafficTransitEx(universe, *currentSystem, timeDays, trafficDayStampBySystem,
+                                             trafficParams,
+                                             /*kMaxBackfillDays=*/14, &trafficLedger);
       }
 
       // --- Escort mission runtime (convoy status + ambush events) ---

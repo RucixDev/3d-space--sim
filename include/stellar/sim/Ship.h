@@ -47,6 +47,35 @@ public:
   void setMassKg(double m) { massKg_ = m; }
   void setInertiaDiagKgKm2(const math::Vec3d& i) { inertiaDiagKgKm2_ = i; }
 
+  // Payload mass (cargo, passengers, etc.). This is kept separate from the base
+  // ship mass so gameplay code can update it frequently without retuning the
+  // hull's default handling.
+  double payloadMassKg() const { return payloadMassKg_; }
+  double payloadCapacityKg() const { return payloadCapacityKg_; }
+
+  // Total mass used for atmosphere/aero and other "external force" models.
+  double totalMassKg() const {
+    const double dry = (massKg_ > 0.0) ? massKg_ : 0.0;
+    const double payload = (payloadMassKg_ > 0.0) ? payloadMassKg_ : 0.0;
+    return dry + payload;
+  }
+
+  void setPayloadMassKg(double kg) { payloadMassKg_ = (kg > 0.0) ? kg : 0.0; }
+  void setPayloadCapacityKg(double kg) { payloadCapacityKg_ = (kg > 0.0) ? kg : 0.0; }
+
+  // At full payload (payloadMass == payloadCapacity), thruster authority is
+  // scaled down to this fraction (0..1). Defaults to a gameplay-friendly 0.70
+  // so a fully loaded ship "feels" heavier without becoming unusable.
+  double payloadHandlingMinScale() const { return payloadHandlingMinScale_; }
+  void setPayloadHandlingMinScale(double s) {
+    // Clamp to sensible range (avoid negative or zero authority).
+    if (s < 0.05) s = 0.05;
+    if (s > 1.0) s = 1.0;
+    payloadHandlingMinScale_ = s;
+  }
+
+  // 0..1 scale applied to acceleration caps (based on payload mass).
+  double payloadHandlingScale() const;
   // Thruster limits (acceleration caps; km/s^2 and rad/s^2).
   //
   // Boost caps are configurable so gameplay code (player modules, NPC archetypes)
@@ -106,6 +135,11 @@ public:
 private:
   // Mass properties
   double massKg_{1.0e5}; // 100t
+  // Dynamic payload properties (typically driven by cargo).
+  double payloadMassKg_{0.0};
+  double payloadCapacityKg_{0.0};        // 0 => unknown/disabled
+  double payloadHandlingMinScale_{0.70}; // at full capacity (fraction)
+
   // For simplicity: diagonal inertia in (kg*km^2) (km to keep magnitudes reasonable).
   math::Vec3d inertiaDiagKgKm2_{ 2.0e4, 2.0e4, 3.0e4 };
 

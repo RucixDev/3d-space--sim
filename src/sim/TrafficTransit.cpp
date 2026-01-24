@@ -5,6 +5,7 @@
 #include "stellar/econ/Market.h"
 #include "stellar/sim/Traffic.h"
 #include "stellar/sim/TrafficLedger.h"
+#include "stellar/sim/Units.h"
 
 #include <algorithm>
 #include <array>
@@ -14,14 +15,176 @@
 #include <vector>
 
 namespace stellar::sim {
+
+const char* trafficTradeModelName(TrafficTradeModel m) {
+  switch (m) {
+    case TrafficTradeModel::SupplyDemand: return "SupplyDemand";
+    case TrafficTradeModel::MarketArbitrage: return "MarketArbitrage";
+    case TrafficTradeModel::Hybrid: return "Hybrid";
+    default: return "Unknown";
+  }
+}
+
+TrafficTradeModel trafficTradeModelFromInt(core::i64 v) {
+  if (v <= 0) return TrafficTradeModel::SupplyDemand;
+  if (v == 1) return TrafficTradeModel::MarketArbitrage;
+  return TrafficTradeModel::Hybrid;
+}
+
 namespace {
 
 static constexpr std::size_t idx(econ::CommodityId id) { return static_cast<std::size_t>(id); }
+
+static TrafficTransitTradeParams sanitizeParams(TrafficTransitTradeParams p) {
+  p.bidAskSpread = std::clamp(p.bidAskSpread, 0.0, 1.0);
+  p.minProfitPerUnitCr = std::max(0.0, p.minProfitPerUnitCr);
+  p.distancePenaltyPerKm = std::max(0.0, p.distancePenaltyPerKm);
+  p.profitWeight = std::max(0.0, p.profitWeight);
+  p.flowWeight = std::max(0.0, p.flowWeight);
+
+  p.maxUnitsFracOfSrcDesired = std::clamp(p.maxUnitsFracOfSrcDesired, 0.0, 1.0);
+  p.maxUnitsFracOfDstCapacity = std::clamp(p.maxUnitsFracOfDstCapacity, 0.0, 1.0);
+
+  p.randomUnitsMinFrac = std::clamp(p.randomUnitsMinFrac, 0.0, 1.0);
+  p.randomUnitsMaxFrac = std::clamp(p.randomUnitsMaxFrac, 0.0, 1.0);
+  if (p.randomUnitsMaxFrac < p.randomUnitsMinFrac) std::swap(p.randomUnitsMinFrac, p.randomUnitsMaxFrac);
+  if (p.randomUnitsMaxFrac <= 0.0) {
+    // Avoid degeneracy.
+    p.randomUnitsMinFrac = 0.25;
+    p.randomUnitsMaxFrac = 0.85;
+  }
+  return p;
+}
 
 struct BestCommodity {
   econ::CommodityId id{econ::CommodityId::Food};
   double score{0.0};
 };
+
+struct PairCandidate {
+  int srcIdx{0};
+  int dstIdx{0};
+  econ::CommodityId commodity{econ::CommodityId::Food};
+  double score{0.0};
+};
+
+static double flowScoreForCommodity(const Station& src,
+                                   const econ::StationEconomyState& srcState,
+                                   const Station& dst,
+                                   const econ::StationEconomyState& dstState,
+                                   std::size_t i) {
+  const double prodS = src.economyModel.productionPerDay[i];
+  const double consS = src.economyModel.consumptionPerDay[i];
+  const double prodD = dst.economyModel.productionPerDay[i];
+  const double consD = dst.economyModel.consumptionPerDay[i];
+
+  const double netSrc = prodS - consS;
+  const double netNeed = consD - prodD;
+  if (netSrc <= 0.0 || netNeed <= 0.0) return 0.0;
+
+  const double invS = srcState.inventory[i];
+  const double invD = dstState.inventory[i];
+  const double desiredS = std::max(1e-9, src.economyModel.desiredStock[i]);
+  const double desiredD = std::max(1e-9, dst.economyModel.desiredStock[i]);
+
+  // If source is extremely dry, don't ship it.
+  if (invS < desiredS * 0.22) return 0.0;
+
+  const double surplus = std::max(0.0, (invS - desiredS) / desiredS);
+  const double shortage = std::max(0.0, (desiredD - invD) / desiredD);
+
+  double score = (netSrc * netNeed);
+  score *= (0.55 + 1.25 * std::min(2.0, surplus));
+  score *= (0.55 + 1.25 * std::min(2.0, shortage));
+  return score;
+}
+
+static double profitScoreForCommodity(const Station& src,
+                                     const econ::StationEconomyState& srcState,
+                                     const Station& dst,
+                                     const econ::StationEconomyState& dstState,
+                                     econ::CommodityId cid,
+                                     std::size_t i,
+                                     const TrafficTransitTradeParams& params,
+                                     double& outProfitPerUnitCr,
+                                     double& outUnitsHint) {
+  outProfitPerUnitCr = 0.0;
+  outUnitsHint = 0.0;
+
+  const double invS = srcState.inventory[i];
+  const double invD = dstState.inventory[i];
+  const double desiredS = std::max(1e-9, src.economyModel.desiredStock[i]);
+  const double desiredD = std::max(1e-9, dst.economyModel.desiredStock[i]);
+  const double capD = std::max(1e-9, dst.economyModel.capacity[i]);
+
+  // Compute a "reasonable" shipment size (same clamps as SupplyDemand, but without RNG).
+  const double surplus = std::max(0.0, invS - desiredS * 0.25);
+  const double need = std::max(0.0, (desiredD * 1.05) - invD);
+  if (surplus <= 1e-6 || need <= 1e-6) return 0.0;
+
+  double units = std::min(surplus, need);
+  units = std::min(units, desiredS * params.maxUnitsFracOfSrcDesired);
+  units = std::min(units, capD * params.maxUnitsFracOfDstCapacity);
+  if (units <= 1e-6) return 0.0;
+  outUnitsHint = units;
+
+  const auto qBuy = econ::quote(srcState, src.economyModel, cid, params.bidAskSpread);
+  const auto qSell = econ::quote(dstState, dst.economyModel, cid, params.bidAskSpread);
+
+  // Apply station fees as a simple transaction tax.
+  const double buyCost = qBuy.ask * (1.0 + std::clamp(src.feeRate, 0.0, 1.0));
+  const double sellRev = qSell.bid * (1.0 - std::clamp(dst.feeRate, 0.0, 1.0));
+  outProfitPerUnitCr = sellRev - buyCost;
+
+  const double profitPerUnit = outProfitPerUnitCr - params.minProfitPerUnitCr;
+  if (profitPerUnit <= 0.0) return 0.0;
+  return profitPerUnit * units;
+}
+
+static BestCommodity pickCommodityMarket(const Station& src,
+                                        const econ::StationEconomyState& srcState,
+                                        const Station& dst,
+                                        const econ::StationEconomyState& dstState,
+                                        double distKm,
+                                        const TrafficTransitTradeParams& params) {
+  BestCommodity best;
+  best.score = 0.0;
+
+  for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+    const econ::CommodityId cid = static_cast<econ::CommodityId>(i);
+
+    // Base flow score (producer -> consumer) used by SupplyDemand + Hybrid.
+    const double flowScore = flowScoreForCommodity(src, srcState, dst, dstState, i);
+
+    // Profit score used by MarketArbitrage + Hybrid.
+    double profitPerUnit = 0.0;
+    double unitsHint = 0.0;
+    const double profitScore = profitScoreForCommodity(src, srcState, dst, dstState, cid, i, params, profitPerUnit, unitsHint);
+
+    double score = 0.0;
+    if (params.model == TrafficTradeModel::SupplyDemand) {
+      score = flowScore;
+    } else if (params.model == TrafficTradeModel::MarketArbitrage) {
+      score = params.profitWeight * profitScore;
+    } else {
+      // Hybrid
+      score = params.profitWeight * profitScore + params.flowWeight * flowScore;
+    }
+
+    if (score <= 1e-9) continue;
+
+    if (params.model != TrafficTradeModel::SupplyDemand && params.distancePenaltyPerKm > 0.0 && distKm > 0.0) {
+      score /= (1.0 + params.distancePenaltyPerKm * distKm);
+    }
+
+    if (score > best.score) {
+      best.id = cid;
+      best.score = score;
+    }
+  }
+
+  return best;
+}
 
 BestCommodity pickCommodity(const Station& src,
                            const econ::StationEconomyState& srcState,
@@ -173,9 +336,12 @@ static void simulateNpcTradeTrafficTransitImpl(Universe& universe,
                                                double timeDays,
                                                int& lastDay,
                                                int kMaxBackfillDays,
-                                               TrafficLedger& ledger) {
+                                               TrafficLedger& ledger,
+                                               const TrafficTransitTradeParams& rawParams) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
+
+  const TrafficTransitTradeParams params = sanitizeParams(rawParams);
 
   const SystemId sysId = system.stub.id;
   const int currentDay = (int)std::floor(timeDays);
@@ -222,14 +388,28 @@ static void simulateNpcTradeTrafficTransitImpl(Universe& universe,
     const int baseRuns = std::clamp(1 + n, 2, 12);
     const int runs = rng.range<int>(std::max(1, baseRuns - 1), std::min(16, baseRuns + 2));
 
-    for (int r = 0; r < runs; ++r) {
+    // Precompute station positions and distances for distance-penalized models.
+    std::vector<math::Vec3d> posKm;
+    posKm.reserve(n);
+    for (int i = 0; i < n; ++i) posKm.push_back(stationPosKm(*stations[i], t));
+
+    std::vector<double> distKm;
+    distKm.resize((std::size_t)n * (std::size_t)n);
+    for (int i = 0; i < n; ++i) {
+      for (int j = 0; j < n; ++j) {
+        const math::Vec3d d = posKm[i] - posKm[j];
+        distKm[(std::size_t)i * (std::size_t)n + (std::size_t)j] = d.length();
+      }
+    }
+
+    auto runSupplyDemandOnce = [&](int runIndex) {
       int srcIdx = rng.range<int>(0, n - 1);
       int dstIdx = rng.range<int>(0, n - 1);
       if (n > 1) {
         int guard = 0;
         while (dstIdx == srcIdx && guard++ < 6) dstIdx = rng.range<int>(0, n - 1);
       }
-      if (dstIdx == srcIdx) continue;
+      if (dstIdx == srcIdx) return;
 
       const Station& src = *stations[srcIdx];
       const Station& dst = *stations[dstIdx];
@@ -246,23 +426,90 @@ static void simulateNpcTradeTrafficTransitImpl(Universe& universe,
       const double desiredD = std::max(1e-9, dst.economyModel.desiredStock[i]);
       const double capD = std::max(1e-9, dst.economyModel.capacity[i]);
 
-      // Compute a "reasonable" shipment size.
       const double surplus = std::max(0.0, invS - desiredS * 0.25);
       const double need = std::max(0.0, (desiredD * 1.05) - invD);
-      if (surplus <= 1e-6 || need <= 1e-6) continue;
+      if (surplus <= 1e-6 || need <= 1e-6) return;
 
       double units = std::min(surplus, need);
       units = std::min(units, desiredS * 0.45);
       units = std::min(units, capD * 0.30);
       units *= rng.range<double>(0.25, 0.85);
-
-      if (units <= 1e-4) continue;
+      if (units <= 1e-4) return;
 
       const double taken = econ::takeInventory(srcState, src.economyModel, cid, units);
-      if (taken <= 1e-6) continue;
+      if (taken <= 1e-6) return;
+      ledger.record(makeNpcTradeShipment(universe.seed(), system, day, runIndex, src, dst, cid, taken, ledger.params));
+    };
 
-      // Record in-flight shipment (do NOT credit destination inventory yet).
-      ledger.record(makeNpcTradeShipment(universe.seed(), system, day, r, src, dst, cid, taken, ledger.params));
+    auto runMarketOnce = [&](int runIndex) {
+      std::vector<PairCandidate> cands;
+      cands.reserve((std::size_t)n * (std::size_t)n);
+
+      double sum = 0.0;
+      for (int si = 0; si < n; ++si) {
+        for (int di = 0; di < n; ++di) {
+          if (di == si) continue;
+          const double dkm = distKm[(std::size_t)si * (std::size_t)n + (std::size_t)di];
+          const BestCommodity bc = pickCommodityMarket(*stations[si], *states[si], *stations[di], *states[di], dkm, params);
+          if (bc.score <= 1e-9) continue;
+          cands.push_back(PairCandidate{si, di, bc.id, bc.score});
+          sum += bc.score;
+        }
+      }
+
+      if (cands.empty() || sum <= 1e-9) {
+        // If no profitable (or meaningful hybrid) move exists, fall back to the
+        // original flow model so the system doesn't go totally "dead".
+        runSupplyDemandOnce(runIndex);
+        return;
+      }
+
+      const double target = rng.nextDouble() * sum;
+      const PairCandidate* chosen = nullptr;
+      double acc = 0.0;
+      for (const auto& c : cands) {
+        acc += c.score;
+        if (target <= acc) { chosen = &c; break; }
+      }
+      if (!chosen) chosen = &cands.back();
+
+      const int srcIdx = chosen->srcIdx;
+      const int dstIdx = chosen->dstIdx;
+      const Station& src = *stations[srcIdx];
+      const Station& dst = *stations[dstIdx];
+      econ::StationEconomyState& srcState = *states[srcIdx];
+      econ::StationEconomyState& dstState = *states[dstIdx];
+
+      const econ::CommodityId cid = chosen->commodity;
+      const std::size_t i = idx(cid);
+
+      const double invS = srcState.inventory[i];
+      const double invD = dstState.inventory[i];
+      const double desiredS = std::max(1e-9, src.economyModel.desiredStock[i]);
+      const double desiredD = std::max(1e-9, dst.economyModel.desiredStock[i]);
+      const double capD = std::max(1e-9, dst.economyModel.capacity[i]);
+
+      const double surplus = std::max(0.0, invS - desiredS * 0.25);
+      const double need = std::max(0.0, (desiredD * 1.05) - invD);
+      if (surplus <= 1e-6 || need <= 1e-6) return;
+
+      double units = std::min(surplus, need);
+      units = std::min(units, desiredS * params.maxUnitsFracOfSrcDesired);
+      units = std::min(units, capD * params.maxUnitsFracOfDstCapacity);
+      units *= rng.range<double>(params.randomUnitsMinFrac, params.randomUnitsMaxFrac);
+      if (units <= 1e-4) return;
+
+      const double taken = econ::takeInventory(srcState, src.economyModel, cid, units);
+      if (taken <= 1e-6) return;
+      ledger.record(makeNpcTradeShipment(universe.seed(), system, day, runIndex, src, dst, cid, taken, ledger.params));
+    };
+
+    for (int r = 0; r < runs; ++r) {
+      if (params.model == TrafficTradeModel::SupplyDemand) {
+        runSupplyDemandOnce(r);
+      } else {
+        runMarketOnce(r);
+      }
     }
   }
 
@@ -285,6 +532,18 @@ void simulateNpcTradeTrafficTransit(Universe& universe,
                                     std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
                                     int kMaxBackfillDays,
                                     TrafficLedger* ledger) {
+  // Preserve legacy behavior: SupplyDemand model with classic clamps.
+  simulateNpcTradeTrafficTransitEx(universe, system, timeDays, lastTrafficDayBySystem,
+                                  TrafficTransitTradeParams{}, kMaxBackfillDays, ledger);
+}
+
+void simulateNpcTradeTrafficTransitEx(Universe& universe,
+                                      const StarSystem& system,
+                                      double timeDays,
+                                      std::unordered_map<SystemId, int>& lastTrafficDayBySystem,
+                                      const TrafficTransitTradeParams& params,
+                                      int kMaxBackfillDays,
+                                      TrafficLedger* ledger) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
@@ -304,7 +563,7 @@ void simulateNpcTradeTrafficTransit(Universe& universe,
     it = lastTrafficDayBySystem.find(sysId);
   }
 
-  simulateNpcTradeTrafficTransitImpl(universe, system, timeDays, it->second, kMaxBackfillDays, *ledger);
+  simulateNpcTradeTrafficTransitImpl(universe, system, timeDays, it->second, kMaxBackfillDays, *ledger, params);
 }
 
 void simulateNpcTradeTrafficTransit(Universe& universe,
@@ -313,6 +572,17 @@ void simulateNpcTradeTrafficTransit(Universe& universe,
                                     std::vector<SystemTrafficStamp>& trafficStamps,
                                     int kMaxBackfillDays,
                                     TrafficLedger* ledger) {
+  simulateNpcTradeTrafficTransitEx(universe, system, timeDays, trafficStamps,
+                                  TrafficTransitTradeParams{}, kMaxBackfillDays, ledger);
+}
+
+void simulateNpcTradeTrafficTransitEx(Universe& universe,
+                                      const StarSystem& system,
+                                      double timeDays,
+                                      std::vector<SystemTrafficStamp>& trafficStamps,
+                                      const TrafficTransitTradeParams& params,
+                                      int kMaxBackfillDays,
+                                      TrafficLedger* ledger) {
   if (system.stations.size() < 2) return;
   if (timeDays < 0.0) return;
 
@@ -342,7 +612,7 @@ void simulateNpcTradeTrafficTransit(Universe& universe,
     first->dayStamp = maxDay;
   }
 
-  simulateNpcTradeTrafficTransitImpl(universe, system, timeDays, first->dayStamp, kMaxBackfillDays, *ledger);
+  simulateNpcTradeTrafficTransitImpl(universe, system, timeDays, first->dayStamp, kMaxBackfillDays, *ledger, params);
 
   // Remove any duplicate entries for this system (keep the first occurrence).
   bool kept = false;

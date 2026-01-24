@@ -12,6 +12,36 @@ Ship::Ship() {
   maxAngAccelBoostRadS2_ = maxAngAccelRadS2_ * 1.4;
 }
 
+double Ship::payloadHandlingScale() const {
+  const double payload = (payloadMassKg_ > 0.0) ? payloadMassKg_ : 0.0;
+  if (payload <= 1e-12) return 1.0;
+
+  // If the gameplay layer provides an explicit payload capacity, use a simple
+  // "cargo fraction" curve so cargo has a noticeable handling impact even when
+  // the ship's dry mass is large.
+  if (payloadCapacityKg_ > 1e-12) {
+    const double frac = payload / payloadCapacityKg_;
+    const double t = std::clamp(frac, 0.0, 1.0);
+
+    const double minScale = std::clamp(payloadHandlingMinScale_, 0.05, 1.0);
+    double scale = 1.0 - (1.0 - minScale) * t;
+
+    // If overloaded, degrade further but softly (avoid "brick" behavior).
+    if (frac > 1.0) {
+      scale *= 1.0 / (1.0 + 0.5 * (frac - 1.0));
+    }
+    return std::clamp(scale, 0.05, 1.0);
+  }
+
+  // Fallback: physical scaling vs dry mass.
+  const double dry = (massKg_ > 0.0) ? massKg_ : 0.0;
+  const double total = dry + payload;
+  if (!(total > 1e-12) || !(dry > 1e-12)) return 1.0;
+
+  return std::clamp(dry / total, 0.05, 1.0);
+}
+
+
 void Ship::setMaxLinearAccelKmS2(double a) {
   maxLinAccelKmS2_ = a;
   if (!customLinBoost_) {
@@ -84,7 +114,7 @@ void Ship::stepWithExternalForces(double dtSeconds,
     // --------
     // Linear
     // --------
-    const double linCap = in.boost ? maxLinAccelBoostKmS2_ : maxLinAccelKmS2_;
+    const double linCap = (in.boost ? maxLinAccelBoostKmS2_ : maxLinAccelKmS2_) * payloadHandlingScale();
 
     stellar::math::Vec3d accelWorld = orient_.rotate(in.thrustLocal) * linCap;
     accelWorld += externalAccelWorldKmS2;
@@ -109,7 +139,7 @@ void Ship::stepWithExternalForces(double dtSeconds,
     // --------
     // Angular (body-local)
     // --------
-    const double angCap = in.boost ? maxAngAccelBoostRadS2_ : maxAngAccelRadS2_;
+    const double angCap = (in.boost ? maxAngAccelBoostRadS2_ : maxAngAccelRadS2_) * payloadHandlingScale();
 
     stellar::math::Vec3d angAccel = in.torqueLocal * angCap;
     angAccel += externalAngAccelLocalRadS2;

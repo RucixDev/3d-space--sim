@@ -764,6 +764,66 @@ void installDefaultCVars() {
                      CVar_Archive,
                      "Enable floating origin / camera-relative rendering to reduce GPU float jitter at large distances.");
 
+  // --------------------------------------------------------------------------
+  // Simulation tuning
+  // --------------------------------------------------------------------------
+
+  // sim.traffic.model:
+  //  0 = SupplyDemand (legacy)
+  //  1 = MarketArbitrage (profit-following)
+  //  2 = Hybrid (profit + producer/consumer baseline)
+  cvars().defineInt("sim.traffic.model",
+                   2,
+                   CVar_Archive,
+                   "NPC trade traffic model: 0=SupplyDemand, 1=MarketArbitrage, 2=Hybrid.");
+
+  cvars().defineFloat("sim.traffic.bid_ask_spread",
+                     0.12,
+                     CVar_Archive,
+                     "Bid/ask spread used by MarketArbitrage/Hybrid NPC traffic (0..1). Higher => more friction.");
+
+  cvars().defineFloat("sim.traffic.min_profit_per_unit",
+                     0.0,
+                     CVar_Archive,
+                     "Minimum profit (credits) per unit required for MarketArbitrage candidates (<=0 disables threshold).");
+
+  cvars().defineFloat("sim.traffic.distance_penalty_per_km",
+                     1e-8,
+                     CVar_Archive,
+                     "Distance penalty k (km^-1) for MarketArbitrage/Hybrid: score /= (1 + k*distKm).");
+
+  // Hybrid weights.
+  cvars().defineFloat("sim.traffic.profit_weight",
+                     1.0,
+                     CVar_Archive,
+                     "Hybrid weight for the profit score in NPC traffic selection.");
+
+  cvars().defineFloat("sim.traffic.flow_weight",
+                     0.35,
+                     CVar_Archive,
+                     "Hybrid weight for the producer/consumer flow score in NPC traffic selection.");
+
+  // Shipment sizing (MarketArbitrage/Hybrid).
+  cvars().defineFloat("sim.traffic.max_units_frac_src_desired",
+                     0.45,
+                     CVar_Archive,
+                     "Max shipment size as a fraction of source desired stock (MarketArbitrage/Hybrid).");
+
+  cvars().defineFloat("sim.traffic.max_units_frac_dst_capacity",
+                     0.30,
+                     CVar_Archive,
+                     "Max shipment size as a fraction of destination capacity (MarketArbitrage/Hybrid).");
+
+  cvars().defineFloat("sim.traffic.random_units_min_frac",
+                     0.25,
+                     CVar_Archive,
+                     "Random shipment size scale min fraction (MarketArbitrage/Hybrid).");
+
+  cvars().defineFloat("sim.traffic.random_units_max_frac",
+                     0.85,
+                     CVar_Archive,
+                     "Random shipment size scale max fraction (MarketArbitrage/Hybrid).");
+
 }
 
 } // namespace stellar::core
