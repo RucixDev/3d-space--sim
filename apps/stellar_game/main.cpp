@@ -146,6 +146,7 @@
 #include "MarketDashboardWindow.h"
 #include "LogbookWindow.h"
 #include "TradePlannerWindow.h"
+#include "SmugglingDashboardWindow.h"
 #include "ProfilerWindow.h"
 #include "BuildInfoWindow.h"
 #include "RuntimeValidationWindow.h"
@@ -3725,6 +3726,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::MarketDashboardWindowState marketDashboardWindow{};
   game::LogbookWindowState logbookWindow{};
   game::TradePlannerWindowState tradePlannerWindow{};
+  game::SmugglingDashboardWindowState smugglingDashboardWindow{};
   bool showGuide = true;
   bool showSprites = false;
   // Integrate the VFX Lab into the base game's default layout.
@@ -32293,7 +32295,7 @@ if (canTrade) {
 
             // Buy / Sell
             const bool bmEnabled = canTrade && bmProfile.available;
-            const auto bmQuote = sim::applyBlackMarketQuote(bmProfile, q);
+            const auto bmQuote = sim::applyBlackMarketQuote(q, bmProfile);
 
             if (!illegalHere) {
               ImGui::BeginDisabled(!canTrade);
@@ -32510,6 +32512,63 @@ ImGui::PopID();
         toast(toasts, std::string(msg), ttlSec);
       };
       game::drawMarketDashboardWindow(marketDashboardWindow, mdCtx);
+    }
+
+    if (smugglingDashboardWindow.open) {
+      // Default origin station: docked (if any), else targeted station.
+      sim::StationId preferredOriginStationId = 0;
+      if (docked && dockedStationId != 0) {
+        preferredOriginStationId = dockedStationId;
+      } else if (currentSystem && target.kind == TargetKind::Station && target.index >= 0
+                 && (std::size_t)target.index < currentSystem->stations.size()) {
+        preferredOriginStationId = currentSystem->stations[(std::size_t)target.index].id;
+      }
+
+      game::SmugglingDashboardContext sctx{universe, currentSystem, timeDays};
+      sctx.preferredOriginStationId = preferredOriginStationId;
+      sctx.cargoCapacityKg = cargoCapacityKg;
+      sctx.cargoUsedKg = cargoMassKg(cargo);
+      sctx.playerCreditsCr = credits;
+      sctx.playerHeat = heat;
+      sctx.smuggleHoldMk = smuggleHoldMk;
+      sctx.effectiveFeeRate = effectiveFeeRate;
+      sctx.reputationForFaction = getRep;
+
+      sctx.routeToStation = [&](sim::SystemId sysId, sim::StationId stId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        if (plotRouteToSystem(sysId, /*showToast=*/true)) {
+          pendingArrivalTargetStationId = stId;
+          // If we're already in-system, target immediately too.
+          if (currentSystem && sysId == currentSystem->stub.id && stId != 0) {
+            tryTargetStationById(stId);
+          }
+        }
+      };
+
+      // Cross-system integration: let the Smuggling Dashboard directly arm navigation auto-run.
+      sctx.goToStation = [&](sim::SystemId sysId, sim::StationId stId, bool armAutoRun) {
+        game::pushGameAction(gameActions,
+                             game::makeActionGoToStation(timeRealSec,
+                                                        timeDays,
+                                                        "SmugglingDashboard",
+                                                        (core::u64)sysId,
+                                                        (core::u64)stId,
+                                                        armAutoRun));
+        if (armAutoRun) {
+          game::pushGameAction(gameActions,
+                               game::makeActionSetCameraRigPreset(timeRealSec,
+                                                                  timeDays,
+                                                                  "SmugglingDashboard",
+                                                                  (core::i32)game::CameraRigPreset::Travel));
+        }
+      };
+
+      sctx.toast = [&](std::string_view msg, double ttlSec) {
+        toast(toasts, std::string(msg), ttlSec);
+      };
+
+      game::drawSmugglingDashboardWindow(smugglingDashboardWindow, sctx);
     }
 
     if (tradePlannerWindow.open) {
@@ -39691,7 +39750,8 @@ const char* pageName =
 
           const sim::Station& station = *dockSt;
           const sim::LawProfile stLaw = lawForFaction(station.factionId);
-          const sim::SystemSecurityProfile sec = currentSystem ? sim::systemSecurityProfile(universe.seed(), *currentSystem)
+          sim::SystemEvent localEv{};
+          const sim::SystemSecurityProfile sec = currentSystem ? effectiveSystemSecurityProfile(*currentSystem, &localEv)
                                                               : sim::SystemSecurityProfile{};
           const double rep = getRep(station.factionId);
           const sim::BlackMarketProfile bm = currentSystem ? sim::blackMarketProfile(universe.seed(),
@@ -39714,9 +39774,19 @@ const char* pageName =
           ImGui::TextDisabled("Access %.0f%% | Risk %.0f%% | Fence cut %.0f%%", bm.access01 * 100.0, bm.risk01 * 100.0, bm.fenceCut * 100.0);
           ImGui::TextDisabled("Bid x%.2f | Ask x%.2f | Sting %.1f%% (heat %.0f)", bm.bidMul, bm.askMul, stingChanceNow * 100.0, heat);
 
+          if (currentSystem && localEv.active) {
+            ImGui::TextDisabled("System event: %s (%.0f%%)", sim::systemEventKindName(localEv.kind), localEv.severity01 * 100.0);
+          }
+
           ImGui::Spacing();
           if (ImGui::Button("Open Market & Trade")) {
             stationMenuPage = StationMenuPage::MarketTrade;
+          }
+
+          ImGui::SameLine();
+          if (ImGui::Button("Smuggling Dashboard")) {
+            smugglingDashboardWindow.open = true;
+            smugglingDashboardWindow.originStationId = station.id;
           }
 
           // Quick fence sell: convert all contraband in hold into credits (excluding mission-reserved units).
@@ -39822,7 +39892,7 @@ const char* pageName =
               if (!sim::blackMarketEligibleCommodity(universe.seed(), station, cid)) continue;
 
               const auto q = econ::quote(stEcon, station.economyModel, cid, 0.10);
-              const auto bmq = sim::applyBlackMarketQuote(bm, q);
+              const auto bmq = sim::applyBlackMarketQuote(q, bm);
 
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);

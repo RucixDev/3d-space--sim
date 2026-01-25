@@ -231,6 +231,9 @@ void applySystemEventInventoryShock(econ::StationEconomyState& state,
     case SystemEventKind::TradeBoom:
     case SystemEventKind::TradeBust:
     case SystemEventKind::None:
+      break;
+    default:
+      break;
   }
 
   state.clampToCapacity(model);

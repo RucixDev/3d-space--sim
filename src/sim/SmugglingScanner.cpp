@@ -6,6 +6,7 @@
 #include "stellar/sim/Law.h"
 #include "stellar/sim/PoliceScan.h"
 #include "stellar/sim/SecurityModel.h"
+#include "stellar/sim/SystemConditions.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -120,7 +121,25 @@ std::vector<SmugglingOpportunity> scanSmugglingOpportunities(Universe& u,
     const auto& sys = u.getSystem(stub.id, &stub);
 
     const double distLy = (stub.posLy - originStub.posLy).length();
-    const SystemSecurityProfile sec = systemSecurityProfile(seed, sys);
+    SystemEvent sysEv{};
+    SystemSecurityProfile sec{};
+    if (params.useLiveSystemConditions) {
+      const auto* deltaMap = u.systemSecurityDeltaMap();
+      const SystemSecurityDeltaState* deltaState = nullptr;
+      if (deltaMap) {
+        const auto it = deltaMap->find(sys.stub.id);
+        if (it != deltaMap->end()) deltaState = &it->second;
+      }
+      sec = effectiveSystemSecurityProfile(seed,
+                                         sys,
+                                         timeDays,
+                                         deltaState,
+                                         u.systemSecurityDynamicsParams(),
+                                         u.systemEventParams(),
+                                         &sysEv);
+    } else {
+      sec = systemSecurityProfile(seed, sys);
+    }
 
     for (const auto& toSt : sys.stations) {
       if (toSt.id == 0) continue;
@@ -128,13 +147,17 @@ std::vector<SmugglingOpportunity> scanSmugglingOpportunities(Universe& u,
 
       // Resolve black market conditions at the destination.
       const LawProfile law = lawProfile(seed, toSt.factionId);
+      double rep = params.playerRep;
+      if (params.repForFaction) {
+        rep = params.repForFaction(toSt.factionId);
+      }
       const BlackMarketProfile bm = blackMarketProfile(seed,
                                                        sys.stub.id,
                                                        toSt,
                                                        sec,
                                                        law,
                                                        timeDays,
-                                                       params.playerRep);
+                                                       rep);
       const double aMul = availabilityMul(params, bm);
       if (aMul <= 1e-9) continue;
 
@@ -232,6 +255,12 @@ std::vector<SmugglingOpportunity> scanSmugglingOpportunities(Universe& u,
         t.unitsPossible = unitsPossible;
         t.unitMassKg = unitMassKg;
         t.distanceLy = distLy;
+
+        t.systemEventKind = (params.useLiveSystemConditions && sysEv.active) ? sysEv.kind : SystemEventKind::None;
+        t.systemEventSeverity01 = (params.useLiveSystemConditions && sysEv.active) ? sysEv.severity01 : 0.0;
+        t.systemSecurity01 = sec.security01;
+        t.systemPiracy01 = sec.piracy01;
+        t.systemTraffic01 = sec.traffic01;
 
         t.blackMarketAvailable = bm.available;
         t.blackMarketAccess01 = bm.access01;

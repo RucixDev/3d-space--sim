@@ -3,6 +3,7 @@
 #include "stellar/core/Types.h"
 #include "stellar/econ/Commodity.h"
 #include "stellar/sim/System.h"
+#include "stellar/sim/SystemEvents.h"
 
 #include <cstddef>
 #include <functional>
@@ -55,6 +56,8 @@ enum class SmugglingScoreMode : core::u8 {
   ExpectedProfitPerLy = 3,
 };
 
+using SmugglingRepFn = std::function<double(core::u32 /*factionId*/) >;
+
 struct SmugglingScanParams {
   // Universe query settings (only used by scanSmugglingOpportunities()).
   double radiusLy{200.0};
@@ -78,11 +81,18 @@ struct SmugglingScanParams {
 
   // Player context.
   //
-  // In this prototype these are treated as a single scalar applied to all factions.
-  // Front-ends that track per-faction rep can pass an adjusted value per call.
+  // `playerRep` is used as a fallback value; if `repForFaction` is provided it will
+  // be queried per-destination station using that station's factionId.
   double playerRep{0.0};
+  SmugglingRepFn repForFaction{};
   double playerHeat{0.0};
   int smuggleHoldMk{0};
+
+  // If true, incorporate the Universe's live system security dynamics and system events
+  // (if configured) when modelling black market access/risk.
+  //
+  // This does *not* change legality masks (those remain deterministic).
+  bool useLiveSystemConditions{false};
 
   // Scoring.
   SmugglingAvailabilityMode availability{SmugglingAvailabilityMode::TodayOnly};
@@ -120,6 +130,14 @@ struct SmugglingOpportunity {
 
   // Geometry.
   double distanceLy{0.0};
+
+  // System conditions context (filled for every row; systemEventKind is only meaningful
+  // when params.useLiveSystemConditions==true).
+  SystemEventKind systemEventKind{SystemEventKind::None};
+  double systemEventSeverity01{0.0};
+  double systemSecurity01{0.0};
+  double systemPiracy01{0.0};
+  double systemTraffic01{0.0};
 
   // Black market profile summary.
   bool blackMarketAvailable{false};

@@ -69,6 +69,15 @@ public:
   void setSystemEventEconomyParams(const SystemEventEconomyParams& params);
   void setEnableSystemEventEconomy(bool enable);
 
+  // --- Introspection (used by analysis/UI layers) ---
+  const std::unordered_map<SystemId, SystemSecurityDeltaState>* systemSecurityDeltaMap() const {
+    return systemSecurityDeltaMap_;
+  }
+  const SystemSecurityDynamicsParams& systemSecurityDynamicsParams() const { return systemSecurityDynParams_; }
+  const SystemEventParams& systemEventParams() const { return systemEventParams_; }
+  const SystemEventEconomyParams& systemEventEconomyParams() const { return systemEventEconomyParams_; }
+  bool enableSystemEventEconomy() const { return enableSystemEventEconomy_; }
+
   // Persist/restore known station economy states (only what you have in cache / visited).
   std::vector<StationEconomyOverride> exportStationOverrides() const;
   void importStationOverrides(const std::vector<StationEconomyOverride>& overrides);

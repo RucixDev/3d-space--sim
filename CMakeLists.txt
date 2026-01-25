@@ -398,6 +398,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/MarketDashboardWindow.cpp
   apps/stellar_game/LogbookWindow.cpp
     apps/stellar_game/TradePlannerWindow.cpp
+    apps/stellar_game/SmugglingDashboardWindow.cpp
     apps/stellar_game/ConsoleWindow.cpp
     apps/stellar_game/LogWindow.cpp
     apps/stellar_game/CVarWindow.cpp
