@@ -67,6 +67,16 @@ public:
                    double energy,
                    int count = -1);
 
+  // Expanding ring shockwave burst. Intended for high-impact moments (ship destruction,
+  // large impacts). The ring is oriented around axisWorld.
+  void spawnShockwaveRing(const math::Vec3d& centerU,
+                          const math::Vec3d& axisWorld,
+                          double baseRadiusU,
+                          double maxRadiusU,
+                          double lifetimeSec,
+                          double energy = 1.0,
+                          int count = -1);
+
 private:
   struct Particle {
     math::Vec3d posU{0,0,0};

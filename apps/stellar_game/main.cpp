@@ -15,6 +15,7 @@
 #include "stellar/core/Random.h"
 #include "stellar/core/Hash.h"
 #include "stellar/core/Clamp.h"
+#include "stellar/core/Fmt.h"
 #include "stellar/math/Vec2.h"
 #include "stellar/proc/Noise.h"
 #include "stellar/proc/HyperlaneRouter.h"
@@ -283,6 +284,23 @@ static const char* starClassName(sim::StarClass c) {
     case sim::StarClass::M: return "M";
     default: return "?";
   }
+}
+
+static std::pair<sim::SystemId, sim::StationId> uiMissionNextStop(const sim::Mission& m) {
+  // Multi-leg deliveries: go to the via stop first.
+  const bool hasViaStop = (m.viaSystem != 0 && m.viaStation != 0 && m.leg == 0
+                           && (m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Passenger));
+  if (hasViaStop) {
+    return {m.viaSystem, m.viaStation};
+  }
+
+  // Salvage jobs: before the site is visited, the objective is the mission site (not a station).
+  if (m.type == sim::MissionType::Salvage && !m.scanned) {
+    return {m.toSystem, 0};
+  }
+
+  // Default: the destination station (if any).
+  return {m.toSystem, m.toStation};
 }
 
 static void starClassRgb(sim::StarClass cls, float& r, float& g, float& b) {
@@ -1913,6 +1931,7 @@ int main(int argc, char** argv) {
   bool vfxStarfieldTextured = true;
   bool vfxStarfieldGpuEnabled = true;
   int vfxStarCount = 5200;
+  int vfxStarCountLast = vfxStarCount;
   double vfxStarRadiusU = 18000.0;
 
   // Nebula (large background cloud puffs)
@@ -1937,6 +1956,7 @@ int main(int argc, char** argv) {
   bool vfxThrustersEnabled = true;
   bool vfxImpactsEnabled = true;
   bool vfxExplosionsEnabled = true;
+	  bool vfxShockwaveEnabled = true; // expanding ring burst on ship death
   float vfxParticleIntensity = 1.0f; // global scaler
 
   // GPU dust field (GPGPU). Simulates a large number of particles entirely on
@@ -5391,7 +5411,7 @@ auto fieldOpsSkipTarget = [&]() {
     m.body = std::move(body);
     m.systemId = systemId;
     m.factionId = snap.base.controllingFactionId;
-    m.importance01 = snap.event.active ? std::clamp(snap.event.severity01, 0.0, 1.0) : 0.25;
+    const double importance01 = snap.event.active ? std::clamp(snap.event.severity01, 0.0, 1.0) : 0.25;
 
     pushTransmission(m, showOverlay);
 
@@ -5406,8 +5426,8 @@ auto fieldOpsSkipTarget = [&]() {
                         timeDays,
                         game::GameEventKind::Gameplay,
                         "GalNet",
-                        ui::stripMarkup(m.subject),
-                        /*important*/ (m.importance01 >= 0.75),
+                        ui::textfx::stripMarkup(m.subject),
+                        /*important*/ (importance01 >= 0.75),
                         ship.positionKm(),
                         /*refA*/ (core::u64)systemId,
                         /*refB*/ 0});
@@ -8442,7 +8462,7 @@ progression.unlockWeapon(weaponSecondary);
     // used for saves. This keeps resets consistent and avoids missing state.
     core::u32 startSystemId = 0;
     {
-      const sim::Universe tmpUniverse(newSeed);
+      sim::Universe tmpUniverse(newSeed);
       if (auto s = tmpUniverse.findClosestSystem(math::Vec3d{0.0, 0.0, 0.0}, 80.0)) {
         startSystemId = s->id;
       }
@@ -8691,9 +8711,9 @@ progression.unlockWeapon(weaponSecondary);
           {
             const auto& c = contacts[candIdx];
             double hullSig = 1.0;
-            if (c.shipHullClass == ShipHullClass::Scout) hullSig = 0.92;
-            else if (c.shipHullClass == ShipHullClass::Fighter) hullSig = 1.05;
-            else if (c.shipHullClass == ShipHullClass::Hauler) hullSig = 1.20;
+	            if (c.hullClass == ShipHullClass::Scout) hullSig = 0.92;
+	            else if (c.hullClass == ShipHullClass::Fighter) hullSig = 1.05;
+	            else if (c.hullClass == ShipHullClass::Hauler) hullSig = 1.20;
 
             const double spd01 = std::clamp(c.ship.velocityKmS().length() / 220.0, 0.0, 1.0);
             const double speedFactor = 0.65 + 0.55 * spd01;
@@ -14030,13 +14050,13 @@ auto spawnPolicePack = [&](int maxCount) -> int {
   for (const auto& st : currentSystem->stations) {
     if (st.factionId == 0) continue; // no jurisdiction
 
-    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
-    const math::Vec3d stV = currentSystem->v0;
+	    const math::Vec3d stPos = sim::stationPosKm(st, timeDays);
+	    const math::Vec3d stV = sim::stationVelKmS(st, timeDays);
     const math::Quatd stQ = stationOrient(st, stPos, timeDays);
 
     bool hasClearance = false;
     if (auto it = clearances.find(st.id); it != clearances.end()) {
-      hasClearance = sim::isClearanceValid(it->second, timeDays);
+	      hasClearance = sim::dockingClearanceValid(it->second, timeDays);
     }
 
     sim::StationSecurityState& sec = stationSecurity[st.id];
@@ -14067,8 +14087,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
     auto portComms = [&](const std::string& subject, const std::string& body, bool showOverlay) {
       sim::CommsMessage msg{};
       msg.timeDays = timeDays;
-      msg.source = sourceName;
-      msg.channel = (core::i32)sim::CommsChannel::Security;
+	      msg.from = sourceName;
+	      msg.channel = sim::CommsChannel::Security;
       msg.subject = subject;
       msg.body = body;
       msg.stationId = st.id;
@@ -14080,9 +14100,8 @@ auto spawnPolicePack = [&](int maxCount) -> int {
       auto it = clearances.find(st.id);
       if (it == clearances.end()) return;
       auto& cs = it->second;
+	      cs.granted = false;
       cs.assignedPad = 0;
-      cs.validUntilDays = -1e9;
-      cs.status = (core::u8)sim::DockingClearanceStatus::Denied;
       cs.cooldownUntilDays = std::max(cs.cooldownUntilDays, timeDays + (120.0 / 86400.0));
     };
 
@@ -14777,8 +14796,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               in.shieldMk = c.shieldMk;
               in.distributorMk = c.distributorMk;
               in.weapon = c.weapon;
-              in.hullFrac = c.hullFrac;
-              in.shieldFrac = c.shieldFrac;
+	              in.hullFrac = (c.hullMax > 1e-9) ? std::clamp(c.hull / c.hullMax, 0.0, 1.0) : 0.0;
+	              in.shieldFrac = (c.shieldMax > 1e-9) ? std::clamp(c.shield / c.shieldMax, 0.0, 1.0) : 0.0;
               in.aiSkill01 = c.aiSkill;
               in.jammerPower = c.jammerPower;
               in.cargoCommodity = c.tradeCommodity;
@@ -16044,18 +16063,17 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                                          1,
 	                                          1,
 	                                          1,
-
-	                  // Some ambush pirates carry a jammer to muddy radar returns.
-	                  if (rng.nextUnit() < 0.30) {
-	                    p.jammerPower = rng.range(0.7, 1.4);
-	                  }
-
 	                                          w,
 	                                          /*hullMul=*/0.95,
 	                                          /*shieldMul=*/0.67,
 	                                          /*regenMul=*/0.63,
 	                                          /*accelMul=*/0.70,
 	                                          /*aiSkill=*/0.55);
+
+	                  // Some ambush pirates carry a jammer to muddy radar returns.
+	                  if (rng.nextUnit() < 0.30) {
+	                    p.jammerPower = rng.range(0.7, 1.4);
+	                  }
 	                  p.pips = sim::Pips{1, 3, 2};
 	                  sim::normalizePips(p.pips);
 	                  contacts.push_back(p);
@@ -16987,7 +17005,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         // Legacy behavior: instantly process the insurance claim and respawn docked.
         sim::InsurancePolicy pol{};
         sim::PlayerShipEconomyState econShip{};
-        econShip.shipHullClass = shipHullClass;
+	        econShip.hull = shipHullClass;
         econShip.thrusterMk = thrusterMk;
         econShip.shieldMk = shieldMk;
         econShip.distributorMk = distributorMk;
@@ -17002,7 +17020,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         const auto rebuy = sim::applyRebuyOnDeath(pol, econShip, credits, insuranceDebtCr);
 
-        shipHullClass = econShip.shipHullClass;
+	        shipHullClass = econShip.hull;
         thrusterMk = econShip.thrusterMk;
         shieldMk = econShip.shieldMk;
         distributorMk = econShip.distributorMk;
@@ -17016,14 +17034,14 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         fsdRangeLy = econShip.fsdRangeLy;
         recalcPlayerStats();
 
-        if (vfxShockwaveEnabled) {
-          vfx::ShockwaveFx fx{};
-          fx.posKm = ship.positionKm();
-          fx.baseRadiusKm = 0.05;
-          fx.maxRadiusKm = 0.65;
-          fx.lifetimeSec = 1.0;
-          shockwaves.push_back(fx);
-        }
+	        if (vfxShockwaveEnabled && vfxParticlesEnabled) {
+	          particles.spawnShockwaveRing(toRenderPosU(ship.positionKm()),
+	                                     ship.forward(),
+	                                     /*baseRadiusU=*/0.45,
+	                                     /*maxRadiusU=*/4.5,
+	                                     /*lifetimeSec=*/1.15,
+	                                     /*energy=*/1.0);
+	        }
 
         // Reset ship state.
         playerHull = playerHullMax;
@@ -17064,14 +17082,14 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
       } else if (!deathRebuy.active) {
         // Enter the insurance claim screen (pauses sim until the player chooses a rebuy option).
-        if (vfxShockwaveEnabled) {
-          vfx::ShockwaveFx fx{};
-          fx.posKm = ship.positionKm();
-          fx.baseRadiusKm = 0.05;
-          fx.maxRadiusKm = 0.65;
-          fx.lifetimeSec = 1.0;
-          shockwaves.push_back(fx);
-        }
+	        if (vfxShockwaveEnabled && vfxParticlesEnabled) {
+	          particles.spawnShockwaveRing(toRenderPosU(ship.positionKm()),
+	                                       ship.forward(),
+	                                       /*baseRadiusU=*/0.45,
+	                                       /*maxRadiusU=*/4.5,
+	                                       /*lifetimeSec=*/1.15,
+	                                       /*energy=*/1.0);
+	        }
 
         toast(toasts, "SHIP DESTROYED", 2.5);
 
@@ -17100,7 +17118,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         // Build rebuy presets.
         sim::PlayerShipEconomyState full{};
-        full.shipHullClass = shipHullClass;
+	        full.hull = shipHullClass;
         full.thrusterMk = thrusterMk;
         full.shieldMk = shieldMk;
         full.distributorMk = distributorMk;
@@ -17122,8 +17140,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         budget.smuggleHoldMk = 0;
         budget.fuelScoopMk = 0;
 
-        sim::PlayerShipEconomyState loaner{};
-        loaner.shipHullClass = sim::ShipHullClass::Scout;
+	        sim::PlayerShipEconomyState loaner{};
+	        loaner.hull = sim::ShipHullClass::Scout;
         loaner.thrusterMk = 1;
         loaner.shieldMk = 1;
         loaner.distributorMk = 1;
@@ -21144,7 +21162,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         // Only treat local-system Security orders as "live".
         if (m.systemId != 0 && m.systemId != currentSystem->stub.id) return out;
 
-        const std::string subj = ui::stripMarkup(m.subject);
+        const std::string subj = ui::textfx::stripMarkup(m.subject);
         const bool isBribeMsg = (subj.find("DISCRETIONARY") != std::string::npos);
         const bool isBountyMsg = (subj.find("ENFORCEMENT") != std::string::npos);
 
@@ -21516,6 +21534,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const float t = std::min(tx, ty);
         return ImVec2(center.x + dir.x * t, center.y + dir.y * t);
       };
+
+	      auto triangleRotated = [&](const std::array<ImVec2, 3>& tri, float ang) {
+	        const float c = std::cos(ang);
+	        const float s = std::sin(ang);
+	        std::array<ImVec2, 3> out = tri;
+	        for (auto& v : out) {
+	          const float x = v.x;
+	          const float y = v.y;
+	          v.x = x * c - y * s;
+	          v.y = x * s + y * c;
+	        }
+	        return out;
+	      };
 
       auto drawArc = [&](float radius, float a0, float a1, ImU32 col, float thickness) {
         const int segments = std::max(12, (int)(radius * 0.35f));
@@ -21983,7 +22014,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         sim::Mission* wpMission = nullptr;
         if (trackedMissionId != 0) {
           for (auto& m : missions) {
-            if (m.id == trackedMissionId && m.active) {
+	            if (m.id == trackedMissionId && !m.completed && !m.failed) {
               wpMission = &m;
               break;
             }
@@ -21991,7 +22022,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
         if (!wpMission) {
           for (auto& m : missions) {
-            if (m.active) {
+	            if (!m.completed && !m.failed) {
               wpMission = &m;
               trackedMissionId = m.id;
               break;
@@ -22054,8 +22085,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         if (wp.kind != TargetKind::None && wpLabel &&
             !(wp.kind == target.kind && wp.index == target.index)) {
-          const auto sp = projectToScreenAny(toRenderPosU(wpPosKm, ship.positionKm()), view, proj, w, h, 0.96);
-          const ImU32 col = ImColor(hudColorPrimary);
+	          const float dpiScale = uiScale;
+	          const auto sp = projectToScreenAny(toRenderPosU(wpPosKm), view, proj, w, h, 0.96);
+	          const ImU32 col = hudU32(hudColorPrimary, (220.0f / 255.0f));
 
           if (sp.ok) {
             const ImVec2 p(sp.x, sp.y);
@@ -22065,18 +22097,19 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               const auto spr = hudAtlas.get(wpIcon->first, wpIcon->second);
               const ImVec2 p0(p.x - 12.0f * dpiScale, p.y - 12.0f * dpiScale);
               const ImVec2 p1(p.x + 12.0f * dpiScale, p.y + 12.0f * dpiScale);
-              draw->AddImage(atlasId, p0, p1, spr.uv0, spr.uv1, col);
+	              draw->AddImage(atlasId, p0, p1, ImVec2(spr.u0, spr.v0), ImVec2(spr.u1, spr.v1), col);
             }
 
             draw->AddText(ImVec2(p.x + 16.0f * dpiScale, p.y - 8.0f * dpiScale), col, wpLabel);
-          } else if (hudOffscreenTargetIndicator) {
-            const ImVec2 c(w * 0.5f, h * 0.5f);
-            const ImVec2 dir = ImVec2(sp.x - c.x, sp.y - c.y);
+	          } else if (hudOffscreenTargetIndicator) {
+	            const ImVec2 dir = ImVec2(sp.x - center.x, sp.y - center.y);
             const float ang = std::atan2f(dir.y, dir.x);
 
-            const ImVec2 pe = clampToEdge(c, dir, w, h, 24.0f * dpiScale);
+	            const ImVec2 pe = clampToEdge(ImVec2(sp.x, sp.y), 24.0f * dpiScale);
 
-            std::array<ImVec2, 3> tri = {ImVec2(14.0f, 0.0f), ImVec2(-10.0f, 8.0f), ImVec2(-10.0f, -8.0f)};
+	            std::array<ImVec2, 3> tri = {ImVec2(14.0f * dpiScale, 0.0f),
+	                                        ImVec2(-10.0f * dpiScale, 8.0f * dpiScale),
+	                                        ImVec2(-10.0f * dpiScale, -8.0f * dpiScale)};
             tri = triangleRotated(tri, ang);
             for (auto& v : tri) v += pe;
 
@@ -22401,26 +22434,13 @@ auto uiStationNameById = [&](sim::SystemId sysId, sim::StationId stId) -> std::s
   return "Station " + std::to_string(stId);
 };
 
-auto uiMissionNextStop = [&](const sim::Mission& m) -> std::pair<sim::SystemId, sim::StationId> {
-  // Multi-leg contracts: go to the via stop first.
-  const bool hasViaStop = (m.viaSystem != 0 && m.viaStation != 0 && m.leg == 0
-                           && (m.type == sim::MissionType::MultiDelivery || m.type == sim::MissionType::Passenger));
-  if (hasViaStop) {
-    return {m.viaSystem, m.viaStation};
-  }
-
-  // Salvage jobs: before the site is visited, the objective is the mission signal (not a station).
-  if (m.type == sim::MissionType::Salvage && !m.scanned) {
-    return {m.toSystem, 0};
-  }
-
-  // Bounty missions provide a best-effort station hint where the target tends to lurk.
-  if (m.type == sim::MissionType::BountyScan || m.type == sim::MissionType::BountyKill) {
-    return {m.toSystem, m.toStation};
-  }
-
-  return {m.toSystem, m.toStation};
-};
+	auto currentSystemStationById = [&](sim::StationId stId) -> const sim::Station* {
+	  if (!currentSystem || stId == 0) return nullptr;
+	  for (const auto& st : currentSystem->stations) {
+	    if (st.id == stId) return &st;
+	  }
+	  return nullptr;
+	};
 
 auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
   std::string out;
@@ -23421,7 +23441,7 @@ auto executeTradeLoopDockedTurn = [&](bool showToast, bool plotAndAutoRun, const
     return;
   }
 
-  sim::Station* st = currentSystemStationById(dockedStationId);
+	const sim::Station* st = currentSystemStationById(dockedStationId);
   if (!st) return;
 
   // Reserve mission cargo (delivery/smuggle/etc) so automation never sells it.
@@ -24214,10 +24234,9 @@ if (objectiveHudEnabled) {
         return;
       }
 
-      // Resolve info from the chosen kind/index.
-      scanLockedTargetKind = k;
-      scanLockedTarget = idx;
-      scanLockedDanger = 0;
+	      // Resolve info from the chosen kind/index.
+	      scanLockedTarget.kind = k;
+	      scanLockedTarget.index = idx;
 
       switch (k) {
       case TargetKind::Signal: {
@@ -24226,9 +24245,8 @@ if (objectiveHudEnabled) {
           return;
         }
         const auto& s = signals[idx];
-        scanLockedId = s.id;
-        scanLockedName = s.label;
-        scanLockedDanger = s.danger;
+	        scanLockedId = s.id;
+	        scanLabel = std::string("Signal scan: ") + signalTypeName(s.type);
         scanRangeKm = 120000.0;
         scanDurationSec = 12.0;
       } break;
@@ -24238,9 +24256,8 @@ if (objectiveHudEnabled) {
           return;
         }
         const auto& c = contacts[idx];
-        scanLockedId = c.id;
-        scanLockedName = c.name;
-        scanLockedDanger = c.danger;
+	        scanLockedId = c.id;
+	        scanLabel = std::string("Ship scan: ") + c.name;
         scanRangeKm = 20000.0;
         scanDurationSec = 6.0;
       } break;
@@ -24250,9 +24267,8 @@ if (objectiveHudEnabled) {
           return;
         }
         const auto& st = currentSystem->stations[idx];
-        scanLockedId = st.id;
-        scanLockedName = st.name;
-        scanLockedDanger = 0;
+	        scanLockedId = st.id;
+	        scanLabel = std::string("Station scan: ") + st.name;
         scanRangeKm = 60000.0;
         scanDurationSec = 10.0;
       } break;
@@ -24261,10 +24277,10 @@ if (objectiveHudEnabled) {
         return;
       }
 
-      scanTimerSec = 0.0;
+	      scanProgressSec = 0.0;
       scanning = true;
 
-      toast(toasts, std::string("Scan started: ") + scanLockedName, 1.6);
+	      toast(toasts, scanLabel.empty() ? "Scan started." : scanLabel, 1.6);
     };
 
         auto requestDockingQuick = [&](const std::size_t stationIdx) {
@@ -24801,6 +24817,8 @@ if (!objectiveHudEnabled && !docked) {
     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize |
     ImGuiWindowFlags_NoFocusOnAppearing;
 
+	  const float dpiScale = uiScale;
+
   const float pad = 10.0f * dpiScale;
   ImGui::SetNextWindowBgAlpha(0.18f);
   ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
@@ -24811,7 +24829,7 @@ if (!objectiveHudEnabled && !docked) {
   sim::Mission* trackedMini = nullptr;
   if (trackedMissionId != 0) {
     for (auto& m : missions) {
-      if (m.id == trackedMissionId && m.active) {
+      if (m.id == trackedMissionId && !m.completed && !m.failed) {
         trackedMini = &m;
         break;
       }
@@ -24819,7 +24837,7 @@ if (!objectiveHudEnabled && !docked) {
   }
   if (!trackedMini) {
     for (auto& m : missions) {
-      if (m.active) {
+      if (!m.completed && !m.failed) {
         trackedMini = &m;
         break;
       }
@@ -29187,7 +29205,7 @@ if (showScanner) {
     sim::Mission* tracked = nullptr;
     if (trackedMissionId != 0) {
       for (auto& m : missions) {
-        if (m.id == trackedMissionId && m.active) {
+        if (m.id == trackedMissionId && !m.completed && !m.failed) {
           tracked = &m;
           break;
         }
@@ -29195,7 +29213,7 @@ if (showScanner) {
     }
     if (!tracked) {
       for (auto& m : missions) {
-        if (m.active) {
+        if (!m.completed && !m.failed) {
           tracked = &m;
           break;
         }
@@ -32728,7 +32746,7 @@ ImGui::PopID();
         } else {
           const sim::Station* fromSt = nullptr;
           if (docked && dockedStationId == fromStationId) {
-            if (sim::Station* st = currentSystemStationById(fromStationId)) {
+	          if (const sim::Station* st = currentSystemStationById(fromStationId)) {
               fromSt = st;
             }
           }
@@ -40466,12 +40484,12 @@ for (int i = 0; i < (int)std::size(kWeaponDefs); ++i) {
         const UnlockReq req = goalReq(g);
         const float p = unlockReqProgress(req);
 
-        const float pad = 12.0f * dpiScale;
+	        const float pad = 12.0f * uiScale;
         float y = pad;
 
         // Keep clear of the mini objective tracker (also top-left) when it's visible.
         if (!objectiveHudEnabled && !docked) {
-          y += 110.0f * dpiScale;
+	          y += 110.0f * uiScale;
         }
 
         ImGui::SetNextWindowBgAlpha(0.20f);
@@ -40491,7 +40509,7 @@ for (int i = 0; i < (int)std::size(kWeaponDefs); ++i) {
 
           char pb[32];
           std::snprintf(pb, sizeof(pb), "%d%%", (int)std::lround(p * 100.0f));
-          ImGui::ProgressBar(p, ImVec2(260.0f * dpiScale, 0.0f), pb);
+	          ImGui::ProgressBar(p, ImVec2(260.0f * uiScale, 0.0f), pb);
 
           ImGui::TextDisabled("Credits HW: %.0f   Rep best: %.1f",
                               progression.creditsHighWaterCr,

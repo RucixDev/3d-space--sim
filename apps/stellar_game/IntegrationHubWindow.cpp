@@ -229,6 +229,8 @@ static std::string formatActionLine(const GameAction& a) {
   return ss.str();
 }
 
+} // namespace
+
 void hubScheduleAction(IntegrationHubWindowState& st, GameAction a) {
   st.totalActionsScheduled++;
 

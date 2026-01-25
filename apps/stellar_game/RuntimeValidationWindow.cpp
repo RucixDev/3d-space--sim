@@ -14,6 +14,7 @@
 #include "stellar/sim/Aerodynamics.h"
 #include "stellar/sim/Atmosphere.h"
 #include "stellar/sim/TimeTrial.h"
+#include "stellar/sim/Ship.h"
 
 #include <imgui.h>
 

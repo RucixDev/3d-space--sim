@@ -140,6 +140,11 @@ inline const HullDef& hullDef(ShipHullClass cls) {
   return kHullDefs[idx];
 }
 
+// Convenience: stable human-readable name for the given hull class.
+inline const char* shipHullClassName(ShipHullClass cls) {
+  return hullDef(cls).name;
+}
+
 inline const WeaponDef& weaponDef(WeaponType t) {
   const int idx = std::clamp((int)t, 0, (int)weaponDefCount() - 1);
   return kWeaponDefs[idx];

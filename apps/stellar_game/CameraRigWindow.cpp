@@ -278,7 +278,8 @@ static void applyBodyCollision(math::Vec3d& camPosU,
   if (!system) return;
 
   const sim::DominantGravityBody body = sim::dominantGravityBody(*system, timeDays, ship.positionKm(), gravityParams);
-  if (body.kind == sim::DominantBodyKind::None) return;
+	  if (!body.valid) return;
+	  const auto& gb = body.body;
 
   // Convert body center to render-units using the same scale as the visual instancing.
   // NOTE: This code mirrors the instancing scales in main.cpp:
@@ -296,9 +297,9 @@ static void applyBodyCollision(math::Vec3d& camPosU,
     return shipPosU + (relKm * (1.0 / kRENDER_UNIT_KM));
   };
 
-  const math::Vec3d bodyPosU = toRenderPosU(body.posKm);
-  const double scaleFactor = (body.kind == sim::DominantBodyKind::Star) ? 3.0 : 200.0;
-  const double bodyRadiusU = std::max(0.1, (body.radiusKm / kRENDER_UNIT_KM) * scaleFactor);
+	  const math::Vec3d bodyPosU = toRenderPosU(gb.posKm);
+	  const double scaleFactor = (gb.kind == sim::GravityBody::Kind::Star) ? 3.0 : 200.0;
+	  const double bodyRadiusU = std::max(0.1, (gb.radiusKm / kRENDER_UNIT_KM) * scaleFactor);
   const double minDist = bodyRadiusU + paddingU;
 
   math::Vec3d d = camPosU - bodyPosU;

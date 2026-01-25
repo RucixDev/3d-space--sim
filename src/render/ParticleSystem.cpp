@@ -269,4 +269,59 @@ void ParticleSystem::spawnSparks(const math::Vec3d& posU,
   }
 }
 
+void ParticleSystem::spawnShockwaveRing(const math::Vec3d& centerU,
+                                        const math::Vec3d& axisWorld,
+                                        double baseRadiusU,
+                                        double maxRadiusU,
+                                        double lifetimeSec,
+                                        double energy,
+                                        int count) {
+  energy = std::max(0.0, energy);
+  lifetimeSec = std::max(0.05, lifetimeSec);
+  baseRadiusU = std::max(0.0, baseRadiusU);
+  maxRadiusU = std::max(baseRadiusU + 1e-6, maxRadiusU);
+
+  if (count < 0) {
+    // A dense ring reads much better than a few sparks.
+    count = (int)std::clamp(90.0 + energy * 120.0, 64.0, 260.0);
+  }
+
+  const math::Vec3d axis = (axisWorld.lengthSq() > 1e-12) ? axisWorld.normalized() : math::Vec3d{0, 1, 0};
+  const math::Vec3d u = orthogonal(axis);
+  const math::Vec3d v = math::cross(axis, u).normalized();
+
+  const double speed = (maxRadiusU - baseRadiusU) / lifetimeSec;
+  const float baseA = (float)std::clamp(0.35 + 0.55 * std::sqrt(energy), 0.0, 1.0);
+  const float size = (float)std::clamp(3.5 + 5.0 * energy, 3.5, 14.0);
+
+  for (int i = 0; i < count; ++i) {
+    const double t = (count > 1) ? (double)i / (double)count : 0.0;
+    const double jitter = rng_.range(-0.02, 0.02);
+    const double ang = 2.0 * math::kPi * (t + jitter);
+    const double ca = std::cos(ang);
+    const double sa = std::sin(ang);
+    math::Vec3d radial = u * ca + v * sa;
+    radial = radial.normalized();
+
+    Particle p;
+    p.posU = centerU + radial * baseRadiusU;
+
+    // Outward motion with a touch of noise to break perfect symmetry.
+    const math::Vec3d noise = sampleCone(rng_, radial, 0.18);
+    p.velU = noise * (speed * rng_.range(0.85, 1.15));
+
+    // Cool blue/white ring.
+    p.r = (float)std::clamp(0.55 + 0.35 * rng_.nextUnit(), 0.0, 1.0);
+    p.g = (float)std::clamp(0.75 + 0.25 * rng_.nextUnit(), 0.0, 1.0);
+    p.b = 1.0f;
+
+    p.baseAlpha = baseA;
+    p.sizePx = size;
+    p.life = p.maxLife = (float)lifetimeSec;
+    p.drag = (float)rng_.range(0.3, 0.8);
+
+    push(p);
+  }
+}
+
 } // namespace stellar::render
