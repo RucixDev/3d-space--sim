@@ -5,6 +5,7 @@
 #include "stellar/core/Log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -70,6 +71,19 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
 
   f << "cargoCapacityKg " << s.cargoCapacityKg << "\n";
   f << "passengerSeats " << s.passengerSeats << "\n";
+  // Search & Rescue: rescued escape pods carried onboard.
+  f << "rescued_pods " << s.rescuedPods.size() << "\n";
+  for (const auto& p : s.rescuedPods) {
+    f << "rescued_pod "
+      << p.id << " "
+      << p.recoveredSystem << " "
+      << p.registryFactionId << " "
+      << p.recoveredDay << " "
+      << p.lifeSupportEndDay << " "
+      << (p.fromPlayerKill ? 1 : 0)
+      << "\n";
+  }
+
   f << "fsdReadyDay " << s.fsdReadyDay << "\n";
 
   // Navigation UI state (quality-of-life).
@@ -586,6 +600,34 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       f >> out.cargoCapacityKg;
     } else if (key == "passengerSeats") {
       f >> out.passengerSeats;
+    } else if (key == "rescued_pods") {
+      std::size_t n = 0;
+      f >> n;
+      out.rescuedPods.clear();
+      out.rescuedPods.reserve(std::min<std::size_t>(n, 4096));
+
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "rescued_pod") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        RescuedPod p{};
+        int fromKill = 0;
+        if (!(f >> p.id >> p.recoveredSystem >> p.registryFactionId >> p.recoveredDay >> p.lifeSupportEndDay >> fromKill)) break;
+        p.fromPlayerKill = (fromKill != 0);
+
+        // Defensive clamps for partially-written / corrupt saves.
+        if (!std::isfinite(p.recoveredDay)) p.recoveredDay = 0.0;
+        if (!std::isfinite(p.lifeSupportEndDay)) p.lifeSupportEndDay = 0.0;
+        if (p.recoveredDay < 0.0) p.recoveredDay = 0.0;
+
+        out.rescuedPods.push_back(p);
+      }
     } else if (key == "fsdReadyDay") {
       f >> out.fsdReadyDay;
     } else if (key == "navAutoRun") {

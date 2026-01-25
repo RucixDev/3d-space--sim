@@ -134,6 +134,35 @@ struct AsteroidState {
   double remainingUnits{0.0};
 };
 
+// Persisted "Search & Rescue" escape pod state.
+//
+// When the player scoops an escape pod (survivors) in space, it is stored here
+// until delivered to a station authority. Each pod consumes one passenger seat
+// while onboard (similar to passenger missions).
+//
+// The prototype treats pods as abstract records (no NPC entities). Gameplay/UI
+// layers can spawn visuals and use this state for payouts.
+struct RescuedPod {
+  core::u64 id{0};
+
+  // Where the pod was recovered (used only for flavor / future routing).
+  SystemId recoveredSystem{0};
+
+  // Faction registry that should reward the rescue (0 = independent).
+  core::u32 registryFactionId{0};
+
+  // Time (SaveGame::timeDays) when the pod was recovered.
+  double recoveredDay{0.0};
+
+  // Life support deadline in timeDays. After this point, the pod is considered expired.
+  double lifeSupportEndDay{0.0};
+
+  // Anti-farm: if true, this pod was spawned from a ship the player destroyed and
+  // yields no credits/rep when turned in.
+  bool fromPlayerKill{false};
+};
+
+
 // Persisted state for an escort-mission convoy NPC.
 //
 // Escort missions spawn a specific convoy ship (mission.targetNpcId). Without persisting
@@ -415,6 +444,11 @@ struct SaveGame {
   // Passenger capacity (seats) for cabin-style missions.
   // Kept intentionally simple for the prototype loop.
   int passengerSeats{2};
+
+  // Rescued escape pods currently onboard.
+  // Each pod consumes one passenger seat until turned in at a station.
+  std::vector<RescuedPod> rescuedPods{};
+
   double fsdReadyDay{0.0}; // timeDays when the next hyperspace jump is allowed
 
   // Navigation UI state (quality-of-life).

@@ -101,6 +101,28 @@ int test_savegame() {
   s.fuelMax = 20.0;
   s.cargoCapacityKg = 240.0;
   s.passengerSeats = 6;
+
+  // Search & Rescue (escape pods) persistence.
+  {
+    RescuedPod p{};
+    p.id = 0x9000000000000001ull;
+    p.recoveredSystem = 999001;
+    p.registryFactionId = 7;
+    p.recoveredDay = 42.40;
+    p.lifeSupportEndDay = 43.10;
+    p.fromPlayerKill = false;
+    s.rescuedPods.push_back(p);
+  }
+  {
+    RescuedPod p{};
+    p.id = 0x9000000000000002ull;
+    p.recoveredSystem = 10;
+    p.registryFactionId = 0; // independent
+    p.recoveredDay = 42.45;
+    p.lifeSupportEndDay = 42.60; // will be expired at timeDays=42.5
+    p.fromPlayerKill = true;
+    s.rescuedPods.push_back(p);
+  }
   // Navigation UI persistence (route plotting + auto-run).
   s.navAutoRun = true;
   s.navRouteMode = 2;
@@ -387,6 +409,24 @@ int test_savegame() {
   if (l.passengerSeats != s.passengerSeats) {
     std::cerr << "[test_savegame] passengerSeats mismatch\n";
     ++fails;
+  }
+
+  // Rescued pods persistence.
+  if (l.rescuedPods.size() != s.rescuedPods.size()) {
+    std::cerr << "[test_savegame] rescuedPods size mismatch\n";
+    ++fails;
+  } else {
+    for (std::size_t i = 0; i < s.rescuedPods.size(); ++i) {
+      const auto& a = s.rescuedPods[i];
+      const auto& b = l.rescuedPods[i];
+      if (a.id != b.id || a.recoveredSystem != b.recoveredSystem || a.registryFactionId != b.registryFactionId ||
+          !nearly(a.recoveredDay, b.recoveredDay) || !nearly(a.lifeSupportEndDay, b.lifeSupportEndDay) ||
+          a.fromPlayerKill != b.fromPlayerKill) {
+        std::cerr << "[test_savegame] rescuedPods entry mismatch\n";
+        ++fails;
+        break;
+      }
+    }
   }
 
   // Navigation UI state.

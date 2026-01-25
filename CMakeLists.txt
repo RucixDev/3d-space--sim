@@ -263,6 +263,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/TradeScanner.cpp
   src/sim/TradeLoopScanner.cpp
   src/sim/SalvageSweep.cpp
+  src/sim/SearchAndRescue.cpp
   src/sim/TradeRunPlanner.cpp
   src/sim/MarketAnalysis.cpp
   src/sim/Universe.cpp
