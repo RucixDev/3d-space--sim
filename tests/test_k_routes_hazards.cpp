@@ -48,7 +48,7 @@ double navIntegral(stellar::core::u64 seed,
 
 } // namespace
 
-int test_nav_route_hazards() {
+int test_k_routes_hazards() {
   int failures = 0;
 
   using namespace stellar;
@@ -57,8 +57,7 @@ int test_nav_route_hazards() {
   const double timeDays = 123.0;
   const double maxJumpLy = 8.0;
 
-  // Build a symmetric 2-hop geometry where start->mid and mid->goal are exactly maxJumpLy,
-  // but the two mids are farther apart than maxJumpLy. This yields two disjoint 2-hop routes.
+  // Same symmetric 2-hop geometry as test_nav_route_hazards.
   const double spanLy = 12.0;
   const double halfSpan = spanLy / 2.0;
   const double dy = std::sqrt(std::max(0.0, maxJumpLy * maxJumpLy - halfSpan * halfSpan));
@@ -77,8 +76,7 @@ int test_nav_route_hazards() {
   Candidate best{};
   best.diff = -1.0;
 
-  // Search a small grid of translations to find a region where the hazard field makes
-  // the two routes meaningfully different.
+  // Search a small grid of translations to find a stable hazard difference.
   for (int ix = -10; ix <= 10; ++ix) {
     for (int iy = -10; iy <= 10; ++iy) {
       const double tx = ix * 24.0;
@@ -100,7 +98,6 @@ int test_nav_route_hazards() {
     }
   }
 
-  // Keep the threshold loose to avoid flakiness across platforms.
   CHECK(best.diff > 1e-6);
 
   const math::Vec3d start{best.tx, best.ty, 0.0};
@@ -116,24 +113,55 @@ int test_nav_route_hazards() {
   nodes.push_back(makeStub(4, goal));
 
   const sim::SystemId expectedMid = (best.hazTop < best.hazBottom) ? 2 : 3;
+  const sim::SystemId otherMid = (expectedMid == 2) ? 3 : 2;
 
-  sim::RoutePlanStats stats{};
-  const auto route = sim::plotRouteAStarCostHazards(nodes,
-                                                    /*startId=*/1,
-                                                    /*goalId=*/4,
-                                                    maxJumpLy,
-                                                    /*costPerJump=*/0.0,
-                                                    /*costPerLy=*/0.0,
-                                                    /*hazardWeightPerLy=*/5.0,
-                                                    seed,
-                                                    timeDays,
-                                                    &stats);
+  const auto routes = sim::plotKRoutesAStarCostHazards(nodes,
+                                                      /*startId=*/1,
+                                                      /*goalId=*/4,
+                                                      maxJumpLy,
+                                                      /*costPerJump=*/0.0,
+                                                      /*costPerLy=*/0.0,
+                                                      /*hazardWeightPerLy=*/5.0,
+                                                      seed,
+                                                      timeDays,
+                                                      /*k=*/2);
 
-  CHECK(stats.reached);
-  CHECK(route.size() == 3);
-  CHECK(route[0] == 1);
-  CHECK(route[2] == 4);
-  CHECK(route[1] == expectedMid);
+  CHECK(routes.size() == 2);
+  if (routes.size() >= 2) {
+    CHECK(routes[0].path.size() == 3);
+    CHECK(routes[0].path[0] == 1);
+    CHECK(routes[0].path[2] == 4);
+    CHECK(routes[0].path[1] == expectedMid);
+
+    CHECK(routes[1].path.size() == 3);
+    CHECK(routes[1].path[0] == 1);
+    CHECK(routes[1].path[2] == 4);
+    CHECK(routes[1].path[1] == otherMid);
+
+    std::string err;
+    CHECK(sim::validateRoute(nodes, routes[0].path, maxJumpLy, &err));
+    CHECK(sim::validateRoute(nodes, routes[1].path, maxJumpLy, &err));
+
+    CHECK(routes[0].cost <= routes[1].cost + 1e-12);
+  }
+
+  // Determinism: run again and ensure identical ordering.
+  const auto routes2 = sim::plotKRoutesAStarCostHazards(nodes,
+                                                       /*startId=*/1,
+                                                       /*goalId=*/4,
+                                                       maxJumpLy,
+                                                       /*costPerJump=*/0.0,
+                                                       /*costPerLy=*/0.0,
+                                                       /*hazardWeightPerLy=*/5.0,
+                                                       seed,
+                                                       timeDays,
+                                                       /*k=*/2);
+  CHECK(routes2.size() == routes.size());
+  if (routes2.size() == routes.size()) {
+    for (std::size_t i = 0; i < routes.size(); ++i) {
+      CHECK(routes2[i].path == routes[i].path);
+    }
+  }
 
   return failures;
 }
