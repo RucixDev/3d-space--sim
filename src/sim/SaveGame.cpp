@@ -91,6 +91,7 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
   f << "navRouteHop " << s.navRouteHop << "\n";
   f << "navRouteMode " << (int)s.navRouteMode << "\n";
   f << "navConstrainToCurrentFuelRange " << (s.navConstrainToCurrentFuelRange ? 1 : 0) << "\n";
+  f << "navHazardWeight " << s.navHazardWeight << "\n";
   f << "pendingArrivalStation " << s.pendingArrivalStation << "\n";
 
   f << "navRoute " << s.navRoute.size() << "\n";
@@ -644,6 +645,8 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
       int v = 0;
       f >> v;
       out.navConstrainToCurrentFuelRange = (v != 0);
+    } else if (key == "navHazardWeight") {
+      f >> out.navHazardWeight;
     } else if (key == "pendingArrivalStation") {
       f >> out.pendingArrivalStation;
     } else if (key == "navRoute") {

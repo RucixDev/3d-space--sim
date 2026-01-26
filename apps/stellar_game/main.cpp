@@ -19,6 +19,7 @@
 #include "stellar/math/Vec2.h"
 #include "stellar/proc/Noise.h"
 #include "stellar/proc/HyperlaneRouter.h"
+#include "stellar/proc/GalaxyHazards.h"
 #include "stellar/econ/Market.h"
 #include "stellar/econ/RoutePlanner.h"
 #include "stellar/render/Camera.h"
@@ -3603,7 +3604,10 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
 
   // Mining UI: aggregate mined-yield toasts (avoid per-pod spam).
   std::array<double, econ::kCommodityCount> miningToastPendingUnits{};
+  std::array<double, econ::kCommodityCount> miningToastLastDays{};
   double miningToastCooldownUntilDays = 0.0;
+
+  miningToastLastDays.fill(-1e9);
 
   // Cached resource field metadata (for scanner readouts / hazards).
   std::vector<sim::ResourceFieldSite> resourceFieldSites;
@@ -3855,6 +3859,7 @@ bool focusMissionsWindow = false;
 
 
   // HUD overlays
+  bool showHUD = true;
   bool showRadarHud = true;
   bool showShipHud = true;
   double radarRangeKm = 220000.0;
@@ -3876,6 +3881,7 @@ bool focusMissionsWindow = false;
   // generate false returns (ghost blips).
   bool radarEnableEw = true;
   bool radarShowEwGhosts = true;
+  bool radarShowEnvNoise = true; // environment-driven false returns from sensor occlusion
   sim::EwJammerParams ewJammerParams{};
   sim::EwGhostParams ewGhostParams{};
 
@@ -4281,6 +4287,7 @@ bool focusMissionsWindow = false;
   FsdState fsdState = FsdState::Idle;
   sim::SystemId fsdTargetSystem{0};
   double fsdChargeRemainingSec = 0.0;
+  double fsdChargeTotalSec = 0.0;
   double fsdTravelRemainingSec = 0.0;
   double fsdTravelTotalSec = 0.0;
   double fsdFuelCost = 0.0;
@@ -4309,6 +4316,9 @@ bool focusMissionsWindow = false;
   // Route graph mode: direct range graph (A* edges within jump range) or hyperlane corridors.
   enum class NavGraphMode { Direct = 0, Hyperlanes = 1 };
   NavGraphMode navGraphMode = NavGraphMode::Direct;
+
+  // Additional cost per LY for avoiding galaxy navigation disruption (0 disables hazard-aware routing).
+  double navHazardWeight = 0.0;
 
   // Hyperlane routing tuning (used when navGraphMode == Hyperlanes).
   proc::HyperlaneTravelParams navHyperlaneTravel{};
@@ -5190,6 +5200,7 @@ auto fieldOpsSkipTarget = [&]() {
     fsdState = FsdState::Idle;
     fsdTargetSystem = 0;
     fsdChargeRemainingSec = 0.0;
+    fsdChargeTotalSec = 0.0;
     fsdTravelRemainingSec = 0.0;
     fsdTravelTotalSec = 0.0;
     supercruiseState = SupercruiseState::Idle;
@@ -6047,6 +6058,13 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     return kFsdFuelBase + distanceLy * kFsdFuelPerLy;
   };
 
+  auto sampleLocalGalaxyHazards = [&]() -> proc::GalaxyHazardSample {
+    if (!currentSystem) return {};
+    proc::GalaxyHazardsParams hp{};
+    hp.timeDays = timeDays;
+    return proc::sampleGalaxyHazards(universe.seed(), currentSystem->stub.posLy, hp);
+  };
+
   // ---- Navigation helpers ----
   auto tryTargetStationById = [&](sim::StationId stationId) -> bool {
     if (!currentSystem) return false;
@@ -6445,7 +6463,12 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
     fsdTargetSystem = destId;
     fsdJumpDistanceLy = distLy;
     fsdFuelCost = fuelCost;
-    fsdChargeRemainingSec = kFsdChargeSec;
+    {
+      const auto env = sampleLocalGalaxyHazards();
+      const double chargeMult = std::clamp(1.0 + 0.85 * env.navDisruption01, 1.0, 2.25);
+      fsdChargeTotalSec = kFsdChargeSec * chargeMult;
+      fsdChargeRemainingSec = fsdChargeTotalSec;
+    }
     fsdTravelRemainingSec = 0.0;
     fsdTravelTotalSec = 0.0;
     fsdState = FsdState::Charging;
@@ -7276,7 +7299,7 @@ applyLocalSecurityImpulse(-0.010, +0.008, -0.010);
                 break;
             }
 
-            applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+	          	applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic);
           };
 
           auto findPrev = [&](core::u64 id) -> const sim::Mission* {
@@ -7530,6 +7553,7 @@ auto findMostRecentSavePath = [&]() -> std::optional<std::filesystem::path> {
           s.navAutoRun = navAutoRun;
 	          s.navRouteMode = core::clampCast<core::u8>((int)navRouteMode, 0, 2);
           s.navConstrainToCurrentFuelRange = navConstrainToCurrentFuelRange;
+          s.navHazardWeight = navHazardWeight;
           s.pendingArrivalStation = pendingArrivalTargetStationId;
 
           // Loadout
@@ -8198,6 +8222,7 @@ progression.unlockWeapon(weaponSecondary);
             navAutoRun = s.navAutoRun;
 	            navRouteMode = (NavRouteMode)core::clamp((int)s.navRouteMode, 0, 2);
             navConstrainToCurrentFuelRange = s.navConstrainToCurrentFuelRange;
+            navHazardWeight = std::clamp(s.navHazardWeight, 0.0, 5.0);
             pendingArrivalTargetStationId = s.pendingArrivalStation;
 
             // Planner diagnostics are derived; invalidate on load (will refresh when plotting).
@@ -9691,6 +9716,7 @@ progression.unlockWeapon(weaponSecondary);
             fsdState = FsdState::Idle;
             fsdTargetSystem = 0;
             fsdChargeRemainingSec = 0.0;
+            fsdChargeTotalSec = 0.0;
             fsdTravelRemainingSec = 0.0;
             fsdTravelTotalSec = 0.0;
             fsdFuelCost = 0.0;
@@ -11272,7 +11298,11 @@ if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone |
         scParams.safeWindowSlackSec = 2.0;
         scParams.minClosingKmS = 0.05;
         scParams.maxLateralFrac = std::clamp(std::tan(math::degToRad(supercruiseCorridorDeg)), 0.05, 2.0);
-        scParams.maxSpeedKmS = supercruiseMaxSpeedKmS;
+        {
+          const auto env = sampleLocalGalaxyHazards();
+          const double speedMult = std::clamp(1.0 - 0.45 * env.navDisruption01, 0.35, 1.0);
+          scParams.maxSpeedKmS = supercruiseMaxSpeedKmS * speedMult;
+        }
         scParams.accelCapKmS2 = 6.0;
         scParams.angularCapRadS2 = 1.2;
         scParams.useBrakingDistanceLimit = true;
@@ -11455,6 +11485,7 @@ if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone |
     fsdState = FsdState::Idle;
     fsdTargetSystem = 0;
     fsdChargeRemainingSec = 0.0;
+    fsdChargeTotalSec = 0.0;
     fsdTravelRemainingSec = 0.0;
     fsdTravelTotalSec = 0.0;
     supercruiseState = SupercruiseState::Idle;
@@ -11581,6 +11612,7 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
     fsdState = FsdState::Idle;
     fsdTargetSystem = 0;
     fsdChargeRemainingSec = 0.0;
+    fsdChargeTotalSec = 0.0;
     fsdTravelRemainingSec = 0.0;
     fsdTravelTotalSec = 0.0;
     supercruiseState = SupercruiseState::Idle;
@@ -14960,7 +14992,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                     break;
                 }
 
-                applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+                applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic);
               };
 
               auto findPrev = [&](core::u64 id) -> const sim::Mission* {
@@ -16663,7 +16695,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               break;
           }
 
-          applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic, timeDays);
+	      applySystemSecurityImpulseTo(m.fromSystem, dSec, dPiracy, dTraffic);
         };
 
         for (const auto& m : tmp.missions) {
@@ -19280,7 +19312,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
         float fx = 0.0f;
         if (fsdState == FsdState::Charging) {
-          const float t = 1.0f - (float)std::clamp(fsdChargeRemainingSec / kFsdChargeSec, 0.0, 1.0);
+          const float t = 1.0f - (float)std::clamp((fsdChargeTotalSec > 0.0 ? (fsdChargeRemainingSec / fsdChargeTotalSec) : 0.0), 0.0, 1.0);
           fx = smooth01(t);
         } else if (fsdState == FsdState::Jumping) {
           const float total = (float)std::max(0.001, fsdTravelTotalSec);
@@ -21136,8 +21168,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       };
       cctx.syncNavToMission = [&](core::u64 missionId, bool armAutoRun) {
         game::hubPushAction(integrationHubWindow,
-                            game::GameAction{timeRealSec, timeDays, "Comms", game::GameActionKind::SyncNavToMission,
-                                             missionId, 0, 0, armAutoRun, ""});
+		                    game::makeActionSyncNavToMission(timeRealSec, timeDays, "Comms", missionId, armAutoRun));
       };
       cctx.plotTo = [&](sim::SystemId sysId, sim::StationId stId) {
         if (cctx.goTo) {
@@ -21208,6 +21239,159 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       cctx.actSecurityComplyOrSubmit = [&]() { doAuthorityComplyOrSubmit("Comms", /*requireNoUiCapture=*/false); };
       cctx.securityBribeChord = game::chordLabel(controls.actions.bribe);
       cctx.securityComplyChord = game::chordLabel(controls.actions.complyOrSubmit);
+
+      // Live Pirate response actions (cargo extortion / tribute).
+      // Mirrors the Threat HUD widget but lets you respond directly from the Ultimatum message.
+      cctx.queryPirateDemand = [&](const sim::CommsMessage& m, bool allowMissionCargo) -> game::PirateDemandUi {
+        game::PirateDemandUi out{};
+        if (!currentSystem) return out;
+        if (m.channel != sim::CommsChannel::Pirate) return out;
+        if (!pirateDemand.active || pirateDemand.requiredValueCr <= 0.0) return out;
+        if (timeDays >= pirateDemand.untilDays) return out;
+
+        // Only treat local-system pirate ultimatums as "live".
+        if (m.systemId != 0 && m.systemId != currentSystem->stub.id) return out;
+
+        // Match group id when available.
+        if (m.relatedId != 0 && pirateDemand.groupId != 0 && m.relatedId != pirateDemand.groupId) return out;
+
+        out.kind = game::PirateDemandUi::Kind::Ultimatum;
+        out.groupId = pirateDemand.groupId;
+        out.pirateName = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
+        out.requiredValueCr = pirateDemand.requiredValueCr;
+        out.deliveredValueCr = pirateDemand.deliveredValueCr;
+        out.remainingValueCr = std::max(0.0, pirateDemand.requiredValueCr - pirateDemand.deliveredValueCr);
+
+        out.secondsLeft = std::max(0.0, (pirateDemand.untilDays - timeDays) * 86400.0);
+        out.secondsTotal = std::max(0.001, (pirateDemand.untilDays - pirateDemand.startDays) * 86400.0);
+
+        out.actionAllowed = (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
+
+        // Reserve mission cargo (prevents accidental dumping like the Market sell guard).
+        std::array<double, econ::kCommodityCount> reservedUnits{};
+        reservedUnits.fill(0.0);
+        for (const auto& ms : missions) {
+          if (ms.completed || ms.failed) continue;
+          if (ms.type != sim::MissionType::Delivery
+           && ms.type != sim::MissionType::MultiDelivery
+           && ms.type != sim::MissionType::Smuggle) continue;
+          const std::size_t idx = (std::size_t)ms.commodity;
+          if (idx >= reservedUnits.size()) continue;
+          reservedUnits[idx] += std::max(0.0, ms.units);
+        }
+
+        // Witness warning (cargo dumping can generate a bounty when observed).
+        const auto wit = authorityWitness();
+        out.witnessLikely = wit.first;
+        out.witnessName = wit.second;
+
+        out.plan = sim::planCargoJettisonForValue(cargo, reservedUnits, out.remainingValueCr, allowMissionCargo);
+
+        if (!out.plan.success && out.remainingValueCr > 1e-6) {
+          double freeValueCr = 0.0;
+          double reservedValueCr = 0.0;
+          for (std::size_t i = 0; i < econ::kCommodityCount; ++i) {
+            const double reserved = std::max(0.0, reservedUnits[i]);
+            const double haveU = std::max(0.0, cargo[i]);
+            const double freeU = std::max(0.0, haveU - reserved);
+            freeValueCr += freeU * econ::commodityDef((econ::CommodityId)i).basePrice;
+            reservedValueCr += std::min(haveU, reserved) * econ::commodityDef((econ::CommodityId)i).basePrice;
+          }
+          out.freeValueCr = freeValueCr;
+          out.reservedValueCr = reservedValueCr;
+        }
+
+        return out;
+      };
+
+      cctx.actPirateAutoJettison = [&](bool allowMissionCargo) {
+        if (!pirateDemand.active || pirateDemand.requiredValueCr <= 0.0) return;
+
+        // Keep it consistent with the Threat HUD: only allow while in normal space.
+        if (docked || fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle) {
+          toast(toasts, "Can't jettison tribute right now.", 2.0);
+          return;
+        }
+
+        const std::string src = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
+
+        const double need = std::max(0.0, pirateDemand.requiredValueCr);
+        const double have = std::max(0.0, pirateDemand.deliveredValueCr);
+        const double remainingCr = std::max(0.0, need - have);
+        if (remainingCr <= 1e-6) {
+          toast(toasts, "Tribute already delivered.", 1.6);
+          if (pirateDemand.active) {
+            resolvePirateDemand(true, src + ": tribute received. We'll take it and leave.");
+          }
+          return;
+        }
+
+        // Reserve mission cargo (prevents accidental dumping like the Market sell guard).
+        std::array<double, econ::kCommodityCount> reservedUnits{};
+        reservedUnits.fill(0.0);
+        for (const auto& ms : missions) {
+          if (ms.completed || ms.failed) continue;
+          if (ms.type != sim::MissionType::Delivery
+           && ms.type != sim::MissionType::MultiDelivery
+           && ms.type != sim::MissionType::Smuggle) continue;
+          const std::size_t idx = (std::size_t)ms.commodity;
+          if (idx >= reservedUnits.size()) continue;
+          reservedUnits[idx] += std::max(0.0, ms.units);
+        }
+
+        // Witness warning (cargo dumping can generate a bounty when observed).
+        const auto wit = authorityWitness();
+
+        // Planner: minimize overpay, then minimize jettisoned mass.
+        const sim::CargoJettisonPlan plan = sim::planCargoJettisonForValue(cargo, reservedUnits, remainingCr, allowMissionCargo);
+        if (!plan.success) {
+          toast(toasts, "Auto-jettison: insufficient cargo value.", 2.6);
+          return;
+        }
+
+        double dumpedValueCr = 0.0;
+        bool anyContraband = false;
+
+        for (const auto& ln : plan.lines) {
+          const std::size_t idx = (std::size_t)ln.commodity;
+          if (idx >= econ::kCommodityCount) continue;
+          const double reserved = reservedUnits[idx];
+          const double freeU = std::max(0.0, cargo[idx] - reserved);
+          const double maxU = allowMissionCargo ? cargo[idx] : freeU;
+          const double take = std::min(maxU, std::max(0.0, ln.units));
+          if (take <= 1e-6) continue;
+
+          cargo[idx] = std::max(0.0, cargo[idx] - take);
+          doPlayerJettison(ln.commodity, take);
+          dumpedValueCr += take * econ::commodityDef(ln.commodity).basePrice;
+
+          if (currentSystem && currentSystem->stub.factionId != 0) {
+            if (isIllegalCommodity(currentSystem->stub.factionId, ln.commodity)) anyContraband = true;
+          }
+        }
+
+        if (dumpedValueCr > 1e-6) {
+          toast(toasts, "Auto-jettisoned tribute: " + std::to_string((int)std::round(dumpedValueCr)) + " cr", 2.8);
+
+          // Apply a single crime event if witnessed (mirrors the cargo management UI).
+          if (wit.first) {
+            applyDumpCrime(dumpedValueCr, wit.second, anyContraband);
+          }
+
+          // If this completes the demand, resolve immediately so the pirate pack disengages.
+          if (pirateDemand.active && pirateDemand.deliveredValueCr + 1e-6 >= pirateDemand.requiredValueCr) {
+            resolvePirateDemand(true, src + ": tribute received. We'll take it and leave.");
+          }
+        } else {
+          toast(toasts, "Auto-jettison: nothing to dump.", 2.0);
+        }
+      };
+
+      cctx.actPirateRefuse = [&]() {
+        if (!pirateDemand.active) return;
+        const std::string src = pirateDemand.leaderName.empty() ? std::string("Pirates") : pirateDemand.leaderName;
+        resolvePirateDemand(false, src + ": last chance. Open fire!");
+      };
 
       game::drawCommsWindow(commsWindow, commsOverlay, cctx);
     }
@@ -22086,11 +22270,13 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (wp.kind != TargetKind::None && wpLabel &&
             !(wp.kind == target.kind && wp.index == target.index)) {
 	          const float dpiScale = uiScale;
-	          const auto sp = projectToScreenAny(toRenderPosU(wpPosKm), view, proj, w, h, 0.96);
+	          ImVec2 spPx{};
+	          bool spOffscreen = false;
+	          const bool spOk = projectToScreenAny(toRenderPosU(wpPosKm), view, proj, w, h, spPx, spOffscreen);
 	          const ImU32 col = hudU32(hudColorPrimary, (220.0f / 255.0f));
 
-          if (sp.ok) {
-            const ImVec2 p(sp.x, sp.y);
+          if (spOk && !spOffscreen) {
+            const ImVec2 p = spPx;
             draw->AddCircle(p, 14.0f * dpiScale, col, 0, 2.0f * dpiScale);
 
             if (wpIcon) {
@@ -22101,17 +22287,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             }
 
             draw->AddText(ImVec2(p.x + 16.0f * dpiScale, p.y - 8.0f * dpiScale), col, wpLabel);
-	          } else if (hudOffscreenTargetIndicator) {
-	            const ImVec2 dir = ImVec2(sp.x - center.x, sp.y - center.y);
+	          } else if (hudOffscreenTargetIndicator && spOk && spOffscreen) {
+	            const ImVec2 dir = ImVec2(spPx.x - center.x, spPx.y - center.y);
             const float ang = std::atan2f(dir.y, dir.x);
 
-	            const ImVec2 pe = clampToEdge(ImVec2(sp.x, sp.y), 24.0f * dpiScale);
+	            const ImVec2 pe = clampToEdge(spPx, 24.0f * dpiScale);
 
 	            std::array<ImVec2, 3> tri = {ImVec2(14.0f * dpiScale, 0.0f),
 	                                        ImVec2(-10.0f * dpiScale, 8.0f * dpiScale),
 	                                        ImVec2(-10.0f * dpiScale, -8.0f * dpiScale)};
             tri = triangleRotated(tri, ang);
-            for (auto& v : tri) v += pe;
+            for (auto& v : tri) {
+              v.x += pe.x;
+              v.y += pe.y;
+            }
 
             draw->AddTriangleFilled(tri[0], tri[1], tri[2], col);
             draw->AddText(ImVec2(pe.x - 6.0f * dpiScale, pe.y - 22.0f * dpiScale), col, wpLabel);
@@ -22507,17 +22696,31 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
 
 
 // HUD layout helpers (persistent position for overlay windows)
-auto hudSetNextWindowPosFromLayout = [&](ui::HudWidgetId id) {
+auto hudSetNextWindowPosFromLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, float padYpx = 0.0f) {
   ImGuiViewport* vp = ImGui::GetMainViewport();
   const auto& wl = hudLayout.widget(id);
-  const ImVec2 pos(vp->WorkPos.x + vp->WorkSize.x * wl.posNormX,
-                   vp->WorkPos.y + vp->WorkSize.y * wl.posNormY);
+
+  const float padX = std::max(0.0f, padXpx);
+  const float padY = std::max(0.0f, padYpx);
+
+  const ImVec2 workPos(vp->WorkPos.x + padX, vp->WorkPos.y + padY);
+  ImVec2 workSize(vp->WorkSize.x - padX * 2.0f, vp->WorkSize.y - padY * 2.0f);
+  workSize.x = std::max(1.0f, workSize.x);
+  workSize.y = std::max(1.0f, workSize.y);
+
+  const ImVec2 pos(workPos.x + workSize.x * wl.posNormX,
+                   workPos.y + workSize.y * wl.posNormY);
   ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(wl.pivotX, wl.pivotY));
 };
 
-auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id) {
+auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, float padYpx = 0.0f) {
   ImGuiViewport* vp = ImGui::GetMainViewport();
-  if (vp->WorkSize.x <= 1.0f || vp->WorkSize.y <= 1.0f) return;
+  const float padX = std::max(0.0f, padXpx);
+  const float padY = std::max(0.0f, padYpx);
+  const ImVec2 workPos(vp->WorkPos.x + padX, vp->WorkPos.y + padY);
+  const ImVec2 workSize(vp->WorkSize.x - padX * 2.0f, vp->WorkSize.y - padY * 2.0f);
+
+  if (workSize.x <= 1.0f || workSize.y <= 1.0f) return;
 
   auto& wl = hudLayout.widget(id);
   const ImVec2 winPos = ImGui::GetWindowPos();
@@ -22527,8 +22730,8 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id) {
   const ImVec2 pivotPoint(winPos.x + winSize.x * wl.pivotX,
                           winPos.y + winSize.y * wl.pivotY);
 
-  wl.posNormX = (pivotPoint.x - vp->WorkPos.x) / vp->WorkSize.x;
-  wl.posNormY = (pivotPoint.y - vp->WorkPos.y) / vp->WorkSize.y;
+  wl.posNormX = (pivotPoint.x - workPos.x) / workSize.x;
+  wl.posNormY = (pivotPoint.y - workPos.y) / workSize.y;
   wl.posNormX = std::clamp(wl.posNormX, 0.0f, 1.0f);
   wl.posNormY = std::clamp(wl.posNormY, 0.0f, 1.0f);
 };
@@ -22669,8 +22872,14 @@ if (showRadarHud && currentSystem) {
   sensorParams.occlusionAtten = 0.10;
 
   // A short active ping boosts sensor power for a moment (and draws a sweep ring).
+  const auto envHaz = sampleLocalGalaxyHazards();
+  const double envSensorOcclusion01 = envHaz.sensorOcclusion01;
+
   double sensorPower = pingActive ? sensorPingPowerBoost : 1.0;
   if (silentRunning) sensorPower *= 0.80;
+
+  // Galaxy-scale sensor occlusion (nebulae, dust).
+  sensorPower *= std::clamp(1.0 - 0.60 * envSensorOcclusion01, 0.30, 1.0);
 
   struct Occluder {
     math::Vec3d cKm{0,0,0};
@@ -22864,6 +23073,30 @@ if (showRadarHud && currentSystem) {
         const math::Vec3d wpos = shipPos + ship.orientation().rotate(local);
         addBlip(TargetKind::None, (std::size_t)g.id, wpos, false, g.strength01, false);
       }
+    }
+  }
+
+  // Environmental noise returns (false contacts) due to high sensor occlusion.
+  if (radarShowEnvNoise && envSensorOcclusion01 > 0.05) {
+    const double noise01 = std::clamp((envSensorOcclusion01 - 0.05) / 0.95, 0.0, 1.0);
+
+    sim::EwGhostParams gp = ewGhostParams;
+    gp.maxBlips = std::min(gp.maxBlips, 16);
+    gp.minStrength01 = 0.04;
+    gp.maxStrength01 = 0.18;
+    gp.driftKmPerSec = 250.0;
+    gp.reseedHz = 0.06;
+
+    const int budget = std::max(0, radarMaxBlips - (int)blips.size());
+    gp.maxBlips = std::min(gp.maxBlips, budget);
+
+    const core::u64 gSeed = core::hashCombine(core::hashCombine(universe.seed(), (core::u64)currentSystem->stub.id),
+                                              core::fnv1a64("radar_env_noise"));
+    const auto ghosts = sim::generateGhostBlips(gSeed, timeRealSec, rangeKm, noise01, gp);
+    for (const auto& g : ghosts) {
+      const math::Vec3d local{g.xKm, 0.0, g.zKm};
+      const math::Vec3d wpos = shipPos + ship.orientation().rotate(local);
+      addBlip(TargetKind::None, (std::size_t)g.id, wpos, false, g.strength01, false);
     }
   }
 
@@ -23191,7 +23424,7 @@ if (showShipHud) {
   float fsdFrac = 0.0f;
   char fsdText[32]{};
   if (fsdState == FsdState::Charging) {
-    fsdFrac = (float)std::clamp(1.0 - (fsdChargeRemainingSec / kFsdChargeSec), 0.0, 1.0);
+    fsdFrac = (float)std::clamp(1.0 - ((fsdChargeTotalSec > 0.0 ? (fsdChargeRemainingSec / fsdChargeTotalSec) : 0.0)), 0.0, 1.0);
     std::snprintf(fsdText, sizeof(fsdText), "CHG %d%%", (int)std::lround(fsdFrac * 100.0f));
   } else if (fsdState == FsdState::Jumping) {
     const double total = std::max(1e-6, fsdTravelTotalSec);
@@ -24347,7 +24580,13 @@ if (objectiveHudEnabled) {
       autopilot = true;
       dockingComputer.reset();
       toast(toasts, "Docking computer engaged.", 1.6);
-      game::hubPushEvent(integrationHubWindow, game::GameEvent{"DockingComputerEngaged", game::EventAttrs{{"source", "ObjectiveHUD"}}});
+	  game::hubPushEvent(
+	      integrationHubWindow,
+	      game::makeEvent(timeRealSec,
+	                      timeDays,
+	                      game::GameEventKind::Docking,
+	                      "DockingComputerEngaged",
+	                      "Objective HUD engaged docking computer"));
     };
 
     // Resolve an in-system mission objective we can point at / interact with.
@@ -24507,7 +24746,7 @@ if (objectiveHudEnabled) {
       if (missionSignalIdx != static_cast<std::size_t>(-1)) {
         ImGui::Spacing();
         ImGui::TextDisabled("Scanner");
-        ImGui::Text("Mission site: %s", signals[missionSignalIdx].label.c_str());
+	    ImGui::Text("Mission site: %s", signalTypeName(signals[missionSignalIdx].type));
         if (ImGui::SmallButton("Target site")) setTargetQuick(TargetKind::Signal, missionSignalIdx);
         ImGui::SameLine();
         if (ImGui::SmallButton("Scan site")) startScanQuick(TargetKind::Signal, missionSignalIdx);
@@ -24533,16 +24772,14 @@ if (objectiveHudEnabled) {
     if (tracked && tracked->id != 0) {
       if (ImGui::SmallButton("Plot mission")) {
         game::hubPushAction(integrationHubWindow,
-                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
-                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/false, ""});
+		                    game::makeActionSyncNavToMission(timeRealSec, timeDays, "ObjectiveHUD", (core::u64)tracked->id, /*armAutoRun=*/false));
       }
       ImGui::SameLine();
       if (ImGui::SmallButton("Auto-run mission")) {
         game::hubPushAction(integrationHubWindow,
                             game::makeActionSetCameraRigPreset(timeRealSec, timeDays, "ObjectiveHUD", (int)game::CameraRigPreset::Travel));
         game::hubPushAction(integrationHubWindow,
-                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
-                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/true, ""});
+		                    game::makeActionSyncNavToMission(timeRealSec, timeDays, "ObjectiveHUD", (core::u64)tracked->id, /*armAutoRun=*/true));
       }
       ImGui::SameLine();
       if (ImGui::SmallButton("Capture + Auto-run")) {
@@ -24553,8 +24790,7 @@ if (objectiveHudEnabled) {
         game::hubPushAction(integrationHubWindow,
                             game::makeActionSetCameraRigPreset(timeRealSec, timeDays, "ObjectiveHUD", (int)game::CameraRigPreset::Travel));
         game::hubPushAction(integrationHubWindow,
-                            game::GameAction{timeRealSec, timeDays, "ObjectiveHUD", game::GameActionKind::SyncNavToMission,
-                                             (core::u64)tracked->id, 0, 0, /*armAutoRun=*/true, ""});
+		                    game::makeActionSyncNavToMission(timeRealSec, timeDays, "ObjectiveHUD", (core::u64)tracked->id, /*armAutoRun=*/true));
       }
 
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -24637,7 +24873,7 @@ if (objectiveHudEnabled) {
             ImGui::TextWrapped("Trade loop — leg %d / %d", trackedTradeLoop.legIndex + 1, (int)trackedTradeLoop.loop.legs.size());
             ImGui::PopTextWrapPos();
 
-            ImGui::TextDisabled("Loop profit: +%.0f cr", trackedTradeLoop.loop.totalNetProfitCr);
+	          ImGui::TextDisabled("Loop profit: +%.0f cr", trackedTradeLoop.loop.totalProfitCr);
             ImGui::TextDisabled("Next: %s / %s", leg->toSystemName.c_str(), leg->toStationName.c_str());
             ImGui::TextDisabled("Leg profit: +%.0f cr (buy %.0f / sell %.0f)",
                                 leg->manifest.netProfitCr, leg->manifest.netBuyCr, leg->manifest.netSellCr);
@@ -24652,7 +24888,7 @@ if (objectiveHudEnabled) {
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Auto-run leg")) {
-              hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
+		      	game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Stop")) {
@@ -24967,7 +25203,7 @@ if (!objectiveHudEnabled && !docked) {
     if (leg) {
       ImGui::TextDisabled("Trade loop: sync nav");
       if (ImGui::SmallButton("Nav")) {
-        hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
+		    game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg->toSystem, leg->toStation, true));
       }
     } else {
       ImGui::TextDisabled("Tip: plot a route or track a mission.");
@@ -25453,7 +25689,7 @@ if (hudJumpOverlay && fsdState != FsdState::Idle) {
   }
 
   if (fsdState == FsdState::Charging) {
-    const float t = (float)std::clamp(1.0 - (fsdChargeRemainingSec / std::max(0.001, kFsdChargeSec)), 0.0, 1.0);
+    const float t = (float)std::clamp(1.0 - (fsdChargeRemainingSec / std::max(0.001, (fsdChargeTotalSec > 0.0 ? fsdChargeTotalSec : kFsdChargeSec))), 0.0, 1.0);
     ImGui::Text("FSD CHARGING");
     ImGui::TextDisabled("Destination: %s | %.1f ly", destName.c_str(), fsdJumpDistanceLy);
     ImGui::ProgressBar(t, ImVec2(320.0f * uiScale, 0.0f));
@@ -26502,16 +26738,14 @@ if (showShip) {
           galaxySelectedSystemId = destSys;
           showGalaxy = true;
           game::hubPushAction(integrationHubWindow,
-                              game::GameAction{timeRealSec, timeDays, "MissionTracker", game::GameActionKind::SyncNavToMission,
-                                               (core::u64)tracked->id, 0, 0, false, ""});
+		                      game::makeActionSyncNavToMission(timeRealSec, timeDays, "MissionTracker", (core::u64)tracked->id, false));
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Auto-run")) {
           galaxySelectedSystemId = destSys;
           showGalaxy = true;
           game::hubPushAction(integrationHubWindow,
-                              game::GameAction{timeRealSec, timeDays, "MissionTracker", game::GameActionKind::SyncNavToMission,
-                                               (core::u64)tracked->id, 0, 0, true, ""});
+		                      game::makeActionSyncNavToMission(timeRealSec, timeDays, "MissionTracker", (core::u64)tracked->id, true));
         }
         ImGui::SameLine();
         if (tracked->type == sim::MissionType::Salvage && destSys == currentSystem->stub.id && !tracked->scanned) {
@@ -27959,7 +28193,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
 
       if (fsdState == FsdState::Charging) {
         label = "Charging";
-        total = kFsdChargeSec;
+        total = (fsdChargeTotalSec > 0.0 ? fsdChargeTotalSec : kFsdChargeSec);
         timer = std::clamp(total - fsdChargeRemainingSec, 0.0, total);
       } else if (fsdState == FsdState::Jumping) {
         label = "Jumping";
@@ -29247,7 +29481,7 @@ if (showScanner) {
             if (signals[i].id == tracked->targetNpcId) { idx = i; break; }
           }
           if (idx != static_cast<std::size_t>(-1)) {
-            ImGui::Text("Mission site: %s", signals[idx].label.c_str());
+	        ImGui::Text("Mission site: %s", signalTypeName(signals[idx].type));
             if (ImGui::SmallButton("Target site")) { target.kind = TargetKind::Signal; target.index = idx; }
             ImGui::SameLine();
             if (ImGui::SmallButton("Scan site")) { uiStartScan(TargetKind::Signal, idx); }
@@ -33206,7 +33440,7 @@ ImGui::PopID();
                       ImGui::PushID((int)i);
 
                       const double distLy = loop.totalDistanceLy;
-                      const double profitCr = loop.totalNetProfitCr;
+	                  const double profitCr = loop.totalProfitCr;
                       const double perLy = (distLy > 1e-6) ? (profitCr / distLy) : 0.0;
 
                       std::string header = "Loop: +" + std::to_string((long long)std::llround(profitCr)) + " cr";
@@ -33240,7 +33474,7 @@ ImGui::PopID();
                       if (ImGui::SmallButton("Go first leg")) {
                         if (!loop.legs.empty()) {
                           const auto& leg0 = loop.legs[0];
-                          hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg0.toSystem, leg0.toStation, true));
+		                  	game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg0.toSystem, leg0.toStation, true));
                         }
                       }
 
@@ -33290,7 +33524,7 @@ ImGui::PopID();
                           }
 
                           if (ImGui::SmallButton("Go to leg dest")) {
-                            hubPushAction(game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg.toSystem, leg.toStation, true));
+		                    	game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg.toSystem, leg.toStation, true));
                           }
                         }
 
@@ -33889,9 +34123,7 @@ std::sort(board.systemSecurityDeltas.begin(), board.systemSecurityDeltas.end(),
                   showGalaxy = true;
 
                   const core::u64 mid = (core::u64)missions.back().id;
-                  game::hubPushAction(integrationHubWindow,
-                                      game::GameAction{timeRealSec, timeDays, "MissionAccepted", game::GameActionKind::SyncNavToMission,
-                                                       mid, 0, 0, /*armAutoRun=*/false, ""});
+		        	game::hubPushAction(integrationHubWindow, game::makeActionSyncNavToMission(timeRealSec, timeDays, "MissionAccepted", mid, false));
                 }
 
                 return true;
@@ -34553,15 +34785,54 @@ if (showContacts) {
           if (navRouteMode == NavRouteMode::Hops) {
             costPerJump = 1.0;
             costPerLy = 0.0;
-            navRoute = sim::plotRouteAStarHops(nodes, currentSystem->stub.id, dstId, planMaxLy, &stats);
+            if (navHazardWeight > 0.0) {
+              navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                       currentSystem->stub.id,
+                                                       dstId,
+                                                       planMaxLy,
+                                                       costPerJump,
+                                                       costPerLy,
+                                                       navHazardWeight,
+                                                       universe.seed(),
+                                                       timeDays,
+                                                       &stats);
+            } else {
+              navRoute = sim::plotRouteAStarHops(nodes, currentSystem->stub.id, dstId, planMaxLy, &stats);
+            }
           } else if (navRouteMode == NavRouteMode::Distance) {
             costPerJump = 0.0;
             costPerLy = 1.0;
-            navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+            if (navHazardWeight > 0.0) {
+              navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                       currentSystem->stub.id,
+                                                       dstId,
+                                                       planMaxLy,
+                                                       costPerJump,
+                                                       costPerLy,
+                                                       navHazardWeight,
+                                                       universe.seed(),
+                                                       timeDays,
+                                                       &stats);
+            } else {
+              navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+            }
           } else {
             costPerJump = kFsdFuelBase;
             costPerLy = kFsdFuelPerLy;
-            navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+            if (navHazardWeight > 0.0) {
+              navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                       currentSystem->stub.id,
+                                                       dstId,
+                                                       planMaxLy,
+                                                       costPerJump,
+                                                       costPerLy,
+                                                       navHazardWeight,
+                                                       universe.seed(),
+                                                       timeDays,
+                                                       &stats);
+            } else {
+              navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+            }
           }
         }
 
@@ -35580,6 +35851,12 @@ if (showContacts) {
               int modeIdx = (int)navRouteMode;
               if (ImGui::Combo("Mode", &modeIdx, kRouteModes, (int)(sizeof(kRouteModes) / sizeof(kRouteModes[0])))) {
                 navRouteMode = (NavRouteMode)modeIdx;
+              }
+
+              {
+                double mn = 0.0, mx = 5.0;
+                ImGui::SliderScalar("Avoid hazards", ImGuiDataType_Double, &navHazardWeight, &mn, &mx, "%.2f");
+                ImGui::TextDisabled("Adds cost proportional to nav disruption (storms) along each jump leg.");
               }
             } else {
               ImGui::SeparatorText("Hyperlane travel");

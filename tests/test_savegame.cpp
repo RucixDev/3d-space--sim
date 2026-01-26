@@ -127,6 +127,7 @@ int test_savegame() {
   s.navAutoRun = true;
   s.navRouteMode = 2;
   s.navConstrainToCurrentFuelRange = false;
+  s.navHazardWeight = 3.25;
   s.navRouteHop = 1;
   s.pendingArrivalStation = 424242;
   s.navRoute = {1001, 1002, 1003, 1004};
@@ -444,6 +445,10 @@ int test_savegame() {
   }
   if (l.navConstrainToCurrentFuelRange != s.navConstrainToCurrentFuelRange) {
     std::cerr << "[test_savegame] navConstrainToCurrentFuelRange mismatch\n";
+    ++fails;
+  }
+  if (!nearly(l.navHazardWeight, s.navHazardWeight, 1e-9)) {
+    std::cerr << "[test_savegame] navHazardWeight mismatch\n";
     ++fails;
   }
   if (l.pendingArrivalStation != s.pendingArrivalStation) {

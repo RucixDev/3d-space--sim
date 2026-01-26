@@ -1,4 +1,5 @@
 #include "stellar/sim/NavRoute.h"
+#include "stellar/proc/GalaxyHazards.h"
 
 #include <algorithm>
 #include <cmath>
@@ -584,6 +585,168 @@ std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
   setStats(outStats, stats);
   return {};
 }
+
+std::vector<SystemId> plotRouteAStarCostHazards(const std::vector<SystemStub>& nodes,
+                                               SystemId startId,
+                                               SystemId goalId,
+                                               double maxJumpLy,
+                                               double costPerJump,
+                                               double costPerLy,
+                                               double hazardWeightPerLy,
+                                               core::u64 universeSeed,
+                                               double timeDays,
+                                               RoutePlanStats* outStats,
+                                               std::size_t maxExpansions) {
+  if (hazardWeightPerLy <= 0.0) {
+    return plotRouteAStarCost(nodes, startId, goalId, maxJumpLy, costPerJump, costPerLy, outStats, maxExpansions);
+  }
+
+  if (nodes.empty() || startId == 0 || goalId == 0) return {};
+  if (maxJumpLy <= 0.0) return {};
+  if (maxExpansions == 0) return {};
+
+  const std::size_t N = nodes.size();
+  const auto idxMap = buildIndexMap(nodes);
+
+  const auto itStart = idxMap.find(startId);
+  const auto itGoal = idxMap.find(goalId);
+  if (itStart == idxMap.end() || itGoal == idxMap.end()) return {};
+
+  const std::size_t start = itStart->second;
+  const std::size_t goal = itGoal->second;
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  // Galaxy hazard sampling parameters: driven by in-game time (drift).
+  proc::GalaxyHazardsParams hp{};
+  hp.timeDays = timeDays;
+
+  auto avgNavDisruption01 = [&](const math::Vec3d& aLy, const math::Vec3d& bLy) -> double {
+    // Midpoint sampling to approximate the average hazard along the segment.
+    // Keep this small; it's called in the inner loop of A*.
+    const int samples = 5;
+    double sum = 0.0;
+    for (int si = 0; si < samples; ++si) {
+      const double t = (si + 0.5) / (double)samples;
+      const math::Vec3d p = aLy + (bLy - aLy) * t;
+      sum += proc::sampleGalaxyHazards(universeSeed, p, hp).navDisruption01;
+    }
+    return std::clamp(sum / (double)samples, 0.0, 1.0);
+  };
+
+  struct EdgeKey {
+    std::size_t a{0};
+    std::size_t b{0};
+    bool operator==(const EdgeKey& o) const { return a == o.a && b == o.b; }
+  };
+  struct EdgeKeyHash {
+    std::size_t operator()(const EdgeKey& k) const {
+      std::size_t h = std::hash<std::size_t>{}(k.a);
+      h = hashCombine(h, std::hash<std::size_t>{}(k.b));
+      return h;
+    }
+  };
+  auto edgeKey = [&](std::size_t a, std::size_t b) -> EdgeKey {
+    if (a < b) return EdgeKey{a, b};
+    return EdgeKey{b, a};
+  };
+
+  std::unordered_map<EdgeKey, double, EdgeKeyHash> edgeHazCache;
+  edgeHazCache.reserve(4096);
+
+  struct NodeRec {
+    std::size_t i{0};
+    double f{0.0};
+    bool operator<(const NodeRec& o) const { return f > o.f; } // min-heap via priority_queue
+  };
+
+  std::priority_queue<NodeRec> open;
+  std::vector<double> gScore(N, std::numeric_limits<double>::infinity());
+  std::vector<std::size_t> cameFrom(N, (std::size_t)-1);
+  std::vector<unsigned char> closed(N, 0);
+
+  auto heuristic = [&](std::size_t a) -> double {
+    const double d = (nodes[a].posLy - nodes[goal].posLy).length();
+    const double minHops = std::ceil(d / std::max(1e-9, maxJumpLy));
+    // IMPORTANT: heuristic ignores hazards; since hazard cost is non-negative, this remains admissible.
+    return minHops * costPerJump + d * costPerLy;
+  };
+
+  gScore[start] = 0.0;
+  open.push(NodeRec{start, heuristic(start)});
+
+  std::size_t expansions = 0;
+
+  while (!open.empty() && expansions < maxExpansions) {
+    const NodeRec cur = open.top();
+    open.pop();
+
+    if (closed[cur.i]) continue;
+    closed[cur.i] = 1;
+
+    expansions++;
+
+    if (cur.i == goal) break;
+
+    const CellCoord cell = cellForPos(nodes[cur.i].posLy, maxJumpLy);
+    const auto neighCells = neighborsForCell(cell);
+
+    std::vector<std::size_t> cand;
+    cand.reserve(128);
+    for (const auto& nc : neighCells) {
+      const auto it = grid.find(nc);
+      if (it == grid.end()) continue;
+      cand.insert(cand.end(), it->second.begin(), it->second.end());
+    }
+
+    for (std::size_t j : cand) {
+      if (j == cur.i) continue;
+      if (closed[j]) continue;
+
+      const double d = (nodes[cur.i].posLy - nodes[j].posLy).length();
+      if (d > maxJumpLy + 1e-9) continue;
+
+      const EdgeKey ek = edgeKey(cur.i, j);
+      double navDisrupt01 = 0.0;
+      if (const auto it = edgeHazCache.find(ek); it != edgeHazCache.end()) {
+        navDisrupt01 = it->second;
+      } else {
+        navDisrupt01 = avgNavDisruption01(nodes[cur.i].posLy, nodes[j].posLy);
+        edgeHazCache.emplace(ek, navDisrupt01);
+      }
+
+      const double tentative =
+        gScore[cur.i] + costPerJump + costPerLy * d + hazardWeightPerLy * navDisrupt01 * d;
+      if (tentative < gScore[j]) {
+        gScore[j] = tentative;
+        cameFrom[j] = cur.i;
+        open.push(NodeRec{j, tentative + heuristic(j)});
+      }
+    }
+  }
+
+  if (outStats) {
+    outStats->expanded = expansions;
+    if (std::isfinite(gScore[goal])) {
+      outStats->found = true;
+      outStats->cost = gScore[goal];
+      // Approx route distance (pure geometric; hazard penalty is reflected in outStats->cost).
+      // Rebuild path temporarily to measure distance.
+      const auto route = rebuildPath(nodes, cameFrom, start, goal, idxMap);
+      outStats->distanceLy = routeDistanceLy(nodes, route);
+      outStats->hops = route.empty() ? 0 : (int)route.size() - 1;
+    } else {
+      outStats->found = false;
+      outStats->cost = 0.0;
+      outStats->distanceLy = 0.0;
+      outStats->hops = 0;
+    }
+  }
+
+  if (!std::isfinite(gScore[goal])) return {};
+  return rebuildPath(nodes, cameFrom, start, goal, idxMap);
+}
+
 
 std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
                                         SystemId startId,

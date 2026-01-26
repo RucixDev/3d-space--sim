@@ -459,6 +459,7 @@ struct SaveGame {
   bool navAutoRun{false};
   core::u8 navRouteMode{0};
   bool navConstrainToCurrentFuelRange{true};
+  double navHazardWeight{0.0};
   StationId pendingArrivalStation{0};
 
   // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).

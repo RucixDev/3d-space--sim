@@ -55,6 +55,22 @@ std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
                                         RoutePlanStats* outStats = nullptr,
                                         std::size_t maxExpansions = 250000);
 
+
+// A* route planner with additional hazard penalty.
+// Hazard cost is computed as: hazardWeightPerLy * avgNavDisruption01 * segmentDistanceLy
+// where avgNavDisruption01 is sampled along the segment using the galaxy hazard field.
+std::vector<SystemId> plotRouteAStarCostHazards(const std::vector<SystemStub>& nodes,
+                                               SystemId startId,
+                                               SystemId goalId,
+                                               double maxJumpLy,
+                                               double costPerJump,
+                                               double costPerLy,
+                                               double hazardWeightPerLy,
+                                               core::u64 universeSeed,
+                                               double timeDays,
+                                               RoutePlanStats* outStats = nullptr,
+                                               std::size_t maxExpansions = 250000);
+
 // Result for K-shortest route planning.
 struct KRoute {
   std::vector<SystemId> path;

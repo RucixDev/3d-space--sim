@@ -1,6 +1,7 @@
 #include "CommsWindow.h"
 
 #include "stellar/sim/Universe.h"
+#include "stellar/econ/Commodity.h"
 #include "stellar/ui/FuzzySearch.h"
 #include "stellar/ui/TextFx.h"
 
@@ -467,6 +468,90 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
       ImGui::ProgressBar((float)frac, ImVec2(-1, 0));
       ImGui::TextDisabled("Time remaining: %.1f s", std::max(0.0, sd.secondsLeft));
     }
+
+  // Live Pirate response (cargo extortion / tribute).
+  // Lets the player respond directly from the Ultimatum message instead of hunting for the HUD widget.
+  if (ctx.queryPirateDemand && (m.channel == sim::CommsChannel::Pirate)) {
+    const PirateDemandUi pd = ctx.queryPirateDemand(m, st.pirateAutoAllowMissionCargo);
+    if (pd.kind != PirateDemandUi::Kind::None) {
+      ImGui::Separator();
+
+      ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Live pirate channel");
+      if (!pd.pirateName.empty()) {
+        ImGui::TextDisabled("Source: %s", pd.pirateName.c_str());
+      }
+
+      const double need = std::max(0.0, pd.requiredValueCr);
+      const double have = std::max(0.0, pd.deliveredValueCr);
+      const double remainingCr = std::max(0.0, pd.remainingValueCr);
+
+      const float frac = (need > 1e-6) ? (float)std::clamp(have / need, 0.0, 1.0) : 0.0f;
+      ImGui::ProgressBar(frac, ImVec2(-1, 0));
+      ImGui::TextDisabled("Drop cargo value: %.0f / %.0f cr | %.1f s left", have, need, std::max(0.0, pd.secondsLeft));
+
+      ImGui::Separator();
+      ImGui::Checkbox("Auto: allow mission cargo", &st.pirateAutoAllowMissionCargo);
+      ImGui::SameLine();
+      ImGui::TextDisabled("(uses reserved cargo if needed)");
+
+      if (pd.witnessLikely) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "WARNING: Dump may be witnessed (%s)", pd.witnessName.c_str());
+      }
+
+      if (remainingCr <= 1e-6) {
+        ImGui::TextDisabled("Tribute delivered.");
+      } else if (!pd.plan.success) {
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Auto: insufficient cargo value");
+        if (pd.freeValueCr > 1e-6 || pd.reservedValueCr > 1e-6) {
+          ImGui::TextDisabled("Need %.0f cr | Free %.0f cr | Reserved %.0f cr", remainingCr, pd.freeValueCr, pd.reservedValueCr);
+        }
+        ImGui::TextDisabled("Tip: open Ship/Status -> Cargo management to dump manually.");
+      } else {
+        if (pd.plan.usedReserved) {
+          ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.65f, 1.0f), "Auto plan uses mission cargo!");
+        }
+        ImGui::TextDisabled("Auto plan: %.0f cr (%.0f kg)", pd.plan.plannedValueCr, pd.plan.plannedMassKg);
+
+        int shown = 0;
+        for (const auto& ln : pd.plan.lines) {
+          if (shown >= 3) break;
+          const auto name = econ::commodityName(ln.commodity);
+          ImGui::TextDisabled("- %.*s x%d (%.0f cr)", (int)name.size(), name.data(), (int)std::round(ln.units), ln.valueCr);
+          ++shown;
+        }
+        if ((int)pd.plan.lines.size() > shown) {
+          ImGui::TextDisabled("(+%d more)", (int)pd.plan.lines.size() - shown);
+        }
+
+        const bool canDump = pd.actionAllowed && ((bool)ctx.actPirateAutoJettison);
+        const bool canRefuse = pd.actionAllowed && ((bool)ctx.actPirateRefuse);
+
+        ImGui::BeginDisabled(!canDump);
+        if (ImGui::Button("Auto-jettison tribute")) {
+          ctx.actPirateAutoJettison(st.pirateAutoAllowMissionCargo);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!canRefuse);
+        if (ImGui::Button("Refuse")) {
+          ctx.actPirateRefuse();
+        }
+        ImGui::EndDisabled();
+
+        if (!pd.actionAllowed) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(not available while docked/jumping)");
+        }
+      }
+
+      // Countdown bar
+      const double total = std::max(0.001, pd.secondsTotal);
+      const double tfrac = std::clamp(1.0 - (pd.secondsLeft / total), 0.0, 1.0);
+      ImGui::ProgressBar((float)tfrac, ImVec2(-1, 0));
+    }
+  }
+
   }
 
   ImGui::Separator();

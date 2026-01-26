@@ -2,6 +2,7 @@
 
 #include "stellar/core/Types.h"
 #include "stellar/sim/Comms.h"
+#include "stellar/sim/CargoJettisonPlanner.h"
 
 #include <functional>
 
@@ -21,6 +22,9 @@ struct CommsWindowState {
   bool newestFirst{true};
   bool pinnedFirst{true};
   bool wrapBody{true};
+
+  // Pirate extortion UX
+  bool pirateAutoAllowMissionCargo{false};
 
   // Filters
   int channelFilter{-1}; // -1 = all, else cast to sim::CommsChannel
@@ -80,6 +84,41 @@ struct SecurityDemandUi {
   bool actionAllowed{true};
 };
 
+
+struct PirateDemandUi {
+  enum class Kind : core::u8 {
+    None = 0,
+    Ultimatum
+  };
+
+  Kind kind{Kind::None};
+
+  core::u64 groupId{0};
+  std::string pirateName;
+
+  double requiredValueCr{0.0};
+  double deliveredValueCr{0.0};
+  double remainingValueCr{0.0};
+
+  // Jettison planner output for remainingValueCr.
+  sim::CargoJettisonPlan plan{};
+
+  // When plan.success==false, these help explain why.
+  double freeValueCr{0.0};
+  double reservedValueCr{0.0};
+
+  // Witness warning (dumping may add bounty).
+  bool witnessLikely{false};
+  std::string witnessName;
+
+  // Timing seconds
+  double secondsLeft{0.0};
+  double secondsTotal{0.0};
+
+  // Capability flags
+  bool actionAllowed{true};
+};
+
 struct CommsWindowContext {
   sim::Universe* universe{nullptr};
   const sim::StarSystem* currentSystem{nullptr};
@@ -104,8 +143,11 @@ struct CommsWindowContext {
   // Optional: make Security transmissions actionable (pay bribe / comply / submit bounty).
   // When provided, the Comms UI can surface live response buttons on the selected message.
   std::function<SecurityDemandUi(const sim::CommsMessage& selected)> querySecurityDemand;
+  std::function<PirateDemandUi(const sim::CommsMessage& selected, bool allowMissionCargo)> queryPirateDemand;
   std::function<void()> actSecurityBribe;
   std::function<void()> actSecurityComplyOrSubmit;
+  std::function<void(bool allowMissionCargo)> actPirateAutoJettison;
+  std::function<void()> actPirateRefuse;
 
   // Hotkey display strings (e.g. "C", "I"). Purely cosmetic.
   std::string securityBribeChord;

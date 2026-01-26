@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <string>
+#include <utility>
 
 namespace stellar::game {
 
@@ -67,6 +68,29 @@ struct GameEvent {
   core::u64 u64a{0};
   core::u64 u64b{0};
 };
+
+// Helper for concise event emission without fragile aggregate ordering.
+inline GameEvent makeEvent(double tRealSec,
+                           double tSimDays,
+                           GameEventKind kind,
+                           std::string tag,
+                           std::string msg,
+                           bool hasPos = false,
+                           math::Vec3d posKm = {},
+                           core::u64 u64a = 0,
+                           core::u64 u64b = 0) {
+  GameEvent ev;
+  ev.tRealSec = tRealSec;
+  ev.tSimDays = tSimDays;
+  ev.kind = kind;
+  ev.tag = std::move(tag);
+  ev.msg = std::move(msg);
+  ev.hasPos = hasPos;
+  ev.posKm = posKm;
+  ev.u64a = u64a;
+  ev.u64b = u64b;
+  return ev;
+}
 
 struct GameEventLog {
   int maxEvents{2000};
@@ -317,6 +341,23 @@ inline GameAction makeActionSetTrackedMission(double tRealSec, double tSimDays, 
   a.origin = std::move(origin);
   a.kind = GameActionKind::SetTrackedMissionId;
   a.u64a = missionId;
+  return a;
+}
+
+inline GameAction makeActionSyncNavToMission(double tRealSec,
+                                             double tSimDays,
+                                             std::string origin,
+                                             core::u64 missionId,
+                                             bool armAutoRun,
+                                             std::string msg = {}) {
+  GameAction a;
+  a.tRealSec = tRealSec;
+  a.tSimDays = tSimDays;
+  a.origin = std::move(origin);
+  a.kind = GameActionKind::SyncNavToMission;
+  a.u64a = missionId;
+  a.b = armAutoRun;
+  a.msg = std::move(msg);
   return a;
 }
 

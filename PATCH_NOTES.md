@@ -1,3 +1,31 @@
+## Round 140 - Actionable Pirate Ultimatums in Comms
+
+This round makes pirate extortion messages interactive: you can now respond directly from the **Comms** inbox.
+
+### ☠️ What shipped
+
+- **Pirate "ULTIMATUM" messages are now actionable**
+  - Selecting the ultimatium shows a **Live pirate channel** panel.
+  - Clear progress bar: **delivered / required** tribute value and **time left**.
+
+- **One-click response options**
+  - **Auto-jettison tribute** uses the existing cargo jettison planner to meet the demanded value with minimal overpay.
+  - **Refuse** immediately resolves the negotiation and triggers hostility (same behavior as the Threat HUD).
+
+- **Safer cargo dumping**
+  - Auto mode **avoids mission-reserved cargo by default**.
+  - Optional toggle: **allow mission cargo** if you’re desperate.
+  - Shows a quick **witness warning** when dumping is likely to be observed (may add bounty), matching the Threat HUD heuristic.
+
+### Files changed/added
+
+- `apps/stellar_game/CommsWindow.h`
+- `apps/stellar_game/CommsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 139 - Silent Running (Stealth Mode) + Thermal/Sensor Tradeoffs
 
 This round adds a *high-risk / high-reward* stealth mechanic inspired by space-sim classics: **Silent Running**.
@@ -3529,3 +3557,60 @@ This round targets two common sources of frame time spikes in OpenGL apps:
 - `include/stellar/render/MeshRenderer.h`
 - `src/render/MeshRenderer.cpp`
 - `PATCH_NOTES.md`
+
+
+## Round 128 - Objective HUD + Integration Hub build fixes + safer HUD layout padding
+
+This round fixes a hard build break introduced by stale Objective HUD / Integration Hub glue
+code and improves the robustness of HUD overlay positioning.
+
+### What changed
+
+- **Fixed Objective HUD emitting an invalid `GameEvent` initializer**.
+  A stale brace-initializer referenced a non-existent `EventAttrs` type, causing a large
+  cascade of syntax errors. Objective HUD now emits a normal `GameEvent` via a helper.
+
+- **Added `makeActionSyncNavToMission()` helper + migrated call sites**.
+  `SyncNavToMission` actions were being created with brittle aggregate initializers.
+  The new helper prevents field-order mistakes and avoids MSVC narrowing diagnostics.
+
+- **HUD layout helpers now support per-widget padding**.
+  `hudSetNextWindowPosFromLayout()` / `hudCaptureWindowPosToLayout()` accept optional
+  padding in pixels so HUD windows can be anchored inside a safe edge margin.
+  This unblocks the Objective HUD fallback tracker’s padded placement.
+
+- **Fixed incorrect `projectToScreenAny()` usage in the offscreen waypoint indicator**.
+  Updated the call to match the current signature and removed invalid `ImVec2 +=` usage
+  (not supported by ImGui’s vector type).
+
+- **Declared missing runtime state for HUD toggling and mining toast timestamps**.
+  Restores compilation and keeps future work on per-commodity mining-toasts straightforward.
+
+### Files changed/added
+
+- `apps/stellar_game/GameSignals.h`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 2 - Integration Hub Trace Import + Replay
+
+This patch expands the **Integration Hub** into a proper “trace lab”:
+you can now **import** trace JSON into a safe staging buffer, selectively apply it to the current hub,
+and **replay** recorded actions with timing controls.
+
+### Fixes
+
+- Fixed a stray `} // namespace` in `IntegrationHubWindow.cpp` that prematurely closed `stellar::game`
+  and caused a cascade of MSVC syntax errors.
+
+### New
+
+- Added a small, dependency-free JSON parser: `include/stellar/core/SimpleJson.h` (header-only).
+- Added Integration Hub **Import** tab:
+  - Load a `stellar_integration_trace` JSON from file or clipboard into a staging buffer.
+  - Apply events/actions/rules selectively (with clear warnings before pushing *pending* actions).
+- Added **Replay scheduler**:
+  - Schedule actions from imported trace (or current action history).
+  - Timed replay (preserve original trace deltas), speed multiplier, lead-in delay.
+  - Filters: exclude Toasts and file-output actions by default.
+  - Optional: temporarily disable automations during replay and automatically restore afterwards.
