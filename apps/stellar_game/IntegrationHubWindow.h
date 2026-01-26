@@ -2,6 +2,9 @@
 
 #include "GameSignals.h"
 
+#include "stellar/core/Types.h"
+#include "stellar/math/Vec3.h"
+
 #include <deque>
 #include <functional>
 #include <string>

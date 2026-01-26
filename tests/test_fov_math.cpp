@@ -7,6 +7,7 @@
 // Small sanity checks for FOV conversions and distance-dependent projection helpers.
 
 int test_fov_math() {
+  int failures = 0;
   using stellar::math::degToRad;
   using stellar::math::radToDeg;
 
