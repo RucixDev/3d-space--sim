@@ -14,13 +14,16 @@ namespace {
 stellar::sim::SystemStub makeStub(stellar::sim::SystemId id, const stellar::math::Vec3d& posLy) {
   stellar::sim::SystemStub s{};
   s.id = id;
-  s.seed = (stellar::core::u64)id * 1337ULL;
   s.name = "T" + std::to_string((unsigned long long)id);
   s.posLy = posLy;
-  s.primaryClass = stellar::sim::StarClass::G;
-  s.planetCount = 0;
-  s.stationCount = 0;
+  s.population = 0;
   s.factionId = 0;
+  s.econId = 0;
+  s.govId = 0;
+  s.securityId = 0;
+  s.techLevel = 0;
+  s.habitable = false;
+  s.radiusLy = 0.0;
   return s;
 }
 
@@ -129,7 +132,7 @@ int test_nav_route_hazards() {
                                                     timeDays,
                                                     &stats);
 
-  CHECK(stats.reached);
+  CHECK(stats.found);
   CHECK(route.size() == 3);
   CHECK(route[0] == 1);
   CHECK(route[2] == 4);

@@ -91,7 +91,15 @@ static void jsonAction(core::JsonWriter& w, const GameAction& a) {
 
     default:
       w.key("u64a"); w.value((long long)a.u64a);
+      if (a.u64a) {
+        const std::string s = std::to_string((unsigned long long)a.u64a);
+        w.key("u64a_str"); w.value(std::string_view{s});
+      }
       w.key("u64b"); w.value((long long)a.u64b);
+      if (a.u64b) {
+        const std::string s = std::to_string((unsigned long long)a.u64b);
+        w.key("u64b_str"); w.value(std::string_view{s});
+      }
       w.key("i32a"); w.value(a.i32a);
       w.key("b"); w.value(a.b);
       w.key("msg"); w.value(a.msg);
@@ -111,8 +119,16 @@ static void jsonEvent(core::JsonWriter& w, const GameEvent& e) {
   if (e.hasPos) {
     w.key("posKm"); jsonVec3(w, e.posKm);
   }
-  if (e.u64a) { w.key("u64a"); w.value((long long)e.u64a); }
-  if (e.u64b) { w.key("u64b"); w.value((long long)e.u64b); }
+  if (e.u64a) {
+    w.key("u64a"); w.value((long long)e.u64a);
+    const std::string s = std::to_string((unsigned long long)e.u64a);
+    w.key("u64a_str"); w.value(std::string_view{s});
+  }
+  if (e.u64b) {
+    w.key("u64b"); w.value((long long)e.u64b);
+    const std::string s = std::to_string((unsigned long long)e.u64b);
+    w.key("u64b_str"); w.value(std::string_view{s});
+  }
   w.endObject();
 }
 
