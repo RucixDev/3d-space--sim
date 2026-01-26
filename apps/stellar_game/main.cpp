@@ -237,35 +237,6 @@ using namespace stellar;
 using sim::ShipHullClass;
 using sim::WeaponType;
 
-// Small Dear ImGui helpers used throughout this translation unit.
-namespace ig {
-
-// Optional bold font; if not configured these helpers are no-ops.
-static ImFont* gBoldFont = nullptr;
-
-inline void setBoldFont(ImFont* f) { gBoldFont = f; }
-
-inline void pushBoldFont() {
-  if (gBoldFont) ImGui::PushFont(gBoldFont);
-}
-
-inline void popBoldFont() {
-  if (gBoldFont) ImGui::PopFont();
-}
-
-// ImGui::DragFloat works on float*, but some sim values are doubles.
-inline bool DragDouble(const char* label,
-                       double* v,
-                       double speed = 1.0,
-                       double min = 0.0,
-                       double max = 0.0,
-                       const char* format = "%.3f",
-                       ImGuiSliderFlags flags = 0) {
-  return ImGui::DragScalar(label, ImGuiDataType_Double, v, speed, &min, &max, format, flags);
-}
-
-} // namespace ig
-
 static constexpr double kAU_KM = 149597870.7;
 static constexpr double kSOLAR_RADIUS_KM = 695700.0;
 static constexpr double kEARTH_RADIUS_KM = 6371.0;
@@ -20289,7 +20260,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (showMainMenu || !docked) ImGui::EndDisabled();
 
         ImGui::Separator();
-	        static core::u32 selectedFactionId = 0;
         if (ImGui::MenuItem("Main Menu")) {
           showMainMenu = true;
           mainMenuPage = MainMenuPage::Root;
@@ -31100,8 +31070,6 @@ if (showScanner) {
         const auto& station = currentSystem->stations[(std::size_t)selectedStationIndex];
         auto& stEcon = universe.stationEconomy(station, timeDays);
         const double feeEff = effectiveFeeRate(station);
-	        const double rep = getRep(station.factionId);
-	        const double stationFeeRate = feeEff;
         double cargoKgNow = cargoMassKg(cargo);
 
         if (focusMarketDetailsWindow) {
@@ -32583,23 +32551,18 @@ if (canTrade) {
 
             if (!illegalHere) {
               ImGui::BeginDisabled(!canTrade);
-	              if (ImGui::SmallButton("Buy")) {
+              if (ImGui::SmallButton("Buy")) {
                 const double buyUnits = std::min<double>(qty[i], std::max<double>(0.0, q.inventory));
                 const double availKg = std::max(0.0, cargoCapacityKg - cargoKgNow);
                 const double maxByMass = (econ::commodityDef(cid).massKg > 1e-9) ? (availKg / econ::commodityDef(cid).massKg) : 0.0;
                 const double buyClamped = std::min(buyUnits, maxByMass);
 
-	                if (buyClamped <= 1e-9) {
-	                  toast(toasts, "Cannot buy: cargo hold full (mass limit).", 2.0);
-	                } else {
-	                  const auto out = econ::buy(stEcon, station.economyModel, cid, buyClamped, credits, /*bidAskSpread=*/0.10, stationFeeRate);
-	                  if (!out.ok) {
-	                    toast(toasts, std::string("Buy failed: ") + (out.reason ? out.reason : "error"), 2.0);
-	                  } else if (out.unitsDelta > 1e-9) {
-	                    cargo[i] += out.unitsDelta;
-	                    cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + out.unitsDelta * econ::commodityDef(cid).massKg);
-	                  }
-	                }
+                const auto out = econ::buy(stEcon, station.economyModel, cid, buyClamped, credits, stationFeeRate);
+                if (out.boughtUnits > 1e-9) {
+                  credits = out.creditsAfter;
+                  cargo[i] += out.boughtUnits;
+                  cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + out.boughtUnits * econ::commodityDef(cid).massKg);
+                }
               }
               ImGui::EndDisabled();
             } else {
@@ -32730,16 +32693,14 @@ if (canTrade) {
                             + std::to_string((int)std::round(payout)) + " cr.",
                           2.0);
                   }
-	                } else {
-	                  const auto out = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, /*bidAskSpread=*/0.10, stationFeeRate);
-	                  if (!out.ok) {
-	                    toast(toasts, std::string("Sell failed: ") + (out.reason ? out.reason : "error"), 2.0);
-	                  } else if (out.unitsDelta < -1e-9) {
-	                    const double sold = -out.unitsDelta;
-	                    cargo[i] = std::max(0.0, cargo[i] - sold);
-	                    cargoKgNow = std::max(0.0, cargoKgNow - sold * econ::commodityDef(cid).massKg);
-	                  }
-	                }
+                } else {
+                  const auto out = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, stationFeeRate);
+                  if (out.soldUnits > 1e-9) {
+                    credits = out.creditsAfter;
+                    cargo[i] = std::max(0.0, cargo[i] - out.soldUnits);
+                    cargoKgNow = std::max(0.0, cargoKgNow - out.soldUnits * econ::commodityDef(cid).massKg);
+                  }
+                }
               }
             }
             ImGui::EndDisabled();
@@ -36677,10 +36638,9 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
         pushUnique(0);
         for (const auto& f : universe.factions()) pushUnique(f.id);
         for (const auto& [fid, _] : repByFaction) pushUnique(fid);
-	        // LawLedger isn't directly iterable; pull ids from each internal map.
-	        for (const auto& [fid, _] : lawLedger.bounties()) pushUnique(fid);
-	        for (const auto& [fid, _] : lawLedger.fines()) pushUnique(fid);
-	        for (const auto& [fid, _] : lawLedger.vouchers()) pushUnique(fid);
+        for (const auto& [fid, _] : lawLedger) pushUnique(fid);
+        for (const auto& [fid, _] : fineLedger) pushUnique(fid);
+        for (const auto& [fid, _] : voucherLedger) pushUnique(fid);
 
         auto toLowerInPlace = [&](std::string& s) {
           for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
@@ -36748,13 +36708,7 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-	            {
-	              const bool isSelected = (selectedFactionId == r.factionId);
-	              const std::string label = r.name + "##faction_" + std::to_string(r.factionId);
-	              if (ImGui::Selectable(label.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap)) {
-	                selectedFactionId = r.factionId;
-	              }
-	            }
+            ImGui::TextUnformatted(r.name.c_str());
 
             ImGui::TableSetColumnIndex(1);
             if (r.rep < 0.0) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "%.1f", r.rep);
@@ -36784,73 +36738,12 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
           ImGui::EndTable();
         }
       }
-	      ImGui::Separator();
-	      {
-	        const core::u32 fid = selectedFactionId;
-	        const std::string fidName = (fid == 0) ? std::string("Independent") : factionName(fid);
-	        ImGui::Text("Selected: %s", fidName.c_str());
-	        ImGui::SameLine();
-	        ImGui::TextDisabled("(click a row to select)");
-
-	        const double rep = getRep(fid);
-	        const double bounty = getBounty(fid);
-	        const double fine = getFine(fid);
-	        const double voucher = getVoucher(fid);
-	        const double fineDue = getFineDueDay(fid);
-
-	        ImGui::Text("Rep: %.1f | Bounty: %.0f cr | Fine: %.0f cr | Vouchers: %.0f cr", rep, bounty, fine, voucher);
-	        if (fine > 1e-6) {
-	          ImGui::SameLine();
-	          ImGui::TextDisabled("Due: %s", fmtDueIn(timeDays, fineDue).c_str());
-	        }
-
-	        // Remote settlement is allowed when you're within comms range of a station owned by the selected faction.
-	        const sim::Station* remoteStation = nullptr;
-	        bool canRemote = false;
-	        if (currentSystem && target.kind == Target::Kind::Station && target.index < currentSystem->stations.size()) {
-	          const sim::Station& st = currentSystem->stations[target.index];
-	          const double distKm = (st.posKm - playerPosKm).length();
-	          if (distKm <= st.commsRangeKm && st.factionId == fid) {
-	            remoteStation = &st;
-	            canRemote = true;
-	          }
-	        }
-	        if (!canRemote) {
-	          ImGui::TextDisabled("Legal actions require comms range of a station of this faction (target one and get closer)."
-	                               "");
-	        }
-
-	        ImGui::BeginDisabled(!canRemote);
-	        if (ImGui::Button("Settle bounty (remote)")) {
-	          payBountyRemotely(*remoteStation, "FactionsDossier");
-	        }
-	        ImGui::SameLine();
-	        if (ImGui::Button("Pay fine (remote)")) {
-	          const double paid = payFine(fid, fine);
-	          if (paid > 1e-6) toast(toasts, "Paid " + std::to_string((int)std::round(paid)) + " cr in fines.", 1.8);
-	          else toast(toasts, "No fine to pay (or insufficient credits).", 1.6);
-	        }
-	        ImGui::SameLine();
-	        if (ImGui::Button("Redeem vouchers")) {
-	          const double before = credits;
-	          lawLedger.redeemVoucher(fid, credits);
-	          const double got = std::max(0.0, credits - before);
-	          if (got > 1e-6) {
-	            addRep(fid, got * 0.001);
-	            toast(toasts, "Redeemed " + std::to_string((int)std::round(got)) + " cr in vouchers.", 1.8);
-	          } else {
-	            toast(toasts, "No vouchers to redeem.", 1.4);
-	          }
-	        }
-	        ImGui::EndDisabled();
-	      }
-
-	      ImGui::End();
-	    }
+      ImGui::End();
+    }
 
 
 
-	    // ---- Notifications (toast history) ----
+    // ---- Notifications (toast history) ----
     if (showNotifications) {
       ImGui::SetNextWindowSize(ImVec2(820, 420), ImGuiCond_FirstUseEver);
       if (ImGui::Begin("Notifications", &showNotifications)) {
@@ -39180,8 +39073,8 @@ const char* pageName =
           previews[i].out = sim::applyRebuyOnDeath(pol, previews[i].shipAfter, previews[i].creditsAfter, previews[i].debtAfter);
         }
 
-	        auto shipSummary = [&](const sim::PlayerShipEconomyState& s) -> std::string {
-	          const char* hull = sim::hullDef(s.hull).name;
+        auto shipSummary = [&](const sim::PlayerShipEconomyState& s) -> std::string {
+          const char* hull = sim::hullDef(s.shipHullClass).name;
 
           const int thrMk = std::clamp(s.thrusterMk, 1, (int)sim::kThrusters.size() - 1);
           const int shdMk = std::clamp(s.shieldMk, 1, (int)sim::kShields.size() - 1);
@@ -39306,8 +39199,8 @@ const char* pageName =
         // Selected option summary.
         const Preview& sel = previews[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
         ImGui::Text("Selected: %s", optionNames[std::clamp(deathRebuy.selectedOption, 0, 2)]);
-	        ImGui::Text("Rebuy cost: %.0f cr | Paid: %.0f cr | Loan: %.0f cr",
-	                    sel.out.rebuyCostCr, sel.out.paidFromCreditsCr, sel.out.loanTakenCr);
+        ImGui::Text("Rebuy cost: %.0f cr | Paid: %.0f cr | Loan: %.0f cr",
+                    sel.out.rebuyCostCr, sel.out.paidCr, sel.out.loanTakenCr);
 
         ImGui::Spacing();
 
@@ -39320,7 +39213,7 @@ const char* pageName =
           sim::PlayerShipEconomyState chosenShip = deathRebuy.options[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
           const auto outcome = sim::applyRebuyOnDeath(pol, chosenShip, credits, insuranceDebtCr);
 
-	              shipHullClass = chosenShip.hull;
+          shipHullClass = chosenShip.shipHullClass;
           thrusterMk = chosenShip.thrusterMk;
           shieldMk = chosenShip.shieldMk;
           distributorMk = chosenShip.distributorMk;
@@ -39850,20 +39743,19 @@ const char* pageName =
 
           if (bigButton("Open Warehouse (Market Details)")) openMarketAt(MarketDetailsJumpTarget::Warehouse);
 
-	          if (dockSt) {
-	            auto* entry = sim::findStorage(stationStorage, dockedStationId);
-	            if (entry) {
-	              const double rep = getRep(dockSt->factionId);
-	              const double sinceAccrueDays = std::max(0.0, timeDays - entry->lastFeeDay);
-	              sim::accrueStorageFees(*entry, timeDays, rep);
-	              const double storedKg = sim::storageMassKg(*entry);
-	              const double dailyFee = sim::estimateStorageDailyFeeCr(*entry, rep);
-	              const double dueNow = std::max(0.0, entry->feesDueCr);
+          if (dockSt) {
+            const auto* entry = sim::findStorage(stationStorage, dockedStationId);
+            if (entry) {
+              const double rep = getRep(dockSt->factionId);
+              const double storedKg = sim::storageMassKg(*entry);
+              const double dailyFee = sim::estimateStorageDailyFeeCr(*entry, rep);
+              const double dueNow = std::max(0.0, entry->feesDueCr);
+              const double nextFeeInDays = std::max(0.0, entry->nextFeeTimeDays - timeDays);
 
               ImGui::Separator();
               ImGui::TextDisabled("Stored mass: %.0f kg", storedKg);
               ImGui::TextDisabled("Estimated daily fee: %.0f cr/day", dailyFee);
-	              ImGui::TextDisabled("Fees due now: %.0f cr   (accrued %.1f days since last check)", dueNow, sinceAccrueDays);
+              ImGui::TextDisabled("Fees due now: %.0f cr   (next fee in %.1f days)", dueNow, nextFeeInDays);
 
               if (ImGui::Button("Pay fees")) {
                 const auto r = sim::payStorageFees(stationStorage, *dockSt, timeDays, rep, credits, 1e30);
@@ -39874,9 +39766,9 @@ const char* pageName =
                   } else {
                     toast(toasts, "No storage fees due.", 1.8);
                   }
-	                } else {
-	                  toast(toasts, (r.reason ? r.reason : "Storage payment failed."), 2.5);
-	                }
+                } else {
+                  toast(toasts, r.msg.c_str(), 2.5);
+                }
               }
             } else {
               ImGui::TextDisabled("No storage rented at this station yet.");

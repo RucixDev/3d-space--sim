@@ -1,6 +1,7 @@
 #include "stellar/sim/NavRoute.h"
 #include "stellar/proc/GalaxyHazards.h"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -56,6 +57,61 @@ static std::unordered_map<SystemId, std::size_t> buildIndex(const std::vector<Sy
     if (id != 0) idx[id] = i;
   }
   return idx;
+}
+
+// -----------------------------------------------------------------------------
+// Back-compat helpers
+//
+// A previous iteration of hazard-aware routing used these helper names.
+// They are kept here as tiny wrappers to avoid brittle compile breaks when
+// experimental code paths (or local edits) still reference them.
+
+static std::unordered_map<SystemId, std::size_t> buildIndexMap(const std::vector<SystemStub>& nodes) {
+  return buildIndex(nodes);
+}
+
+static CellCoord cellForPos(const math::Vec3d& p, double cellSize) {
+  return cellFor(p, cellSize);
+}
+
+static std::array<CellCoord, 27> neighborsForCell(const CellCoord& c) {
+  std::array<CellCoord, 27> out{};
+  std::size_t k = 0;
+  for (long long dx = -1; dx <= 1; ++dx) {
+    for (long long dy = -1; dy <= 1; ++dy) {
+      for (long long dz = -1; dz <= 1; ++dz) {
+        out[k++] = CellCoord{c.x + dx, c.y + dy, c.z + dz};
+      }
+    }
+  }
+  return out;
+}
+
+static std::vector<SystemId> rebuildPath(const std::vector<SystemStub>& nodes,
+                                        const std::vector<std::size_t>& cameFrom,
+                                        std::size_t start,
+                                        std::size_t goal,
+                                        const std::unordered_map<SystemId, std::size_t>& idxMap) {
+  (void)idxMap;
+  if (nodes.empty()) return {};
+  if (start >= nodes.size() || goal >= nodes.size()) return {};
+  if (cameFrom.size() != nodes.size()) return {};
+
+  std::vector<SystemId> path;
+  path.reserve(nodes.size());
+
+  std::size_t cur = goal;
+  for (std::size_t guard = 0; guard < nodes.size() + 1; ++guard) {
+    path.push_back(nodes[cur].id);
+    if (cur == start) break;
+    const std::size_t prev = cameFrom[cur];
+    if (prev == (std::size_t)-1 || prev >= nodes.size()) return {};
+    cur = prev;
+  }
+
+  if (path.empty() || path.back() != nodes[start].id) return {};
+  std::reverse(path.begin(), path.end());
+  return path;
 }
 
 static void setStats(RoutePlanStats* out, const RoutePlanStats& s) {
@@ -132,22 +188,132 @@ static double computeCost(const std::unordered_map<SystemId, std::size_t>& idx,
   return sum;
 }
 
+static double avgNavDisruption01(core::u64 universeSeed,
+                                const math::Vec3d& aLy,
+                                const math::Vec3d& bLy,
+                                const proc::GalaxyHazardsParams& hp,
+                                int samples) {
+  // Midpoint sampling to approximate the average hazard along the segment.
+  if (samples < 1) samples = 1;
+  double sum = 0.0;
+  for (int si = 0; si < samples; ++si) {
+    const double t = (si + 0.5) / (double)samples;
+    const math::Vec3d p = aLy + (bLy - aLy) * t;
+    sum += proc::sampleGalaxyHazards(universeSeed, p, hp).navDisruption01;
+  }
+  return std::clamp(sum / (double)samples, 0.0, 1.0);
+}
+
+struct EdgeKey {
+  std::size_t a{0};
+  std::size_t b{0};
+  bool operator==(const EdgeKey& o) const { return a == o.a && b == o.b; }
+};
+
+struct EdgeKeyHash {
+  std::size_t operator()(const EdgeKey& k) const {
+    std::size_t h = std::hash<std::size_t>{}(k.a);
+    h = hashCombine(h, std::hash<std::size_t>{}(k.b));
+    return h;
+  }
+};
+
+static EdgeKey edgeKey(std::size_t a, std::size_t b) {
+  if (a < b) return EdgeKey{a, b};
+  return EdgeKey{b, a};
+}
+
+// Shared hazard edge cache for hazard-aware searches.
+// Stores average nav disruption (0..1) per undirected edge.
+struct HazardEdgeCost {
+  const std::vector<SystemStub>& nodes;
+  core::u64 universeSeed{0};
+  proc::GalaxyHazardsParams hp{};
+  double hazardWeightPerLy{0.0};
+  int samples{5};
+
+  std::unordered_map<EdgeKey, double, EdgeKeyHash> cache;
+
+  HazardEdgeCost(const std::vector<SystemStub>& nodes_,
+                 core::u64 seed,
+                 double timeDays,
+                 double hazardWeightPerLy_,
+                 int samples_)
+    : nodes(nodes_), universeSeed(seed), hazardWeightPerLy(hazardWeightPerLy_), samples(samples_) {
+    hp.timeDays = timeDays;
+    cache.reserve(4096);
+  }
+
+  double avgDisruption01(std::size_t i, std::size_t j) {
+    if (i == j) return 0.0;
+    const EdgeKey k = edgeKey(i, j);
+    if (const auto it = cache.find(k); it != cache.end()) return it->second;
+    const double v = avgNavDisruption01(universeSeed, nodes[i].posLy, nodes[j].posLy, hp, samples);
+    cache.emplace(k, v);
+    return v;
+  }
+
+  double integralLy(std::size_t i, std::size_t j, double dLy) {
+    if (dLy <= 0.0) return 0.0;
+    return avgDisruption01(i, j) * dLy;
+  }
+
+  double extraCost(std::size_t i, std::size_t j, double dLy) {
+    if (hazardWeightPerLy <= 0.0) return 0.0;
+    return integralLy(i, j, dLy) * hazardWeightPerLy;
+  }
+};
+
+static double computeCostHazards(const std::unordered_map<SystemId, std::size_t>& idx,
+                                 const std::vector<SystemStub>& nodes,
+                                 const std::vector<SystemId>& route,
+                                 double costPerJump,
+                                 double costPerLy,
+                                 HazardEdgeCost& hazards) {
+  if (route.size() < 2) return 0.0;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+
+  double sum = 0.0;
+  for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+    const auto itA = idx.find(route[i]);
+    const auto itB = idx.find(route[i + 1]);
+    if (itA == idx.end() || itB == idx.end()) break;
+    const std::size_t a = itA->second;
+    const std::size_t b = itB->second;
+    const double d = systemDistanceLy(nodes[a], nodes[b]);
+    sum += costPerJump + costPerLy * d + hazards.extraCost(a, b, d);
+  }
+  return sum;
+}
+
 struct AStarSolveResult {
   std::vector<SystemId> path;
   RoutePlanStats stats;
 };
 
-static AStarSolveResult aStarCostSolve(const std::vector<SystemStub>& nodes,
-                                      const std::unordered_map<SystemId, std::size_t>& idx,
-                                      const std::unordered_map<CellCoord, std::vector<std::size_t>, CellHash>& grid,
-                                      SystemId startId,
-                                      SystemId goalId,
-                                      double maxJumpLy,
-                                      double costPerJump,
-                                      double costPerLy,
-                                      const std::unordered_set<SystemId>* bannedNodes,
-                                      const std::unordered_set<Edge, EdgeHash>* bannedEdges,
-                                      std::size_t maxExpansions) {
+// A* route planner on the implicit "range graph" (systems are connected if within maxJumpLy).
+//
+// This internal solver is used by the K-shortest routes planner (Yen) and by the
+// hazard-aware planner. The extraEdgeCost callback enables additional non-negative
+// costs (e.g., hazards) without duplicating the full search implementation.
+//
+// IMPORTANT: The heuristic ignores extraEdgeCost. As long as extraEdgeCost is
+// non-negative, the heuristic remains admissible.
+template <class ExtraEdgeCostFn>
+static AStarSolveResult aStarCostSolveEx(const std::vector<SystemStub>& nodes,
+                                        const std::unordered_map<SystemId, std::size_t>& idx,
+                                        const std::unordered_map<CellCoord, std::vector<std::size_t>, CellHash>& grid,
+                                        SystemId startId,
+                                        SystemId goalId,
+                                        double maxJumpLy,
+                                        double costPerJump,
+                                        double costPerLy,
+                                        const std::unordered_set<SystemId>* bannedNodes,
+                                        const std::unordered_set<Edge, EdgeHash>* bannedEdges,
+                                        std::size_t maxExpansions,
+                                        ExtraEdgeCostFn&& extraEdgeCost) {
   AStarSolveResult out{};
   RoutePlanStats stats{};
 
@@ -278,7 +444,9 @@ static AStarSolveResult aStarCostSolve(const std::vector<SystemStub>& nodes,
             const double d = systemDistanceLy(nodes[cur.i], nodes[j]);
             if (d > maxJumpLy + 1e-9) continue;
 
-            const double legCost = costPerJump + costPerLy * d;
+            double extra = extraEdgeCost(cur.i, j, d);
+            if (!std::isfinite(extra) || extra < 0.0) extra = 0.0;
+            const double legCost = costPerJump + costPerLy * d + extra;
             const double tentative = gScore[cur.i] + legCost;
 
             if (tentative + 1e-12 < gScore[j]) {
@@ -295,6 +463,27 @@ static AStarSolveResult aStarCostSolve(const std::vector<SystemStub>& nodes,
 
   out.stats = stats;
   return out;
+}
+
+static AStarSolveResult aStarCostSolve(const std::vector<SystemStub>& nodes,
+                                      const std::unordered_map<SystemId, std::size_t>& idx,
+                                      const std::unordered_map<CellCoord, std::vector<std::size_t>, CellHash>& grid,
+                                      SystemId startId,
+                                      SystemId goalId,
+                                      double maxJumpLy,
+                                      double costPerJump,
+                                      double costPerLy,
+                                      const std::unordered_set<SystemId>* bannedNodes,
+                                      const std::unordered_set<Edge, EdgeHash>* bannedEdges,
+                                      std::size_t maxExpansions) {
+  auto noop = [](std::size_t /*fromIdx*/, std::size_t /*toIdx*/, double /*dLy*/) -> double { return 0.0; };
+  return aStarCostSolveEx(nodes, idx, grid,
+                          startId, goalId,
+                          maxJumpLy,
+                          costPerJump, costPerLy,
+                          bannedNodes, bannedEdges,
+                          maxExpansions,
+                          noop);
 }
 
 } // namespace
@@ -597,154 +786,50 @@ std::vector<SystemId> plotRouteAStarCostHazards(const std::vector<SystemStub>& n
                                                double timeDays,
                                                RoutePlanStats* outStats,
                                                std::size_t maxExpansions) {
+  // When hazardWeightPerLy is 0, this reduces to the standard cost planner.
   if (hazardWeightPerLy <= 0.0) {
     return plotRouteAStarCost(nodes, startId, goalId, maxJumpLy, costPerJump, costPerLy, outStats, maxExpansions);
   }
 
-  if (nodes.empty() || startId == 0 || goalId == 0) return {};
-  if (maxJumpLy <= 0.0) return {};
-  if (maxExpansions == 0) return {};
+  RoutePlanStats stats{};
 
-  const std::size_t N = nodes.size();
-  const auto idxMap = buildIndexMap(nodes);
+  if (nodes.empty() || startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0 || maxExpansions == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
 
-  const auto itStart = idxMap.find(startId);
-  const auto itGoal = idxMap.find(goalId);
-  if (itStart == idxMap.end() || itGoal == idxMap.end()) return {};
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
 
-  const std::size_t start = itStart->second;
-  const std::size_t goal = itGoal->second;
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
 
+  // Spatial hash grid for neighbor queries.
   const auto grid = buildGrid(nodes, maxJumpLy);
 
-  // Galaxy hazard sampling parameters: driven by in-game time (drift).
-  proc::GalaxyHazardsParams hp{};
-  hp.timeDays = timeDays;
+  // Shared edge cache for hazard sampling (saves a *lot* of noise evaluations).
+  HazardEdgeCost hazards(nodes, universeSeed, timeDays, hazardWeightPerLy, /*samples=*/5);
 
-  auto avgNavDisruption01 = [&](const math::Vec3d& aLy, const math::Vec3d& bLy) -> double {
-    // Midpoint sampling to approximate the average hazard along the segment.
-    // Keep this small; it's called in the inner loop of A*.
-    const int samples = 5;
-    double sum = 0.0;
-    for (int si = 0; si < samples; ++si) {
-      const double t = (si + 0.5) / (double)samples;
-      const math::Vec3d p = aLy + (bLy - aLy) * t;
-      sum += proc::sampleGalaxyHazards(universeSeed, p, hp).navDisruption01;
-    }
-    return std::clamp(sum / (double)samples, 0.0, 1.0);
-  };
+  const auto res = aStarCostSolveEx(nodes, idx, grid,
+                                   startId, goalId,
+                                   maxJumpLy,
+                                   costPerJump, costPerLy,
+                                   /*bannedNodes=*/nullptr,
+                                   /*bannedEdges=*/nullptr,
+                                   maxExpansions,
+                                   [&](std::size_t fromIdx, std::size_t toIdx, double dLy) -> double {
+                                     return hazards.extraCost(fromIdx, toIdx, dLy);
+                                   });
 
-  struct EdgeKey {
-    std::size_t a{0};
-    std::size_t b{0};
-    bool operator==(const EdgeKey& o) const { return a == o.a && b == o.b; }
-  };
-  struct EdgeKeyHash {
-    std::size_t operator()(const EdgeKey& k) const {
-      std::size_t h = std::hash<std::size_t>{}(k.a);
-      h = hashCombine(h, std::hash<std::size_t>{}(k.b));
-      return h;
-    }
-  };
-  auto edgeKey = [&](std::size_t a, std::size_t b) -> EdgeKey {
-    if (a < b) return EdgeKey{a, b};
-    return EdgeKey{b, a};
-  };
-
-  std::unordered_map<EdgeKey, double, EdgeKeyHash> edgeHazCache;
-  edgeHazCache.reserve(4096);
-
-  struct NodeRec {
-    std::size_t i{0};
-    double f{0.0};
-    bool operator<(const NodeRec& o) const { return f > o.f; } // min-heap via priority_queue
-  };
-
-  std::priority_queue<NodeRec> open;
-  std::vector<double> gScore(N, std::numeric_limits<double>::infinity());
-  std::vector<std::size_t> cameFrom(N, (std::size_t)-1);
-  std::vector<unsigned char> closed(N, 0);
-
-  auto heuristic = [&](std::size_t a) -> double {
-    const double d = (nodes[a].posLy - nodes[goal].posLy).length();
-    const double minHops = std::ceil(d / std::max(1e-9, maxJumpLy));
-    // IMPORTANT: heuristic ignores hazards; since hazard cost is non-negative, this remains admissible.
-    return minHops * costPerJump + d * costPerLy;
-  };
-
-  gScore[start] = 0.0;
-  open.push(NodeRec{start, heuristic(start)});
-
-  std::size_t expansions = 0;
-
-  while (!open.empty() && expansions < maxExpansions) {
-    const NodeRec cur = open.top();
-    open.pop();
-
-    if (closed[cur.i]) continue;
-    closed[cur.i] = 1;
-
-    expansions++;
-
-    if (cur.i == goal) break;
-
-    const CellCoord cell = cellForPos(nodes[cur.i].posLy, maxJumpLy);
-    const auto neighCells = neighborsForCell(cell);
-
-    std::vector<std::size_t> cand;
-    cand.reserve(128);
-    for (const auto& nc : neighCells) {
-      const auto it = grid.find(nc);
-      if (it == grid.end()) continue;
-      cand.insert(cand.end(), it->second.begin(), it->second.end());
-    }
-
-    for (std::size_t j : cand) {
-      if (j == cur.i) continue;
-      if (closed[j]) continue;
-
-      const double d = (nodes[cur.i].posLy - nodes[j].posLy).length();
-      if (d > maxJumpLy + 1e-9) continue;
-
-      const EdgeKey ek = edgeKey(cur.i, j);
-      double navDisrupt01 = 0.0;
-      if (const auto it = edgeHazCache.find(ek); it != edgeHazCache.end()) {
-        navDisrupt01 = it->second;
-      } else {
-        navDisrupt01 = avgNavDisruption01(nodes[cur.i].posLy, nodes[j].posLy);
-        edgeHazCache.emplace(ek, navDisrupt01);
-      }
-
-      const double tentative =
-        gScore[cur.i] + costPerJump + costPerLy * d + hazardWeightPerLy * navDisrupt01 * d;
-      if (tentative < gScore[j]) {
-        gScore[j] = tentative;
-        cameFrom[j] = cur.i;
-        open.push(NodeRec{j, tentative + heuristic(j)});
-      }
-    }
-  }
-
-  if (outStats) {
-    outStats->expanded = expansions;
-    if (std::isfinite(gScore[goal])) {
-      outStats->found = true;
-      outStats->cost = gScore[goal];
-      // Approx route distance (pure geometric; hazard penalty is reflected in outStats->cost).
-      // Rebuild path temporarily to measure distance.
-      const auto route = rebuildPath(nodes, cameFrom, start, goal, idxMap);
-      outStats->distanceLy = routeDistanceLy(nodes, route);
-      outStats->hops = route.empty() ? 0 : (int)route.size() - 1;
-    } else {
-      outStats->found = false;
-      outStats->cost = 0.0;
-      outStats->distanceLy = 0.0;
-      outStats->hops = 0;
-    }
-  }
-
-  if (!std::isfinite(gScore[goal])) return {};
-  return rebuildPath(nodes, cameFrom, start, goal, idxMap);
+  setStats(outStats, res.stats);
+  return res.path;
 }
 
 
@@ -889,6 +974,194 @@ std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
   return out;
 }
 
+std::vector<KRoute> plotKRoutesAStarCostHazards(const std::vector<SystemStub>& nodes,
+                                               SystemId startId,
+                                               SystemId goalId,
+                                               double maxJumpLy,
+                                               double costPerJump,
+                                               double costPerLy,
+                                               double hazardWeightPerLy,
+                                               core::u64 universeSeed,
+                                               double timeDays,
+                                               std::size_t k,
+                                               std::size_t maxExpansionsPerSolve) {
+  // Degenerate: no hazard penalty => fall back to standard K-shortest.
+  if (hazardWeightPerLy <= 0.0) {
+    return plotKRoutesAStarCost(nodes,
+                               startId,
+                               goalId,
+                               maxJumpLy,
+                               costPerJump,
+                               costPerLy,
+                               k,
+                               maxExpansionsPerSolve);
+  }
+
+  std::vector<KRoute> out;
+  if (k == 0) return out;
+
+  if (startId == 0 || goalId == 0) return out;
+  if (maxJumpLy <= 0.0) return out;
+  if (nodes.empty()) return out;
+  if (maxExpansionsPerSolve == 0) return out;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) return out;
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  // Shared edge cache across all spur solves and cost evaluations.
+  HazardEdgeCost hazards(nodes, universeSeed, timeDays, hazardWeightPerLy, /*samples=*/5);
+  auto extraEdgeCost = [&](std::size_t fromIdx, std::size_t toIdx, double dLy) -> double {
+    return hazards.extraCost(fromIdx, toIdx, dLy);
+  };
+
+  // First shortest path.
+  {
+    const auto base = aStarCostSolveEx(nodes,
+                                      idx,
+                                      grid,
+                                      startId,
+                                      goalId,
+                                      maxJumpLy,
+                                      costPerJump,
+                                      costPerLy,
+                                      nullptr,
+                                      nullptr,
+                                      maxExpansionsPerSolve,
+                                      extraEdgeCost);
+    if (base.path.empty()) return out;
+    out.push_back(KRoute{base.path, base.stats.hops, base.stats.distanceLy, base.stats.cost});
+  }
+
+  struct Candidate {
+    std::vector<SystemId> path;
+    int hops{0};
+    double distanceLy{0.0};
+    double cost{0.0};
+  };
+
+  const auto containsPath = [](const std::vector<KRoute>& routes, const std::vector<SystemId>& p) {
+    for (const auto& r : routes) {
+      if (r.path == p) return true;
+    }
+    return false;
+  };
+
+  const auto containsPathCand = [](const std::vector<Candidate>& cands, const std::vector<SystemId>& p) {
+    for (const auto& c : cands) {
+      if (c.path == p) return true;
+    }
+    return false;
+  };
+
+  const auto betterCand = [](const Candidate& a, const Candidate& b) {
+    const double da = a.cost;
+    const double db = b.cost;
+    if (std::abs(da - db) > 1e-12) return da < db;
+    return pathLexLess(a.path, b.path);
+  };
+
+  std::vector<Candidate> candidates;
+
+  // Yen's algorithm (loopless K-shortest).
+  for (std::size_t kth = 1; kth < k; ++kth) {
+    const auto& prev = out[kth - 1].path;
+    if (prev.size() < 2) break;
+
+    for (std::size_t i = 0; i + 1 < prev.size(); ++i) {
+      const SystemId spurNode = prev[i];
+
+      // Root path includes spur node.
+      std::vector<SystemId> root(prev.begin(), prev.begin() + (long long)i + 1);
+
+      // Ban nodes in the root path *except* the spur node to enforce loopless paths.
+      std::unordered_set<SystemId> bannedNodes;
+      bannedNodes.reserve(i);
+      for (std::size_t r = 0; r < i; ++r) bannedNodes.insert(root[r]);
+
+      // Ban edges that would recreate any previously found shortest path with this root.
+      std::unordered_set<Edge, EdgeHash> bannedEdges;
+      for (const auto& found : out) {
+        const auto& p = found.path;
+        if (p.size() > i + 1 && pathHasPrefix(p, root)) {
+          bannedEdges.insert(Edge{p[i], p[i + 1]});
+        }
+      }
+
+      const auto spur = aStarCostSolveEx(nodes,
+                                        idx,
+                                        grid,
+                                        spurNode,
+                                        goalId,
+                                        maxJumpLy,
+                                        costPerJump,
+                                        costPerLy,
+                                        &bannedNodes,
+                                        &bannedEdges,
+                                        maxExpansionsPerSolve,
+                                        extraEdgeCost);
+
+      if (spur.path.empty()) continue;
+
+      // Combine root + spur (skip spurNode duplicate).
+      std::vector<SystemId> total = root;
+      if (spur.path.size() > 1) {
+        total.insert(total.end(), spur.path.begin() + 1, spur.path.end());
+      }
+
+      if (total.size() < 2) continue;
+      if (containsPath(out, total)) continue;
+      if (containsPathCand(candidates, total)) continue;
+
+      const double dist = computeDistanceLy(idx, nodes, total);
+      const double cst = computeCostHazards(idx, nodes, total, costPerJump, costPerLy, hazards);
+      const int hops = (int)total.size() - 1;
+
+      candidates.push_back(Candidate{std::move(total), hops, dist, cst});
+    }
+
+    if (candidates.empty()) break;
+
+    // Pick the best candidate.
+    std::size_t bestIdx = 0;
+    for (std::size_t i = 1; i < candidates.size(); ++i) {
+      if (betterCand(candidates[i], candidates[bestIdx])) bestIdx = i;
+    }
+
+    Candidate best = std::move(candidates[bestIdx]);
+    candidates.erase(candidates.begin() + (long long)bestIdx);
+    out.push_back(KRoute{std::move(best.path), best.hops, best.distanceLy, best.cost});
+  }
+
+  return out;
+}
+
+std::vector<KRoute> plotKRoutesAStarHopsHazards(const std::vector<SystemStub>& nodes,
+                                               SystemId startId,
+                                               SystemId goalId,
+                                               double maxJumpLy,
+                                               double hazardWeightPerLy,
+                                               core::u64 universeSeed,
+                                               double timeDays,
+                                               std::size_t k,
+                                               std::size_t maxExpansionsPerSolve) {
+  return plotKRoutesAStarCostHazards(nodes,
+                                    startId,
+                                    goalId,
+                                    maxJumpLy,
+                                    /*costPerJump=*/1.0,
+                                    /*costPerLy=*/0.0,
+                                    hazardWeightPerLy,
+                                    universeSeed,
+                                    timeDays,
+                                    k,
+                                    maxExpansionsPerSolve);
+}
+
 std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         SystemId startId,
                                         SystemId goalId,
@@ -934,6 +1207,54 @@ double routeCost(const std::vector<SystemStub>& nodes,
     sum += costPerJump + costPerLy * d;
   }
   return sum;
+}
+
+RouteHazardStats routeHazardStats(const std::vector<SystemStub>& nodes,
+                                 const std::vector<SystemId>& route,
+                                 core::u64 universeSeed,
+                                 double timeDays,
+                                 int samplesPerLeg) {
+  RouteHazardStats out{};
+  if (route.size() < 2) return out;
+  if (samplesPerLeg < 1) samplesPerLeg = 1;
+
+  const auto idx = buildIndex(nodes);
+
+  proc::GalaxyHazardsParams hp{};
+  hp.timeDays = timeDays;
+
+  double totalDist = 0.0;
+
+  for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+    const auto itA = idx.find(route[i]);
+    const auto itB = idx.find(route[i + 1]);
+    if (itA == idx.end() || itB == idx.end()) break;
+
+    const auto& a = nodes[itA->second];
+    const auto& b = nodes[itB->second];
+    const double d = systemDistanceLy(a, b);
+    if (d <= 0.0) continue;
+
+    const double avg01 = avgNavDisruption01(universeSeed, a.posLy, b.posLy, hp, samplesPerLeg);
+    out.integralLy += avg01 * d;
+    totalDist += d;
+
+    if (avg01 > out.max01) {
+      out.max01 = avg01;
+      out.maxLegIndex = (int)i;
+    }
+  }
+
+  if (totalDist > 0.0) out.average01 = out.integralLy / totalDist;
+  return out;
+}
+
+double routeHazardIntegralLy(const std::vector<SystemStub>& nodes,
+                             const std::vector<SystemId>& route,
+                             core::u64 universeSeed,
+                             double timeDays,
+                             int samplesPerLeg) {
+  return routeHazardStats(nodes, route, universeSeed, timeDays, samplesPerLeg).integralLy;
 }
 
 bool validateRoute(const std::vector<SystemStub>& nodes,

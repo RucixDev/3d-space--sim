@@ -14,16 +14,13 @@ namespace {
 stellar::sim::SystemStub makeStub(stellar::sim::SystemId id, const stellar::math::Vec3d& posLy) {
   stellar::sim::SystemStub s{};
   s.id = id;
+  s.seed = (stellar::core::u64)id * 1337ULL;
   s.name = "T" + std::to_string((unsigned long long)id);
   s.posLy = posLy;
-  s.population = 0;
+  s.primaryClass = stellar::sim::StarClass::G;
+  s.planetCount = 0;
+  s.stationCount = 0;
   s.factionId = 0;
-  s.econId = 0;
-  s.govId = 0;
-  s.securityId = 0;
-  s.techLevel = 0;
-  s.habitable = false;
-  s.radiusLy = 0.0;
   return s;
 }
 
@@ -132,11 +129,41 @@ int test_nav_route_hazards() {
                                                     timeDays,
                                                     &stats);
 
-  CHECK(stats.found);
+  CHECK(stats.reached);
   CHECK(route.size() == 3);
   CHECK(route[0] == 1);
   CHECK(route[2] == 4);
   CHECK(route[1] == expectedMid);
+
+  // Validate hazard summary helpers against the same sampling logic used above.
+  const int samplesPerLeg = 5;
+  const auto hz = sim::routeHazardStats(nodes, route, seed, timeDays, samplesPerLeg);
+
+  const std::vector<sim::SystemId> expectTop{1, 2, 4};
+  const std::vector<sim::SystemId> expectBottom{1, 3, 4};
+  const double expectedIntegral = (expectedMid == 2) ? navIntegral(nodes, expectTop, seed, hp, samplesPerLeg)
+                                                     : navIntegral(nodes, expectBottom, seed, hp, samplesPerLeg);
+  CHECK(std::abs(hz.integralLy - expectedIntegral) < 1e-9);
+
+  const double expectedDist = sim::routeDistanceLy(nodes, route);
+  CHECK(expectedDist > 0.0);
+  CHECK(std::abs(hz.average01 - (expectedIntegral / expectedDist)) < 1e-9);
+
+  const auto& a = nodes.at(0);
+  const auto& b = nodes.at(expectedMid == 2 ? 1 : 2);
+  const auto& c = nodes.at(3);
+  const double leg0Avg = avgNavDisruption01(seed, a.posLy, b.posLy, hp, samplesPerLeg);
+  const double leg1Avg = avgNavDisruption01(seed, b.posLy, c.posLy, hp, samplesPerLeg);
+  const double expectedMax = std::max(leg0Avg, leg1Avg);
+  CHECK(std::abs(hz.max01 - expectedMax) < 1e-9);
+  if (std::abs(leg0Avg - leg1Avg) > 1e-12) {
+    CHECK(hz.maxLegIndex == (leg0Avg > leg1Avg ? 0 : 1));
+  } else {
+    CHECK(hz.maxLegIndex == 0 || hz.maxLegIndex == 1);
+  }
+
+  // routeHazardIntegralLy should match the integral reported by routeHazardStats.
+  CHECK(std::abs(sim::routeHazardIntegralLy(nodes, route, seed, timeDays, samplesPerLeg) - hz.integralLy) < 1e-9);
 
   return failures;
 }
