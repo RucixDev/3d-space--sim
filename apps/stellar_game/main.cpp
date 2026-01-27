@@ -237,6 +237,35 @@ using namespace stellar;
 using sim::ShipHullClass;
 using sim::WeaponType;
 
+// Small Dear ImGui helpers used throughout this translation unit.
+namespace ig {
+
+// Optional bold font; if not configured these helpers are no-ops.
+static ImFont* gBoldFont = nullptr;
+
+inline void setBoldFont(ImFont* f) { gBoldFont = f; }
+
+inline void pushBoldFont() {
+  if (gBoldFont) ImGui::PushFont(gBoldFont);
+}
+
+inline void popBoldFont() {
+  if (gBoldFont) ImGui::PopFont();
+}
+
+// ImGui::DragFloat works on float*, but some sim values are doubles.
+inline bool DragDouble(const char* label,
+                       double* v,
+                       double speed = 1.0,
+                       double min = 0.0,
+                       double max = 0.0,
+                       const char* format = "%.3f",
+                       ImGuiSliderFlags flags = 0) {
+  return ImGui::DragScalar(label, ImGuiDataType_Double, v, speed, &min, &max, format, flags);
+}
+
+} // namespace ig
+
 static constexpr double kAU_KM = 149597870.7;
 static constexpr double kSOLAR_RADIUS_KM = 695700.0;
 static constexpr double kEARTH_RADIUS_KM = 6371.0;
@@ -20260,6 +20289,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (showMainMenu || !docked) ImGui::EndDisabled();
 
         ImGui::Separator();
+	        static core::u32 selectedFactionId = 0;
         if (ImGui::MenuItem("Main Menu")) {
           showMainMenu = true;
           mainMenuPage = MainMenuPage::Root;
@@ -25212,10 +25242,8 @@ if (!objectiveHudEnabled && !docked) {
     ImGui::TextDisabled("Tip: plot a route or track a mission.");
   }
 
-  ImGui::End();
-}
-
-
+	      ImGui::End();
+	    }
 // Traffic escort HUD (ambient contract)
 if (trafficEscort.active && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
 
@@ -31070,6 +31098,8 @@ if (showScanner) {
         const auto& station = currentSystem->stations[(std::size_t)selectedStationIndex];
         auto& stEcon = universe.stationEconomy(station, timeDays);
         const double feeEff = effectiveFeeRate(station);
+	        const double rep = getRep(station.factionId);
+	        const double stationFeeRate = feeEff;
         double cargoKgNow = cargoMassKg(cargo);
 
         if (focusMarketDetailsWindow) {
@@ -32551,18 +32581,23 @@ if (canTrade) {
 
             if (!illegalHere) {
               ImGui::BeginDisabled(!canTrade);
-              if (ImGui::SmallButton("Buy")) {
+	              if (ImGui::SmallButton("Buy")) {
                 const double buyUnits = std::min<double>(qty[i], std::max<double>(0.0, q.inventory));
                 const double availKg = std::max(0.0, cargoCapacityKg - cargoKgNow);
                 const double maxByMass = (econ::commodityDef(cid).massKg > 1e-9) ? (availKg / econ::commodityDef(cid).massKg) : 0.0;
                 const double buyClamped = std::min(buyUnits, maxByMass);
 
-                const auto out = econ::buy(stEcon, station.economyModel, cid, buyClamped, credits, stationFeeRate);
-                if (out.boughtUnits > 1e-9) {
-                  credits = out.creditsAfter;
-                  cargo[i] += out.boughtUnits;
-                  cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + out.boughtUnits * econ::commodityDef(cid).massKg);
-                }
+	                if (buyClamped <= 1e-9) {
+	                  toast(toasts, "Cannot buy: cargo hold full (mass limit).", 2.0);
+	                } else {
+	                  const auto out = econ::buy(stEcon, station.economyModel, cid, buyClamped, credits, /*bidAskSpread=*/0.10, stationFeeRate);
+	                  if (!out.ok) {
+	                    toast(toasts, std::string("Buy failed: ") + (out.reason ? out.reason : "error"), 2.0);
+	                  } else if (out.unitsDelta > 1e-9) {
+	                    cargo[i] += out.unitsDelta;
+	                    cargoKgNow = std::min(cargoCapacityKg, cargoKgNow + out.unitsDelta * econ::commodityDef(cid).massKg);
+	                  }
+	                }
               }
               ImGui::EndDisabled();
             } else {
@@ -32693,14 +32728,16 @@ if (canTrade) {
                             + std::to_string((int)std::round(payout)) + " cr.",
                           2.0);
                   }
-                } else {
-                  const auto out = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, stationFeeRate);
-                  if (out.soldUnits > 1e-9) {
-                    credits = out.creditsAfter;
-                    cargo[i] = std::max(0.0, cargo[i] - out.soldUnits);
-                    cargoKgNow = std::max(0.0, cargoKgNow - out.soldUnits * econ::commodityDef(cid).massKg);
-                  }
-                }
+	                } else {
+	                  const auto out = econ::sell(stEcon, station.economyModel, cid, sellUnits, credits, /*bidAskSpread=*/0.10, stationFeeRate);
+	                  if (!out.ok) {
+	                    toast(toasts, std::string("Sell failed: ") + (out.reason ? out.reason : "error"), 2.0);
+	                  } else if (out.unitsDelta < -1e-9) {
+	                    const double sold = -out.unitsDelta;
+	                    cargo[i] = std::max(0.0, cargo[i] - sold);
+	                    cargoKgNow = std::max(0.0, cargoKgNow - sold * econ::commodityDef(cid).massKg);
+	                  }
+	                }
               }
             }
             ImGui::EndDisabled();
@@ -32953,603 +32990,14 @@ ImGui::PopID();
       game::drawLogbookWindow(logbookWindow, lctx);
     }
 
-    if (showTrade) {
-      ImGui::Begin("Trade Helper");
-
-      if (!currentSystem) {
-        ImGui::TextDisabled("No current system.");
-      } else {
-        // Choose a 'from' station: prefer docked, otherwise prefer current galaxy selection.
-        sim::StationId fromStationId = 0;
-        if (docked) {
-          fromStationId = dockedStationId;
-        } else if (galaxySelectedSystem != 0) {
-          if (galaxySelectedStation != 0) {
-            fromStationId = galaxySelectedStation;
-          } else {
-            if (sim::System* sys = universe.systemById(galaxySelectedSystem)) {
-              if (!sys->stations.empty()) {
-                fromStationId = sys->stations[0].id;
-              }
-            }
-          }
-        }
-
-        if (fromStationId == 0) {
-          ImGui::TextDisabled("Pick a station on the Galaxy Map (or dock) to scan trade.");
-        } else {
-          const sim::Station* fromSt = nullptr;
-          if (docked && dockedStationId == fromStationId) {
-	          if (const sim::Station* st = currentSystemStationById(fromStationId)) {
-              fromSt = st;
-            }
-          }
-          if (!fromSt) {
-            for (auto& sys : universe.systems) {
-              for (auto& st : sys.stations) {
-                if (st.id == fromStationId) {
-                  fromSt = &st;
-                  break;
-                }
-              }
-              if (fromSt) break;
-            }
-          }
-
-          if (!fromSt) {
-            ImGui::TextDisabled("Station not found.");
-          } else {
-            ImGui::Text("From: %s (%s)", fromSt->name.c_str(), uiSystemNameById(fromSt->systemId).c_str());
-
-            econ::StationEconomy fromEcon;
-            if (!universe.tryGetStationEconomy(fromStationId, fromEcon)) {
-              ImGui::TextDisabled("No market data for this station.");
-            } else {
-              const int dayStamp = (int)std::floor(timeDays);
-              const double jr = std::max(1e-6, fsdCurrentRangeLy());
-              const double usedKg = cargoMassKg(cargo);
-              const double freeKg = std::max(0.0, cargoCapacityKg - usedKg);
-
-              const double feeEff = effectiveFeeRate(*fromSt);
-          ImGui::TextDisabled("Hold: %.0f / %.0f kg used (%.0f kg free)  |  Credits: %.0f cr", usedKg, cargoCapacityKg, freeKg, credits);
-
-
-              // Common scan settings
-              float radiusLy = (float)tradeSearchRadiusLy;
-              if (ImGui::SliderFloat("Search radius (ly)", &radiusLy, 10.0f, 250.0f, "%.0f")) {
-                tradeSearchRadiusLy = (double)radiusLy;
-                tradeIdeasDayStamp = -1;
-                tradeMixDayStamp = -1;
-                tradeLoopsDayStamp = -1;
-              }
-              ImGui::SameLine();
-              if (ImGui::SmallButton("Refresh")) {
-                tradeIdeasDayStamp = -1;
-                tradeMixDayStamp = -1;
-                tradeLoopsDayStamp = -1;
-              }
-
-              bool useFreeHold = tradeUseFreeHold;
-              if (ImGui::Checkbox("Use free hold only", &useFreeHold)) {
-                tradeUseFreeHold = useFreeHold;
-                tradeIdeasDayStamp = -1;
-                tradeMixDayStamp = -1;
-                tradeLoopsDayStamp = -1;
-              }
-
-              bool includeSameSystem = tradeIncludeSameSystem;
-              if (ImGui::Checkbox("Include same system", &includeSameSystem)) {
-                tradeIncludeSameSystem = includeSameSystem;
-                tradeIdeasDayStamp = -1;
-                tradeMixDayStamp = -1;
-                tradeLoopsDayStamp = -1;
-              }
-
-              ImGui::Separator();
-
-              if (ImGui::BeginTabBar("TradeTabs")) {
-                // -----------------------------------------------------------------
-                // IDEAS TAB (single commodity)
-                if (ImGui::BeginTabItem("Ideas")) {
-                  tradeHelperTab = 0;
-
-                  float minProfit = (float)tradeMinNetProfit;
-                  if (ImGui::SliderFloat("Min net profit / trip", &minProfit, 0.0f, 25000.0f, "%.0f")) {
-                    tradeMinNetProfit = (double)minProfit;
-                    tradeIdeasDayStamp = -1;
-                  }
-
-                  int ips = tradeIdeasPerStation;
-                  if (ImGui::SliderInt("Ideas / station", &ips, 1, 5)) {
-                    tradeIdeasPerStation = ips;
-                    tradeIdeasDayStamp = -1;
-                  }
-
-                  // Commodity filter
-                  {
-                    std::vector<const char*> items;
-                    items.reserve((std::size_t)econ::commodityCount() + 1);
-                    items.push_back("All commodities");
-                    for (int i = 0; i < econ::commodityCount(); ++i) {
-                      items.push_back(econ::commodityDef((econ::Commodity)i).code);
-                    }
-                    ImGui::Combo("Filter", &tradeCommodityFilterIdx, items.data(), (int)items.size());
-                  }
-
-                  // Scan if needed
-                  if (tradeFromStationId != fromStationId || tradeIdeasDayStamp != dayStamp) {
-                    tradeFromStationId = fromStationId;
-                    tradeIdeasDayStamp = dayStamp;
-                    tradeIdeas.clear();
-
-                    sim::TradeScanParams scan;
-                    scan.maxStations = 128;
-                    scan.maxIdeasPerStation = (std::size_t)tradeIdeasPerStation;
-                    scan.includeSameSystem = tradeIncludeSameSystem;
-                    scan.minNetProfitCr = tradeMinNetProfit;
-                    scan.commodityFilter = (tradeCommodityFilterIdx <= 0) ? std::optional<econ::Commodity>{}
-                                                                          : std::optional<econ::Commodity>{(econ::Commodity)(tradeCommodityFilterIdx - 1)};
-
-                    scan.cargoCapacityKg = cargoCapacityKg;
-                    scan.cargoUsedKg = usedKg;
-                    scan.useFreeHold = tradeUseFreeHold;
-                    scan.bidAskSpread = 0.10;
-                    scan.fromFeeRate = feeEff;
-
-                    tradeIdeas = sim::scanTradeOpportunities(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
-                                                            scan, effectiveFeeRate);
-                  }
-
-                  if (tradeIdeas.empty()) {
-                    ImGui::TextDisabled("No trade ideas found.");
-                  } else {
-                    if (ImGui::BeginTable("trade_ideas", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                      ImGui::TableSetupColumn("To station");
-                      ImGui::TableSetupColumn("Commodity");
-                      ImGui::TableSetupColumn("Units");
-                      ImGui::TableSetupColumn("Buy (avg)");
-                      ImGui::TableSetupColumn("Sell (avg)");
-                      ImGui::TableSetupColumn("Net profit");
-                      ImGui::TableSetupColumn("Actions");
-                      ImGui::TableHeadersRow();
-
-                      for (std::size_t i = 0; i < tradeIdeas.size(); ++i) {
-                        const auto& idea = tradeIdeas[i];
-                        ImGui::PushID((int)i);
-
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        ImGui::TextUnformatted(idea.toStationName.c_str());
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("(%s)", idea.toSystemName.c_str());
-
-                        ImGui::TableNextColumn();
-                        ImGui::TextUnformatted(econ::commodityDef(idea.commodity).code);
-
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.0f", idea.unitsPossible);
-
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.0f", idea.avgBuyUnitPriceCr);
-
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.0f", idea.avgSellUnitPriceCr);
-
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.0f", idea.netProfitCr);
-
-                        ImGui::TableNextColumn();
-                        if (ImGui::SmallButton("Fill")) {
-                          if (auto* econ = universe.stationEconomyById(fromStationId)) {
-                            const double maxUnits = idea.unitsPossible;
-                            const double bought = buyCommodityIntoCargoHold(*econ, cargo, cargoCapacityKg, credits,
-                                                                          idea.commodity, maxUnits, feeEff);
-                            if (bought > 0) {
-                              tradeIdeasDayStamp = -1;
-                              tradeMixDayStamp = -1;
-                              tradeLoopsDayStamp = -1;
-                            }
-                          }
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("Plot")) {
-                          if (plotRouteToSystem(idea.toSystemId)) {
-                            pendingArrivalTargetStationId = idea.toStationId;
-                            toast(toasts, "Route plotted.", 2.0);
-                          } else {
-                            toast(toasts, "No route found.", 3.0);
-                          }
-                        }
-
-                        ImGui::PopID();
-                      }
-
-                      ImGui::EndTable();
-                    }
-                  }
-
-                  ImGui::EndTabItem();
-                }
-
-                // -----------------------------------------------------------------
-                // CARGO MIX TAB (manifest)
-                if (ImGui::BeginTabItem("Cargo Mix")) {
-                  tradeHelperTab = 1;
-
-                  float minProfit = (float)tradeMinNetProfit;
-                  if (ImGui::SliderFloat("Min net profit / trip", &minProfit, 0.0f, 25000.0f, "%.0f")) {
-                    tradeMinNetProfit = (double)minProfit;
-                    tradeMixDayStamp = -1;
-                  }
-
-                  float stepKg = (float)tradeMixStepKg;
-                  if (ImGui::SliderFloat("Step (kg)", &stepKg, 0.2f, 5.0f, "%.1f")) {
-                    tradeMixStepKg = (double)stepKg;
-                    tradeMixDayStamp = -1;
-                  }
-
-                  bool simImpact = tradeMixSimulateImpact;
-                  if (ImGui::Checkbox("Price impact", &simImpact)) {
-                    tradeMixSimulateImpact = simImpact;
-                    tradeMixDayStamp = -1;
-                  }
-
-                  bool beam = tradeMixBeamSearch;
-                  if (ImGui::Checkbox("Beam search", &beam)) {
-                    tradeMixBeamSearch = beam;
-                    tradeMixDayStamp = -1;
-                  }
-                  if (tradeMixBeamSearch) {
-                    int bw = tradeMixBeamWidth;
-                    if (ImGui::SliderInt("Beam width", &bw, 4, 64)) {
-                      tradeMixBeamWidth = bw;
-                      tradeMixDayStamp = -1;
-                    }
-                  }
-
-                  int linesShown = tradeMixLinesShown;
-                  if (ImGui::SliderInt("Lines shown", &linesShown, 1, 8)) {
-                    tradeMixLinesShown = linesShown;
-                  }
-
-                  // Scan if needed
-                  if (tradeMixFromStationId != fromStationId || tradeMixDayStamp != dayStamp) {
-                    tradeMixFromStationId = fromStationId;
-                    tradeMixDayStamp = dayStamp;
-                    tradeMixIdeas.clear();
-
-                    sim::TradeManifestScanParams scan;
-                    scan.maxStations = 96;
-                    scan.includeSameSystem = tradeIncludeSameSystem;
-                    scan.minNetProfitCr = tradeMinNetProfit;
-                    scan.cargoCapacityKg = cargoCapacityKg;
-                    scan.cargoUsedKg = usedKg;
-                    scan.useFreeHold = tradeUseFreeHold;
-                    scan.bidAskSpread = 0.10;
-                    scan.fromFeeRate = feeEff;
-
-                    scan.manifest.stepKg = tradeMixStepKg;
-                    scan.manifest.maxBuyCreditsCr = 0.0; // display mode: ignore credits
-                    scan.manifest.simulatePriceImpact = tradeMixSimulateImpact;
-                    scan.manifest.planner = tradeMixBeamSearch ? econ::CargoManifestPlanner::BeamSearch : econ::CargoManifestPlanner::Greedy;
-                    scan.manifest.beamWidth = (std::size_t)std::max(1, tradeMixBeamWidth);
-
-                    tradeMixIdeas = sim::scanTradeManifests(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
-                                                            scan, effectiveFeeRate);
-                  }
-
-                  if (tradeMixIdeas.empty()) {
-                    ImGui::TextDisabled("No cargo mix ideas found.");
-                  } else {
-                    for (std::size_t i = 0; i < tradeMixIdeas.size(); ++i) {
-                      const auto& idea = tradeMixIdeas[i];
-                      ImGui::PushID((int)i);
-
-                      if (ImGui::CollapsingHeader(
-                            (std::string(idea.toStationName) + " (" + idea.toSystemName + ")").c_str(),
-                            ImGuiTreeNodeFlags_DefaultOpen)) {
-
-                        ImGui::TextDisabled("Distance: %.0f ly (%.0f jumps at %.0f ly range)",
-                                            idea.distanceLy, std::ceil(idea.distanceLy / jr), jr);
-                        ImGui::TextDisabled("Net profit: %.0f cr | Buy: %.0f cr | Sell: %.0f cr",
-                                            idea.plan.netProfitCr, idea.plan.netBuyCr, idea.plan.netSellCr);
-
-                        const auto showLines = (int)std::min<std::size_t>((std::size_t)tradeMixLinesShown, idea.plan.lines.size());
-                        if (showLines > 0) {
-                          if (ImGui::BeginTable("mix_lines", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                            ImGui::TableSetupColumn("Commodity");
-                            ImGui::TableSetupColumn("Units");
-                            ImGui::TableSetupColumn("Buy");
-                            ImGui::TableSetupColumn("Sell");
-                            ImGui::TableSetupColumn("Profit");
-                            ImGui::TableHeadersRow();
-
-                            for (int li = 0; li < showLines; ++li) {
-                              const auto& line = idea.plan.lines[(std::size_t)li];
-                              ImGui::TableNextRow();
-                              ImGui::TableNextColumn();
-                              ImGui::TextUnformatted(econ::commodityDef(line.commodity).code);
-                              ImGui::TableNextColumn();
-                              ImGui::Text("%.0f", line.units);
-                              ImGui::TableNextColumn();
-                              ImGui::Text("%.0f", line.avgBuyUnitPriceCr);
-                              ImGui::TableNextColumn();
-                              ImGui::Text("%.0f", line.avgSellUnitPriceCr);
-                              ImGui::TableNextColumn();
-                              ImGui::Text("%.0f", line.netProfitCr);
-                            }
-
-                            ImGui::EndTable();
-                          }
-                        }
-
-                        if (ImGui::SmallButton("Fill mix")) {
-                          if (auto* econ = universe.stationEconomyById(fromStationId)) {
-                            double boughtAny = 0.0;
-                            for (const auto& line : idea.plan.lines) {
-                              const double wanted = line.units;
-                              if (wanted <= 0) continue;
-                              boughtAny += buyCommodityIntoCargoHold(*econ, cargo, cargoCapacityKg, credits,
-                                                                    line.commodity, wanted, feeEff);
-                            }
-                            if (boughtAny > 0.0) {
-                              tradeIdeasDayStamp = -1;
-                              tradeMixDayStamp = -1;
-                              tradeLoopsDayStamp = -1;
-                            }
-                          }
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::SmallButton("Plot")) {
-                          if (plotRouteToSystem(idea.toSystemId)) {
-                            pendingArrivalTargetStationId = idea.toStationId;
-                            toast(toasts, "Route plotted.", 2.0);
-                          } else {
-                            toast(toasts, "No route found.", 3.0);
-                      }
-
-                      ImGui::PopID();
-                    }
-                  }
-
-                  ImGui::EndTabItem();
-                }
-
-                // -----------------------------------------------------------------
-                // LOOPS TAB (multi-leg closed loops)
-                if (ImGui::BeginTabItem("Loops")) {
-                  const bool entering = (tradeHelperTab != 2);
-                  tradeHelperTab = 2;
-
-                  ImGui::TextDisabled("Closed loops start and end at the selected station.");
-
-                  bool loopsDirty = false;
-
-                  int legs = tradeLoopLegs;
-                  if (ImGui::SliderInt("Legs", &legs, 2, 3)) {
-                    tradeLoopLegs = legs;
-                    loopsDirty = true;
-                  }
-
-                  float minLeg = (float)tradeLoopMinLegProfit;
-                  if (ImGui::SliderFloat("Min profit / leg", &minLeg, 0.0f, 40000.0f, "%.0f")) {
-                    tradeLoopMinLegProfit = (double)minLeg;
-                    loopsDirty = true;
-                  }
-
-                  float minLoop = (float)tradeLoopMinLoopProfit;
-                  if (ImGui::SliderFloat("Min profit / loop", &minLoop, 0.0f, 120000.0f, "%.0f")) {
-                    tradeLoopMinLoopProfit = (double)minLoop;
-                    loopsDirty = true;
-                  }
-
-                  int maxLeg = tradeLoopMaxLegCandidates;
-                  if (ImGui::SliderInt("Max leg candidates", &maxLeg, 4, 32)) {
-                    tradeLoopMaxLegCandidates = maxLeg;
-                    loopsDirty = true;
-                  }
-
-                  int maxRes = tradeLoopMaxResults;
-                  if (ImGui::SliderInt("Max results", &maxRes, 4, 24)) {
-                    tradeLoopMaxResults = maxRes;
-                    loopsDirty = true;
-                  }
-
-                  bool limitCredits = tradeLoopUseCreditsLimit;
-                  if (ImGui::Checkbox("Limit by current credits", &limitCredits)) {
-                    tradeLoopUseCreditsLimit = limitCredits;
-                    loopsDirty = true;
-                  }
-
-                  float lstep = (float)tradeLoopStepKg;
-                  if (ImGui::SliderFloat("Manifest step (kg)", &lstep, 0.2f, 5.0f, "%.1f")) {
-                    tradeLoopStepKg = (double)lstep;
-                    loopsDirty = true;
-                  }
-
-                  bool limact = tradeLoopSimulateImpact;
-                  if (ImGui::Checkbox("Price impact", &limact)) {
-                    tradeLoopSimulateImpact = limact;
-                    loopsDirty = true;
-                  }
-
-                  bool lbeam = tradeLoopBeamSearch;
-                  if (ImGui::Checkbox("Beam search", &lbeam)) {
-                    tradeLoopBeamSearch = lbeam;
-                    loopsDirty = true;
-                  }
-                  if (tradeLoopBeamSearch) {
-                    int bw = tradeLoopBeamWidth;
-                    if (ImGui::SliderInt("Beam width", &bw, 4, 64)) {
-                      tradeLoopBeamWidth = bw;
-                      loopsDirty = true;
-                    }
-                  }
-
-                  if (loopsDirty) {
-                    tradeLoopsDayStamp = -1;
-                    tradeLoops.clear();
-                  }
-
-                  const bool loopsStale =
-                    (tradeLoopsFromStationId != fromStationId) || (tradeLoopsDayStamp != dayStamp);
-
-                  ImGui::Separator();
-                  if (loopsStale) {
-                    ImGui::TextDisabled("Loops are stale. Compute to refresh.");
-                  }
-
-                  // Auto-compute on tab entry (but don't auto-recompute while dragging settings).
-                  const bool shouldAutoCompute = entering && loopsStale;
-
-                  if (ImGui::SmallButton(loopsStale ? "Compute loops" : "Recompute loops") || shouldAutoCompute) {
-                    tradeLoopsFromStationId = fromStationId;
-                    tradeLoopsDayStamp = dayStamp;
-                    tradeLoops.clear();
-
-                    sim::TradeLoopScanParams scan;
-                    scan.legs = (std::size_t)std::clamp(tradeLoopLegs, 2, 3);
-                    scan.maxLegCandidates = (std::size_t)std::max(2, tradeLoopMaxLegCandidates);
-                    scan.maxResults = (std::size_t)std::max(1, tradeLoopMaxResults);
-                    scan.maxStations = 160;
-                    scan.includeSameSystem = tradeIncludeSameSystem;
-                    scan.minLegProfitCr = tradeLoopMinLegProfit;
-                    scan.minLoopProfitCr = tradeLoopMinLoopProfit;
-
-                    scan.manifest.bidAskSpread = 0.10;
-                    scan.manifest.cargoCapacityKg = cargoCapacityKg;
-                    scan.manifest.cargoUsedKg = usedKg;
-                    scan.manifest.useFreeHold = tradeUseFreeHold;
-                    scan.manifest.stepKg = tradeLoopStepKg;
-                    scan.manifest.maxBuyCreditsCr = tradeLoopUseCreditsLimit ? credits : 0.0;
-                    scan.manifest.simulatePriceImpact = tradeLoopSimulateImpact;
-                    scan.manifest.planner = tradeLoopBeamSearch ? econ::CargoManifestPlanner::BeamSearch : econ::CargoManifestPlanner::Greedy;
-                    scan.manifest.beamWidth = (std::size_t)std::max(1, tradeLoopBeamWidth);
-
-                    tradeLoops = sim::scanTradeLoops(universe, currentSystem->stub, *fromSt, timeDays, tradeSearchRadiusLy, 256,
-                                                    scan, effectiveFeeRate);
-                  }
-
-                  ImGui::Separator();
-
-                  if (tradeLoops.empty()) {
-                    ImGui::TextDisabled("No profitable loops found for current filters.");
-                  } else {
-                    for (std::size_t i = 0; i < tradeLoops.size(); ++i) {
-                      const auto& loop = tradeLoops[i];
-                      ImGui::PushID((int)i);
-
-                      const double distLy = loop.totalDistanceLy;
-	                  const double profitCr = loop.totalProfitCr;
-                      const double perLy = (distLy > 1e-6) ? (profitCr / distLy) : 0.0;
-
-                      std::string header = "Loop: +" + std::to_string((long long)std::llround(profitCr)) + " cr";
-                      header += "  |  " + std::to_string(loop.legs.size()) + " legs";
-                      header += "  |  " + std::to_string((long long)std::llround(distLy)) + " ly";
-                      header += "  |  " + std::to_string((long long)std::llround(perLy)) + " cr/ly";
-
-                      const bool open = ImGui::CollapsingHeader(header.c_str());
-
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Track")) {
-                        trackedTradeLoop.active = true;
-                        trackedTradeLoop.loop = loop;
-                        trackedTradeLoop.legIndex = 0;
-                        trackedTradeLoop.originStationId = fromStationId;
-                        trackedTradeLoop.lastDocked = false;
-                        trackedTradeLoop.lastDockedSystemId = 0;
-                        trackedTradeLoop.lastDockedStationId = 0;
-
-                        // Clear last execution telemetry so the HUD doesn't show stale results.
-                        trackedTradeLoop.lastTradeTimeDays = 0.0;
-                        trackedTradeLoop.lastTradeStationId = 0;
-                        trackedTradeLoop.lastTradeCreditsDelta = 0.0;
-                        trackedTradeLoop.lastTradeSoldCr = 0.0;
-                        trackedTradeLoop.lastTradeBoughtCr = 0.0;
-
-                        toast(toasts, "Tracking trade loop (see Objective Tracker).", 3.0);
-                      }
-
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Go first leg")) {
-                        if (!loop.legs.empty()) {
-                          const auto& leg0 = loop.legs[0];
-		                  	game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg0.toSystem, leg0.toStation, true));
-                        }
-                      }
-
-                      if (open) {
-                        ImGui::Indent();
-                        ImGui::TextDisabled("Loop total profit: +%.0f cr", profitCr);
-
-                        for (std::size_t li = 0; li < loop.legs.size(); ++li) {
-                          const auto& leg = loop.legs[li];
-                          ImGui::Separator();
-                          ImGui::Text("Leg %d/%d: %s -> %s",
-                                      (int)li + 1, (int)loop.legs.size(),
-                                      leg.fromStationName.c_str(), leg.toStationName.c_str());
-                          ImGui::TextDisabled("%s  →  %s  |  %.0f ly (%.0f jumps)",
-                                              leg.fromSystemName.c_str(), leg.toSystemName.c_str(),
-                                              leg.distanceLy, std::ceil(leg.distanceLy / jr));
-                          ImGui::TextDisabled("Profit: +%.0f cr | Buy: %.0f cr | Sell: %.0f cr",
-                                              leg.manifest.netProfitCr, leg.manifest.netBuyCr, leg.manifest.netSellCr);
-
-                          const int showLines = (int)std::min<std::size_t>((std::size_t)4, leg.manifest.lines.size());
-                          if (showLines > 0) {
-                            if (ImGui::BeginTable("loop_leg_lines", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                              ImGui::TableSetupColumn("Commodity");
-                              ImGui::TableSetupColumn("Units");
-                              ImGui::TableSetupColumn("Buy");
-                              ImGui::TableSetupColumn("Sell");
-                              ImGui::TableSetupColumn("Profit");
-                              ImGui::TableHeadersRow();
-
-                              for (int lni = 0; lni < showLines; ++lni) {
-                                const auto& line = leg.manifest.lines[(std::size_t)lni];
-                                ImGui::TableNextRow();
-                                ImGui::TableNextColumn();
-                                ImGui::TextUnformatted(econ::commodityDef(line.commodity).code);
-                                ImGui::TableNextColumn();
-                                ImGui::Text("%.0f", line.units);
-                                ImGui::TableNextColumn();
-                                ImGui::Text("%.0f", line.avgBuyUnitPriceCr);
-                                ImGui::TableNextColumn();
-                                ImGui::Text("%.0f", line.avgSellUnitPriceCr);
-                                ImGui::TableNextColumn();
-                                ImGui::Text("%.0f", line.netProfitCr);
-                              }
-
-                              ImGui::EndTable();
-                            }
-                          }
-
-                          if (ImGui::SmallButton("Go to leg dest")) {
-		                    	game::hubPushAction(integrationHubWindow, game::makeActionGoToStation(timeRealSec, timeDays, "TradeLoop", leg.toSystem, leg.toStation, true));
-                          }
-                        }
-
-                        ImGui::Unindent();
-                      }
-
-                      ImGui::PopID();
-                    }
-                  }
-
-                  ImGui::EndTabItem();
-                }
-
-                ImGui::EndTabBar();
-              }
-            }
-          }
-        }
-      }
-
-      ImGui::End();
-    }
-
-
-    if (showMissions) {
+	
+	    // Keep the legacy toggle functional: route it to the new Trade Planner.
+	    if (showTrade) {
+	      tradePlannerWindow.open = true;
+	      showTrade = false;
+	    }
+
+	    if (showMissions) {
       if (focusMissionsWindow) {
         ImGui::SetNextWindowFocus();
         focusMissionsWindow = false;
@@ -36638,9 +36086,10 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
         pushUnique(0);
         for (const auto& f : universe.factions()) pushUnique(f.id);
         for (const auto& [fid, _] : repByFaction) pushUnique(fid);
-        for (const auto& [fid, _] : lawLedger) pushUnique(fid);
-        for (const auto& [fid, _] : fineLedger) pushUnique(fid);
-        for (const auto& [fid, _] : voucherLedger) pushUnique(fid);
+	        // LawLedger isn't directly iterable; pull ids from each internal map.
+	        for (const auto& [fid, _] : lawLedger.bounties()) pushUnique(fid);
+	        for (const auto& [fid, _] : lawLedger.fines()) pushUnique(fid);
+	        for (const auto& [fid, _] : lawLedger.vouchers()) pushUnique(fid);
 
         auto toLowerInPlace = [&](std::string& s) {
           for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
@@ -36708,7 +36157,13 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(r.name.c_str());
+	            {
+	              const bool isSelected = (selectedFactionId == r.factionId);
+	              const std::string label = r.name + "##faction_" + std::to_string(r.factionId);
+	              if (ImGui::Selectable(label.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap)) {
+	                selectedFactionId = r.factionId;
+	              }
+	            }
 
             ImGui::TableSetColumnIndex(1);
             if (r.rep < 0.0) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "%.1f", r.rep);
@@ -36738,12 +36193,71 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
           ImGui::EndTable();
         }
       }
-      ImGui::End();
-    }
+	      ImGui::Separator();
+	      {
+	        const core::u32 fid = selectedFactionId;
+	        const std::string fidName = (fid == 0) ? std::string("Independent") : factionName(fid);
+	        ImGui::Text("Selected: %s", fidName.c_str());
+	        ImGui::SameLine();
+	        ImGui::TextDisabled("(click a row to select)");
 
+	        const double rep = getRep(fid);
+	        const double bounty = getBounty(fid);
+	        const double fine = getFine(fid);
+	        const double voucher = getVoucher(fid);
+	        const double fineDue = getFineDueDay(fid);
 
+	        ImGui::Text("Rep: %.1f | Bounty: %.0f cr | Fine: %.0f cr | Vouchers: %.0f cr", rep, bounty, fine, voucher);
+	        if (fine > 1e-6) {
+	          ImGui::SameLine();
+	          ImGui::TextDisabled("Due: %s", fmtDueIn(fineDue).c_str());
+	        }
 
-    // ---- Notifications (toast history) ----
+	        // Remote settlement is allowed when you're within comms range of a station owned by the selected faction.
+	        const sim::Station* remoteStation = nullptr;
+	        bool canRemote = false;
+	        if (currentSystem && target.kind == Target::Kind::Station && target.index < currentSystem->stations.size()) {
+	          const sim::Station& st = currentSystem->stations[target.index];
+	          const double distKm = (st.posKm - playerPosKm).length();
+	          if (distKm <= st.commsRangeKm && st.factionId == fid) {
+	            remoteStation = &st;
+	            canRemote = true;
+	          }
+	        }
+	        if (!canRemote) {
+	          ImGui::TextDisabled("Legal actions require comms range of a station of this faction (target one and get closer)."
+	                               "");
+	        }
+
+	        ImGui::BeginDisabled(!canRemote);
+	        if (ImGui::Button("Settle bounty (remote)")) {
+	          payBountyRemotely(*remoteStation, "FactionsDossier");
+	        }
+	        ImGui::SameLine();
+	        if (ImGui::Button("Pay fine (remote)")) {
+	          const double paid = payFine(fid, fine);
+	          if (paid > 1e-6) toast(toasts, "Paid " + std::to_string((int)std::round(paid)) + " cr in fines.", 1.8);
+	          else toast(toasts, "No fine to pay (or insufficient credits).", 1.6);
+	        }
+	        ImGui::SameLine();
+	        if (ImGui::Button("Redeem vouchers")) {
+	          const double before = credits;
+	          lawLedger.redeemVoucher(fid, credits);
+	          const double got = std::max(0.0, credits - before);
+	          if (got > 1e-6) {
+	            addRep(fid, got * 0.001);
+	            toast(toasts, "Redeemed " + std::to_string((int)std::round(got)) + " cr in vouchers.", 1.8);
+	          } else {
+	            toast(toasts, "No vouchers to redeem.", 1.4);
+	          }
+	        }
+	        ImGui::EndDisabled();
+	      }
+
+		      ImGui::End();
+		    }
+
+	    // ---- Notifications (toast history) ----
     if (showNotifications) {
       ImGui::SetNextWindowSize(ImVec2(820, 420), ImGuiCond_FirstUseEver);
       if (ImGui::Begin("Notifications", &showNotifications)) {
@@ -39073,12 +38587,12 @@ const char* pageName =
           previews[i].out = sim::applyRebuyOnDeath(pol, previews[i].shipAfter, previews[i].creditsAfter, previews[i].debtAfter);
         }
 
-        auto shipSummary = [&](const sim::PlayerShipEconomyState& s) -> std::string {
-          const char* hull = sim::hullDef(s.shipHullClass).name;
+	        auto shipSummary = [&](const sim::PlayerShipEconomyState& s) -> std::string {
+	          const char* hull = sim::hullDef(s.hull).name;
 
-          const int thrMk = std::clamp(s.thrusterMk, 1, (int)sim::kThrusters.size() - 1);
-          const int shdMk = std::clamp(s.shieldMk, 1, (int)sim::kShields.size() - 1);
-          const int distMk = std::clamp(s.distributorMk, 1, (int)sim::kDistributors.size() - 1);
+    const int thrMk = std::clamp((int)s.thrusterMk, 1, (int)sim::kThrusters.size() - 1);
+    const int shdMk = std::clamp((int)s.shieldMk, 1, (int)sim::kShields.size() - 1);
+    const int distMk = std::clamp((int)s.distributorMk, 1, (int)sim::kDistributors.size() - 1);
 
           const char* thr = sim::kThrusters[(std::size_t)thrMk].name;
           const char* shd = sim::kShields[(std::size_t)shdMk].name;
@@ -39199,8 +38713,8 @@ const char* pageName =
         // Selected option summary.
         const Preview& sel = previews[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
         ImGui::Text("Selected: %s", optionNames[std::clamp(deathRebuy.selectedOption, 0, 2)]);
-        ImGui::Text("Rebuy cost: %.0f cr | Paid: %.0f cr | Loan: %.0f cr",
-                    sel.out.rebuyCostCr, sel.out.paidCr, sel.out.loanTakenCr);
+	        ImGui::Text("Rebuy cost: %.0f cr | Paid: %.0f cr | Loan: %.0f cr",
+	                    sel.out.rebuyCostCr, sel.out.paidFromCreditsCr, sel.out.loanTakenCr);
 
         ImGui::Spacing();
 
@@ -39213,7 +38727,7 @@ const char* pageName =
           sim::PlayerShipEconomyState chosenShip = deathRebuy.options[(std::size_t)std::clamp(deathRebuy.selectedOption, 0, 2)];
           const auto outcome = sim::applyRebuyOnDeath(pol, chosenShip, credits, insuranceDebtCr);
 
-          shipHullClass = chosenShip.shipHullClass;
+	              shipHullClass = chosenShip.hull;
           thrusterMk = chosenShip.thrusterMk;
           shieldMk = chosenShip.shieldMk;
           distributorMk = chosenShip.distributorMk;
@@ -39743,19 +39257,20 @@ const char* pageName =
 
           if (bigButton("Open Warehouse (Market Details)")) openMarketAt(MarketDetailsJumpTarget::Warehouse);
 
-          if (dockSt) {
-            const auto* entry = sim::findStorage(stationStorage, dockedStationId);
-            if (entry) {
-              const double rep = getRep(dockSt->factionId);
-              const double storedKg = sim::storageMassKg(*entry);
-              const double dailyFee = sim::estimateStorageDailyFeeCr(*entry, rep);
-              const double dueNow = std::max(0.0, entry->feesDueCr);
-              const double nextFeeInDays = std::max(0.0, entry->nextFeeTimeDays - timeDays);
+	          if (dockSt) {
+	            auto* entry = sim::findStorage(stationStorage, dockedStationId);
+	            if (entry) {
+	              const double rep = getRep(dockSt->factionId);
+	              const double sinceAccrueDays = std::max(0.0, timeDays - entry->lastFeeDay);
+	              sim::accrueStorageFees(*entry, timeDays, rep);
+	              const double storedKg = sim::storageMassKg(*entry);
+	              const double dailyFee = sim::estimateStorageDailyFeeCr(*entry, rep);
+	              const double dueNow = std::max(0.0, entry->feesDueCr);
 
               ImGui::Separator();
               ImGui::TextDisabled("Stored mass: %.0f kg", storedKg);
               ImGui::TextDisabled("Estimated daily fee: %.0f cr/day", dailyFee);
-              ImGui::TextDisabled("Fees due now: %.0f cr   (next fee in %.1f days)", dueNow, nextFeeInDays);
+	              ImGui::TextDisabled("Fees due now: %.0f cr   (accrued %.1f days since last check)", dueNow, sinceAccrueDays);
 
               if (ImGui::Button("Pay fees")) {
                 const auto r = sim::payStorageFees(stationStorage, *dockSt, timeDays, rep, credits, 1e30);
@@ -39766,9 +39281,9 @@ const char* pageName =
                   } else {
                     toast(toasts, "No storage fees due.", 1.8);
                   }
-                } else {
-                  toast(toasts, r.msg.c_str(), 2.5);
-                }
+	                } else {
+	                  toast(toasts, (r.reason ? r.reason : "Storage payment failed."), 2.5);
+	                }
               }
             } else {
               ImGui::TextDisabled("No storage rented at this station yet.");

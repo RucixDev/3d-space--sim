@@ -2,23 +2,39 @@
 
 #include "stellar/core/Clamp.h"
 #include "stellar/core/Base64.h"
+#include "stellar/core/AtomicWriteFile.h"
 #include "stellar/core/Log.h"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace stellar::sim {
 
 bool saveToFile(const SaveGame& s, const std::string& path) {
-  std::ofstream f(path, std::ios::out | std::ios::trunc);
-  if (!f) {
-    stellar::core::log(stellar::core::LogLevel::Error, "SaveGame: failed to open file for writing: " + path);
-    return false;
+  const std::filesystem::path dstPath(path);
+
+  // Best-effort safety net: keep the previous successful save around as "*.bak".
+  {
+    std::error_code ec;
+    if (std::filesystem::exists(dstPath, ec) && !ec) {
+      auto bakPath = dstPath;
+      bakPath += ".bak";
+      std::filesystem::copy_file(dstPath, bakPath, std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        stellar::core::log(stellar::core::LogLevel::Warn,
+                           "SaveGame: failed to write backup '" + bakPath.string() + "': " + ec.message());
+      }
+    }
   }
+
+  // Serialize to memory first, then atomically replace the destination file.
+  // This avoids corrupting the user's save on crashes or partial writes.
+  std::ostringstream f;
 
   f.setf(std::ios::fixed);
   f.precision(8);
@@ -474,6 +490,32 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
     }
 
     f << "endstation\n";
+  }
+
+  if (!f.good()) {
+    stellar::core::log(stellar::core::LogLevel::Error, "SaveGame: failed to serialize save: " + path);
+    return false;
+  }
+
+  const std::string payload = f.str();
+  std::string err;
+  const bool ok = stellar::core::atomicWriteFile(
+      dstPath,
+      [&](std::ostream& out, std::string* outErr) -> bool {
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        if (!out.good()) {
+          if (outErr) *outErr = "ostream write failed";
+          return false;
+        }
+        return true;
+      },
+      &err);
+
+  if (!ok) {
+    stellar::core::log(stellar::core::LogLevel::Error,
+                       "SaveGame: failed to write '" + dstPath.string() + "': " +
+                           (err.empty() ? std::string("unknown error") : err));
+    return false;
   }
 
   return true;

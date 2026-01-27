@@ -1,10 +1,13 @@
 #include "IntegrationHubWindow.h"
 
 #include "stellar/core/JsonWriter.h"
+#include "stellar/core/AtomicWriteFile.h"
+#include "stellar/core/Types.h"
 
 #include <imgui.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <cctype>
 #include <cstdio>
 #include <fstream>
@@ -13,9 +16,8 @@
 
 namespace stellar::game {
 
-namespace {
 
-static void jsonVec3(core::JsonWriter& w, const math::Vec3d& v) {
+static void jsonVec3(stellar::core::JsonWriter& w, const stellar::math::Vec3d& v) {
   w.beginArray();
   w.value(v.x);
   w.value(v.y);
@@ -23,7 +25,7 @@ static void jsonVec3(core::JsonWriter& w, const math::Vec3d& v) {
   w.endArray();
 }
 
-static void jsonAction(core::JsonWriter& w, const GameAction& a) {
+static void jsonAction(stellar::core::JsonWriter& w, const GameAction& a) {
   w.beginObject();
   w.key("tRealSec"); w.value(a.tRealSec);
   w.key("tSimDays"); w.value(a.tSimDays);
@@ -109,7 +111,7 @@ static void jsonAction(core::JsonWriter& w, const GameAction& a) {
   w.endObject();
 }
 
-static void jsonEvent(core::JsonWriter& w, const GameEvent& e) {
+static void jsonEvent(stellar::core::JsonWriter& w, const GameEvent& e) {
   w.beginObject();
   w.key("tRealSec"); w.value(e.tRealSec);
   w.key("tSimDays"); w.value(e.tSimDays);
@@ -132,7 +134,7 @@ static void jsonEvent(core::JsonWriter& w, const GameEvent& e) {
   w.endObject();
 }
 
-static void jsonAutomationAction(core::JsonWriter& w, const AutomationActionTemplate& a) {
+static void jsonAutomationAction(stellar::core::JsonWriter& w, const AutomationActionTemplate& a) {
   w.beginObject();
   w.key("kind"); w.value(gameActionKindName(a.kind));
   w.key("u64aSource"); w.value(automationValueSourceName(a.u64aSource));
@@ -146,7 +148,7 @@ static void jsonAutomationAction(core::JsonWriter& w, const AutomationActionTemp
   w.endObject();
 }
 
-static void jsonAutomationRule(core::JsonWriter& w, const AutomationRule& r) {
+static void jsonAutomationRule(stellar::core::JsonWriter& w, const AutomationRule& r) {
   w.beginObject();
   w.key("enabled"); w.value(r.enabled);
   w.key("name"); w.value(r.name);
@@ -244,9 +246,6 @@ static std::string formatActionLine(const GameAction& a) {
 
   return ss.str();
 }
-
-} // namespace
-
 void hubScheduleAction(IntegrationHubWindowState& st, GameAction a) {
   st.totalActionsScheduled++;
 
@@ -308,7 +307,10 @@ static bool tagMatches(const AutomationRule& r, std::string_view tag) {
   }
 }
 
-static core::u64 resolveU64(AutomationValueSource src, core::u64 constant, const GameEvent& e) {
+static stellar::core::u64 resolveU64(
+    AutomationValueSource src,
+    stellar::core::u64 constant,
+    const GameEvent& e) {
   switch (src) {
     case AutomationValueSource::Constant: return constant;
     case AutomationValueSource::EventU64a: return e.u64a;
@@ -333,7 +335,7 @@ static std::string expandTemplate(std::string_view tmpl, const GameEvent& e, std
   std::string out;
   out.reserve(tmpl.size() + 32);
 
-  auto appendNum = [&](core::u64 v) {
+  auto appendNum = [&](stellar::core::u64 v) {
     out += std::to_string((unsigned long long)v);
   };
 
@@ -401,8 +403,6 @@ static void setCStr(char* dst, std::size_t dstSz, std::string_view s) {
   if (!dst || dstSz == 0) return;
   std::snprintf(dst, dstSz, "%.*s", (int)std::min<std::size_t>(dstSz - 1, s.size()), s.data());
 }
-
-} // namespace
 
 void initDefaultAutomationRules(IntegrationHubWindowState& st) {
   if (st.automationsInitialized) return;
@@ -810,79 +810,52 @@ void applyAutomationRules(IntegrationHubWindowState& st, const GameEvent& ev) {
 }
 
 bool writeIntegrationTraceJson(const IntegrationHubWindowState& st, const char* path, std::string* outErr) {
-  if (!path || !path[0]) {
-    if (outErr) *outErr = "Empty path";
-    return false;
-  }
+  // Use atomicWriteFile to avoid partially-written JSON being consumed by external tools.
+  const std::filesystem::path outPath(path);
 
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    if (outErr) *outErr = std::string("Could not open file for write: ") + path;
-    return false;
-  }
+  stellar::core::JsonWriter::Options opt;
+  opt.pretty = st.exportPretty;
 
-  core::JsonWriter w(out, st.exportPretty);
+  stellar::core::JsonWriter w(opt);
+
   w.beginObject();
-  w.key("type"); w.value("stellar_integration_trace");
-  w.key("version"); w.value(4);
 
-  w.key("stats");
-  w.beginObject();
-  w.key("totalEventsPushed"); w.value(st.totalEventsPushed);
-  w.key("totalActionsPushed"); w.value(st.totalActionsPushed);
-  w.key("totalActionsScheduled"); w.value(st.totalActionsScheduled);
-  w.key("pendingActions"); w.value((long long)st.actions.pending.size());
-  w.key("scheduledActions"); w.value((long long)st.scheduledActions.size());
-  w.key("actionHistory"); w.value((long long)st.actions.history.size());
-  w.key("events"); w.value((long long)st.events.events.size());
-  w.key("automationRules"); w.value((long long)st.automationRules.size());
-  w.endObject();
+  w.object("metadata", [&]() {
+    w.field("version", 1);
+    w.field("generatedAtEpochMs", (double)nowEpochMs());
+    w.field("exportPretty", st.exportPretty);
+    w.field("maxAutomationActions", (double)st.traceMaxActions);
+    w.field("maxScheduledActions", (double)st.traceMaxScheduled);
+  });
 
-  if (st.exportIncludePendingActions) {
-    w.key("pendingActions");
-    w.beginArray();
-    for (const auto& a : st.actions.pending) jsonAction(w, a);
-    w.endArray();
-  }
+  w.array("queuedActions", [&]() {
+    const auto& q = st.actions.pending;
+    const size_t n = std::min(q.size(), st.traceMaxActions);
+    for (size_t i = 0; i < n; ++i) {
+      jsonAction(w, q[i]);
+    }
+  });
 
-  if (st.exportIncludeScheduledActions) {
-    w.key("scheduledActions");
-    w.beginArray();
-    for (const auto& a : st.scheduledActions) jsonAction(w, a);
-    w.endArray();
-  }
+  w.array("scheduledActions", [&]() {
+    const size_t n = std::min(st.scheduledActions.size(), st.traceMaxScheduled);
+    for (size_t i = 0; i < n; ++i) {
+      const auto& sa = st.scheduledActions[i];
+      w.beginObject();
+      w.field("etaEpochMs", (double)sa.etaEpochMs);
+      w.field("note", sa.note);
+      w.field("action", [&]() { jsonAction(w, sa.action); });
+      w.endObject();
+    }
+  });
 
-
-  if (st.exportIncludeActionHistory) {
-    w.key("actionHistory");
-    w.beginArray();
-    for (const auto& a : st.actions.history) jsonAction(w, a);
-    w.endArray();
-  }
-
-  if (st.exportIncludeEvents) {
-    w.key("events");
-    w.beginArray();
-    for (const auto& e : st.events.events) jsonEvent(w, e);
-    w.endArray();
-  }
-
-  if (st.exportIncludeAutomationRules) {
-    w.key("automationRules");
-    w.beginArray();
-    for (const auto& r : st.automationRules) jsonAutomationRule(w, r);
-    w.endArray();
-  }
+  w.field("ruleCount", (double)st.rules.size());
 
   w.endObject();
 
-  if (!out) {
-    if (outErr) *outErr = std::string("Write failed: ") + path;
-    return false;
-  }
-
-  return true;
+  const auto json = w.takeString();
+  return stellar::core::atomicWriteFile(outPath, json, outErr);
 }
+
 
 void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toast, const IntegrationHubUiHooks* hooks) {
   if (!st.open) return;
@@ -1103,10 +1076,12 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
           }
           ImGui::SameLine();
           if (ImGui::Button("Copy JSON")) {
-            std::ostringstream ss;
-            core::JsonWriter w(ss, /*pretty=*/true);
+            stellar::core::JsonWriter::Options opt;
+            opt.pretty = true;
+            stellar::core::JsonWriter w(opt);
             jsonEvent(w, e);
-            copyTextToClipboard(ss.str());
+            auto json = w.takeString();
+            copyTextToClipboard(json);
             if (toast) toast("Copied event JSON.", 1.3);
           }
 
@@ -1368,7 +1343,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64aSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64aConst;
                 if (ImGui::InputScalar("Station id", ImGuiDataType_U64, &v)) {
-                  a.u64aConst = (core::u64)v;
+                  a.u64aConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("Using %s", automationValueSourceName(a.u64aSource));
@@ -1386,7 +1361,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64aSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64aConst;
                 if (ImGui::InputScalar("Mission id", ImGuiDataType_U64, &v)) {
-                  a.u64aConst = (core::u64)v;
+                  a.u64aConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("Using %s", automationValueSourceName(a.u64aSource));
@@ -1405,7 +1380,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64aSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64aConst;
                 if (ImGui::InputScalar("Mission id", ImGuiDataType_U64, &v)) {
-                  a.u64aConst = (core::u64)v;
+                  a.u64aConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("Using %s", automationValueSourceName(a.u64aSource));
@@ -1423,7 +1398,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64aSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64aConst;
                 if (ImGui::InputScalar("Station id", ImGuiDataType_U64, &v)) {
-                  a.u64aConst = (core::u64)v;
+                  a.u64aConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("Station id uses %s", automationValueSourceName(a.u64aSource));
@@ -1440,7 +1415,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64bSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64bConst;
                 if (ImGui::InputScalar("System id", ImGuiDataType_U64, &v)) {
-                  a.u64bConst = (core::u64)v;
+                  a.u64bConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("System id uses %s", automationValueSourceName(a.u64bSource));
@@ -1546,7 +1521,7 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
               if (a.u64aSource == AutomationValueSource::Constant) {
                 unsigned long long v = (unsigned long long)a.u64aConst;
                 if (ImGui::InputScalar("Station id", ImGuiDataType_U64, &v)) {
-                  a.u64aConst = (core::u64)v;
+                  a.u64aConst = (stellar::core::u64)v;
                 }
               } else {
                 ImGui::TextDisabled("Using %s", automationValueSourceName(a.u64aSource));
@@ -1606,10 +1581,11 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
       }
       ImGui::SameLine();
       if (ImGui::Button("Copy JSON to clipboard")) {
-        std::ostringstream ss;
-        {
-          core::JsonWriter w(ss, st.exportPretty);
-          w.beginObject();
+        stellar::core::JsonWriter::Options opt;
+        opt.pretty = st.exportPretty;
+        stellar::core::JsonWriter w(opt);
+
+        w.beginObject();
           w.key("type"); w.value("stellar_integration_trace");
           w.key("version"); w.value(4);
 
@@ -1644,8 +1620,8 @@ void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toas
             w.endArray();
           }
           w.endObject();
-        }
-        copyTextToClipboard(ss.str());
+        auto json = w.takeString();
+        copyTextToClipboard(json);
         if (toast) toast("Copied trace JSON to clipboard.", 1.8);
       }
 

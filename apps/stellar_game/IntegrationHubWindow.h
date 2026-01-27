@@ -2,6 +2,8 @@
 
 #include "GameSignals.h"
 
+#include "stellar/core/Types.h"
+
 #include <deque>
 #include <functional>
 #include <string>
