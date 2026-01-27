@@ -392,6 +392,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/AudioEngine.cpp
     apps/stellar_game/AudioAnalyzerWindow.cpp
     apps/stellar_game/CommandPalette.cpp
+    apps/stellar_game/CopilotWindow.cpp
     apps/stellar_game/ControlsWindow.cpp
     apps/stellar_game/CommsWindow.cpp
     apps/stellar_game/SensorContacts.cpp

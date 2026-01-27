@@ -7,6 +7,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <cctype>
 #include <cstdio>
@@ -809,6 +810,11 @@ void applyAutomationRules(IntegrationHubWindowState& st, const GameEvent& ev) {
   }
 }
 
+static stellar::core::u64 nowEpochMs() {
+  using namespace std::chrono;
+  return (stellar::core::u64)duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
 bool writeIntegrationTraceJson(const IntegrationHubWindowState& st, const char* path, std::string* outErr) {
   // Use atomicWriteFile to avoid partially-written JSON being consumed by external tools.
   const std::filesystem::path outPath(path);
@@ -819,43 +825,70 @@ bool writeIntegrationTraceJson(const IntegrationHubWindowState& st, const char* 
   stellar::core::JsonWriter w(opt);
 
   w.beginObject();
+    w.key("type"); w.value("stellar_integration_trace");
+    w.key("version"); w.value(4);
 
-  w.object("metadata", [&]() {
-    w.field("version", 1);
-    w.field("generatedAtEpochMs", (double)nowEpochMs());
-    w.field("exportPretty", st.exportPretty);
-    w.field("maxAutomationActions", (double)st.traceMaxActions);
-    w.field("maxScheduledActions", (double)st.traceMaxScheduled);
-  });
+    // Small metadata block to make traces self-describing even when consumers only
+    // stream-read the JSON.
+    w.object("metadata", [&]() {
+      w.field("generatedAtEpochMs", (double)nowEpochMs());
+      w.field("exportPretty", st.exportPretty);
+      w.field("pendingCount", (double)st.actions.pending.size());
+      w.field("scheduledCount", (double)st.scheduledActions.size());
+      w.field("historyCount", (double)st.actions.history.size());
+      w.field("eventCount", (double)st.events.events.size());
+      w.field("automationRuleCount", (double)st.automationRules.size());
 
-  w.array("queuedActions", [&]() {
-    const auto& q = st.actions.pending;
-    const size_t n = std::min(q.size(), st.traceMaxActions);
-    for (size_t i = 0; i < n; ++i) {
-      jsonAction(w, q[i]);
+      // Lightweight session stats (useful for judging if a trace was truncated by ring buffers).
+      w.field("totalEventsPushed", (double)st.totalEventsPushed);
+      w.field("totalActionsPushed", (double)st.totalActionsPushed);
+      w.field("totalActionsScheduled", (double)st.totalActionsScheduled);
+
+      // Embed current timestamps so actions/events can be correlated to wall clock.
+      w.field("nowRealSec", st.nowRealSec);
+      w.field("nowSimDays", st.nowSimDays);
+    });
+
+    if (st.exportIncludePendingActions) {
+      w.key("pendingActions");
+      w.beginArray();
+      for (const auto& a : st.actions.pending) jsonAction(w, a);
+      w.endArray();
     }
-  });
 
-  w.array("scheduledActions", [&]() {
-    const size_t n = std::min(st.scheduledActions.size(), st.traceMaxScheduled);
-    for (size_t i = 0; i < n; ++i) {
-      const auto& sa = st.scheduledActions[i];
-      w.beginObject();
-      w.field("etaEpochMs", (double)sa.etaEpochMs);
-      w.field("note", sa.note);
-      w.field("action", [&]() { jsonAction(w, sa.action); });
-      w.endObject();
+    if (st.exportIncludeScheduledActions) {
+      w.key("scheduledActions");
+      w.beginArray();
+      for (const auto& a : st.scheduledActions) jsonAction(w, a);
+      w.endArray();
     }
-  });
 
-  w.field("ruleCount", (double)st.rules.size());
+    if (st.exportIncludeActionHistory) {
+      w.key("actionHistory");
+      w.beginArray();
+      for (const auto& a : st.actions.history) jsonAction(w, a);
+      w.endArray();
+    }
+
+    if (st.exportIncludeEvents) {
+      w.key("events");
+      w.beginArray();
+      for (const auto& e : st.events.events) jsonEvent(w, e);
+      w.endArray();
+    }
+
+    if (st.exportIncludeAutomationRules) {
+      w.key("automationRules");
+      w.beginArray();
+      for (const auto& r : st.automationRules) jsonAutomationRule(w, r);
+      w.endArray();
+    }
 
   w.endObject();
 
   const auto json = w.takeString();
   return stellar::core::atomicWriteFile(outPath, json, outErr);
 }
-
 
 void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toast, const IntegrationHubUiHooks* hooks) {
   if (!st.open) return;

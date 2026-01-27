@@ -268,6 +268,16 @@ void armRouteFromRun(TradePlannerWindowState& st, const stellar::sim::TradeRun& 
   rr.startedAtDays = timeDays;
   rr.lastAdvanceAtDays = timeDays;
 
+  rr.requestExecuteDockedTurn = false;
+  rr.lastTradeTimeDays = 0.0;
+  rr.lastTradeStationId = 0;
+  rr.lastTradeSoldLines = 0;
+  rr.lastTradeBoughtLines = 0;
+  rr.lastTradeIllegalSkips = 0;
+  rr.lastTradeCreditsDelta = 0.0;
+  rr.lastTradeSoldCr = 0.0;
+  rr.lastTradeBoughtCr = 0.0;
+
   rr.legs.reserve(r.legs.size());
   for (const auto& leg : r.legs) {
     TradePlannerWindowState::TradeRouteLeg out;
@@ -299,6 +309,16 @@ void armRouteFromLoop(TradePlannerWindowState& st, const stellar::sim::TradeLoop
   rr.startedAtDays = timeDays;
   rr.lastAdvanceAtDays = timeDays;
 
+  rr.requestExecuteDockedTurn = false;
+  rr.lastTradeTimeDays = 0.0;
+  rr.lastTradeStationId = 0;
+  rr.lastTradeSoldLines = 0;
+  rr.lastTradeBoughtLines = 0;
+  rr.lastTradeIllegalSkips = 0;
+  rr.lastTradeCreditsDelta = 0.0;
+  rr.lastTradeSoldCr = 0.0;
+  rr.lastTradeBoughtCr = 0.0;
+
   rr.legs.reserve(l.legs.size());
   for (const auto& leg : l.legs) {
     TradePlannerWindowState::TradeRouteLeg out;
@@ -329,6 +349,15 @@ void drawRouteRunnerPanel(TradePlannerWindowState& st, const TradePlannerContext
   ImGui::Checkbox("Arm auto-run when starting", &rr.armAutoRun);
   ImGui::SameLine();
   ImGui::Checkbox("Repeat loops", &rr.repeat);
+
+  ImGui::Checkbox("Auto-trade on dock", &rr.autoTradeOnDock);
+  if (rr.autoTradeOnDock) {
+    ImGui::SameLine();
+    ImGui::Checkbox("Toast", &rr.autoTradeToast);
+    ImGui::SameLine();
+    ImGui::Checkbox("Allow illegal via black market", &rr.autoTradeAllowIllegalViaBlackMarket);
+  }
+  ImGui::Checkbox("Auto-plot next leg", &rr.autoPlotNextLeg);
 
   if (!rr.active) {
     ImGui::TextDisabled("No active route. Arm one from the results below.");
@@ -400,6 +429,34 @@ void drawRouteRunnerPanel(TradePlannerWindowState& st, const TradePlannerContext
     rr.endEventPending = true;
     rr.endReason = TradePlannerWindowState::TradeRouteRunner::EndReason::Cancelled;
     toastMaybe(ctx, "Trade route cancelled.", 2.0);
+  }
+
+  // Dockside execution request.
+  {
+    const bool dockedHere = ctx.docked && ctx.currentSystem &&
+                            ctx.currentSystem->stub.id == leg.fromSystem &&
+                            ctx.dockedStationId != 0 && ctx.dockedStationId == leg.fromStation;
+    ImGui::BeginDisabled(!dockedHere || !rr.autoTradeOnDock);
+    if (ImGui::SmallButton("Execute dockside turn now")) {
+      rr.requestExecuteDockedTurn = true;
+      toastMaybe(ctx, "Trade route: dockside execution requested.", 1.8);
+    }
+    ImGui::EndDisabled();
+    if (!dockedHere) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(dock at the leg's origin station)");
+    }
+  }
+
+  // Last auto-trade summary (if any).
+  if (rr.lastTradeStationId != 0) {
+    ImGui::TextDisabled("Last trade: net %+.0f cr (sold +%.0f, bought -%.0f) | lines %d/%d | illegal skips %d",
+                        rr.lastTradeCreditsDelta,
+                        rr.lastTradeSoldCr,
+                        rr.lastTradeBoughtCr,
+                        rr.lastTradeSoldLines,
+                        rr.lastTradeBoughtLines,
+                        rr.lastTradeIllegalSkips);
   }
 
   // Manifest summary.

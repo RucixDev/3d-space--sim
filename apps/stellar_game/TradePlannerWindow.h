@@ -136,6 +136,22 @@ struct TradePlannerWindowState {
     // If true, the runner will arm nav auto-run on each leg transition.
     bool armAutoRun{true};
 
+    // If true, execute the leg's manifest automatically when docking at each stop:
+    //  - Sell inbound cargo from the just-completed leg.
+    //  - Buy outbound cargo for the next leg.
+    // This mirrors the tracked trade-loop automation and makes multi-leg runs feel
+    // like a coherent "dockside turn".
+    bool autoTradeOnDock{true};
+    bool autoTradeToast{true};
+    bool autoTradeAllowIllegalViaBlackMarket{true};
+
+    // If true, automatically plot the next leg when arriving at a stop.
+    // (When armAutoRun is also true, this will arm auto-run/auto-dock.)
+    bool autoPlotNextLeg{true};
+
+    // UI -> main loop bridge: request a one-shot dockside execution.
+    bool requestExecuteDockedTurn{false};
+
     // Index of the current leg we are traveling *towards* (destination).
     int legIndex{0};
 
@@ -147,6 +163,16 @@ struct TradePlannerWindowState {
 
     double startedAtDays{0.0};
     double lastAdvanceAtDays{0.0};
+
+    // Last auto-trade summary (for UI feedback).
+    double lastTradeTimeDays{0.0};
+    stellar::sim::StationId lastTradeStationId{0};
+    int lastTradeSoldLines{0};
+    int lastTradeBoughtLines{0};
+    int lastTradeIllegalSkips{0};
+    double lastTradeCreditsDelta{0.0};
+    double lastTradeSoldCr{0.0};
+    double lastTradeBoughtCr{0.0};
 
     std::vector<TradeRouteLeg> legs;
   };
@@ -161,6 +187,10 @@ struct TradePlannerContext {
   stellar::sim::Universe& universe;
   const stellar::sim::StarSystem* currentSystem{nullptr};
   double timeDays{0.0};
+
+  // Docking context (enables route runner UI + optional auto-trade).
+  bool docked{false};
+  stellar::sim::StationId dockedStationId{0};
 
   // Suggested default origin station (docked/targeted), if any.
   stellar::sim::StationId preferredFromStationId{0};
