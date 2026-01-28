@@ -188,6 +188,42 @@ static double computeCost(const std::unordered_map<SystemId, std::size_t>& idx,
   return sum;
 }
 
+static double computeCostRisk(const std::unordered_map<SystemId, std::size_t>& idx,
+                              const std::vector<SystemStub>& nodes,
+                              const std::vector<SystemId>& route,
+                              double costPerJump,
+                              double costPerLy,
+                              double riskWeightPerLy,
+                              std::span<const double> risk01PerNode) {
+  if (route.size() < 2) return 0.0;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  const bool hasRisk = (risk01PerNode.size() == nodes.size());
+  auto riskAt = [&](std::size_t i) -> double {
+    if (!hasRisk) return 0.0;
+    const double r = risk01PerNode[i];
+    if (r < 0.0) return 0.0;
+    if (r > 1.0) return 1.0;
+    return r;
+  };
+
+  double sum = 0.0;
+  for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+    const auto itA = idx.find(route[i]);
+    const auto itB = idx.find(route[i + 1]);
+    if (itA == idx.end() || itB == idx.end()) break;
+    const std::size_t ia = itA->second;
+    const std::size_t ib = itB->second;
+    const double d = systemDistanceLy(nodes[ia], nodes[ib]);
+    const double avgRisk01 = 0.5 * (riskAt(ia) + riskAt(ib));
+    sum += costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d;
+  }
+  return sum;
+}
+
 struct AStarSolveResult {
   std::vector<SystemId> path;
   RoutePlanStats stats;
@@ -335,6 +371,180 @@ static AStarSolveResult aStarCostSolve(const std::vector<SystemStub>& nodes,
             if (d > maxJumpLy + 1e-9) continue;
 
             const double legCost = costPerJump + costPerLy * d;
+            const double tentative = gScore[cur.i] + legCost;
+
+            if (tentative + 1e-12 < gScore[j]) {
+              gScore[j] = tentative;
+              cameFrom[j] = (int)cur.i;
+              const double f = tentative + heuristic(j);
+              open.push(QN{f, tentative, j});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  out.stats = stats;
+  return out;
+}
+
+static AStarSolveResult aStarCostSolveRisk(const std::vector<SystemStub>& nodes,
+                                          const std::unordered_map<SystemId, std::size_t>& idx,
+                                          const std::unordered_map<CellCoord, std::vector<std::size_t>, CellHash>& grid,
+                                          SystemId startId,
+                                          SystemId goalId,
+                                          double maxJumpLy,
+                                          double costPerJump,
+                                          double costPerLy,
+                                          double riskWeightPerLy,
+                                          std::span<const double> risk01PerNode,
+                                          const std::unordered_set<SystemId>* bannedNodes,
+                                          const std::unordered_set<Edge, EdgeHash>* bannedEdges,
+                                          std::size_t maxExpansions) {
+  AStarSolveResult out{};
+  RoutePlanStats stats{};
+
+  if (startId == 0 || goalId == 0) {
+    out.stats = stats;
+    return out;
+  }
+  if (maxJumpLy <= 0.0) {
+    out.stats = stats;
+    return out;
+  }
+  if (nodes.empty()) {
+    out.stats = stats;
+    return out;
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  if (bannedNodes) {
+    if (bannedNodes->count(startId) != 0) {
+      out.stats = stats;
+      return out;
+    }
+    if (bannedNodes->count(goalId) != 0) {
+      out.stats = stats;
+      return out;
+    }
+  }
+
+  auto itS = idx.find(startId);
+  auto itG = idx.find(goalId);
+  if (itS == idx.end() || itG == idx.end()) {
+    out.stats = stats;
+    return out;
+  }
+
+  const std::size_t start = itS->second;
+  const std::size_t goal  = itG->second;
+  const std::size_t N = nodes.size();
+
+  if (start == goal) {
+    stats.reached = true;
+    stats.hops = 0;
+    stats.distanceLy = 0.0;
+    stats.cost = 0.0;
+    out.stats = stats;
+    out.path = {startId};
+    return out;
+  }
+
+  const bool hasRisk = (risk01PerNode.size() == nodes.size());
+  auto riskAt = [&](std::size_t i) -> double {
+    if (!hasRisk) return 0.0;
+    const double r = risk01PerNode[i];
+    if (r < 0.0) return 0.0;
+    if (r > 1.0) return 1.0;
+    return r;
+  };
+
+  std::vector<int> cameFrom(N, -1);
+  std::vector<double> gScore(N, std::numeric_limits<double>::infinity());
+  std::vector<char> closed(N, 0);
+
+  // Admissible heuristic: ignore risk.
+  auto heuristic = [&](std::size_t i) -> double {
+    if (i == goal) return 0.0;
+    const double d = systemDistanceLy(nodes[i], nodes[goal]);
+    const double minHops = std::ceil(d / maxJumpLy);
+    return minHops * costPerJump + d * costPerLy;
+  };
+
+  struct QN {
+    double f{0.0};
+    double g{0.0};
+    std::size_t i{0};
+  };
+
+  struct Cmp {
+    bool operator()(const QN& a, const QN& b) const {
+      if (a.f != b.f) return a.f > b.f;
+      if (a.g != b.g) return a.g > b.g;
+      return a.i > b.i;
+    }
+  };
+
+  std::priority_queue<QN, std::vector<QN>, Cmp> open;
+  gScore[start] = 0.0;
+  open.push(QN{heuristic(start), 0.0, start});
+
+  std::size_t expansions = 0;
+
+  while (!open.empty() && expansions < maxExpansions) {
+    const QN cur = open.top();
+    open.pop();
+
+    if (closed[cur.i]) continue;
+    closed[cur.i] = 1;
+
+    ++expansions;
+    ++stats.visited;
+    stats.expansions = (int)expansions;
+
+    if (cur.i == goal) {
+      std::vector<SystemId> path;
+      for (int at = (int)goal; at != -1; at = cameFrom[(std::size_t)at]) {
+        path.push_back(nodes[(std::size_t)at].id);
+      }
+      std::reverse(path.begin(), path.end());
+
+      stats.reached = true;
+      stats.hops = path.size() > 0 ? (int)path.size() - 1 : 0;
+      stats.distanceLy = computeDistanceLy(idx, nodes, path);
+      stats.cost = gScore[goal];
+
+      out.path = std::move(path);
+      out.stats = stats;
+      return out;
+    }
+
+    const CellCoord c = cellFor(nodes[cur.i].posLy, maxJumpLy);
+
+    for (long long dx = -1; dx <= 1; ++dx) {
+      for (long long dy = -1; dy <= 1; ++dy) {
+        for (long long dz = -1; dz <= 1; ++dz) {
+          const CellCoord cc{c.x + dx, c.y + dy, c.z + dz};
+          auto it = grid.find(cc);
+          if (it == grid.end()) continue;
+
+          for (const std::size_t j : it->second) {
+            if (j == cur.i) continue;
+            if (closed[j]) continue;
+
+            const SystemId nid = nodes[j].id;
+            if (bannedNodes && bannedNodes->count(nid) != 0) continue;
+            if (bannedEdges && bannedEdges->count(Edge{nodes[cur.i].id, nid}) != 0) continue;
+
+            const double d = systemDistanceLy(nodes[cur.i], nodes[j]);
+            if (d > maxJumpLy + 1e-9) continue;
+
+            const double avgRisk01 = 0.5 * (riskAt(cur.i) + riskAt(j));
+            const double legCost = costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d;
             const double tentative = gScore[cur.i] + legCost;
 
             if (tentative + 1e-12 < gScore[j]) {
@@ -624,6 +834,172 @@ std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
             if (d > maxJumpLy + 1e-9) continue;
 
             const double legCost = costPerJump + costPerLy * d;
+            const double tentative = gScore[cur.i] + legCost;
+
+            if (tentative + 1e-12 < gScore[j]) {
+              gScore[j] = tentative;
+              cameFrom[j] = (int)cur.i;
+              const double f = tentative + heuristic(j);
+              open.push(QN{f, tentative, j});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  setStats(outStats, stats);
+  return {};
+}
+
+std::vector<SystemId> plotRouteAStarCostRisk(const std::vector<SystemStub>& nodes,
+                                            SystemId startId,
+                                            SystemId goalId,
+                                            double maxJumpLy,
+                                            double costPerJump,
+                                            double costPerLy,
+                                            double riskWeightPerLy,
+                                            std::span<const double> risk01PerNode,
+                                            RoutePlanStats* outStats,
+                                            std::size_t maxExpansions) {
+  RoutePlanStats stats{};
+
+  if (riskWeightPerLy <= 0.0) {
+    return plotRouteAStarCost(nodes, startId, goalId, maxJumpLy, costPerJump, costPerLy, outStats, maxExpansions);
+  }
+
+  if (startId == 0 || goalId == 0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (maxJumpLy <= 0.0) {
+    setStats(outStats, stats);
+    return {};
+  }
+  if (nodes.empty()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  // Degenerate: no optimization signal. Fall back to hop planner.
+  if (costPerJump <= 0.0 && costPerLy <= 0.0 && riskWeightPerLy <= 0.0) {
+    return plotRouteAStarHops(nodes, startId, goalId, maxJumpLy, outStats, maxExpansions);
+  }
+
+  const auto idx = buildIndex(nodes);
+  auto itS = idx.find(startId);
+  auto itG = idx.find(goalId);
+  if (itS == idx.end() || itG == idx.end()) {
+    setStats(outStats, stats);
+    return {};
+  }
+
+  const std::size_t start = itS->second;
+  const std::size_t goal  = itG->second;
+  const std::size_t N = nodes.size();
+
+  if (start == goal) {
+    stats.reached = true;
+    stats.hops = 0;
+    stats.distanceLy = 0.0;
+    stats.cost = 0.0;
+    setStats(outStats, stats);
+    return {startId};
+  }
+
+  const bool hasRisk = (risk01PerNode.size() == nodes.size());
+  auto riskAt = [&](std::size_t i) -> double {
+    if (!hasRisk) return 0.0;
+    const double r = risk01PerNode[i];
+    if (r < 0.0) return 0.0;
+    if (r > 1.0) return 1.0;
+    return r;
+  };
+
+  // Spatial hash grid for neighbor queries.
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  std::vector<int> cameFrom(N, -1);
+  std::vector<double> gScore(N, std::numeric_limits<double>::infinity());
+  std::vector<char> closed(N, 0);
+
+  // Admissible heuristic: ignore risk.
+  auto heuristic = [&](std::size_t i) -> double {
+    if (i == goal) return 0.0;
+    const double d = systemDistanceLy(nodes[i], nodes[goal]);
+    const double minHops = std::ceil(d / maxJumpLy);
+    return minHops * costPerJump + d * costPerLy;
+  };
+
+  struct QN {
+    double f{0.0};
+    double g{0.0};
+    std::size_t i{0};
+  };
+
+  struct Cmp {
+    bool operator()(const QN& a, const QN& b) const {
+      if (a.f != b.f) return a.f > b.f;
+      if (a.g != b.g) return a.g > b.g;
+      return a.i > b.i;
+    }
+  };
+
+  std::priority_queue<QN, std::vector<QN>, Cmp> open;
+  gScore[start] = 0.0;
+  open.push(QN{heuristic(start), 0.0, start});
+
+  std::size_t expansions = 0;
+
+  while (!open.empty() && expansions < maxExpansions) {
+    const QN cur = open.top();
+    open.pop();
+
+    if (closed[cur.i]) continue;
+    closed[cur.i] = 1;
+
+    ++expansions;
+    ++stats.visited;
+    stats.expansions = (int)expansions;
+
+    if (cur.i == goal) {
+      std::vector<SystemId> path;
+      for (int at = (int)goal; at != -1; at = cameFrom[(std::size_t)at]) {
+        path.push_back(nodes[(std::size_t)at].id);
+      }
+      std::reverse(path.begin(), path.end());
+
+      stats.reached = true;
+      stats.hops = path.size() > 0 ? (int)path.size() - 1 : 0;
+      stats.distanceLy = routeDistanceLy(nodes, path);
+      stats.cost = gScore[goal];
+
+      setStats(outStats, stats);
+      return path;
+    }
+
+    const CellCoord c = cellFor(nodes[cur.i].posLy, maxJumpLy);
+
+    for (long long dx = -1; dx <= 1; ++dx) {
+      for (long long dy = -1; dy <= 1; ++dy) {
+        for (long long dz = -1; dz <= 1; ++dz) {
+          const CellCoord cc{c.x + dx, c.y + dy, c.z + dz};
+          auto it = grid.find(cc);
+          if (it == grid.end()) continue;
+
+          for (const std::size_t j : it->second) {
+            if (j == cur.i) continue;
+            if (closed[j]) continue;
+
+            const double d = systemDistanceLy(nodes[cur.i], nodes[j]);
+            if (d > maxJumpLy + 1e-9) continue;
+
+            const double avgRisk01 = 0.5 * (riskAt(cur.i) + riskAt(j));
+            const double legCost = costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d;
             const double tentative = gScore[cur.i] + legCost;
 
             if (tentative + 1e-12 < gScore[j]) {
@@ -946,6 +1322,153 @@ std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
   return out;
 }
 
+std::vector<KRoute> plotKRoutesAStarCostRisk(const std::vector<SystemStub>& nodes,
+                                            SystemId startId,
+                                            SystemId goalId,
+                                            double maxJumpLy,
+                                            double costPerJump,
+                                            double costPerLy,
+                                            double riskWeightPerLy,
+                                            std::span<const double> risk01PerNode,
+                                            std::size_t k,
+                                            std::size_t maxExpansionsPerSolve) {
+  if (riskWeightPerLy <= 0.0) {
+    return plotKRoutesAStarCost(nodes, startId, goalId, maxJumpLy, costPerJump, costPerLy, k, maxExpansionsPerSolve);
+  }
+
+  std::vector<KRoute> out;
+  if (k == 0) return out;
+
+  if (startId == 0 || goalId == 0) return out;
+  if (maxJumpLy <= 0.0) return out;
+  if (nodes.empty()) return out;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  // Degenerate: if nothing contributes to cost, treat as hop-minimizing.
+  if (costPerJump <= 0.0 && costPerLy <= 0.0 && riskWeightPerLy <= 0.0) {
+    costPerJump = 1.0;
+    costPerLy = 0.0;
+  }
+
+  const auto idx = buildIndex(nodes);
+  if (idx.find(startId) == idx.end() || idx.find(goalId) == idx.end()) return out;
+
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  // First shortest path.
+  {
+    const auto base = aStarCostSolveRisk(nodes, idx, grid, startId, goalId, maxJumpLy,
+                                        costPerJump, costPerLy, riskWeightPerLy, risk01PerNode,
+                                        nullptr, nullptr,
+                                        maxExpansionsPerSolve);
+    if (base.path.empty()) return out;
+    out.push_back(KRoute{base.path, base.stats.hops, base.stats.distanceLy, base.stats.cost});
+  }
+
+  struct Candidate {
+    std::vector<SystemId> path;
+    int hops{0};
+    double distanceLy{0.0};
+    double cost{0.0};
+  };
+
+  const auto containsPath = [](const std::vector<KRoute>& routes, const std::vector<SystemId>& p) {
+    for (const auto& r : routes) {
+      if (r.path == p) return true;
+    }
+    return false;
+  };
+
+  const auto containsPathCand = [](const std::vector<Candidate>& cands, const std::vector<SystemId>& p) {
+    for (const auto& c : cands) {
+      if (c.path == p) return true;
+    }
+    return false;
+  };
+
+  const auto betterCand = [](const Candidate& a, const Candidate& b) {
+    const double da = a.cost;
+    const double db = b.cost;
+    if (std::abs(da - db) > 1e-12) return da < db;
+    return pathLexLess(a.path, b.path);
+  };
+
+  std::vector<Candidate> candidates;
+
+  // Yen's algorithm:
+  //  - out[0] is the shortest.
+  //  - candidates holds the next-best deviations.
+  for (std::size_t kth = 1; kth < k; ++kth) {
+    const auto& prev = out[kth - 1].path;
+    if (prev.size() < 2) break;
+
+    for (std::size_t i = 0; i + 1 < prev.size(); ++i) {
+      const SystemId spurNode = prev[i];
+
+      // Root path includes spur node.
+      std::vector<SystemId> root(prev.begin(), prev.begin() + (long long)i + 1);
+
+      // Ban nodes in the root path *except* the spur node to enforce loopless paths.
+      std::unordered_set<SystemId> bannedNodes;
+      bannedNodes.reserve(i);
+      for (std::size_t r = 0; r < i; ++r) bannedNodes.insert(root[r]);
+
+      // Ban edges that would recreate any previously found shortest path with this root.
+      std::unordered_set<Edge, EdgeHash> bannedEdges;
+      for (const auto& found : out) {
+        const auto& p = found.path;
+        if (p.size() > i + 1 && pathHasPrefix(p, root)) {
+          bannedEdges.insert(Edge{p[i], p[i + 1]});
+        }
+      }
+
+      const auto spur = aStarCostSolveRisk(nodes, idx, grid,
+                                          spurNode, goalId,
+                                          maxJumpLy,
+                                          costPerJump, costPerLy, riskWeightPerLy, risk01PerNode,
+                                          &bannedNodes,
+                                          &bannedEdges,
+                                          maxExpansionsPerSolve);
+
+      if (spur.path.empty()) continue;
+
+      // Combine root + spur (skip spurNode duplicate).
+      std::vector<SystemId> total = root;
+      if (spur.path.size() > 1) {
+        total.insert(total.end(), spur.path.begin() + 1, spur.path.end());
+      }
+
+      if (total.size() < 2) continue;
+      if (containsPath(out, total)) continue;
+      if (containsPathCand(candidates, total)) continue;
+
+      const double dist = computeDistanceLy(idx, nodes, total);
+      const double cst  = computeCostRisk(idx, nodes, total, costPerJump, costPerLy, riskWeightPerLy, risk01PerNode);
+
+      const int hops = (int)total.size() - 1;
+      candidates.push_back(Candidate{std::move(total), hops, dist, cst});
+    }
+
+    if (candidates.empty()) break;
+
+    // Pick the best candidate.
+    std::size_t bestIdx = 0;
+    for (std::size_t i = 1; i < candidates.size(); ++i) {
+      if (betterCand(candidates[i], candidates[bestIdx])) bestIdx = i;
+    }
+
+    Candidate best = std::move(candidates[bestIdx]);
+    candidates.erase(candidates.begin() + (long long)bestIdx);
+
+    out.push_back(KRoute{std::move(best.path), best.hops, best.distanceLy, best.cost});
+  }
+
+  return out;
+}
+
 std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         SystemId startId,
                                         SystemId goalId,
@@ -989,6 +1512,44 @@ double routeCost(const std::vector<SystemStub>& nodes,
     if (itA == idx.end() || itB == idx.end()) break;
     const double d = systemDistanceLy(nodes[itA->second], nodes[itB->second]);
     sum += costPerJump + costPerLy * d;
+  }
+  return sum;
+}
+
+double routeCostRisk(const std::vector<SystemStub>& nodes,
+                     const std::vector<SystemId>& route,
+                     double costPerJump,
+                     double costPerLy,
+                     double riskWeightPerLy,
+                     std::span<const double> risk01PerNode) {
+  if (route.size() < 2) return 0.0;
+
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  const bool hasRisk = (risk01PerNode.size() == nodes.size());
+  auto riskAt = [&](std::size_t i) -> double {
+    if (!hasRisk) return 0.0;
+    const double r = risk01PerNode[i];
+    if (r < 0.0) return 0.0;
+    if (r > 1.0) return 1.0;
+    return r;
+  };
+
+  const auto idx = buildIndex(nodes);
+
+  double sum = 0.0;
+  for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+    const auto itA = idx.find(route[i]);
+    const auto itB = idx.find(route[i + 1]);
+    if (itA == idx.end() || itB == idx.end()) break;
+
+    const std::size_t ia = itA->second;
+    const std::size_t ib = itB->second;
+    const double d = systemDistanceLy(nodes[ia], nodes[ib]);
+    const double avgRisk01 = 0.5 * (riskAt(ia) + riskAt(ib));
+    sum += costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d;
   }
   return sum;
 }

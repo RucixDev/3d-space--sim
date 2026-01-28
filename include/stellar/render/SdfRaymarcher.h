@@ -54,16 +54,12 @@ struct SdfRaymarchSettings {
   // Canonical colors: baseColor / backgroundColor.
   // Legacy aliases: lightColor / ambientColor / fogColor.
   union {
-    struct {
-      float baseColor[3]{0.85f, 0.9f, 1.0f};
-    };
+    float baseColor[3]{0.85f, 0.9f, 1.0f};
     float lightColor[3];
     float ambientColor[3];
   };
   union {
-    struct {
-      float backgroundColor[3]{0.02f, 0.03f, 0.05f};
-    };
+    float backgroundColor[3]{0.02f, 0.03f, 0.05f};
     float fogColor[3];
   };
 

@@ -272,6 +272,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Universe.cpp
   src/sim/NavRoute.cpp
   src/sim/NavRouteBatch.cpp
+  src/sim/NavRisk.cpp
   src/sim/MissionAssist.cpp
   src/sim/MissionBriefing.cpp
   src/sim/MissionPlanner.cpp
@@ -420,6 +421,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/OrbitAnalyzerWindow.cpp
     apps/stellar_game/TrafficLanesWindow.cpp
     apps/stellar_game/SystemConditionsWindow.cpp
+    apps/stellar_game/GalNetInboxWindow.cpp
     apps/stellar_game/PorkchopPlot.cpp
     apps/stellar_game/ProceduralLabWindow.cpp
     apps/stellar_game/ProceduralFluidLabWindow.cpp

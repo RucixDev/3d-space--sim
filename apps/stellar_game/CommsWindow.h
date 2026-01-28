@@ -5,10 +5,13 @@
 #include "stellar/sim/CargoJettisonPlanner.h"
 
 #include <functional>
+#include <span>
 
 namespace stellar::sim {
 class Universe;
 struct StarSystem;
+struct FactionReputation;
+struct SystemSecurityDeltaState;
 } // namespace stellar::sim
 
 namespace stellar::game {
@@ -148,6 +151,11 @@ struct CommsWindowContext {
   std::function<void()> actSecurityComplyOrSubmit;
   std::function<void(bool allowMissionCargo)> actPirateAutoJettison;
   std::function<void()> actPirateRefuse;
+
+  // Optional inputs for risk-aware travel/intel helpers.
+  double maxJumpLy{0.0};
+  std::span<const sim::FactionReputation> playerRepWithFaction{};
+  std::span<const sim::SystemSecurityDeltaState> securityDeltas{};
 
   // Hotkey display strings (e.g. "C", "I"). Purely cosmetic.
   std::string securityBribeChord;

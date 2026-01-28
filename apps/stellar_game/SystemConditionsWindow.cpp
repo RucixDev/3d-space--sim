@@ -133,6 +133,17 @@ void drawSystemConditionsWindow(SystemConditionsWindowState& st, const SystemCon
     ImGui::SameLine();
     ImGui::Checkbox("Toast##galnet_watch_toast", &st.galNetWatchedShowToast);
 
+    if (st.galNetAutoBroadcastWatched) {
+      ImGui::Indent();
+      ImGui::Checkbox("Watched: send digest (one msg / cycle)", &st.galNetWatchedDigest);
+      if (st.galNetWatchedDigest) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::SliderInt("Max items##galnet_digest_max", &st.galNetWatchedDigestMaxItems, 3, 32);
+      }
+      ImGui::Unindent();
+    }
+
     ImGui::Checkbox("Broadcast event ends", &st.galNetBroadcastEventEnds);
 
     ImGui::SetNextItemWidth(220.0f);

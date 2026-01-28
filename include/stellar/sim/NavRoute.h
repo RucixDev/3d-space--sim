@@ -3,6 +3,7 @@
 #include "stellar/sim/Celestial.h"
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,32 @@ std::vector<SystemId> plotRouteAStarCost(const std::vector<SystemStub>& nodes,
                                         RoutePlanStats* outStats = nullptr,
                                         std::size_t maxExpansions = 250000);
 
+// A* route planner with an additional travel-risk penalty.
+//
+// Cost model:
+//   baseLeg = costPerJump + costPerLy * d
+//   riskLeg = riskWeightPerLy * avgRisk01 * d
+//   legCost = baseLeg + riskLeg
+//
+// where avgRisk01 is 0.5*(risk[a] + risk[b]) for the segment endpoints and
+// `risk01PerNode[i]` corresponds to nodes[i].
+//
+// Notes:
+//  - riskWeightPerLy is a *cost per ly* scaling factor; higher values bias toward
+//    safer routes (potentially longer / more hops).
+//  - The heuristic ignores risk (still admissible) which keeps behavior stable
+//    even if the risk model changes.
+std::vector<SystemId> plotRouteAStarCostRisk(const std::vector<SystemStub>& nodes,
+                                            SystemId startId,
+                                            SystemId goalId,
+                                            double maxJumpLy,
+                                            double costPerJump,
+                                            double costPerLy,
+                                            double riskWeightPerLy,
+                                            std::span<const double> risk01PerNode,
+                                            RoutePlanStats* outStats = nullptr,
+                                            std::size_t maxExpansions = 250000);
+
 
 // A* route planner with additional hazard penalty.
 // Hazard cost is computed as: hazardWeightPerLy * avgNavDisruption01 * segmentDistanceLy
@@ -95,6 +122,19 @@ std::vector<KRoute> plotKRoutesAStarCost(const std::vector<SystemStub>& nodes,
                                         std::size_t k,
                                         std::size_t maxExpansionsPerSolve = 250000);
 
+// K-shortest routes variant using the risk-augmented leg cost model.
+// See plotRouteAStarCostRisk() for the cost definition.
+std::vector<KRoute> plotKRoutesAStarCostRisk(const std::vector<SystemStub>& nodes,
+                                            SystemId startId,
+                                            SystemId goalId,
+                                            double maxJumpLy,
+                                            double costPerJump,
+                                            double costPerLy,
+                                            double riskWeightPerLy,
+                                            std::span<const double> risk01PerNode,
+                                            std::size_t k,
+                                            std::size_t maxExpansionsPerSolve = 250000);
+
 // Convenience wrapper for hop-minimizing K-shortest paths.
 std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         SystemId startId,
@@ -114,6 +154,15 @@ double routeCost(const std::vector<SystemStub>& nodes,
                  const std::vector<SystemId>& route,
                  double costPerJump,
                  double costPerLy);
+
+// Helper: total cost of a route using the risk-augmented model.
+// Returns 0 for empty/single-node routes.
+double routeCostRisk(const std::vector<SystemStub>& nodes,
+                     const std::vector<SystemId>& route,
+                     double costPerJump,
+                     double costPerLy,
+                     double riskWeightPerLy,
+                     std::span<const double> risk01PerNode);
 
 // Helper: validate that a route is contiguous (each hop <= maxJumpLy) and that all ids exist.
 // Useful for tests/tooling.

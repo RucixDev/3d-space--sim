@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +25,7 @@ struct NavRouteBatch {
   double maxJumpLy{0.0};
   double costPerJump{0.0};
   double costPerLy{0.0};
+  double riskWeightPerLy{0.0};
 
   // Maps SystemId -> index into the input `nodes` vector used for the solve.
   std::unordered_map<SystemId, std::size_t> index;
@@ -82,6 +84,21 @@ NavRouteBatch computeNavRouteBatchCost(const std::vector<SystemStub>& nodes,
                                       double costPerJump,
                                       double costPerLy,
                                       std::size_t maxExpansions = 250000);
+
+// Risk-aware variant.
+//
+// cost model: legCost = costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d
+// where avgRisk01 is the average of the endpoint risk values for the leg.
+//
+// If risk01PerNode.size() != nodes.size(), all risks are treated as 0.
+NavRouteBatch computeNavRouteBatchCostRisk(const std::vector<SystemStub>& nodes,
+                                          SystemId startId,
+                                          double maxJumpLy,
+                                          double costPerJump,
+                                          double costPerLy,
+                                          double riskWeightPerLy,
+                                          std::span<const double> risk01PerNode,
+                                          std::size_t maxExpansions = 250000);
 
 // Convenience wrappers.
 inline NavRouteBatch computeNavRouteBatchHops(const std::vector<SystemStub>& nodes,

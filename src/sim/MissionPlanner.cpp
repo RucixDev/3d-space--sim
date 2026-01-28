@@ -2,6 +2,7 @@
 
 #include "stellar/sim/MissionBriefing.h"
 #include "stellar/sim/NavRouteBatch.h"
+#include "stellar/sim/NavRisk.h"
 #include "stellar/sim/Universe.h"
 
 #include <algorithm>
@@ -220,6 +221,9 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
       MissionBriefingParams bp{};
       bp.useMarkup = false;
       bp.includeRiskHints = false;
+      // Keep planner risk in sync with the universe tuning knobs.
+      bp.dynamicsParams = universe.systemSecurityDynamicsParams();
+      bp.eventParams = universe.systemEventParams();
       const auto r = computeMissionRisk(universe, *originSys, *originSt, timeDays, rep, m, securityDeltas, bp);
       risk01 = clamp01(r.overall01);
     }
@@ -288,11 +292,31 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
       nodes.push_back(universe.getSystem(curId).stub);
     }
 
-    const auto batch = computeNavRouteBatchCost(nodes,
-                                               curId,
-                                               maxJumpLy,
-                                               params.costPerJump,
-                                               params.costPerLy);
+    // Batch routes from the current system to all nearby nodes.
+    NavRouteBatch batch{};
+    std::vector<double> nodeRisk01;
+
+    if (params.navRiskWeightPerLy > 1e-9) {
+      // Build a travel-risk vector aligned with the queried node list.
+      NavRiskParams rp{};
+      rp.dynamicsParams = universe.systemSecurityDynamicsParams();
+      rp.eventParams = universe.systemEventParams();
+      nodeRisk01 = computeNavRisk01ForNodes(universe, nodes, etaNowDay, securityDeltas, rp);
+
+      batch = computeNavRouteBatchCostRisk(nodes,
+                                           curId,
+                                           maxJumpLy,
+                                           params.costPerJump,
+                                           params.costPerLy,
+                                           params.navRiskWeightPerLy,
+                                           nodeRisk01);
+    } else {
+      batch = computeNavRouteBatchCost(nodes,
+                                      curId,
+                                      maxJumpLy,
+                                      params.costPerJump,
+                                      params.costPerLy);
+    }
 
     // Choose the best candidate.
     int bestIdx = -1;
@@ -392,6 +416,7 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
     }
 
     out.totalCost += bestCost;
+    out.totalRewardCr += s.rewardCr;
     out.totalHops += bestHops;
     out.totalDistanceLy += bestDist;
     if (!bestReach) out.unreachableStops += 1;

@@ -92,6 +92,7 @@ stellar::core::u64 computePlanCacheKey(const MissionControlWindowState& st,
   h = stellar::core::hashCombine(h, q(st.rewardWeight, 1000.0));
   h = stellar::core::hashCombine(h, q(st.riskWeight, 1000.0));
   h = stellar::core::hashCombine(h, q(st.urgencyWeight, 1000.0));
+  h = stellar::core::hashCombine(h, q(st.navRiskWeightPerLy, 1000.0));
 
   // ETA model.
   h = stellar::core::hashCombine(h, (stellar::core::u64)(st.etaAwareUrgency ? 1 : 0));
@@ -294,6 +295,13 @@ void drawMissionControlWindow(MissionControlWindowState& st, const MissionContro
       ImGui::Combo("Route", &st.routeMode,
                    "Min hops\0"
                    "Min distance\0\0");
+
+      ImGui::SetNextItemWidth(180);
+      sliderDouble("Route safety", &st.navRiskWeightPerLy, 0.0, 2.0, "%.2f");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("0 disables. Higher values prefer safer routes by adding a risk penalty per LY.\n"
+                          "This only affects inter-system routing (not mission risk scoring).");
+      }
 
       ImGui::SetNextItemWidth(180);
       ImGui::SliderInt("Max stops", &st.maxStops, 1, 32);
@@ -544,6 +552,8 @@ void drawMissionControlWindow(MissionControlWindowState& st, const MissionContro
           pp.costPerJump = 1.0;
           pp.costPerLy = 0.0;
         }
+
+        pp.navRiskWeightPerLy = st.navRiskWeightPerLy;
 
         st.plan = stellar::sim::planMissionItinerary(ctx.universe,
                                                     *ctx.currentSystem,

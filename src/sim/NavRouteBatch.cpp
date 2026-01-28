@@ -91,6 +91,7 @@ NavRouteBatch computeNavRouteBatchCost(const std::vector<SystemStub>& nodes,
   out.maxJumpLy = maxJumpLy;
   out.costPerJump = costPerJump;
   out.costPerLy = costPerLy;
+  out.riskWeightPerLy = 0.0;
 
   out.index = buildIndex(nodes);
   const auto itS = out.index.find(startId);
@@ -164,6 +165,155 @@ NavRouteBatch computeNavRouteBatchCost(const std::vector<SystemStub>& nodes,
             if (d > maxJumpLy + 1e-9) continue;
 
             const double legCost = costPerJump + costPerLy * d;
+            const double tentative = out.bestCost[cur.i] + legCost;
+            const int tentativeHops = out.hops[cur.i] + 1;
+            const double tentativeDist = out.distanceLy[cur.i] + d;
+
+            bool better = (tentative + 1e-12 < out.bestCost[j]);
+            const bool tie = (!better && std::abs(tentative - out.bestCost[j]) <= 1e-12);
+
+            if (tie) {
+              // Deterministic tie-break:
+              //  1) prefer fewer hops
+              //  2) then prefer smaller parent SystemId
+              if (tentativeHops < out.hops[j]) {
+                better = true;
+              } else if (tentativeHops == out.hops[j]) {
+                const SystemId newParent = nodes[cur.i].id;
+                SystemId oldParent = std::numeric_limits<SystemId>::max();
+                if (out.parent[j] >= 0) oldParent = nodes[(std::size_t)out.parent[j]].id;
+                if (newParent < oldParent) better = true;
+              }
+            }
+
+            if (better) {
+              out.bestCost[j] = tentative;
+              out.parent[j] = (int)cur.i;
+              out.hops[j] = tentativeHops;
+              out.distanceLy[j] = tentativeDist;
+              open.push(QN{tentative, tentativeHops, j});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  out.stats.expansions = expansions;
+  out.stats.visited = visited;
+  return out;
+}
+
+NavRouteBatch computeNavRouteBatchCostRisk(const std::vector<SystemStub>& nodes,
+                                          SystemId startId,
+                                          double maxJumpLy,
+                                          double costPerJump,
+                                          double costPerLy,
+                                          double riskWeightPerLy,
+                                          std::span<const double> risk01PerNode,
+                                          std::size_t maxExpansions) {
+  NavRouteBatch out{};
+
+  if (startId == 0) return out;
+  if (maxJumpLy <= 0.0) return out;
+  if (nodes.empty()) return out;
+
+  if (!std::isfinite(costPerJump)) costPerJump = 0.0;
+  if (!std::isfinite(costPerLy)) costPerLy = 0.0;
+  if (!std::isfinite(riskWeightPerLy)) riskWeightPerLy = 0.0;
+  if (costPerJump < 0.0) costPerJump = 0.0;
+  if (costPerLy < 0.0) costPerLy = 0.0;
+  if (riskWeightPerLy < 0.0) riskWeightPerLy = 0.0;
+
+  out.startId = startId;
+  out.maxJumpLy = maxJumpLy;
+  out.costPerJump = costPerJump;
+  out.costPerLy = costPerLy;
+  out.riskWeightPerLy = riskWeightPerLy;
+
+  const bool hasRisk = (risk01PerNode.size() == nodes.size());
+  auto riskAt = [&](std::size_t i) -> double {
+    if (!hasRisk) return 0.0;
+    const double r = risk01PerNode[i];
+    if (!std::isfinite(r)) return 0.0;
+    if (r < 0.0) return 0.0;
+    if (r > 1.0) return 1.0;
+    return r;
+  };
+
+  out.index = buildIndex(nodes);
+  const auto itS = out.index.find(startId);
+  if (itS == out.index.end()) {
+    // Caller did not include startId in nodes.
+    return out;
+  }
+
+  const std::size_t start = itS->second;
+  const std::size_t N = nodes.size();
+
+  out.parent.assign(N, -1);
+  out.bestCost.assign(N, std::numeric_limits<double>::infinity());
+  out.hops.assign(N, std::numeric_limits<int>::max());
+  out.distanceLy.assign(N, std::numeric_limits<double>::infinity());
+
+  std::vector<char> closed(N, 0);
+  const auto grid = buildGrid(nodes, maxJumpLy);
+
+  struct QN {
+    double g{0.0};
+    int hops{0};
+    std::size_t i{0};
+  };
+
+  struct Cmp {
+    bool operator()(const QN& a, const QN& b) const {
+      // min-heap behavior via reversed comparator
+      if (a.g != b.g) return a.g > b.g;
+      if (a.hops != b.hops) return a.hops > b.hops;
+      return a.i > b.i;
+    }
+  };
+
+  std::priority_queue<QN, std::vector<QN>, Cmp> open;
+
+  out.bestCost[start] = 0.0;
+  out.hops[start] = 0;
+  out.distanceLy[start] = 0.0;
+  open.push(QN{0.0, 0, start});
+
+  int expansions = 0;
+  int visited = 0;
+
+  while (!open.empty() && (std::size_t)expansions < maxExpansions) {
+    const QN cur = open.top();
+    open.pop();
+
+    if (closed[cur.i]) continue;
+    closed[cur.i] = 1;
+    ++expansions;
+    ++visited;
+
+    const CellCoord c = cellFor(nodes[cur.i].posLy, maxJumpLy);
+
+    for (long long dx = -1; dx <= 1; ++dx) {
+      for (long long dy = -1; dy <= 1; ++dy) {
+        for (long long dz = -1; dz <= 1; ++dz) {
+          const CellCoord cc{c.x + dx, c.y + dy, c.z + dz};
+          auto it = grid.find(cc);
+          if (it == grid.end()) continue;
+
+          for (const std::size_t j : it->second) {
+            if (j == cur.i) continue;
+            if (closed[j]) continue;
+
+            const SystemId nid = nodes[j].id;
+            if (nid == 0) continue;
+
+            const double d = systemDistanceLy(nodes[cur.i], nodes[j]);
+            if (d > maxJumpLy + 1e-9) continue;
+
+            const double avgRisk01 = 0.5 * (riskAt(cur.i) + riskAt(j));
+            const double legCost = costPerJump + costPerLy * d + riskWeightPerLy * avgRisk01 * d;
             const double tentative = out.bestCost[cur.i] + legCost;
             const int tentativeHops = out.hops[cur.i] + 1;
             const double tentativeDist = out.distanceLy[cur.i] + d;

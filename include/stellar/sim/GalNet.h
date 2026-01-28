@@ -32,6 +32,12 @@ namespace stellar::sim {
 struct GalNetAnnounceState {
   double lastCycleStartDay{-1.0};
   bool lastCycleHadActiveEvent{false};
+
+  // Bookkeeping for richer UI/analytics.
+  // These are not persisted; they simply track the most recently observed
+  // active event for this system so callers can label "event ended" updates.
+  SystemEventKind lastActiveEventKind{SystemEventKind::None};
+  double lastActiveEventSeverity01{0.0};
 };
 
 struct GalNetAutoBroadcastDecision {
@@ -105,5 +111,42 @@ GalNetBulletinResult makeGalNetBulletin(const Universe& universe,
                                         double timeDays,
                                         std::string_view contextTag = {},
                                         bool allowWhenNoEvent = false);
+
+// -----------------------------------------------------------------------------
+// Watchlist digest (multi-system)
+// -----------------------------------------------------------------------------
+
+// A compact multi-system bulletin intended to reduce Comms spam when watching
+// many systems.
+//
+// This is a pure helper that does *not* update GalNetAnnounceState. The game
+// layer should decide which systems to include (typically those that triggered
+// a publish decision on the current cycle boundary).
+struct GalNetDigestParams {
+  // Maximum number of systems listed in the digest body.
+  // If more systems are supplied, the digest truncates and notes the remainder.
+  int maxItems{10};
+
+  // Filter active events below this severity.
+  // Inactive systems are still included (status updates), since the digest is
+  // often used for "event ended" notifications.
+  double minSeverity01{0.0};
+
+  // If true, sort active events first by severity descending. Inactive updates
+  // are listed last.
+  bool sortBySeverity{true};
+};
+
+// Compose a single GalNet digest bulletin covering multiple systems.
+//
+// - systems: list of system ids to summarize (duplicates are ignored).
+// - allowWhenNoEvent is implied: inactive systems are included as "status
+//   updates".
+// - contextTag is optional text shown at the top of the bulletin.
+GalNetBulletinResult makeGalNetDigestBulletin(const Universe& universe,
+                                              const std::vector<SystemId>& systems,
+                                              double timeDays,
+                                              const GalNetDigestParams& params = {},
+                                              std::string_view contextTag = {});
 
 } // namespace stellar::sim

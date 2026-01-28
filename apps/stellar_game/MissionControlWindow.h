@@ -27,6 +27,10 @@ struct MissionControlWindowState {
   bool groupBySystem{false};
   int routeMode{0}; // 0=hops, 1=distance
 
+  // When > 0, prefer safer inter-system routes by adding a risk penalty per LY.
+  // (See sim::MissionItineraryParams::navRiskWeightPerLy)
+  double navRiskWeightPerLy{0.0};
+
   double maxJumpLyOverride{0.0}; // 0 => use ctx.maxJumpLy
   double queryRadiusLy{0.0};     // 0 => auto
   int maxSystems{1800};

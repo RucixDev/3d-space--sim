@@ -42,6 +42,13 @@ GalNetAutoBroadcastDecision galNetMaybeAutoBroadcast(GalNetAnnounceState& ioStat
   // Update tracking even if autoEnabled is off, to avoid retroactive spam when enabling.
   ioState.lastCycleStartDay = ev.startDay;
   ioState.lastCycleHadActiveEvent = ev.active;
+
+  // Record the most recently observed active event so callers can label
+  // "event ended" updates in digests/UI.
+  if (ev.active) {
+    ioState.lastActiveEventKind = ev.kind;
+    ioState.lastActiveEventSeverity01 = std::clamp(ev.severity01, 0.0, 1.0);
+  }
   return d;
 }
 
@@ -264,6 +271,178 @@ GalNetBulletinResult makeGalNetBulletin(const Universe& universe,
                             /*controllingFactionName=*/factionName,
                             contextTag,
                             allowWhenNoEvent);
+}
+
+GalNetBulletinResult makeGalNetDigestBulletin(const Universe& universe,
+                                              const std::vector<SystemId>& systems,
+                                              double timeDays,
+                                              const GalNetDigestParams& params,
+                                              std::string_view contextTag) {
+  GalNetBulletinResult r{};
+
+  if (!std::isfinite(timeDays)) timeDays = 0.0;
+
+  // Defensive clamping.
+  GalNetDigestParams p = params;
+  p.maxItems = std::clamp(p.maxItems, 1, 64);
+  if (!std::isfinite(p.minSeverity01)) p.minSeverity01 = 0.0;
+  p.minSeverity01 = std::clamp(p.minSeverity01, 0.0, 1.0);
+
+  std::vector<SystemId> uniq = systems;
+  uniq.erase(std::remove(uniq.begin(), uniq.end(), SystemId{0}), uniq.end());
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+  if (uniq.empty()) {
+    r.ok = false;
+    r.reason = "No systems provided.";
+    return r;
+  }
+
+  struct Row {
+    SystemId id{0};
+    std::string name{};
+    std::string controllingFaction{};
+    bool active{false};
+    SystemEventKind kind{SystemEventKind::None};
+    double severity01{0.0};
+    int secPct{0};
+    int pirPct{0};
+    int trfPct{0};
+    int dSecPct{0};
+    int dPirPct{0};
+    int dTrfPct{0};
+    double endsInDays{0.0};
+    double importance01{0.25};
+  };
+
+  std::vector<Row> rows;
+  rows.reserve(uniq.size());
+
+  for (const auto sysId : uniq) {
+    const StarSystem& sys = universe.getSystem(sysId);
+
+    const SystemSecurityDeltaState* delta = nullptr;
+    if (const auto* map = universe.systemSecurityDeltaMap()) {
+      auto it = map->find(sysId);
+      if (it != map->end()) delta = &it->second;
+    }
+
+    const SystemConditionsSnapshot snap = snapshotSystemConditions(
+        universe.seed(),
+        sys,
+        timeDays,
+        delta,
+        universe.systemSecurityDynamicsParams(),
+        universe.systemEventParams());
+
+    const double sev = std::clamp(snap.event.severity01, 0.0, 1.0);
+    if (snap.event.active && (sev + 1e-9 < p.minSeverity01)) {
+      // Skip low-severity active events. Inactive status updates remain.
+      continue;
+    }
+
+    const int baseSec = pct01(snap.base.security01);
+    const int basePir = pct01(snap.base.piracy01);
+    const int baseTrf = pct01(snap.base.traffic01);
+    const int effSec = pct01(snap.effective.security01);
+    const int effPir = pct01(snap.effective.piracy01);
+    const int effTrf = pct01(snap.effective.traffic01);
+
+    Row row{};
+    row.id = sysId;
+    row.name = sys.stub.name;
+    row.controllingFaction = factionNameOrId(snap.base.controllingFactionId, universe.factions());
+    row.active = snap.event.active;
+    row.kind = snap.event.kind;
+    row.severity01 = sev;
+    row.secPct = effSec;
+    row.pirPct = effPir;
+    row.trfPct = effTrf;
+    row.dSecPct = effSec - baseSec;
+    row.dPirPct = effPir - basePir;
+    row.dTrfPct = effTrf - baseTrf;
+    row.endsInDays = snap.event.endDay - timeDays;
+    row.importance01 = row.active ? row.severity01 : 0.25;
+    rows.push_back(std::move(row));
+  }
+
+  if (rows.empty()) {
+    r.ok = false;
+    r.reason = "No events matched digest filters.";
+    return r;
+  }
+
+  if (p.sortBySeverity) {
+    std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+      if (a.active != b.active) return a.active > b.active;
+      if (a.active) {
+        if (a.severity01 != b.severity01) return a.severity01 > b.severity01;
+        return a.name < b.name;
+      }
+      return a.name < b.name;
+    });
+  }
+
+  const int shown = std::min((int)rows.size(), p.maxItems);
+  const int hidden = (int)rows.size() - shown;
+
+  std::ostringstream body;
+  if (!contextTag.empty()) {
+    body << contextTag << "\n\n";
+  }
+
+  body << "Watchlist digest (" << rows.size() << " system" << (rows.size() == 1 ? "" : "s") << "):\n";
+  for (int i = 0; i < shown; ++i) {
+    const auto& row = rows[(std::size_t)i];
+    body << "- ";
+    if (row.active) {
+      const int sevPct = pct01(row.severity01);
+      body << "[" << galNetSystemEventKindLabel(row.kind) << " " << sevPct << "%] ";
+    } else {
+      body << "[Status] ";
+    }
+    body << row.name;
+
+    if (!row.controllingFaction.empty()) {
+      body << " (" << row.controllingFaction << ")";
+    }
+
+    if (row.active) {
+      body << " — ends in " << fmtEndsIn(row.endsInDays);
+    }
+
+    body << " — Sec " << row.secPct << "% (" << fmtDeltaPct(row.dSecPct) << "%)";
+    body << "  Pir " << row.pirPct << "% (" << fmtDeltaPct(row.dPirPct) << "%)";
+    body << "  Trf " << row.trfPct << "% (" << fmtDeltaPct(row.dTrfPct) << "%)";
+    body << "\n";
+  }
+
+  if (hidden > 0) {
+    body << "\n+" << hidden << " more system" << (hidden == 1 ? "" : "s") << " not shown (increase maxItems).\n";
+  }
+
+  // Compose message.
+  CommsMessage msg{};
+  msg.timeDays = timeDays;
+  msg.channel = CommsChannel::System;
+  msg.from = "GalNet";
+  msg.subject = "GalNet Digest — " + std::to_string((int)rows.size()) + " update" + ((rows.size() == 1) ? "" : "s");
+  msg.body = body.str();
+
+  r.ok = true;
+  r.reason = nullptr;
+  r.bulletin.msg = std::move(msg);
+
+  double maxImp = 0.25;
+  bool anyActive = false;
+  for (const auto& row : rows) {
+    maxImp = std::max(maxImp, row.importance01);
+    anyActive = anyActive || row.active;
+  }
+  r.bulletin.importance01 = std::clamp(maxImp, 0.0, 1.0);
+  r.bulletin.hasActiveEvent = anyActive;
+  return r;
 }
 
 } // namespace stellar::sim

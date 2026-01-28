@@ -33,6 +33,12 @@ struct SystemConditionsWindowState {
   bool galNetWatchedShowOverlay{false};
   bool galNetWatchedShowToast{false};
 
+  // Watched-systems spam control:
+  // If enabled, watched-system auto-broadcasts are combined into a single
+  // "digest" message per cycle boundary.
+  bool galNetWatchedDigest{true};
+  int galNetWatchedDigestMaxItems{10};
+
   // Ignore events below this severity when auto-broadcasting.
   float galNetMinSeverity{0.0f};
 

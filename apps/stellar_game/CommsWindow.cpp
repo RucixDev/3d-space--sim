@@ -1,6 +1,8 @@
 #include "CommsWindow.h"
 
 #include "stellar/sim/Universe.h"
+#include "stellar/sim/SystemEvents.h"
+#include "stellar/sim/SystemConditions.h"
 #include "stellar/econ/Commodity.h"
 #include "stellar/ui/FuzzySearch.h"
 #include "stellar/ui/TextFx.h"
@@ -16,6 +18,42 @@ namespace stellar::game {
 
 namespace {
 static ui::textfx::ProgramCache g_textFxCache(1024);
+
+
+static const sim::SystemSecurityDeltaState* findSecurityDelta(
+    std::span<const sim::SystemSecurityDeltaState> deltas,
+    sim::SystemId systemId) {
+  if (systemId == 0) return nullptr;
+  for (const sim::SystemSecurityDeltaState& d : deltas) {
+    if (d.systemId == systemId) return &d;
+  }
+  return nullptr;
+}
+
+static double findFactionRep(std::span<const sim::FactionReputation> reps, core::u32 factionId) {
+  if (factionId == 0) return 0.0;
+  for (const sim::FactionReputation& fr : reps) {
+    if (fr.factionId == factionId) return fr.rep;
+  }
+  return 0.0;
+}
+
+static const sim::Faction* findFaction(const sim::Universe* u, core::u32 factionId) {
+  if (!u || factionId == 0) return nullptr;
+  for (const sim::Faction& f : u->factions()) {
+    if (f.id == factionId) return &f;
+  }
+  return nullptr;
+}
+
+static const char* repBandLabel(double rep) {
+  if (rep <= -50.0) return "Hostile";
+  if (rep <= -15.0) return "Unfriendly";
+  if (rep < 15.0) return "Neutral";
+  if (rep < 50.0) return "Friendly";
+  return "Allied";
+}
+
 } // namespace
 
 static std::string formatSimTime(double timeDays) {
@@ -389,6 +427,89 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
     }
   }
 
+
+
+// System intel for the selected message (distance / security / events / reputation).
+if (ImGui::CollapsingHeader("Intel", ImGuiTreeNodeFlags_DefaultOpen)) {
+  if (ctx.universe && m.systemId != 0) {
+    const sim::StarSystem& sys = ctx.universe->getSystem(m.systemId);
+
+    // Travel estimate (straight-line; actual plotted routes may differ).
+    if (ctx.currentSystem && ctx.maxJumpLy > 0.01) {
+      const math::Vec3d a = ctx.currentSystem->stub.posLy;
+      const math::Vec3d b = sys.stub.posLy;
+      const double dx = (b.x - a.x);
+      const double dy = (b.y - a.y);
+      const double dz = (b.z - a.z);
+      const double distLy = std::sqrt(dx * dx + dy * dy + dz * dz);
+      const int jumps = (distLy < 1e-6) ? 0 : (int)std::max(1.0, std::ceil(distLy / ctx.maxJumpLy));
+      ImGui::Text("Distance: %.1f ly", distLy);
+      ImGui::Text("Estimated jumps: %d (%.1f ly/jump)", jumps, ctx.maxJumpLy);
+    } else if (ctx.currentSystem) {
+      ImGui::TextDisabled("Distance estimate unavailable (ship jump range unknown).");
+    } else {
+      ImGui::TextDisabled("Distance estimate unavailable (no current system).");
+    }
+
+    const sim::SystemSecurityDeltaState* delta = findSecurityDelta(ctx.securityDeltas, m.systemId);
+    const sim::SystemConditionsSnapshot snap = sim::snapshotSystemConditions(
+        ctx.universe->seed(),
+        sys,
+        ctx.timeDays,
+        delta,
+        ctx.universe->systemSecurityDynamicsParams(),
+        ctx.universe->systemEventParams());
+
+    const auto bar = [](const char* label, double v01) {
+      const float clamped = (float)std::clamp(v01, 0.0, 1.0);
+      ImGui::Text("%s: %.0f%%", label, 100.0 * clamped);
+      ImGui::ProgressBar(clamped, ImVec2(-1, 0));
+    };
+
+    bar("Security", snap.effective.security01);
+    bar("Piracy", snap.effective.piracy01);
+    bar("Traffic", snap.effective.traffic01);
+
+    // Simple danger heuristic for quick decision-making.
+    const double danger01 = std::clamp(0.65 * snap.effective.piracy01 + 0.35 * (1.0 - snap.effective.security01), 0.0, 1.0);
+    ImGui::Text("Danger: %.0f%%", 100.0 * danger01);
+    ImGui::ProgressBar((float)danger01, ImVec2(-1, 0));
+
+    // Jurisdiction + reputation.
+    const core::u32 ctrlFid = snap.base.controllingFactionId;
+    const sim::Faction* ctrlFaction = findFaction(ctx.universe, ctrlFid);
+    const double ctrlRep = findFactionRep(ctx.playerRepWithFaction, ctrlFid);
+    if (ctrlFid != 0) {
+      ImGui::Text("Jurisdiction: %s", ctrlFaction ? ctrlFaction->name.c_str() : "Unknown faction");
+    } else {
+      ImGui::Text("Jurisdiction: Independent");
+    }
+    ImGui::Text("Your rep: %.1f (%s)", ctrlRep, repBandLabel(ctrlRep));
+
+    if (m.factionId != 0 && m.factionId != ctrlFid) {
+      const sim::Faction* msgFaction = findFaction(ctx.universe, m.factionId);
+      const double msgRep = findFactionRep(ctx.playerRepWithFaction, m.factionId);
+      ImGui::Text("Message faction: %s | rep %.1f (%s)",
+                  msgFaction ? msgFaction->name.c_str() : "Unknown faction",
+                  msgRep,
+                  repBandLabel(msgRep));
+    }
+
+    // Active system event (if any).
+    if (snap.systemEvent.active && snap.systemEvent.kind != sim::SystemEventKind::None) {
+      const double leftDays = std::max(0.0, snap.systemEvent.endDay - ctx.timeDays);
+      ImGui::Text("Event: %s (severity %.0f%%, %.1f days remaining)",
+                  sim::systemEventKindName(snap.systemEvent.kind),
+                  100.0 * std::clamp(snap.systemEvent.severity01, 0.0, 1.0),
+                  leftDays);
+    } else {
+      ImGui::TextDisabled("Event: none");
+    }
+  } else {
+    ImGui::TextDisabled("No system intel available for this message.");
+  }
+}
+
   // Live Security response (authority scans / bounty submission).
   // This keeps the Comms inbox diegetic while still letting players react quickly
   // (especially useful if they missed the HUD prompt).
@@ -468,6 +589,7 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
       ImGui::ProgressBar((float)frac, ImVec2(-1, 0));
       ImGui::TextDisabled("Time remaining: %.1f s", std::max(0.0, sd.secondsLeft));
     }
+  }
 
   // Live Pirate response (cargo extortion / tribute).
   // Lets the player respond directly from the Ultimatum message instead of hunting for the HUD widget.
@@ -550,8 +672,6 @@ void drawCommsWindow(CommsWindowState& st, CommsOverlayState& overlay, CommsWind
       const double tfrac = std::clamp(1.0 - (pd.secondsLeft / total), 0.0, 1.0);
       ImGui::ProgressBar((float)tfrac, ImVec2(-1, 0));
     }
-  }
-
   }
 
   ImGui::Separator();

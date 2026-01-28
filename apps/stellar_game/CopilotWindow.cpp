@@ -106,6 +106,56 @@ static std::string stationName(sim::Universe& universe, sim::SystemId systemId, 
   return "?";
 }
 
+
+static std::string formatTimeDaysShort(double days) {
+  if (!std::isfinite(days)) return "?";
+  const bool neg = (days < 0.0);
+  double d = std::abs(days);
+
+  const double hoursF = d * 24.0;
+  const double minsF = hoursF * 60.0;
+
+  std::string out;
+  if (neg) out.push_back('-');
+
+  if (hoursF < 1.0) {
+    const int mins = (int)std::round(minsF);
+    out += std::to_string(mins);
+    out += "m";
+    return out;
+  }
+
+  if (d < 1.0) {
+    const int hrs = (int)std::round(hoursF);
+    out += std::to_string(hrs);
+    out += "h";
+    return out;
+  }
+
+  if (d < 10.0) {
+    int daysI = (int)std::floor(d);
+    int hrsI = (int)std::round((d - (double)daysI) * 24.0);
+    if (hrsI >= 24) {
+      daysI += 1;
+      hrsI = 0;
+    }
+
+    out += std::to_string(daysI);
+    out += "d";
+    if (hrsI > 0) {
+      out += " ";
+      out += std::to_string(hrsI);
+      out += "h";
+    }
+    return out;
+  }
+
+  const int daysI = (int)std::round(d);
+  out += std::to_string(daysI);
+  out += "d";
+  return out;
+}
+
 struct NearestStation {
   sim::StationId id{0};
   double distKm{0.0};
@@ -646,7 +696,7 @@ static core::u64 buildPlaybookKey(const CopilotWindowState& st, const CopilotCon
       const core::u64 deadlineQ = (core::u64)std::llround(std::max(0.0, m.deadlineDay) * 1000.0);
       h = core::hashCombine(h, deadlineQ);
 
-      const core::u64 rewardQ = (core::u64)std::llround(std::max(0.0, m.rewardCr));
+      const core::u64 rewardQ = (core::u64)std::llround(std::max(0.0, m.reward));
       h = core::hashCombine(h, rewardQ);
     }
   }

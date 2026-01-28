@@ -93,6 +93,8 @@ int test_galnet_bulletins() {
         st, ev, /*minSeverity01=*/0.25, /*autoEnabled=*/true, /*broadcastEventEnds=*/true);
     CHECK(d1.shouldPublish);
     CHECK(!d1.allowWhenNoEvent);
+    CHECK(st.lastActiveEventKind == stellar::sim::SystemEventKind::PirateRaid);
+    CHECK(st.lastActiveEventSeverity01 > 0.49 && st.lastActiveEventSeverity01 < 0.51);
 
     // Same cycle: no publish.
     const auto d2 = stellar::sim::galNetMaybeAutoBroadcast(
@@ -109,6 +111,8 @@ int test_galnet_bulletins() {
         st, evEnd, /*minSeverity01=*/0.25, /*autoEnabled=*/true, /*broadcastEventEnds=*/true);
     CHECK(d3.shouldPublish);
     CHECK(d3.allowWhenNoEvent);
+    // Ended-cycle: should preserve the last active event kind for UI labeling.
+    CHECK(st.lastActiveEventKind == stellar::sim::SystemEventKind::PirateRaid);
 
     // Auto disabled: should not publish, but should still advance state.
     stellar::sim::GalNetAnnounceState st2{};
@@ -116,6 +120,7 @@ int test_galnet_bulletins() {
         st2, ev, /*minSeverity01=*/0.25, /*autoEnabled=*/false, /*broadcastEventEnds=*/true);
     CHECK(!d4.shouldPublish);
     CHECK(st2.lastCycleStartDay == ev.startDay);
+    CHECK(st2.lastActiveEventKind == stellar::sim::SystemEventKind::PirateRaid);
 
     // Enabling later should not retro-spam the same cycle.
     const auto d5 = stellar::sim::galNetMaybeAutoBroadcast(

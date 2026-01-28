@@ -48,6 +48,15 @@ struct MissionItineraryParams {
   double costPerJump{1.0};
   double costPerLy{0.0};
 
+  // Optional risk-aware navigation.
+  //
+  // If > 0, route planning will prefer safer paths (lower piracy/contest/
+  // low-security) even if they are longer.
+  //
+  // cost model: legCost = costPerJump + costPerLy*d + navRiskWeightPerLy*avgRisk01*d
+  // where avgRisk01 is the average endpoint travel-risk for the leg.
+  double navRiskWeightPerLy{0.0};
+
   // Route batching search radius.
   // If <= 0, an automatic radius is chosen based on remaining objectives.
   double queryRadiusLy{0.0};
@@ -115,6 +124,7 @@ struct MissionItineraryResult {
 
   int unreachableStops{0};
   double totalCost{0.0};
+  double totalRewardCr{0.0};
   int totalHops{0};
   double totalDistanceLy{0.0};
 };

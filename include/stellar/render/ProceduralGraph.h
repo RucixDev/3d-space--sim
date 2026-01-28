@@ -86,10 +86,10 @@ struct ProcNode {
   // Canonical: p0..p3. Legacy alias: p[4].
   union {
     struct {
-      float p0{0.0f};
-      float p1{0.0f};
-      float p2{0.0f};
-      float p3{0.0f};
+      float p0;
+      float p1;
+      float p2;
+      float p3;
     };
     float p[4];
   };
@@ -106,9 +106,9 @@ struct ProcPaletteStop {
   };
   union {
     struct {
-      float r{0.0f};
-      float g{0.0f};
-      float b{0.0f};
+      float r;
+      float g;
+      float b;
     };
     float rgb[3];
   };

@@ -121,6 +121,7 @@
 #include "stellar/sim/SystemSecurityDynamics.h"
 #include "stellar/sim/SystemEvents.h"
 #include "stellar/sim/SystemConditions.h"
+#include "stellar/sim/GalNet.h"
 #include "stellar/sim/DockingPads.h"
 #include "stellar/sim/Docking.h"
 #include "stellar/sim/DockingComputer.h"
@@ -162,6 +163,7 @@
 #include "OrbitAnalyzerWindow.h"
 #include "TrafficLanesWindow.h"
 #include "SystemConditionsWindow.h"
+#include "GalNetInboxWindow.h"
 #include "LogWindow.h"
 #include "Screenshot.h"
 #include "PhotoModeWindow.h"
@@ -3779,6 +3781,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::OrbitAnalyzerWindowState orbitAnalyzerWindow{};
   game::TrafficLanesWindowState trafficLanesWindow{};
   game::SystemConditionsWindowState systemConditionsWindow{};
+  game::GalNetInboxWindowState galNetInboxWindow{};
   game::PhotoModeWindowState photoModeWindow{};
   game::ProceduralLabWindowState proceduralLabWindow{};
   game::ProceduralFluidLabWindowState proceduralFluidLabWindow{};
@@ -4526,16 +4529,16 @@ bool focusMissionsWindow = false;
   game::CommsOverlayState commsOverlay;
   game::CommsWindowState commsWindow;
 
+  // UI caches: backing storage for span views used by multiple windows.
+  std::vector<sim::FactionReputation> copilotRep;
+  std::vector<sim::SystemSecurityDeltaState> copilotSecDeltas;
+
   // GalNet: persistent watchlist of systems to receive system-event bulletins for.
   // This list is saved/loaded via SaveGame.
   std::vector<sim::SystemId> galNetWatchSystems;
 
-  struct GalNetAnnounceState {
-    double lastCycleStartDay{-1.0};
-    bool lastCycleHadActiveEvent{false};
-  };
-  std::unordered_map<sim::SystemId, GalNetAnnounceState> galNetAnnouncedBySystem;
-  int galNetLastWatchScanCycleStamp = 0;
+  std::unordered_map<sim::SystemId, sim::GalNetAnnounceState> galNetAnnouncedBySystem;
+  int galNetLastWatchScanCycleStamp = -1;
 
   auto pushTransmission = [&](sim::CommsMessage msg, bool showOverlay = true) {
     const core::u64 id = commsLog.push(std::move(msg));
@@ -4565,7 +4568,7 @@ auto fieldOpsSummarizeCargoDelta = [&](const std::array<double, econ::kCommodity
     const auto cid = (econ::CommodityId)i;
     const auto def = econ::commodityDef(cid);
     if (!out.empty()) out += ", ";
-    out += fmt::format("{} +{}u", def.name, (long long)std::llround(d));
+    out += fmt::format("{} +{}u", def.name.c_str(), (long long)std::llround(d));
     shown++;
     if (shown >= 3) break;
   }
@@ -4899,6 +4902,9 @@ auto fieldOpsSkipTarget = [&]() {
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"SystemConditions", "GalNet", "Gameplay", 55, false, true}, &systemConditionsWindow.open,
+                                {}, {}, {}});
+
+    uiWindows.add(WindowBinding{WindowDesc{"GalNetInbox", "GalNet Inbox", "Gameplay", 55, false, true}, &galNetInboxWindow.open,
                                 {}, {}, {}});
 
     uiWindows.add(WindowBinding{WindowDesc{"UiSettings", "UI Settings", "UI", 60, false, true}, &showUiSettingsWindow,
@@ -5417,127 +5423,11 @@ auto fieldOpsSkipTarget = [&]() {
                                    std::string_view contextTag) -> bool {
     if (systemId == 0) return false;
 
-    const sim::StarSystem& sys = universe.getSystem(systemId);
-    const auto snap = snapshotSystemConditions(sys);
+    const auto res = sim::makeGalNetBulletin(universe, systemId, timeDays, contextTag, allowWhenNoEvent);
+    if (!res.ok) return false;
 
-    if (!snap.event.active && !allowWhenNoEvent) return false;
-
-    const auto pct = [](double x) -> int {
-      return (int)std::lround(std::clamp(x, 0.0, 1.0) * 100.0);
-    };
-
-    const int baseSec = pct(snap.base.security01);
-    const int effSec = pct(snap.effective.security01);
-    const int basePir = pct(snap.base.piracy01);
-    const int effPir = pct(snap.effective.piracy01);
-    const int baseTrf = pct(snap.base.traffic01);
-    const int effTrf = pct(snap.effective.traffic01);
-
-    const int dSec = effSec - baseSec;
-    const int dPir = effPir - basePir;
-    const int dTrf = effTrf - baseTrf;
-
-    const double remainingDays = std::max(0.0, snap.event.endDay - timeDays);
-    const int remainingHours = (int)std::ceil(remainingDays * 24.0);
-    std::string endsIn;
-    if (remainingHours < 48) {
-      endsIn = std::to_string(remainingHours) + "h";
-    } else {
-      endsIn = std::to_string((int)std::ceil(remainingDays)) + "d";
-    }
-
-    const char* eventLabel = systemEventKindLabel(snap.event.kind);
-    const char* tip = systemEventKindTip(snap.event.kind);
-
-    sim::CommsChannel channel = sim::CommsChannel::System;
-    if (snap.event.active) {
-      switch (snap.event.kind) {
-        case sim::SystemEventKind::TradeBoom:
-        case sim::SystemEventKind::TradeBust:
-          channel = sim::CommsChannel::Trade;
-          break;
-        case sim::SystemEventKind::PirateRaid:
-          channel = sim::CommsChannel::Pirate;
-          break;
-        case sim::SystemEventKind::SecurityCrackdown:
-          channel = sim::CommsChannel::Security;
-          break;
-        case sim::SystemEventKind::CivilUnrest:
-        case sim::SystemEventKind::ResearchBreakthrough:
-        case sim::SystemEventKind::None:
-        default:
-          channel = sim::CommsChannel::System;
-          break;
-      }
-    }
-
-    std::string subject;
-    if (snap.event.active) {
-      subject = std::string("GalNet: ") + eventLabel + " — " + sys.stub.name;
-    } else {
-      subject = std::string("GalNet: System status update — ") + sys.stub.name;
-    }
-
-    std::string body;
-    if (!contextTag.empty()) {
-      body += std::string(contextTag);
-      body += "\n\n";
-    }
-
-    body += "System: " + sys.stub.name + "\n";
-    if (snap.base.controllingFactionId != 0) {
-      const auto fn = factionName(snap.base.controllingFactionId);
-      if (!fn.empty()) {
-        body += "Controlling faction: " + fn + "\n";
-      }
-    }
-
-    if (snap.event.active) {
-      body += "Event: " + std::string(eventLabel) + "\n";
-      body += "Severity: " +
-              std::to_string((int)std::lround(std::clamp(snap.event.severity01, 0.0, 1.0) * 100.0)) +
-              "%\n";
-      body += "Ends in: " + endsIn + "\n\n";
-    } else {
-      body += "Event: None\n";
-      body += "Cycle ends in: " + endsIn + "\n\n";
-    }
-
-    auto fmtDelta = [](int d) -> std::string {
-      if (d == 0) return "0";
-      return (d > 0 ? "+" : "") + std::to_string(d);
-    };
-
-    body += "Conditions:\n";
-    body += "  Security: " + std::to_string(effSec) + "% (" + fmtDelta(dSec) + "%)\n";
-    body += "  Piracy: " + std::to_string(effPir) + "% (" + fmtDelta(dPir) + "%)\n";
-    body += "  Traffic: " + std::to_string(effTrf) + "% (" + fmtDelta(dTrf) + "%)\n";
-
-    {
-      const std::string econLine = sim::systemEventEconomySummary(snap.event);
-      if (!econLine.empty()) {
-        body += "\n";
-        body += econLine;
-        body += "\n";
-      }
-    }
-
-
-    if (snap.event.active && tip && tip[0] != 0) {
-      body += "\nTip: ";
-      body += tip;
-      body += "\n";
-    }
-
-    sim::CommsMessage m{};
-    m.timeDays = timeDays;
-    m.channel = channel;
-    m.from = "GalNet";
-    m.subject = std::move(subject);
-    m.body = std::move(body);
-    m.systemId = systemId;
-    m.factionId = snap.base.controllingFactionId;
-    const double importance01 = snap.event.active ? std::clamp(snap.event.severity01, 0.0, 1.0) : 0.25;
+    sim::CommsMessage m = res.bulletin.msg;
+    const double importance01 = res.bulletin.importance01;
 
     pushTransmission(m, showOverlay);
 
@@ -7131,7 +7021,7 @@ const auto scanKeySystemComplete = [&](sim::SystemId sysId) -> core::u64 {
           char buf[256];
           std::snprintf(buf, sizeof(buf), "Traffic disrupted: -%.0f %s (in transit)",
                         std::round(removed),
-                        econ::commodityDef(st->commodity).name);
+                        econ::commodityDef(st->commodity).name.c_str());
           toast(toasts, buf, 3.5);
         }
       }
@@ -7469,7 +7359,7 @@ if (currentSystem) {
       std::snprintf(buf, sizeof(buf), "%s complies: jettisoned %.0f %s (~%.0f cr)",
                     trg.name.c_str(),
                     std::round(unitsDrop),
-                    econ::commodityDef(trg.tradeCommodity).name,
+                    econ::commodityDef(trg.tradeCommodity).name.c_str(),
                     std::round(stolenValueCr));
       toast(toasts, buf, 3.6);
     } else {
@@ -8749,7 +8639,7 @@ progression.unlockWeapon(weaponSecondary);
 	                convoy.leaderId = 0;
 	
 	                if (m.units > 0.0) {
-	                  convoy.name = std::string("Convoy - ") + econ::commodityDef(m.commodity).name;
+	                  convoy.name = std::string("Convoy - ") + econ::commodityDef(m.commodity).name.c_str();
 	                } else {
 	                  convoy.name = "Convoy";
 	                }
@@ -9646,7 +9536,7 @@ progression.unlockWeapon(weaponSecondary);
               outPosKm = pod.posKm;
               outVelKmS = pod.velKmS;
               outSuggestedDistKm = 1500.0;
-              outName = econ::commodityDef(pod.commodity).name;
+              outName = econ::commodityDef(pod.commodity).name.c_str();
               return true;
             }
             case TargetKind::Asteroid: {
@@ -9669,7 +9559,7 @@ progression.unlockWeapon(weaponSecondary);
               if (s.type == SignalType::TrafficConvoy && s.hasTrafficConvoy) {
                 outVelKmS = s.trafficState.velKmS;
                 const auto def = econ::commodityDef(s.trafficConvoy.commodity);
-                outName = std::string("Traffic Convoy (") + def.name + ")";
+                outName = std::string("Traffic Convoy (") + std::string(def.name.c_str()) + ")";
               } else {
                 outVelKmS = {0, 0, 0};
                 outName = signalTypeName(s.type);
@@ -10121,7 +10011,7 @@ progression.unlockWeapon(weaponSecondary);
 	                  scanRangeKm = std::max(140000.0, a.radiusKm * 55.0);
 	                  const bool known = (scannedKeys.find(scanKeyAsteroid(a.id)) != scannedKeys.end());
 	                  if (known) {
-	                    scanLabel = std::string("Prospect asteroid: ") + econ::commodityDef(a.yield).name;
+	                    scanLabel = std::string("Prospect asteroid: ") + econ::commodityDef(a.yield).name.c_str();
 	                  } else {
 	                    scanLabel = "Prospect asteroid";
 	                  }
@@ -10377,7 +10267,7 @@ progression.unlockWeapon(weaponSecondary);
                 convoy.leaderId = 0;
 
                 if (m.units > 0.0) {
-                  convoy.name = std::string("Convoy - ") + econ::commodityDef(m.commodity).name;
+                  convoy.name = std::string("Convoy - ") + econ::commodityDef(m.commodity).name.c_str();
                 } else {
                   convoy.name = "Convoy";
                 }
@@ -10649,7 +10539,7 @@ progression.unlockWeapon(weaponSecondary);
                           for (int li = 0; li < n; ++li) {
                             const auto& ln = next.manifest.lines[(std::size_t)li];
                             const auto def = econ::commodityDef(ln.commodity);
-                            oss << "\n - " << def.name << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
+                            oss << "\n - " << def.name.c_str() << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
                           }
                           if ((int)next.manifest.lines.size() > n) {
                             oss << "\n - ... +" << ((int)next.manifest.lines.size() - n) << " more";
@@ -11212,7 +11102,7 @@ progression.unlockWeapon(weaponSecondary);
                     for (int li = 0; li < n; ++li) {
                       const auto& ln = next.manifest.lines[(std::size_t)li];
                       const auto def = econ::commodityDef(ln.commodity);
-                      oss << "\n - " << def.name << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
+                      oss << "\n - " << def.name.c_str() << ": " << (long long)std::llround(ln.units) << "u (" << (long long)std::llround(ln.netProfitCr) << " cr)";
                     }
                     if ((int)next.manifest.lines.size() > n) {
                       oss << "\n - ... +" << ((int)next.manifest.lines.size() - n) << " more";
@@ -14949,7 +14839,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
               if (shown < 2) {
                 const auto cid = (econ::CommodityId)i;
                 if (!detail.empty()) detail += ", ";
-                detail += econ::commodityDef(cid).name;
+                detail += econ::commodityDef(cid).name.c_str();
                 detail += " x" + std::to_string((int)std::round(units));
                 ++shown;
               }
@@ -15064,7 +14954,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
                   if (shown < 2) {
                     const auto cid = (econ::CommodityId)i;
                     if (!detail.empty()) detail += ", ";
-                    detail += econ::commodityDef(cid).name;
+                    detail += econ::commodityDef(cid).name.c_str();
                     detail += " x" + std::to_string((int)std::round(units));
                     ++shown;
                   }
@@ -15290,7 +15180,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	              const double moved = std::clamp(std::min(have, need), 0.0, have);
 
 	              if (moved <= 1e-6) {
-	                completeScan(std::string("Distress: no ") + def.name + " in cargo. Bring supplies and scan again.", 3.2);
+	                completeScan(std::string("Distress: no ") + std::string(def.name.c_str()) + " in cargo. Bring supplies and scan again.", 3.2);
 	                continue;
 	              }
 
@@ -15329,13 +15219,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                  ? (" | rep +" + std::to_string((int)std::llround(c.distressRepReward)))
 	                  : std::string{};
 	
-	                completeScan(std::string("Rescue complete: transferred ") + std::to_string(movedI) + " " + def.name +
-	                              " | +" + std::to_string(rewardI) + " cr" + repStr,
+	                completeScan(std::string("Rescue complete: transferred ") + std::to_string(movedI) + " " + std::string(def.name.c_str()) + " | +" + std::to_string(rewardI) + " cr" + repStr,
 	                            4.0);
 	              } else {
 	                const int remainingI = std::max(1, (int)std::llround(c.distressNeedUnits));
-	                completeScan(std::string("Aid delivered: transferred ") + std::to_string(movedI) + " " + def.name +
-	                              " (remaining " + std::to_string(remainingI) + ").",
+	                completeScan(std::string("Aid delivered: transferred ") + std::to_string(movedI) + " " + std::string(def.name.c_str()) + " (remaining " + std::to_string(remainingI) + ").",
 	                            3.2);
 	              }
 	              continue;
@@ -15441,7 +15329,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                     body += "Cargo est: ~" + std::to_string(est) + " cr (" + std::to_string(mn) + ".." + std::to_string(mx) + ")\n";
 
                     if (rep.cargoCommodityKnown) {
-                      body += std::string("Cargo: ") + econ::commodityDef(rep.cargoCommodity).name;
+                      body += std::string("Cargo: ") + econ::commodityDef(rep.cargoCommodity).name.c_str();
                       if (rep.cargoUnitsKnown) {
                         body += " ~" + std::to_string((int)std::llround(rep.cargoUnitsEst)) + "u";
                       }
@@ -15599,7 +15487,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 const int units = (int)std::llround(c.tradeUnits);
                 const int valueCr = (int)std::llround(std::max(0.0, c.cargoValueCr));
 
-                completeScan(tag + ": " + def.name + "  (" + std::to_string(units) + "u)  " +
+                completeScan(tag + ": " + std::string(def.name.c_str()) + "  (" + std::to_string(units) + "u)  " +
                                fromName + " -> " + toName + "   est " + std::to_string(valueCr) + " cr",
                              3.2);
               } else {
@@ -15805,7 +15693,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                    toast(toasts,
 	                          std::string("Derelict analysis: ") + sim::derelictScenarioName(dp.scenario) +
 	                            " " + sim::derelictWreckClassName(dp.wreckClass) + " wreck | salvage ~" +
-	                            std::to_string(u) + " " + def.name + " | risk " + std::to_string(riskPct) + "%",
+	                            std::to_string(u) + " " + std::string(def.name.c_str()) + " | risk " + std::to_string(riskPct) + "%",
 	                          3.9);
 	                  }
 	                  if (dp.hasDataCore && dp.dataUnits > 0.0) {
@@ -15851,11 +15739,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
                 std::string msg = std::string("Resource field analysis: ") + sim::resourceFieldKindName(fk);
                 msg += " | ";
-                msg += econ::commodityDef(primary).name;
+                msg += econ::commodityDef(primary).name.c_str();
                 msg += " primary";
                 if (secondaryChance > 1e-3) {
                   msg += " | ";
-                  msg += econ::commodityDef(secondary).name;
+                  msg += econ::commodityDef(secondary).name.c_str();
                   msg += " secondary (" + std::to_string(secPct) + "%)";
                 }
                 msg += " | richness x";
@@ -15872,8 +15760,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                };
 	                const auto def = econ::commodityDef(s.trafficConvoy.commodity);
 	                toast(toasts,
-	                      std::string("Convoy manifest: ") + def.name +
-	                        " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
+	                      std::string("Convoy manifest: ") + std::string(def.name.c_str()) + " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
 	                        stationNameById(s.trafficConvoy.fromStation) + " -> " + stationNameById(s.trafficConvoy.toStation),
 	                      3.2);
 	              }
@@ -15890,8 +15777,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                    const auto def = econ::commodityDef(s.distress.needCommodity);
 	                    const int needUnits = std::max(1, (int)std::llround(s.distress.needUnits));
 	                    toast(toasts,
-	                          std::string("Distress analysis: request ") + std::to_string(needUnits) + " " + def.name +
-	                            " | reward ~" + std::to_string((int)std::llround(s.distress.rewardCr)) + " cr",
+	                          std::string("Distress analysis: request ") + std::to_string(needUnits) + " " + std::string(def.name.c_str()) + " | reward ~" + std::to_string((int)std::llround(s.distress.rewardCr)) + " cr",
 	                          3.6);
 	                  }
 	                  if (s.distress.ambush) {
@@ -15923,7 +15809,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
 	              const double value = 45.0;
 	              explorationDataCr += value;
-	              const std::string cname = econ::commodityDef(a.yield).name;
+	              const std::string cname = econ::commodityDef(a.yield).name.c_str();
 	              completeScan(std::string("Asteroid prospected: ") + cname + " (+data " + std::to_string((int)value) + " cr).", 2.5);
 
 	              // Detailed readout (field type + remaining estimate + hazard warning).
@@ -16117,7 +16003,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               if (i > 0) msg += ", ";
               const auto cid = (econ::CommodityId)pending[i].idx;
               const int ui = (int)std::round(pending[i].units);
-              msg += econ::commodityDef(cid).name;
+              msg += econ::commodityDef(cid).name.c_str();
               msg += " +" + std::to_string(ui) + "u";
             }
             if ((int)pending.size() > kMaxShown) {
@@ -16239,8 +16125,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
                 const auto def = econ::commodityDef(s.trafficConvoy.commodity);
                 toast(toasts,
-                      std::string("Traffic convoy acquired: ") + def.name +
-                        " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
+                      std::string("Traffic convoy acquired: ") + std::string(def.name.c_str()) + " (" + std::to_string((int)std::llround(s.trafficConvoy.units)) + "u)  " +
                         stationNameById(s.trafficConvoy.fromStation) + " -> " + stationNameById(s.trafficConvoy.toStation),
                       3.2);
 
@@ -16422,7 +16307,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                const int needUnits = std::max(1, (int)std::llround(salvageM->units));
 
 	                toast(toasts,
-	                      std::string("Mission site found: recover ") + std::to_string(needUnits) + " " + def.name + " and return to the station.",
+	                      std::string("Mission site found: recover ") + std::to_string(needUnits) + " " + std::string(def.name.c_str()) + " and return to the station.",
 	                      3.6);
 
 	                // Guaranteed mission cargo burst (tagged with mission id so it can be highlighted in the scanner).
@@ -16614,8 +16499,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	                const auto def = econ::commodityDef(plan.needCommodity);
 	                const int needUnits = std::max(1, (int)std::llround(plan.needUnits));
 	                toast(toasts,
-	                      std::string("Distress vessel requests ") + std::to_string(needUnits) + " " + def.name +
-	                        " (reward " + std::to_string((int)std::llround(plan.rewardCr)) + " cr). Scan the ship to transfer supplies.",
+	                      std::string("Distress vessel requests ") + std::to_string(needUnits) + " " + std::string(def.name.c_str()) + " (reward " + std::to_string((int)std::llround(plan.rewardCr)) + " cr). Scan the ship to transfer supplies.",
 	                      4.2);
 	              }
 
@@ -16686,7 +16570,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	            if (takeUnits >= 1e-4) {
 	              cargo[(int)pod.commodity] += takeUnits;
 	              pod.units -= takeUnits;
-	              toast(toasts, std::string("Scooped ") + def.name + " x" + std::to_string((int)takeUnits), 2.0);
+	              toast(toasts, std::string("Scooped ") + std::string(def.name.c_str()) + " x" + std::to_string((int)takeUnits), 2.0);
 	            } else {
 	              if (timeDays > cargoFullToastCooldownUntilDays) {
 	                cargoFullToastCooldownUntilDays = timeDays + (4.0 / 86400.0);
@@ -16784,16 +16668,11 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         const double cycleDays = std::max(0.001, systemEventParams.cycleDays);
         const int cycleStampNow = (int)std::floor(timeDays / cycleDays);
 
-        auto meetsMinSeverity = [&](const sim::SystemConditionsSnapshot& snap) -> bool {
-          if (!snap.event.active) return false;
-          return (float)snap.event.severity01 + 1e-6f >= systemConditionsWindow.galNetMinSeverity;
-        };
-
         auto maybeAutoBroadcast = [&](const sim::StarSystem& sys,
                                      const sim::SystemConditionsSnapshot& snap,
-                                     bool watched) {
+                                     bool watched,
+                                     std::vector<sim::SystemId>* ioDigestSystems) {
           auto& a = galNetAnnouncedBySystem[sys.stub.id];
-          if (a.lastCycleStartDay == snap.event.startDay) return;
 
           const bool autoEnabled =
               watched ? systemConditionsWindow.galNetAutoBroadcastWatched
@@ -16807,25 +16686,24 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               watched ? systemConditionsWindow.galNetWatchedShowToast
                       : systemConditionsWindow.galNetLocalShowToast;
 
-          const bool activeAndSevereEnough = meetsMinSeverity(snap);
+          const auto decision = sim::galNetMaybeAutoBroadcast(
+              a, snap.event, (double)systemConditionsWindow.galNetMinSeverity, autoEnabled,
+              systemConditionsWindow.galNetBroadcastEventEnds);
 
-          if (autoEnabled && activeAndSevereEnough) {
-            publishGalNetBulletin(sys.stub.id, showOverlay, showToast, /*allowWhenNoEvent=*/false,
-                                  watched ? "Watched system update" : "Local system update");
-          } else if (autoEnabled && systemConditionsWindow.galNetBroadcastEventEnds && a.lastCycleHadActiveEvent &&
-                     !snap.event.active) {
-            publishGalNetBulletin(sys.stub.id, showOverlay, showToast, /*allowWhenNoEvent=*/true,
-                                  watched ? "Watched system update" : "Local system update");
+          if (!decision.shouldPublish) return;
+
+          if (watched && systemConditionsWindow.galNetWatchedDigest && ioDigestSystems) {
+            ioDigestSystems->push_back(sys.stub.id);
+            return;
           }
 
-          // Update tracking even if autoEnabled is off, to avoid retroactive spam when enabling.
-          a.lastCycleStartDay = snap.event.startDay;
-          a.lastCycleHadActiveEvent = snap.event.active;
+          publishGalNetBulletin(sys.stub.id, showOverlay, showToast, decision.allowWhenNoEvent,
+                                watched ? "Watched system update" : "Local system update");
         };
 
         if (currentSystem) {
           const auto snap = snapshotSystemConditions(*currentSystem);
-          maybeAutoBroadcast(*currentSystem, snap, /*watched=*/false);
+          maybeAutoBroadcast(*currentSystem, snap, /*watched=*/false, /*ioDigestSystems=*/nullptr);
         }
 
         // Only scan watched systems once per cycle boundary.
@@ -16833,18 +16711,56 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           galNetLastWatchScanCycleStamp = cycleStampNow;
 
           if (!galNetWatchSystems.empty()) {
+            std::vector<sim::SystemId> digestSystems;
+            if (systemConditionsWindow.galNetAutoBroadcastWatched && systemConditionsWindow.galNetWatchedDigest) {
+              digestSystems.reserve(galNetWatchSystems.size());
+            }
+
             for (const auto sysId : galNetWatchSystems) {
               if (sysId == 0) continue;
               if (currentSystem && sysId == currentSystem->stub.id) continue;
               const auto& sys = universe.getSystem(sysId);
               const auto snap = snapshotSystemConditions(sys);
 
+              // Always update announce tracking so enabling auto-broadcast doesn't
+              // "backfill" a burst of old events.
               if (systemConditionsWindow.galNetAutoBroadcastWatched) {
-                maybeAutoBroadcast(sys, snap, /*watched=*/true);
+                maybeAutoBroadcast(sys, snap, /*watched=*/true,
+                                   systemConditionsWindow.galNetWatchedDigest ? &digestSystems : nullptr);
               } else {
                 auto& a = galNetAnnouncedBySystem[sys.stub.id];
-                a.lastCycleStartDay = snap.event.startDay;
-                a.lastCycleHadActiveEvent = snap.event.active;
+                (void)sim::galNetMaybeAutoBroadcast(
+                    a, snap.event, (double)systemConditionsWindow.galNetMinSeverity,
+                    /*autoEnabled=*/false, systemConditionsWindow.galNetBroadcastEventEnds);
+              }
+            }
+
+            if (systemConditionsWindow.galNetAutoBroadcastWatched && systemConditionsWindow.galNetWatchedDigest &&
+                !digestSystems.empty()) {
+              sim::GalNetDigestParams p{};
+              p.maxItems = std::max(1, systemConditionsWindow.galNetWatchedDigestMaxItems);
+              p.minSeverity01 = (double)systemConditionsWindow.galNetMinSeverity;
+              p.sortBySeverity = true;
+
+              const auto r = sim::makeGalNetDigestBulletin(universe, digestSystems, timeDays, p,
+                                                         /*contextTag=*/"Watched systems digest");
+              if (r.ok) {
+                sim::CommsMessage m = r.bulletin.msg;
+                pushTransmission(m, systemConditionsWindow.galNetWatchedShowOverlay);
+                if (systemConditionsWindow.galNetWatchedShowToast) {
+                  toast(toasts, "GalNet digest received.", 2.25);
+                }
+
+                // Integration Hub: treat the digest as a single GalNet event.
+                game::IntegrationHubEvent ev{};
+                ev.kind = game::IntegrationHubEvent::Kind::GalNet;
+                ev.systemId = 0;
+                ev.systemName = "Watchlist";
+                ev.timeDays = timeDays;
+                ev.title = ui::textfx::stripMarkup(m.subject);
+                ev.detail = ui::textfx::stripMarkup(m.body);
+                ev.importance01 = r.bulletin.importance01;
+                game::hubPushEvent(integrationHub, std::move(ev));
               }
             }
           }
@@ -20749,6 +20665,20 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
+    // Build per-frame UI views required by multiple windows (span-backed).
+    // These are rebuilt every frame so spans remain valid even as the backing maps mutate.
+    copilotRep.clear();
+    copilotRep.reserve(repByFaction.size());
+    for (const auto& [fid, rep] : repByFaction) {
+      copilotRep.push_back(sim::FactionReputation{fid, rep});
+    }
+
+    copilotSecDeltas.clear();
+    copilotSecDeltas.reserve(systemSecurityDeltaBySystem.size());
+    for (const auto& [sid, delta] : systemSecurityDeltaBySystem) {
+      copilotSecDeltas.push_back(delta);
+    }
+
     // HUD layout editor: allow dragging borderless overlay windows.
     // (ImGui defaults to moving windows from the title bar only.)
     io.ConfigWindowsMoveFromTitleBarOnly = !hudLayoutEditMode;
@@ -22168,6 +22098,22 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       game::drawSystemConditionsWindow(systemConditionsWindow, scCtx);
     }
 
+    // GalNet inbox (filtered view of Comms).
+    {
+      game::GalNetInboxWindowContext gCtx{universe, commsLog};
+      gCtx.currentSystem = currentSystem;
+      gCtx.timeDays = timeDays;
+      gCtx.watchSystems = &galNetWatchSystems;
+      gCtx.postGalNetBulletin = [&](sim::SystemId systemId, bool showOverlay, bool showToast) {
+        (void)publishGalNetBulletin(systemId, showOverlay, showToast, /*allowWhenNoEvent=*/false, "Manual bulletin");
+      };
+      gCtx.plotRouteToSystem = [&](sim::SystemId id) { return plotRouteToSystem(id, /*toastOnFail=*/true); };
+      gCtx.targetSystem = [&](sim::SystemId id) { galaxySelectedSystemId = id; };
+      gCtx.toast = [&](std::string_view msg, double ttlSec) { toast(toasts, std::string(msg), ttlSec); };
+
+      game::drawGalNetInboxWindow(galNetInboxWindow, gCtx);
+    }
+
     // Photo mode / screenshot capture
     {
       game::PhotoModeContext ctx;
@@ -22591,14 +22537,14 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        const auto& pod = floatingCargo[target.index];
 	        tgtKm = pod.posKm;
 	        const auto& def = econ::commodityDef(pod.commodity);
-	        tgtLabel = def.name + std::string(" Pod") + (pod.units >= 1.0 ? (" x" + std::to_string((int)std::round(pod.units))) : "");
+	        tgtLabel = def.name.c_str() + std::string(" Pod") + (pod.units >= 1.0 ? (" x" + std::to_string((int)std::round(pod.units))) : "");
 	        tgtIcon = {render::SpriteKind::Cargo,
 	                   core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity)};
 	      } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
 	        const auto& a = asteroids[target.index];
 	        tgtKm = a.posKm;
 	        const auto& def = econ::commodityDef(a.yield);
-	        tgtLabel = std::string("Asteroid [") + def.name + "]";
+	        tgtLabel = std::string("Asteroid [") + std::string(def.name.c_str()) + "]";
 	        tgtIcon = {render::SpriteKind::Asteroid,
 	                   core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield)};
       }
@@ -22983,7 +22929,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             const auto& pod = floatingCargo[i];
             if (pod.units <= 0.0) continue;
             const auto& def = econ::commodityDef(pod.commodity);
-            std::string label = def.name + std::string(" Pod");
+            std::string label = def.name.c_str() + std::string(" Pod");
             if (pod.units >= 1.0) label += " x" + std::to_string((int)std::round(pod.units));
             addMarker(TargetKind::Cargo,
                       i,
@@ -23004,7 +22950,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                       a.posKm,
                       render::SpriteKind::Asteroid,
                       core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield),
-                      std::string("Asteroid [") + def.name + "]");
+                      std::string("Asteroid [") + std::string(def.name.c_str()) + "]");
           }
         }
 
@@ -23188,30 +23134,30 @@ auto uiDescribeMission = [&](const sim::Mission& m) -> std::string {
           + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
   } else if (m.type == sim::MissionType::Delivery) {
     out = std::string("Delivery: ")
-          + econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units))
+          + econ::commodityDef(m.commodity).name.c_str() + " x" + std::to_string((int)std::round(m.units))
           + " to " + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
   } else if (m.type == sim::MissionType::Salvage) {
     out = std::string("Salvage: ")
           + (m.scanned ? "deliver " : "recover ")
-          + econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units))
+          + econ::commodityDef(m.commodity).name.c_str() + " x" + std::to_string((int)std::round(m.units))
           + " -> " + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
     if (!m.scanned) out += " [visit mission derelict]";
   } else if (m.type == sim::MissionType::Smuggle) {
     out = std::string("Smuggle: ")
-          + econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units))
+          + econ::commodityDef(m.commodity).name.c_str() + " x" + std::to_string((int)std::round(m.units))
           + " to " + uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ") [CONTRABAND]";
   } else if (m.type == sim::MissionType::Escort) {
     out = std::string("Escort: ")
           + (m.scanned ? "report in" : "protect convoy")
           + " ";
     if (m.units > 0.0) {
-      out += std::string(econ::commodityDef(m.commodity).name) + " x" + std::to_string((int)std::round(m.units)) + " -> ";
+      out += std::string(econ::commodityDef(m.commodity).name.c_str()) + " x" + std::to_string((int)std::round(m.units)) + " -> ";
     }
     out += uiStationNameById(m.toSystem, m.toStation) + " (" + uiSystemNameById(m.toSystem) + ")";
     if (!m.scanned) out += " [stay close]";
   } else if (m.type == sim::MissionType::MultiDelivery) {
     out = std::string("Multi-delivery: ")
-          + econ::commodityDef(m.commodity).name + " x" + std::to_string((int)std::round(m.units));
+          + econ::commodityDef(m.commodity).name.c_str() + " x" + std::to_string((int)std::round(m.units));
     if (m.viaSystem != 0 && m.viaStation != 0 && m.leg == 0) {
       out += " via " + uiStationNameById(m.viaSystem, m.viaStation) + " (" + uiSystemNameById(m.viaSystem) + ")";
     }
@@ -23808,12 +23754,12 @@ if (showRadarHud && currentSystem) {
         ImGui::SameLine();
         const auto& pod = floatingCargo[b.index];
         const auto& def = econ::commodityDef(pod.commodity);
-        ImGui::Text("%s Pod", def.name);
+        ImGui::Text("%s Pod", def.name.c_str());
       } else if (b.kind == TargetKind::Asteroid && b.index < asteroids.size()) {
         ImGui::SameLine();
         const auto& a = asteroids[b.index];
         const auto& def = econ::commodityDef(a.yield);
-        ImGui::Text("Asteroid [%s]", def.name);
+        ImGui::Text("Asteroid [%s]", def.name.c_str());
       }
 
       if (b.kind == TargetKind::Contact) {
@@ -23843,9 +23789,9 @@ if (showRadarHud && currentSystem) {
               ImGui::TextDisabled("%d..%d cr", (int)std::llround(rep.cargoValueMinCr), (int)std::llround(rep.cargoValueMaxCr));
               if (rep.cargoCommodityKnown) {
                 if (rep.cargoUnitsKnown) {
-                  ImGui::Text("%s ~%du", econ::commodityDef(rep.cargoCommodity).name, (int)std::llround(rep.cargoUnitsEst));
+                  ImGui::Text("%s ~%du", econ::commodityDef(rep.cargoCommodity).name.c_str(), (int)std::llround(rep.cargoUnitsEst));
                 } else {
-                  ImGui::Text("%s", econ::commodityDef(rep.cargoCommodity).name);
+                  ImGui::Text("%s", econ::commodityDef(rep.cargoCommodity).name.c_str());
                 }
               }
             } else {
@@ -24695,7 +24641,7 @@ if (objectiveHudEnabled) {
 
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
               ImGui::BeginTooltip();
-              ImGui::Text("Cargo sources for %s:", def.name);
+              ImGui::Text("Cargo sources for %s:", def.name.c_str());
               ImGui::Separator();
               for (const auto& c : cargoPlan.candidates) {
                 const std::string sN = uiSystemNameById(c.systemId);
@@ -28783,7 +28729,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
     if (c.distressVictim && c.distressNeedUnits > 1e-6) {
       const auto def = econ::commodityDef(c.distressNeedCommodity);
       const int needUnits = std::max(1, (int)std::llround(c.distressNeedUnits));
-      ImGui::TextDisabled("Distress request: %d %s", needUnits, def.name);
+      ImGui::TextDisabled("Distress request: %d %s", needUnits, def.name.c_str());
       ImGui::TextDisabled("Reward: ~%d cr | Rep: +%.1f",
                           (int)std::llround(c.distressRewardCr),
                           c.distressRepReward);
@@ -28802,7 +28748,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
       };
 
       const auto def = econ::commodityDef(s.trafficConvoy.commodity);
-      ImGui::TextDisabled("Convoy: %s  %.0f u", def.name, s.trafficConvoy.units);
+      ImGui::TextDisabled("Convoy: %s  %.0f u", def.name.c_str(), s.trafficConvoy.units);
       ImGui::TextDisabled("Route: %s -> %s",
                           stationNameById(s.trafficConvoy.fromStation).c_str(),
                           stationNameById(s.trafficConvoy.toStation).c_str());
@@ -28816,7 +28762,7 @@ ImGui::Text("Shield: %.0f/%.0f | Hull: %.0f/%.0f", playerShield, playerShieldMax
         const int needUnits = std::max(1, (int)std::llround(s.distress.needUnits));
         ImGui::TextDisabled("Request: %d %s | reward ~%d cr",
                             needUnits,
-                            def.name,
+                            def.name.c_str(),
                             (int)std::llround(s.distress.rewardCr));
       }
       if (s.distress.ambush) {
@@ -29871,7 +29817,7 @@ if (showScanner) {
 	      scanRangeKm = 150000.0;
 	      const bool known = (scannedKeys.find(scanKeyAsteroid(a.id)) != scannedKeys.end());
 	      if (known) {
-	        scanLabel = std::string("Asteroid prospect: ") + econ::commodityDef(a.yield).name;
+	        scanLabel = std::string("Asteroid prospect: ") + econ::commodityDef(a.yield).name.c_str();
 	      } else {
 	        scanLabel = "Asteroid prospect";
 	      }
@@ -30200,13 +30146,13 @@ if (showScanner) {
         if (ImGui::IsItemHovered()) {
           const auto& big = spriteCache.get(render::SpriteKind::Asteroid, aSeed, 96);
           ImGui::BeginTooltip();
-          ImGui::Text("Asteroid [%s]", econ::commodityDef(a.yield).name);
+          ImGui::Text("Asteroid [%s]", econ::commodityDef(a.yield).name.c_str());
           ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
           ImGui::EndTooltip();
         }
         ImGui::SameLine();
       }
-	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name,
+	      ImGui::Text("%s | %.0f u | %.0f km", econ::commodityDef(a.yield).name.c_str(),
 	                  std::round(std::max(0.0, a.remainingUnits)), distKm);
 	      ImGui::SameLine();
 	      if (ImGui::SmallButton("Target##ast")) {
@@ -30240,14 +30186,14 @@ if (showScanner) {
         if (ImGui::IsItemHovered()) {
           const auto& big = spriteCache.get(render::SpriteKind::Cargo, cSeed, 96);
           ImGui::BeginTooltip();
-          ImGui::Text("%s Pod", econ::commodityDef(pod.commodity).name);
+          ImGui::Text("%s Pod", econ::commodityDef(pod.commodity).name.c_str());
           ImGui::Image((ImTextureID)(intptr_t)big.handle(), ImVec2(96, 96));
           ImGui::EndTooltip();
         }
         ImGui::SameLine();
       }
 	      const char* ptag = (pod.missionId != 0) ? " [MISSION]" : "";
-	      ImGui::Text("%s%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name, ptag,
+	      ImGui::Text("%s%s x%.0f | %.0f km | %d min", econ::commodityDef(pod.commodity).name.c_str(), ptag,
 	                  std::round(std::max(0.0, pod.units)), distKm, (int)std::round(std::max(0.0, minsLeft)));
 	      ImGui::SameLine();
 	      if (ImGui::SmallButton("Target##pod")) {
@@ -30856,7 +30802,7 @@ if (showScanner) {
             if (ssrc.type == SignalType::Resource) {
               label = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")";
             } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
-              label = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ")";
+              label = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name.c_str() + ")";
             } else {
               label = signalTypeName(ssrc.type);
             }
@@ -30875,7 +30821,7 @@ if (showScanner) {
             const bool sel = (target.kind == TargetKind::Asteroid && target.index == i);
             drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Asteroid, aSeed, IM_COL32(190, 190, 200, 220), sel);
             considerHover(TargetKind::Asteroid, i, sp, 13.0f * iconScale, render::SpriteKind::Asteroid, aSeed,
-                          std::string("Asteroid [") + econ::commodityDef(a.yield).name + "]");
+                          std::string("Asteroid [") + econ::commodityDef(a.yield).name.c_str() + "]");
           }
         }
 
@@ -30889,7 +30835,7 @@ if (showScanner) {
             const bool sel = (target.kind == TargetKind::Cargo && target.index == i);
             drawIcon(sp, 13.0f * iconScale, render::SpriteKind::Cargo, cSeed, IM_COL32(255, 230, 140, 230), sel);
             considerHover(TargetKind::Cargo, i, sp, 13.0f * iconScale, render::SpriteKind::Cargo, cSeed,
-                          std::string(econ::commodityDef(pod.commodity).name) + " Pod");
+                          std::string(econ::commodityDef(pod.commodity).name.c_str()) + " Pod");
           }
         }
 
@@ -31265,9 +31211,9 @@ if (showScanner) {
                 ImGui::TextDisabled("      %d..%d cr", (int)std::llround(rep.cargoValueMinCr), (int)std::llround(rep.cargoValueMaxCr));
                 if (rep.cargoCommodityKnown) {
                   if (rep.cargoUnitsKnown) {
-                    ImGui::TextDisabled("      %s ~%du", econ::commodityDef(rep.cargoCommodity).name, (int)std::llround(rep.cargoUnitsEst));
+                    ImGui::TextDisabled("      %s ~%du", econ::commodityDef(rep.cargoCommodity).name.c_str(), (int)std::llround(rep.cargoUnitsEst));
                   } else {
-                    ImGui::TextDisabled("      %s", econ::commodityDef(rep.cargoCommodity).name);
+                    ImGui::TextDisabled("      %s", econ::commodityDef(rep.cargoCommodity).name.c_str());
                   }
                 }
               } else {
@@ -31293,7 +31239,7 @@ if (showScanner) {
           if (ssrc.type == SignalType::Resource) {
             title = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ") Signal";
           } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
-            title = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ") Signal";
+            title = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name.c_str() + ") Signal";
           } else {
             title = std::string(signalTypeName(ssrc.type)) + " Signal";
           }
@@ -31309,21 +31255,21 @@ if (showScanner) {
 
             const auto def = econ::commodityDef(ssrc.trafficConvoy.commodity);
             ImGui::TextDisabled("Route: %s -> %s", stationNameById(ssrc.trafficConvoy.fromStation).c_str(), stationNameById(ssrc.trafficConvoy.toStation).c_str());
-            ImGui::TextDisabled("Cargo: %s  %.0f u", def.name, ssrc.trafficConvoy.units);
+            ImGui::TextDisabled("Cargo: %s  %.0f u", def.name.c_str(), ssrc.trafficConvoy.units);
             ImGui::TextDisabled("Speed: %.0f km/s  Progress: %.0f%%", ssrc.trafficState.speedKmS, ssrc.trafficState.progress01 * 100.0);
           }
         } else if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
           const auto& a = asteroids[target.index];
           const core::u64 aSeed = core::hashCombine(core::hashCombine(core::fnv1a64("asteroid"), a.id), (core::u64)a.yield);
           showTargetHeader("Asteroid", render::SpriteKind::Asteroid, aSeed, ImVec4(1,1,1,1));
-          ImGui::TextDisabled("Yield: %s", econ::commodityDef(a.yield).name);
+          ImGui::TextDisabled("Yield: %s", econ::commodityDef(a.yield).name.c_str());
           ImGui::TextDisabled("Remaining: %.0f", a.remainingUnits);
           ImGui::TextDisabled("Distance: %.0f km", (a.posKm - ship.positionKm()).length());
         } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
           const auto& pod = floatingCargo[target.index];
           const core::u64 cSeed = core::hashCombine(core::hashCombine(core::fnv1a64("cargo"), pod.id), (core::u64)pod.commodity);
           showTargetHeader("Cargo Pod", render::SpriteKind::Cargo, cSeed, ImVec4(1,1,1,1));
-          ImGui::TextDisabled("Commodity: %s", econ::commodityDef(pod.commodity).name);
+          ImGui::TextDisabled("Commodity: %s", econ::commodityDef(pod.commodity).name.c_str());
           ImGui::TextDisabled("Units: %.0f", pod.units);
           ImGui::TextDisabled("Distance: %.0f km", (pod.posKm - ship.positionKm()).length());
         } else {
@@ -31487,7 +31433,7 @@ if (showScanner) {
               if (ssrc.type == SignalType::Resource) {
                 name = std::string("Resource Field (") + sim::resourceFieldKindName(ssrc.fieldKind) + ")";
               } else if (ssrc.type == SignalType::TrafficConvoy && ssrc.hasTrafficConvoy) {
-                name = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name + ")";
+                name = std::string("Traffic Convoy (") + econ::commodityDef(ssrc.trafficConvoy.commodity).name.c_str() + ")";
               } else {
                 name = signalTypeName(ssrc.type);
               }
@@ -33558,20 +33504,6 @@ ImGui::PopID();
     if (copilotWindow.open) {
       game::CopilotContext cctx{universe};
       // Build lightweight views for the copilot planner (avoid depending on internal maps).
-      std::vector<sim::FactionReputation> copilotRep;
-      copilotRep.reserve(repByFaction.size());
-      for (const auto& [fid, rep] : repByFaction) {
-        (void)fid;
-        copilotRep.push_back(rep);
-      }
-
-      std::vector<sim::SystemSecurityDeltaState> copilotSecDeltas;
-      copilotSecDeltas.reserve(systemSecurityDeltaBySystem.size());
-      for (const auto& [sid, delta] : systemSecurityDeltaBySystem) {
-        (void)sid;
-        copilotSecDeltas.push_back(delta);
-      }
-
       cctx.currentSystem = currentSystem;
       cctx.timeDays = timeDays;
       cctx.timeRealSec = timeRealSec;
@@ -33772,20 +33704,20 @@ ImGui::PopID();
           } break;
           case sim::MissionType::Delivery: {
             const econ::CommodityId cid = m.commodity;
-            out = "Delivery: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name)
+            out = "Delivery: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name.c_str())
                 + " to " + stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ")";
           } break;
           case sim::MissionType::Salvage: {
             const econ::CommodityId cid = m.commodity;
             const std::string dst = stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ")";
             out = std::string("Salvage: ") + (m.scanned ? "Deliver " : "Recover ")
-                + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name)
+                + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name.c_str())
                 + " -> " + dst;
             if (!m.scanned) out += " [visit mission derelict]";
           } break;
           case sim::MissionType::Smuggle: {
             const econ::CommodityId cid = m.commodity;
-            out = "Smuggle: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name)
+            out = "Smuggle: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name.c_str())
                 + " to " + stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ") [CONTRABAND]";
           } break;
           case sim::MissionType::Escort: {
@@ -33793,7 +33725,7 @@ ImGui::PopID();
             const std::string dst = stationNameById(m.toSystem, m.toStation) + " (" + systemNameById(m.toSystem) + ")";
             out = std::string("Escort: ") + (m.scanned ? "Report in " : "Protect convoy ");
             if (m.units > 0.0) {
-              out += std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name) + " -> " + dst;
+              out += std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name.c_str()) + " -> " + dst;
             } else {
               out += "to " + dst;
             }
@@ -33801,7 +33733,7 @@ ImGui::PopID();
           } break;
           case sim::MissionType::MultiDelivery: {
             const econ::CommodityId cid = m.commodity;
-            out = "Multi-hop: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name);
+            out = "Multi-hop: Deliver " + std::to_string((int)m.units) + " units of " + std::string(econ::commodityDef(cid).name.c_str());
             if (m.viaSystem != 0 && m.viaStation != 0) {
               out += " via " + stationNameById(m.viaSystem, m.viaStation) + " (" + systemNameById(m.viaSystem) + ")";
             }
@@ -34996,7 +34928,7 @@ if (showContacts) {
               if (currentSystem && c.tradeDestStationIndex < currentSystem->stations.size()) {
                 destName = currentSystem->stations[c.tradeDestStationIndex].name;
               }
-              const char* cName = econ::commodityDef(c.tradeCommodity).name;
+              const char* cName = econ::commodityDef(c.tradeCommodity).name.c_str();
               ImGui::Separator();
               if (c.tradeUnits > 1e-6) {
                 ImGui::Text("Hauling: %.0fu %s -> %s", c.tradeUnits, cName, destName.c_str());
@@ -35028,7 +34960,7 @@ if (showContacts) {
 
 	              if (rep.cargoDetected) {
 	                if (rep.cargoKnown) {
-	                  const char* cname = stellar::econ::commodityDef(rep.cargoCommodity).name;
+	                  const char* cname = stellar::econ::commodityDef(rep.cargoCommodity).name.c_str();
 	                  if (rep.cargoCommodityKnown) {
 	                    ImGui::Text("Cargo: ~%.0f cr (%s)", rep.cargoValueEstCr, cname);
 	                  } else {
@@ -40757,7 +40689,7 @@ const char* pageName =
 
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);
-              ImGui::TextUnformatted(econ::commodityDef(cid).name ? econ::commodityDef(cid).name : "");
+              ImGui::TextUnformatted(econ::commodityDef(cid).name.c_str());
               ImGui::TableSetColumnIndex(1);
               ImGui::Text("%.0f", have);
               ImGui::TableSetColumnIndex(2);
