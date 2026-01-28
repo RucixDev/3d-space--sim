@@ -4,6 +4,7 @@
 #include "stellar/core/Random.h"
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/SecurityModel.h"
+#include "stellar/sim/SystemConditions.h"
 #include "stellar/sim/TrafficConvoyLayer.h"
 #include "stellar/sim/Units.h"
 #include "stellar/sim/WorldIds.h"
@@ -56,7 +57,8 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                       const std::vector<Mission>& activeMissions,
                                       const std::vector<core::u64>& resolvedSignalIds,
                                       const SignalGenParams& params,
-                                      const TrafficLedger* trafficLedger) {
+                                      const TrafficLedger* trafficLedger,
+                                      const SystemConditionsSnapshot* conditions) {
   SystemSignalPlan out{};
 
   const Station* anchor = pickAnchorStation(system);
@@ -89,9 +91,92 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
   // Derive compact system-level security knobs used to shape derelict content.
   const auto sec = systemSecurityProfile(universeSeed, system);
 
+  // Optional: caller-provided conditions snapshot for event-reactive signal generation.
+  //
+  // When provided, we can bias signal density (distress / derelicts / convoys) based on the
+  // deterministic system event layer and pass the *effective* security knobs into encounter
+  // planners. This makes system events feel "real" by manifesting as on-the-ground signals.
+  const SystemConditionsSnapshot* cond = nullptr;
+  if (conditions && conditions->systemId == system.stub.id) {
+    cond = conditions;
+  }
+
+  const SystemEvent* ev = nullptr;
+  double sev01 = 0.0;
+
+  // Default to deterministic baseline security for stability. When conditions are provided,
+  // use the effective values (baseline + dynamics + event) to shape encounter plans.
+  double piracy01 = sec.piracy01;
+  double security01 = sec.security01;
+  double contest01 = sec.contest01;
+  if (cond) {
+    piracy01 = cond->effective.piracy01;
+    security01 = cond->effective.security01;
+    contest01 = cond->effective.contest01;
+    ev = &cond->event;
+    if (ev->active) {
+      sev01 = std::clamp(ev->severity01, 0.0, 1.0);
+    }
+  }
+
+  // Apply event-reactive modifiers to the caller's generation knobs.
+  SignalGenParams p = params;
+  int extraDerelictsPerDay = 0;
+  if (ev && ev->active) {
+    switch (ev->kind) {
+      case SystemEventKind::PirateRaid: {
+        // Pirate raids generate lots of distress chatter and wreckage.
+        if (p.includeDistress) {
+          const int bonus = 1 + (int)std::llround(sev01 * 3.0); // +1..+4
+          p.distressPerDay = std::clamp(p.distressPerDay + bonus, 0, 8);
+        }
+        if (p.includeDailyDerelict) {
+          extraDerelictsPerDay = std::clamp((int)std::ceil(sev01 * 2.0), 0, 3);
+        }
+      } break;
+      case SystemEventKind::CivilUnrest: {
+        // Civil unrest also produces distress calls, but usually less than a raid.
+        if (p.includeDistress) {
+          const int bonus = (int)std::llround(sev01 * 2.0); // +0..+2
+          p.distressPerDay = std::clamp(p.distressPerDay + bonus, 0, 8);
+        }
+        if (p.includeDailyDerelict) {
+          extraDerelictsPerDay = std::clamp((int)std::ceil(sev01 * 1.0), 0, 2);
+        }
+      } break;
+      case SystemEventKind::ResearchBreakthrough: {
+        // Breakthroughs can leave behind experimental debris / unmanned probes.
+        if (p.includeDailyDerelict) {
+          extraDerelictsPerDay = std::clamp((int)std::ceil(sev01 * 1.2), 0, 2);
+        }
+      } break;
+      case SystemEventKind::TradeBoom: {
+        if (p.includeTrafficConvoys) {
+          const int bonus = (int)std::llround(sev01 * 3.0);
+          p.trafficLaneParams.convoysPerDayBase = std::max(0, p.trafficLaneParams.convoysPerDayBase + bonus);
+          p.trafficLaneParams.maxConvoysPerDay = std::max(p.trafficLaneParams.maxConvoysPerDay, p.trafficLaneParams.convoysPerDayBase * 4);
+        }
+      } break;
+      case SystemEventKind::TradeBust: {
+        if (p.includeTrafficConvoys) {
+          const int cut = (int)std::llround(sev01 * 2.0);
+          p.trafficLaneParams.convoysPerDayBase = std::max(0, p.trafficLaneParams.convoysPerDayBase - cut);
+        }
+      } break;
+      case SystemEventKind::SecurityCrackdown: {
+        // Crackdowns tend to reduce opportunistic distress spam and convoy piracy.
+        if (p.includeDistress) {
+          const int cut = (int)std::llround(sev01 * 1.0);
+          p.distressPerDay = std::max(0, p.distressPerDay - cut);
+        }
+      } break;
+      default: break;
+    }
+  }
+
   // --- Persistent resource fields ---
-  if (params.resourceFieldCount > 0) {
-    out.resourceFields = generateResourceFields(universeSeed, system.stub.id, anchorPosKm, anchorCommsKm, params.resourceFieldCount, preferredPlaneN);
+  if (p.resourceFieldCount > 0) {
+    out.resourceFields = generateResourceFields(universeSeed, system.stub.id, anchorPosKm, anchorCommsKm, p.resourceFieldCount, preferredPlaneN);
     out.sites.reserve(out.sites.size() + out.resourceFields.fields.size());
     for (const auto& f : out.resourceFields.fields) {
       SignalSite s{};
@@ -106,7 +191,7 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
   }
 
   // --- Daily derelict salvage site ---
-  if (params.includeDailyDerelict) {
+  if (p.includeDailyDerelict) {
     // typeCode=2 in the current game prototype for "daily derelict".
     const core::u64 id = makeDeterministicWorldId(core::hashCombine(sysKey, 2ull), dayStamp);
 
@@ -125,18 +210,61 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                        system.stub.id,
                                        id,
                                        anchorTimeDays,
-                                       sec.piracy01,
-                                       sec.security01,
-                                       sec.contest01,
+                                       piracy01,
+                                       security01,
+                                       contest01,
                                        /*missionSite=*/false,
                                        /*includeDayStamp=*/true);
     out.sites.push_back(s);
   }
 
+
+  // --- Event-reactive derelict "aftermath" sites ---
+  //
+  // These are extra short-lived salvage signals that manifest during certain deterministic
+  // system events (e.g. pirate raids). They make events feel tangible: you can *see*
+  // the chaos in normal space, not just in UI numbers.
+  if (extraDerelictsPerDay > 0 && ev && p.includeDailyDerelict) {
+    const int count = std::clamp(extraDerelictsPerDay, 0, 6);
+
+    // typeCode=6 reserved for event-reactive derelict sites. Mix in event kind so a new
+    // event within the same day doesn't reuse ids (avoids weird "already resolved" states).
+    const core::u64 baseKey = core::hashCombine(sysKey, 6ull);
+    const core::u64 kindKey = core::hashCombine(baseKey, (core::u64)ev->kind);
+
+    for (int i = 0; i < count; ++i) {
+      const core::u64 salt = dayStamp * 16ull + (core::u64)i;
+      const core::u64 id = makeDeterministicWorldId(kindKey, salt);
+
+      core::SplitMix64 srng(core::hashCombine(id, 0xE6E1D11Cull));
+      const math::Vec3d dir = randUnitVec(srng);
+      const double distKm = anchorCommsKm * 1.55 + 210000.0 + srng.range(0.0, 140000.0);
+
+      SignalSite s{};
+      s.id = id;
+      s.kind = SignalKind::Derelict;
+      s.posKm = anchorPosKm + dir * distKm;
+      s.expireDay = (double)dayStamp + 1.0;
+      s.resolved = isSignalResolved(resolvedSignalIds, id);
+
+      s.hasDerelictPlan = true;
+      s.derelict = planDerelictEncounter(universeSeed,
+                                         system.stub.id,
+                                         id,
+                                         anchorTimeDays,
+                                         piracy01,
+                                         security01,
+                                         contest01,
+                                         /*missionSite=*/false,
+                                         /*includeDayStamp=*/true);
+
+      out.sites.push_back(s);
+    }
+  }
   // --- Distress calls ---
-  if (params.includeDistress && params.distressPerDay > 0) {
-    const int count = std::clamp(params.distressPerDay, 0, 8);
-    const double ttl = (params.distressTtlDays > 1e-6) ? params.distressTtlDays : 1.0;
+  if (p.includeDistress && p.distressPerDay > 0) {
+    const int count = std::clamp(p.distressPerDay, 0, 8);
+    const double ttl = (p.distressTtlDays > 1e-6) ? p.distressTtlDays : 1.0;
 
     // Use the station faction if available; fall back to system faction.
     const core::u32 localFactionId = (anchor->factionId != 0) ? anchor->factionId : system.stub.factionId;
@@ -208,8 +336,8 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                        system.stub.id,
                                        s.id,
                                        anchorTimeDays,
-                                       sec.piracy01,
-                                       sec.security01,
+                                       piracy01,
+                                       security01,
                                        sec.contest01,
                                        /*missionSite=*/true,
                                        /*includeDayStamp=*/false);
@@ -218,7 +346,7 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
   }
 
   // --- Traffic convoy signals (moving lane traffic) ---
-  if (params.includeTrafficConvoys) {
+  if (p.includeTrafficConvoys) {
     std::vector<TrafficConvoyView> views;
 
     // Integration hook: if the caller provides a TrafficLedger recorded from
@@ -229,12 +357,12 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
       views = generateTrafficConvoysFromLedger(*trafficLedger,
                                               system,
                                               timeDays,
-                                              params.trafficLaneParams.genWindowDays,
-                                              params.trafficLaneParams.includeInactive,
-                                              params.trafficLaneParams);
+                                              p.trafficLaneParams.genWindowDays,
+                                              p.trafficLaneParams.includeInactive,
+                                              p.trafficLaneParams);
     }
     if (views.empty()) {
-      views = generateTrafficConvoys(universeSeed, system, timeDays, params.trafficLaneParams);
+      views = generateTrafficConvoys(universeSeed, system, timeDays, p.trafficLaneParams);
     }
 
     out.sites.reserve(out.sites.size() + views.size());
@@ -244,7 +372,7 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
 
       // When includeInactive=false, generateTrafficConvoysFromLedger() already
       // filters, but keep this guard for safety (and for the fallback path).
-      if (!params.trafficLaneParams.includeInactive && !v.state.active) continue;
+      if (!p.trafficLaneParams.includeInactive && !v.state.active) continue;
 
       SignalSite s{};
       s.id = v.convoy.id;

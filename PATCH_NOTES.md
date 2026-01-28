@@ -1,3 +1,41 @@
+## Round 141 - System Events Now Spawn Real Signals + GalNet Headless Build Fix
+
+This round makes **system events physically manifest in space**: pirate raids, civil unrest, and research breakthroughs now produce extra **distress calls**, **wreckage / derelict salvage signals**, and (for trade booms/busts) **convoy traffic density** changes — driven by the same deterministic SystemEvent layer that powers GalNet bulletins.
+
+It also fixes a const-correctness build error in headless builds (MSVC C2662) caused by GalNet calling `Universe::getSystem()` on a `const Universe`.
+
+### 🚀 What shipped
+
+- **Event-reactive signal generation (core sim)**
+  - `generateSystemSignals()` now optionally accepts a `SystemConditionsSnapshot`.
+  - When provided, it:
+    - scales distress call density for certain events (**Pirate Raid**, **Civil Unrest**)
+    - injects short-lived "aftermath" **derelict salvage** sites during chaotic events
+    - modulates traffic convoy density for **Trade Boom** / **Trade Bust**
+    - reduces distress noise during **Security Crackdowns**
+  - Encounter planners are fed the **effective** security knobs (baseline + dynamics + event) so the content feels consistent with the system’s current state.
+
+- **Gameplay integration**
+  - The game now passes the current `SystemConditionsSnapshot` into the signal generator when seeding a system, so events immediately show up as extra signal contacts.
+
+- **Headless build fix**
+  - Added a `const` overload for `Universe::getSystem(...)` that forwards to the cached non-const implementation (logically const).
+  - Fixes MSVC error **C2662** when compiling `sim::GalNet` bulletins.
+
+- **Tests**
+  - New `test_signal_event_reactivity` validates Pirate Raid boosts distress density and adds wreckage salvage sites when conditions are provided.
+
+### Files changed/added
+
+- `include/stellar/sim/Universe.h`
+- `include/stellar/sim/Signals.h`
+- `src/sim/Signals.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_signal_event_reactivity.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 140 - Actionable Pirate Ultimatums in Comms
 
 This round makes pirate extortion messages interactive: you can now respond directly from the **Comms** inbox.
