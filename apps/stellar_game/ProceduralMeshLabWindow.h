@@ -116,6 +116,43 @@ struct ProceduralMeshLabWindowState {
   render::SdfGraph graph{render::SdfGraph::makeDefault()};
   bool dirty{true};
 
+  // ---- Variation Studio (SDF idea generator) ----
+  //
+  // Generates mutated variants of the current SDF graph so you can quickly
+  // explore interesting silhouettes without hand-editing every parameter.
+  //
+  // This is deliberately "tooling-grade": variants are cheap to generate and
+  // come with quick sampled stats, but you still do a full remesh for final
+  // export/LOD building.
+  struct SdfVariantCandidate {
+    render::SdfGraph graph{};
+    core::u64 key{0}; // fingerprint for dedupe
+    float insideFraction{0.0f}; // [0,1]
+    float boundingRadius{0.0f};
+    float score{0.0f};
+    float minDistance{0.0f};
+    float maxDistance{0.0f};
+    int samples{0};
+  };
+
+  bool showVariationStudio{false};
+  bool variationAutoRegenerate{false};
+  core::u64 variationSeed{0xA11CEBEEF1234567ULL};
+  int variationCount{8};
+  float variationParamJitter{0.18f};
+  float variationRewireChance{0.06f};
+  float variationOpChance{0.04f};
+  float variationWrapChance{0.15f};
+  bool variationMutateNodeSeeds{true};
+  int variationSampleRes{12};
+  float variationTargetFill{0.25f};
+  float variationTargetRadius{0.85f};
+  bool variationSortByScore{true};
+  std::vector<SdfVariantCandidate> variants{};
+  int selectedVariant{-1};
+  std::string variantsError{};
+
+
   // Last CPU mesh (kept for export)
   render::SdfMeshData cpuMesh{};
   render::SdfMeshStats cpuStats{};

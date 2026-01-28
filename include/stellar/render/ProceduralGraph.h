@@ -67,27 +67,51 @@ std::optional<ProcNodeOp> procNodeOpFromString(const std::string& s);
 struct ProcNode {
   ProcNodeOp op{ProcNodeOp::Constant};
 
-  // Input node indices (use -1 for "none"). Indices need not be topologically sorted;
-  // invalid indices are treated as 0.0 during compilation.
-  int in0{-1};
-  int in1{-1};
-  int in2{-1};
+  // Input node indices (use -1 for "none").
+  // Canonical: in0/in1/in2. Legacy aliases: inA/inB/inC.
+  union {
+    int in0{-1};
+    int inA;
+  };
+  union {
+    int in1{-1};
+    int inB;
+  };
+  union {
+    int in2{-1};
+    int inC;
+  };
 
   // Freeform parameters; meaning depends on op.
-  float p0{0.0f};
-  float p1{0.0f};
-  float p2{0.0f};
-  float p3{0.0f};
+  // Canonical: p0..p3. Legacy alias: p[4].
+  union {
+    struct {
+      float p0{0.0f};
+      float p1{0.0f};
+      float p2{0.0f};
+      float p3{0.0f};
+    };
+    float p[4];
+  };
 
   // Optional node-local seed tweak.
   core::u64 seed{0};
 };
 
 struct ProcPaletteStop {
-  float pos{0.0f}; // [0,1]
-  float r{0.0f};
-  float g{0.0f};
-  float b{0.0f};
+  // Canonical: pos, r/g/b. Legacy aliases: t, rgb[3].
+  union {
+    float pos{0.0f}; // [0,1]
+    float t;
+  };
+  union {
+    struct {
+      float r{0.0f};
+      float g{0.0f};
+      float b{0.0f};
+    };
+    float rgb[3];
+  };
 };
 
 struct ProcGraph {

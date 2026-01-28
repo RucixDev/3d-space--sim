@@ -21650,6 +21650,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       cctx.currentSystem = currentSystem;
       cctx.timeDays = timeDays;
       cctx.timeRealSec = timeRealSec;
+
+      cctx.maxJumpLy = navConstrainToCurrentFuelRange ? fsdCurrentRangeLy() : fsdBaseRangeLy();
+      cctx.playerRepWithFaction = std::span<const sim::FactionReputation>(copilotRep.data(), copilotRep.size());
+      cctx.securityDeltas = std::span<const sim::SystemSecurityDeltaState>(copilotSecDeltas.data(), copilotSecDeltas.size());
       cctx.log = &commsLog;
       cctx.toast = [&](const std::string& msg, double ttlSec) { toast(toasts, msg, ttlSec); };
       cctx.goTo = [&](sim::SystemId sysId, sim::StationId stId, bool armAutoRun) {
@@ -33396,9 +33400,28 @@ ImGui::PopID();
 
     if (copilotWindow.open) {
       game::CopilotContext cctx{universe};
+      // Build lightweight views for the copilot planner (avoid depending on internal maps).
+      std::vector<sim::FactionReputation> copilotRep;
+      copilotRep.reserve(repByFaction.size());
+      for (const auto& [fid, rep] : repByFaction) {
+        (void)fid;
+        copilotRep.push_back(rep);
+      }
+
+      std::vector<sim::SystemSecurityDeltaState> copilotSecDeltas;
+      copilotSecDeltas.reserve(systemSecurityDeltaBySystem.size());
+      for (const auto& [sid, delta] : systemSecurityDeltaBySystem) {
+        (void)sid;
+        copilotSecDeltas.push_back(delta);
+      }
+
       cctx.currentSystem = currentSystem;
       cctx.timeDays = timeDays;
       cctx.timeRealSec = timeRealSec;
+
+      cctx.maxJumpLy = navConstrainToCurrentFuelRange ? fsdCurrentRangeLy() : fsdBaseRangeLy();
+      cctx.playerRepWithFaction = std::span<const sim::FactionReputation>(copilotRep.data(), copilotRep.size());
+      cctx.securityDeltas = std::span<const sim::SystemSecurityDeltaState>(copilotSecDeltas.data(), copilotSecDeltas.size());
       cctx.shipPosKm = ship.positionKm();
 
       cctx.hull = playerHull;
@@ -33459,6 +33482,10 @@ ImGui::PopID();
       cctx.openMissionsWindow = [&]() {
         showMissions = true;
         focusMissionsWindow = true;
+      };
+
+      cctx.openMissionControl = [&]() {
+        missionControlWindow.open = true;
       };
 
       cctx.openTradePlanner = [&]() {
@@ -40573,7 +40600,7 @@ const char* pageName =
 
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);
-              ImGui::TextUnformatted(econ::commodityDef(cid).name.c_str());
+              ImGui::TextUnformatted(econ::commodityDef(cid).name ? econ::commodityDef(cid).name : "");
               ImGui::TableSetColumnIndex(1);
               ImGui::Text("%.0f", have);
               ImGui::TableSetColumnIndex(2);

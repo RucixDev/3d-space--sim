@@ -6,6 +6,7 @@
 
 #include <array>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,6 +16,8 @@ namespace stellar::sim {
 class Universe;
 struct StarSystem;
 struct Mission;
+struct FactionReputation;
+struct SystemSecurityDeltaState;
 } // namespace stellar::sim
 
 namespace stellar::game {
@@ -38,6 +41,13 @@ struct CopilotContext {
 
   double timeDays{0.0};
   double timeRealSec{0.0};
+
+  // Estimated max jump range (LY) used by planning helpers.
+  double maxJumpLy{0.0};
+
+  // Optional inputs for risk-aware planning.
+  std::span<const sim::FactionReputation> playerRepWithFaction{};
+  std::span<const sim::SystemSecurityDeltaState> securityDeltas{};
 
   // Player position (km) for in-system distance checks.
   math::Vec3d shipPosKm{0.0, 0.0, 0.0};
@@ -91,10 +101,40 @@ struct CopilotContext {
   // UI helpers.
   std::function<void()> openStationServices;
   std::function<void()> openMissionsWindow;
+  std::function<void()> openMissionControl;
   std::function<void()> openTradePlanner;
   std::function<void()> openProgressionWindow;
 
   std::function<void(std::string_view msg, double ttlSec)> toast;
+};
+
+struct CopilotItineraryStopSummary {
+  sim::SystemId systemId{0};
+  sim::StationId stationId{0};
+  bool isSite{false};
+  bool reachable{true};
+
+  int missionCount{0};
+  double totalRewardCr{0.0};
+  double avgRisk01{0.0};
+
+  double etaDays{0.0};
+  double earliestDeadlineDay{0.0};
+  double etaSlackHours{0.0};
+
+  std::vector<core::u64> missionIds{};
+};
+
+struct CopilotItineraryCache {
+  core::u64 key{0};
+  double builtAtRealSec{-1.0};
+  bool ok{false};
+  std::string status{};
+
+  double totalRewardCr{0.0};
+  int unreachableStops{0};
+
+  std::vector<CopilotItineraryStopSummary> stops{};
 };
 
 struct CopilotWindowState {
@@ -103,9 +143,18 @@ struct CopilotWindowState {
   bool showRecommendations{true};
   bool showShipStatus{true};
   bool showMissions{true};
+  bool showPlaybook{true};
   bool showProgression{true};
 
   bool compact{false};
+
+  // --- Playbook / itinerary planner ---
+  bool playbookGroupBySystem{true};
+  int playbookMaxStops{8};
+  float playbookRecomputeSec{2.0f};
+
+  CopilotItineraryCache playbook{};
+
 
   float dismissTtlSec{120.0f};
   bool showDismissed{false};

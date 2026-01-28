@@ -66,23 +66,37 @@ struct SdfNode {
   SdfNodeOp op{SdfNodeOp::Sphere};
 
   // Input node indices (use -1 for none).
-  int in0{-1};
-  int in1{-1};
+  // Canonical names: in0 / in1. Legacy aliases: inA / inB.
+  union {
+    int in0{-1};
+    int inA;
+  };
+  union {
+    int in1{-1};
+    int inB;
+  };
 
   // Freeform parameters; interpretation depends on op.
+  // Canonical names: p0..p7. Legacy alias: p[8].
   // Keep this POD-ish so it copies nicely for async jobs.
-  float p0{0.0f};
-  float p1{0.0f};
-  float p2{0.0f};
-  float p3{0.0f};
-  float p4{0.0f};
-  float p5{0.0f};
-  float p6{0.0f};
-  float p7{0.0f};
+  union {
+    struct {
+      float p0{0.0f};
+      float p1{0.0f};
+      float p2{0.0f};
+      float p3{0.0f};
+      float p4{0.0f};
+      float p5{0.0f};
+      float p6{0.0f};
+      float p7{0.0f};
+    };
+    float p[8];
+  };
 
   // Optional node-local seed tweak (used by noise modifiers).
   core::u64 seed{0};
 };
+
 
 struct SdfGraph {
   core::u64 seed{0xBADC0FFEEULL};

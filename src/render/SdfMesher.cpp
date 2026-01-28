@@ -235,7 +235,17 @@ SdfMeshData meshIsosurfaceMarchingTetrahedra(const ScalarField3D& field,
             }
 
             float uu = 0.0f, vv = 0.0f;
-            sphericalUV(pp, uu, vv);
+            if (params.generateUv) {
+              if (params.bakeSdfToUV) {
+                // Simple planar projection for quick debug texturing and data baking.
+                // Map XZ within [-bounds, +bounds] to [0,1].
+                const double inv = 0.5 / std::max(1e-8, (double)params.bounds);
+                uu = (float)std::clamp(pp.x * inv + 0.5, 0.0, 1.0);
+                vv = (float)std::clamp(pp.z * inv + 0.5, 0.0, 1.0);
+              } else {
+                sphericalUV(pp, uu, vv);
+              }
+            }
 
             edgeVert[e] = TempVert{pp, nn, uu, vv};
             edgeValid[e] = true;

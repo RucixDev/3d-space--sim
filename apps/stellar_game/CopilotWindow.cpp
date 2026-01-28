@@ -2,6 +2,7 @@
 
 #include "stellar/econ/Commodity.h"
 #include "stellar/sim/Mission.h"
+#include "stellar/sim/MissionPlanner.h"
 #include "stellar/sim/MissionAssist.h"
 #include "stellar/sim/System.h"
 #include "stellar/sim/Units.h"
@@ -616,6 +617,380 @@ static void drawShipStatusBars(const CopilotContext& ctx, bool compact) {
   }
 }
 
+
+static core::u64 buildPlaybookKey(const CopilotWindowState& st, const CopilotContext& ctx, double maxJumpLy) {
+  core::u64 h = 0;
+
+  if (ctx.currentSystem) {
+    h = core::hashCombine(h, (core::u64)ctx.currentSystem->stub.id);
+  }
+  h = core::hashCombine(h, (core::u64)std::llround(std::max(0.0, maxJumpLy) * 1000.0));
+  h = core::hashCombine(h, (core::u64)st.playbookGroupBySystem);
+  h = core::hashCombine(h, (core::u64)st.playbookMaxStops);
+
+  if (ctx.missions) {
+    for (const sim::Mission& m : *ctx.missions) {
+      if (m.completed || m.failed) {
+        continue;
+      }
+
+      h = core::hashCombine(h, (core::u64)m.id);
+      h = core::hashCombine(h, (core::u64)m.type);
+      h = core::hashCombine(h, (core::u64)m.toSystem);
+      h = core::hashCombine(h, (core::u64)m.toStation);
+      h = core::hashCombine(h, (core::u64)m.viaSystem);
+      h = core::hashCombine(h, (core::u64)m.viaStation);
+      h = core::hashCombine(h, (core::u64)m.leg);
+      h = core::hashCombine(h, (core::u64)m.scanned);
+
+      const core::u64 deadlineQ = (core::u64)std::llround(std::max(0.0, m.deadlineDay) * 1000.0);
+      h = core::hashCombine(h, deadlineQ);
+
+      const core::u64 rewardQ = (core::u64)std::llround(std::max(0.0, m.rewardCr));
+      h = core::hashCombine(h, rewardQ);
+    }
+  }
+
+  return h;
+}
+
+static const sim::Mission* findMissionById(const CopilotContext& ctx, core::u64 missionId) {
+  if (!ctx.missions) {
+    return nullptr;
+  }
+  for (const sim::Mission& m : *ctx.missions) {
+    if (m.id == missionId) {
+      return &m;
+    }
+  }
+  return nullptr;
+}
+
+static core::u64 pickBestMissionToTrack(const CopilotContext& ctx, const std::vector<core::u64>& missionIds) {
+  if (missionIds.empty()) {
+    return 0;
+  }
+
+  // Prefer the mission with the earliest deadline (if any). Otherwise keep order.
+  core::u64 bestId = missionIds.front();
+  double bestDeadline = std::numeric_limits<double>::infinity();
+
+  for (core::u64 mid : missionIds) {
+    const sim::Mission* m = findMissionById(ctx, mid);
+    if (!m) {
+      continue;
+    }
+    if (m->deadlineDay > 0.0 && m->deadlineDay < bestDeadline) {
+      bestDeadline = m->deadlineDay;
+      bestId = mid;
+    }
+  }
+
+  return bestId;
+}
+
+static void updatePlaybookCache(CopilotWindowState& st, const CopilotContext& ctx, bool force) {
+  st.playbook.status.clear();
+
+  if (!ctx.currentSystem) {
+    st.playbook.ok = false;
+    st.playbook.status = "No current system.";
+    st.playbook.stops.clear();
+    return;
+  }
+  if (!ctx.missions) {
+    st.playbook.ok = false;
+    st.playbook.status = "No mission data.";
+    st.playbook.stops.clear();
+    return;
+  }
+
+  const double maxJumpLy = (ctx.maxJumpLy > 0.25) ? ctx.maxJumpLy : 28.0;
+  const core::u64 key = buildPlaybookKey(st, ctx, maxJumpLy);
+
+  const bool stale = (st.playbook.builtAtRealSec < 0.0) ||
+                     ((ctx.timeRealSec - st.playbook.builtAtRealSec) > (double)st.playbookRecomputeSec);
+
+  if (!force && (key == st.playbook.key) && !stale) {
+    return;
+  }
+
+  st.playbook.key = key;
+  st.playbook.builtAtRealSec = ctx.timeRealSec;
+
+  sim::MissionItineraryParams params{};
+  params.maxJumpLy = maxJumpLy;
+  params.maxStops = std::clamp(st.playbookMaxStops, 1, 16);
+  params.groupBySystem = st.playbookGroupBySystem;
+
+  // Copilot defaults: bias slightly more toward urgency so the \"next stop\" feels proactive.
+  params.rewardWeight = 1.0;
+  params.riskWeight = 0.45;
+  params.urgencyWeight = 0.5;
+
+  // Keep ETA-aware urgency enabled so the plan can surface deadline slack.
+  params.etaAwareUrgency = true;
+
+  const sim::MissionItineraryResult res = sim::planMissionItinerary(
+    ctx.universe,
+    *ctx.currentSystem,
+    ctx.timeDays,
+    *ctx.missions,
+    ctx.playerRepWithFaction,
+    ctx.securityDeltas,
+    params);
+
+  st.playbook.ok = res.ok;
+  st.playbook.totalRewardCr = res.totalRewardCr;
+  st.playbook.unreachableStops = res.unreachableStops;
+
+  st.playbook.stops.clear();
+  st.playbook.stops.reserve(res.stops.size());
+
+  for (const sim::MissionItineraryStop& stop : res.stops) {
+    CopilotItineraryStopSummary row{};
+    row.systemId = stop.objective.systemId;
+    row.stationId = stop.objective.stationId;
+    row.isSite = stop.objective.isSite;
+    row.reachable = stop.reachable;
+
+    row.missionCount = (int)stop.missionIds.size();
+    row.totalRewardCr = stop.rewardCr;
+    row.avgRisk01 = stop.avgRisk01;
+
+    // Store *relative* ETA from \"now\" in days for easy display.
+    row.etaDays = stop.etaDay - ctx.timeDays;
+    row.earliestDeadlineDay = stop.earliestDeadlineDay;
+    row.etaSlackHours = stop.etaSlackHours;
+
+    row.missionIds = stop.missionIds;
+
+    st.playbook.stops.push_back(std::move(row));
+  }
+
+  if (!st.playbook.ok) {
+    st.playbook.status = "Planner unavailable.";
+  } else if (st.playbook.stops.empty()) {
+    st.playbook.status = "No active mission objectives.";
+  } else {
+    st.playbook.status.clear();
+  }
+}
+
+static void drawPlaybook(CopilotWindowState& st, const CopilotContext& ctx) {
+  if (!ctx.currentSystem || !ctx.missions) {
+    ImGui::TextDisabled("No mission planning context.");
+    return;
+  }
+
+  bool force = false;
+
+  // Controls row
+  if (ImGui::Checkbox("Group by system", &st.playbookGroupBySystem)) {
+    force = true;
+  }
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110.0f);
+  if (ImGui::SliderInt("Stops", &st.playbookMaxStops, 1, 16)) {
+    // let cache key handle rebuild, butct; but while dragging, rebuild can be noisy
+    // so delay until mouse release.
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      force = true;
+    }
+  }
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(95.0f);
+  if (ImGui::SliderFloat("Refresh", &st.playbookRecomputeSec, 0.25f, 10.0f, "%.2fs")) {
+    // no immediate rebuild necessary
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Rebuild")) {
+    force = true;
+  }
+
+  if (ctx.openMissionControl) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Mission Control")) {
+      ctx.openMissionControl();
+    }
+  }
+  if (ctx.openMissionsWindow) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Missions")) {
+      ctx.openMissionsWindow();
+    }
+  }
+
+  updatePlaybookCache(st, ctx, force);
+
+  if (!st.playbook.ok || !st.playbook.status.empty()) {
+    ImGui::TextDisabled("%s", st.playbook.status.c_str());
+    return;
+  }
+
+  ImGui::Text("Stops: %d   Reward: %.0f cr   Unreachable: %d",
+              (int)st.playbook.stops.size(),
+              st.playbook.totalRewardCr,
+              st.playbook.unreachableStops);
+
+  const double maxJumpLy = (ctx.maxJumpLy > 0.25) ? ctx.maxJumpLy : 28.0;
+  ImGui::SameLine();
+  ImGui::TextDisabled("(max jump %.1fly)", maxJumpLy);
+
+  // Next-stop quick actions
+  if (!st.playbook.stops.empty()) {
+    const CopilotItineraryStopSummary& next = st.playbook.stops.front();
+    ImGui::Separator();
+    ImGui::TextDisabled("Next:");
+    ImGui::SameLine();
+
+    std::string dest = systemName(ctx.universe, next.systemId);
+    if (next.stationId != 0) {
+      dest += " / ";
+      dest += stationName(ctx.universe, next.systemId, next.stationId);
+    } else if (next.isSite) {
+      dest += " / Site";
+    }
+
+    if (!next.reachable) {
+      dest += "  (unreachable)";
+    }
+
+    ImGui::TextUnformatted(dest.c_str());
+
+    ImGui::SameLine();
+    if (ctx.goToStation && ImGui::SmallButton("Go")) {
+      ctx.goToStation(next.systemId, next.stationId, /*armAutoRun=*/true);
+    }
+
+    if (ctx.plotRouteToSystem) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Plot")) {
+        ctx.plotRouteToSystem(next.systemId);
+      }
+    }
+
+    if (ctx.trackMission && !next.missionIds.empty()) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Track")) {
+        ctx.trackMission(pickBestMissionToTrack(ctx, next.missionIds));
+      }
+    }
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("ETA %s", formatTimeDaysShort(next.etaDays).c_str());
+
+    if (std::isfinite(next.etaSlackHours)) {
+      ImGui::SameLine();
+      if (next.etaSlackHours < 0.0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Late %.1fh", next.etaSlackHours);
+      } else {
+        ImGui::TextDisabled("Slack +%.1fh", next.etaSlackHours);
+      }
+    }
+  }
+
+  // Full table
+  ImGui::Separator();
+  const float tableH = std::min(340.0f, 28.0f + 24.0f * (float)st.playbook.stops.size());
+  if (ImGui::BeginTable("##copilot_playbook", 7,
+                        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                        ImVec2(0.0f, tableH))) {
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+    ImGui::TableSetupColumn("Destination", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Missions", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+    ImGui::TableSetupColumn("Reward", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+    ImGui::TableSetupColumn("Risk", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+    ImGui::TableSetupColumn("ETA", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+    ImGui::TableSetupColumn("Slack", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+    ImGui::TableHeadersRow();
+
+    for (int i = 0; i < (int)st.playbook.stops.size(); ++i) {
+      const CopilotItineraryStopSummary& row = st.playbook.stops[(std::size_t)i];
+
+      ImGui::TableNextRow();
+      ImGui::PushID(i);
+
+      ImGui::TableSetColumnIndex(0);
+      ImGui::Text("%d", i + 1);
+
+      ImGui::TableSetColumnIndex(1);
+      std::string dest = systemName(ctx.universe, row.systemId);
+      if (row.stationId != 0) {
+        dest += " / ";
+        dest += stationName(ctx.universe, row.systemId, row.stationId);
+      } else if (row.isSite) {
+        dest += " / Site";
+      }
+      if (!row.reachable) {
+        dest += "  (unreachable)";
+      }
+      ImGui::TextUnformatted(dest.c_str());
+
+      ImGui::TableSetColumnIndex(2);
+      ImGui::Text("%d", row.missionCount);
+
+      ImGui::TableSetColumnIndex(3);
+      ImGui::Text("%.0f", row.totalRewardCr);
+
+      ImGui::TableSetColumnIndex(4);
+      ImGui::Text("%.0f%%", row.avgRisk01 * 100.0);
+
+      ImGui::TableSetColumnIndex(5);
+      ImGui::Text("%s", formatTimeDaysShort(row.etaDays).c_str());
+
+      ImGui::TableSetColumnIndex(6);
+      if (std::isfinite(row.etaSlackHours)) {
+        if (row.etaSlackHours < 0.0) {
+          ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%.1fh", row.etaSlackHours);
+        } else {
+          ImGui::Text("+%.1fh", row.etaSlackHours);
+        }
+      } else {
+        ImGui::TextDisabled("-");
+      }
+
+      // Row actions (right-aligned-ish): render after slack with a tooltip
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("ETA slack relative to earliest deadline at this stop.");
+      }
+
+      // Inline action buttons under destination row (avoids extra column width)
+      if (ImGui::IsItemHovered()) {
+        // noop
+      }
+
+      // Draw actions as a second line beneath the destination
+      ImGui::TableSetColumnIndex(1);
+      ImGui::Dummy(ImVec2(0.0f, 0.0f));
+      if (ctx.goToStation && ImGui::SmallButton("Go")) {
+        ctx.goToStation(row.systemId, row.stationId, /*armAutoRun=*/true);
+      }
+      if (ctx.plotRouteToSystem) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Plot")) {
+          ctx.plotRouteToSystem(row.systemId);
+        }
+      }
+      if (ctx.trackMission && !row.missionIds.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Track")) {
+          ctx.trackMission(pickBestMissionToTrack(ctx, row.missionIds));
+        }
+      }
+
+      ImGui::PopID();
+    }
+
+    ImGui::EndTable();
+  }
+
+  ImGui::TextDisabled("Note: this playbook is a greedy plan. Use Mission Control to tweak priorities and constraints.");
+}
+
+
 } // namespace
 
 void drawCopilotWindow(CopilotWindowState& st, const CopilotContext& ctx) {
@@ -635,6 +1010,8 @@ void drawCopilotWindow(CopilotWindowState& st, const CopilotContext& ctx) {
   ImGui::Checkbox("Recommendations", &st.showRecommendations);
   ImGui::SameLine();
   ImGui::Checkbox("Missions", &st.showMissions);
+  ImGui::SameLine();
+  ImGui::Checkbox("Playbook", &st.showPlaybook);
   ImGui::SameLine();
   ImGui::Checkbox("Progression", &st.showProgression);
 

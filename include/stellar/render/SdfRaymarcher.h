@@ -33,37 +33,69 @@ enum class SdfRaymarchDebug : core::u8 {
 };
 
 struct SdfRaymarchSettings {
-  // Core sphere-tracing parameters.
   int maxSteps{128};
-  float epsilon{0.0015f};
-  float maxDistance{25.0f};
 
-  // Clip rays to an AABB around the origin to avoid wasting steps.
+  // Canonical names: epsilon / maxDistance.
+  // Legacy aliases: hitEps / normalEps / maxDist.
+  union {
+    float epsilon{0.0015f};
+    float hitEps;
+    float normalEps;
+  };
+  union {
+    float maxDistance{25.0f};
+    float maxDist;
+  };
+
   bool useBoundsAabb{true};
 
-  // Lighting.
-  float lightDir[3]{0.40f, 0.75f, 0.20f};
-  float baseColor[3]{0.85f, 0.90f, 1.00f};
-  float backgroundColor[3]{0.02f, 0.02f, 0.03f};
-  float ambient{0.20f};
-  float diffuse{0.85f};
-  float specular{0.18f};
-  float shininess{64.0f};
+  float lightDir[3]{0.3f, 0.75f, 0.55f};
 
-  // Soft shadows (IQ-style). This is approximate and tuned for previews.
+  // Canonical colors: baseColor / backgroundColor.
+  // Legacy aliases: lightColor / ambientColor / fogColor.
+  union {
+    struct {
+      float baseColor[3]{0.85f, 0.9f, 1.0f};
+    };
+    float lightColor[3];
+    float ambientColor[3];
+  };
+  union {
+    struct {
+      float backgroundColor[3]{0.02f, 0.03f, 0.05f};
+    };
+    float fogColor[3];
+  };
+
+  float ambient{0.2f};
+  float diffuse{0.8f};
+  float specular{0.25f};
+  float shininess{16.0f};
+
   bool softShadows{true};
-  int shadowSteps{32};
-  float shadowMaxDistance{8.0f};
-  float shadowK{16.0f};
+  int shadowSteps{24};
+  union {
+    float shadowMaxDistance{8.0f};
+    float shadowMaxDist;
+  };
+  float shadowK{32.0f};
 
-  // Ambient occlusion (cheap sample-based). Also approximate.
   bool ambientOcclusion{true};
-  int aoSteps{5};
-  float aoStepSize{0.12f};
-  float aoStrength{1.0f};
+  // Canonical names: aoSteps / aoStepSize.
+  // Legacy aliases: aoSamples / aoStep.
+  union {
+    int aoSteps{5};
+    int aoSamples;
+  };
+  union {
+    float aoStepSize{0.12f};
+    float aoStep;
+  };
+  float aoStrength{0.65f};
 
-  SdfRaymarchDebug debug{SdfRaymarchDebug::Shaded};
+  SdfRaymarchDebug debug{};
 };
+
 
 // Optional surface material inputs for the preview shader.
 // When albedoTex is provided, shaded mode samples it using spherical UVs.

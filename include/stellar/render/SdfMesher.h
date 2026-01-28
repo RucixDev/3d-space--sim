@@ -25,26 +25,32 @@ struct SdfMeshData {
 };
 
 struct SdfMesherParams {
-  // Number of cells per axis in the cubic domain.
-  // Total sampled grid points is (resolution+1)^3.
   int resolution{32};
-
-  // Half-extent of the cubic domain: positions are sampled in [-bounds, +bounds].
   float bounds{1.25f};
 
-  // Iso value threshold.
-  float iso{0.0f};
+  // Canonical name: iso.
+  // Legacy alias: isoValue.
+  union {
+    float iso{0.0f};
+    float isoValue;
+  };
 
-  // Compute smooth per-vertex normals from the scalar field gradient (central differences).
-  bool computeNormalsFromField{true};
+  // Canonical name: computeNormalsFromField.
+  // Legacy alias: computeNormals.
+  union {
+    bool computeNormalsFromField{true};
+    bool computeNormals;
+  };
 
-  // Step size for gradient sampling (in world units).
   float normalEps{0.0025f};
-
-  // Flip triangle winding so generated geometry is front-facing for
-  // standard backface culling when the field is an SDF (positive outside).
   bool fixWindingFromNormals{true};
+
+  // Legacy toggles retained for older UI code. These are implemented in
+  // SdfMesher.cpp (UV projection path) and default to the current behavior.
+  bool generateUv{true};
+  bool bakeSdfToUV{false};
 };
+
 
 struct SdfMeshStats {
   std::size_t vertexCount{0};
