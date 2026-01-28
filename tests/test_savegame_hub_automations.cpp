@@ -1,6 +1,7 @@
 #include "test_harness.h"
 
 #include "stellar/sim/SaveGame.h"
+#include "stellar/sim/HubAutomations.h"
 
 #include <cmath>
 #include <filesystem>
@@ -9,12 +10,12 @@
 int test_savegame_hub_automations() {
   int failures = 0;
 
-  sim::SaveGame s{};
+  stellar::sim::SaveGame s{};
   s.version = 32;
   s.seed = 123;
   s.hubAutomationsEnabled = false;
 
-  sim::IntegrationHubAutomationRuleState r{};
+  stellar::sim::IntegrationHubAutomationRuleState r{};
   r.enabled = true;
   r.name = "Test rule";
   r.eventKind = 5;  // GameEventKind::Validation in apps/stellar_game
@@ -22,7 +23,7 @@ int test_savegame_hub_automations() {
   r.tagText = "foo";
   r.cooldownSec = 1.25;
 
-  sim::IntegrationHubAutomationActionState a{};
+  stellar::sim::IntegrationHubAutomationActionState a{};
   a.kind = 10;      // GameActionKind::TransmitComms
   a.u64aSource = 1; // AutomationValueSource::EventU64a
   a.u64aConst = 42;
@@ -37,10 +38,10 @@ int test_savegame_hub_automations() {
   s.hubAutomationRules.push_back(r);
 
   const std::string path = "__test_savegame_hub_automations.sav";
-  CHECK(sim::saveToFile(s, path));
+  CHECK(stellar::sim::saveToFile(s, path));
 
-  sim::SaveGame loaded{};
-  CHECK(sim::loadFromFile(path, loaded));
+  stellar::sim::SaveGame loaded{};
+  CHECK(stellar::sim::loadFromFile(path, loaded));
 
   CHECK(loaded.hubAutomationsEnabled == s.hubAutomationsEnabled);
   CHECK(loaded.hubAutomationRules.size() == 1);

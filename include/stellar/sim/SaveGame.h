@@ -5,6 +5,7 @@
 #include "stellar/math/Vec3.h"
 #include "stellar/sim/Celestial.h"
 #include "stellar/sim/Industry.h"
+#include "stellar/sim/HubAutomations.h"
 #include "stellar/sim/Logbook.h"
 #include "stellar/sim/Comms.h"
 #include "stellar/sim/TrafficEscort.h"
@@ -326,43 +327,7 @@ struct Mission {
 // GameActionKind rather than depending on the app-layer types here.
 // Those enums are now assigned explicit stable IDs (see apps/stellar_game/GameSignals.h).
 
-struct IntegrationHubAutomationActionState {
-  // Numeric value of stellar::game::GameActionKind.
-  core::u8 kind{0};
-
-  // Numeric value of stellar::game::AutomationValueSource.
-  core::u8 u64aSource{0};
-  core::u64 u64aConst{0};
-
-  core::u8 u64bSource{0};
-  core::u64 u64bConst{0};
-
-  int i32Const{0};
-  bool bConst{false};
-
-  double delaySec{0.0};
-
-  // Stored as a normal string; the file format base64-encodes it into a single token.
-  std::string msgTemplate{};
-};
-
-struct IntegrationHubAutomationRuleState {
-  bool enabled{false};
-
-  // Human-friendly name.
-  std::string name{"Rule"};
-
-  // Numeric value of stellar::game::GameEventKind.
-  core::u8 eventKind{0};
-
-  // Numeric value of stellar::game::AutomationTagMatch.
-  core::u8 tagMatch{0};
-  std::string tagText{};
-
-  double cooldownSec{0.25};
-
-  std::vector<IntegrationHubAutomationActionState> actions{};
-};
+// Persisted automation types live in HubAutomations.h.
 
 struct SaveGame {
   int version{35};

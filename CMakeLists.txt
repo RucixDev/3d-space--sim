@@ -252,6 +252,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/StationServices.cpp
   src/sim/Insurance.cpp
   src/sim/Logbook.cpp
+  src/sim/HubAutomations.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp
   src/sim/TrafficTransit.cpp
@@ -272,6 +273,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/MissionAssist.cpp
   src/sim/MissionBriefing.cpp
   src/sim/Comms.cpp
+  src/sim/GalNet.cpp
   src/sim/MissionLogic.cpp
 
   src/econ/Commodity.cpp
