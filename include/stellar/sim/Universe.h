@@ -54,6 +54,9 @@ public:
 
   // Generate (or fetch cached) full system data.
   const StarSystem& getSystem(SystemId id, const SystemStub* hintStub = nullptr);
+  const StarSystem& getSystem(SystemId id, const SystemStub* hintStub = nullptr) const {
+    return const_cast<Universe*>(this)->getSystem(id, hintStub);
+  }
 
   // Economy state access for a station. Will create deterministic initial state if missing,
   // then advance it to `timeDays`.

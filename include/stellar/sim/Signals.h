@@ -14,6 +14,7 @@ namespace stellar::sim {
 
 struct Mission; // fwd
 struct TrafficLedger; // fwd
+struct SystemConditionsSnapshot; // fwd
 
 enum class SignalKind : core::u8 {
   ResourceField = 0,
@@ -90,7 +91,8 @@ SystemSignalPlan generateSystemSignals(core::u64 universeSeed,
                                       const std::vector<Mission>& activeMissions,
                                       const std::vector<core::u64>& resolvedSignalIds,
                                       const SignalGenParams& params = {},
-                                      const TrafficLedger* trafficLedger = nullptr);
+                                      const TrafficLedger* trafficLedger = nullptr,
+                                      const SystemConditionsSnapshot* conditions = nullptr);
 
 // O(n) helper (resolvedSignalIds is usually small). Returns true if signalId is contained.
 bool isSignalResolved(const std::vector<core::u64>& resolvedSignalIds, core::u64 signalId);

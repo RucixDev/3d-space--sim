@@ -4994,7 +4994,8 @@ auto fieldOpsSkipTarget = [&]() {
   gen.includeTrafficConvoys = true;
   gen.trafficLaneParams = trafficLaneParamsGame;
 
-  const auto plan = sim::generateSystemSignals(universe.seed(), sys, timeDays, missions, resolved, gen, &trafficLedger);
+  const auto conditions = snapshotSystemConditions(sys);
+  const auto plan = sim::generateSystemSignals(universe.seed(), sys, timeDays, missions, resolved, gen, &trafficLedger, &conditions);
 
   // Cache resource field metadata for scanner readouts + hazard traits.
   resourceFieldSites = plan.resourceFields.fields;
