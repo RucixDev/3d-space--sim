@@ -586,6 +586,11 @@ static void requestRemesh(ProceduralMeshLabWindowState& st) {
   });
 }
 
+// Forward declarations (used before definition).
+static void uploadPreviewMeshForCurrentLod(ProceduralMeshLabWindowState& st);
+static void resetLodChainToBaseMesh(ProceduralMeshLabWindowState& st);
+static void requestBuildLods(ProceduralMeshLabWindowState& st);
+
 static void pollRemeshJob(ProceduralMeshLabWindowState& st, const ToastFn& toast) {
   if (!st.jobRunning) return;
   if (!st.job.valid()) {

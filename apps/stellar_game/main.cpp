@@ -10868,10 +10868,11 @@ progression.unlockWeapon(weaponSecondary);
                             const double t = std::clamp(1.0 - d / blastRadiusKm, 0.0, 1.0);
                             const double dmg = 55.0 * t;
                             applyDamage(dmg, playerShield, playerHull);
+                          }
+                        }
+                      } else {
+                        toast(toasts, "Asteroid depleted.", 1.5);
                       }
-                    } else {
-                      toast(toasts, "Asteroid depleted.", 1.5);
-                    }
                   }
                 } else if (fr.hitKind == sim::CombatTargetKind::Ship) {
                   if (fr.hitIndex < contacts.size()) {
@@ -36781,9 +36782,9 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
       ImGui::End();
     }
 
-    if (showFactionsWindow) {
-      ImGui::SetNextWindowSize(ImVec2(680, 520), ImGuiCond_FirstUseEver);
-      if (ImGui::Begin("Factions / Standing", &showFactionsWindow)) {
+	    if (showFactionsWindow) {
+	      ImGui::SetNextWindowSize(ImVec2(680, 520), ImGuiCond_FirstUseEver);
+	      if (ImGui::Begin("Factions / Standing", &showFactionsWindow)) {
 	        // Persistent UI selection state for the window.
 	        static core::u32 selectedFactionId = 0;
         ImGui::TextDisabled("Docking access prototype:");
@@ -36838,10 +36839,9 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
         static char factionFilter[64] = "";
         ImGui::InputTextWithHint("##FactionFilter", "Filter by faction name...", factionFilter, sizeof(factionFilter));
 
-        enum class SortKey : int { Name = 0, Rep, Bounty, Fine, Voucher };
-        static int sortKeyInt = 0;
-        static bool sortDesc = true;
-        static core::u32 selectedFactionId = 0;
+	        enum class SortKey : int { Name = 0, Rep, Bounty, Fine, Voucher };
+	        static int sortKeyInt = 0;
+	        static bool sortDesc = true;
         const char* sortLabels[] = {"Name", "Rep", "Bounty", "Fine", "Voucher"};
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120.0f);
@@ -36868,7 +36868,7 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
 
         pushUnique(0);
         for (const auto& f : universe.factions()) pushUnique(f.id);
-        for (const auto& [fid, _] : repByFaction) pushUnique(fid);
+	        for (const auto& [fid, _] : repByFaction) pushUnique(fid);
 	        // LawLedger isn't directly iterable; pull ids from each internal map.
 	        for (const auto& [fid, _] : lawLedger.bounties()) pushUnique(fid);
 	        for (const auto& [fid, _] : lawLedger.fines()) pushUnique(fid);
@@ -36939,7 +36939,7 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
             const bool dockingDenied = (r.rep <= kDockDenyRep) || (r.bounty > kDockDenyBountyMinCr);
 
             ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
+	            ImGui::TableSetColumnIndex(0);
 	            {
 	              const bool isSelected = (selectedFactionId == r.factionId);
 	              const std::string label = r.name + "##faction_" + std::to_string(r.factionId);
@@ -36974,15 +36974,15 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
           }
 
           ImGui::EndTable();
-        }
-      }
-	      ImGui::Separator();
-	      {
-	        const core::u32 fid = selectedFactionId;
-	        const std::string fidName = (fid == 0) ? std::string("Independent") : factionName(fid);
-	        ImGui::Text("Selected: %s", fidName.c_str());
-	        ImGui::SameLine();
-	        ImGui::TextDisabled("(click a row to select)");
+	        }
+
+	        ImGui::Separator();
+	        {
+	          const core::u32 fid = selectedFactionId;
+	          const std::string fidName = (fid == 0) ? std::string("Independent") : factionName(fid);
+	          ImGui::Text("Selected: %s", fidName.c_str());
+	          ImGui::SameLine();
+	          ImGui::TextDisabled("(click a row to select)");
 
 	        const double rep = getRep(fid);
 	        const double bounty = getBounty(fid);
@@ -37035,10 +37035,10 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
 	          }
 	        }
 	        ImGui::EndDisabled();
+	        }
 	      }
-
-		      ImGui::End();
-		    }
+	      ImGui::End();
+	    }
 
 	    // ---- Notifications (toast history) ----
     if (showNotifications) {

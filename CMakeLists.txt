@@ -252,6 +252,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/StationServices.cpp
   src/sim/Insurance.cpp
   src/sim/Logbook.cpp
+  src/sim/ExplorationData.cpp
   src/sim/HubAutomations.cpp
   src/sim/SaveGame.cpp
   src/sim/Traffic.cpp

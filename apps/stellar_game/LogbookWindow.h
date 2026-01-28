@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stellar/sim/Logbook.h"
+#include "stellar/sim/ExplorationData.h"
 #include "stellar/sim/System.h"
 #include "stellar/sim/Universe.h"
 
@@ -12,12 +13,16 @@
 namespace stellar::game {
 
 struct ExplorationDataBrokerState {
-  // Premium model (optional): payout multiplier based on distance and jurisdiction.
-  bool enablePremium{true};
-  float distanceScaleLy{250.0f};
-  float maxDistancePremium{0.30f}; // up to +30% for very distant data
-  float sameFactionBonus{0.10f};   // +10% when selling data from same faction space
-  float otherFactionPenalty{0.05f}; // -5% when selling foreign-space data
+  // Broker payout model parameters (used by both the station broker UI and the logbook planner).
+  stellar::sim::ExplorationDataBrokerParams params{};
+
+  // Master toggle for all broker-side multipliers (keeps the UI simple).
+  bool enableMultipliers{true};
+
+  // Planner search (logbook window only).
+  float plannerRadiusLy{250.0f};
+  int plannerMaxSystems{128};
+  int plannerMaxStations{64};
 
   // UI
   bool showDetails{false};

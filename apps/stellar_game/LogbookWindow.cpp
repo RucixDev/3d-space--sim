@@ -1,6 +1,7 @@
 #include "LogbookWindow.h"
 
 #include "stellar/econ/Commodity.h"
+#include "stellar/sim/ExplorationData.h"
 #include "stellar/sim/Signals.h"
 
 #include <imgui.h>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace stellar::game {
 
@@ -91,31 +93,18 @@ static std::string entryTargetLabel(sim::Universe& u, const sim::LogbookEntry& e
   }
 }
 
-static double computeBrokerMultiplier(const ExplorationDataBrokerState& st,
+static double brokerMultiplierForEntry(const ExplorationDataBrokerState& st,
                                       const sim::StarSystem& saleSystem,
                                       const sim::Station& saleStation,
-                                      const sim::SystemStub& scanStub) {
-  if (!st.enablePremium) return 1.0;
-
-  double mult = 1.0;
-
-  // Distance premium: linear ramp up to maxDistancePremium.
-  const double distLy = (scanStub.posLy - saleSystem.stub.posLy).length();
-  const double scale = std::max(1.0, (double)st.distanceScaleLy);
-  const double t = std::clamp(distLy / scale, 0.0, 1.0);
-  mult *= (1.0 + (double)st.maxDistancePremium * t);
-
-  // Jurisdiction premium/penalty: faction alignment.
-  const core::u32 saleF = saleStation.factionId;
-  const core::u32 scanF = scanStub.factionId;
-  if (saleF != 0 && scanF != 0) {
-    if (saleF == scanF) mult *= (1.0 + (double)st.sameFactionBonus);
-    else mult *= (1.0 - (double)st.otherFactionPenalty);
-  }
-
-  // Clamp to avoid extreme exploitation.
-  mult = std::clamp(mult, 0.75, 1.50);
-  return mult;
+                                      const sim::SystemStub& scanStub,
+                                      const sim::LogbookEntry& e) {
+  if (!st.enableMultipliers) return 1.0;
+  return sim::explorationDataBrokerMultiplier(st.params,
+                                              saleSystem.stub,
+                                              saleStation,
+                                              scanStub,
+                                              e.kind,
+                                              e.subKind);
 }
 
 } // namespace
@@ -159,6 +148,7 @@ void drawExplorationDataBrokerPanel(ExplorationDataBrokerState& st,
   };
 
   std::unordered_map<sim::SystemId, std::size_t> idx;
+  std::unordered_map<sim::SystemId, sim::SystemStub> stubCache;
   std::vector<Group> groups;
   groups.reserve(64);
 
@@ -178,16 +168,25 @@ void drawExplorationDataBrokerPanel(ExplorationDataBrokerState& st,
     Group& g = groups[it->second];
     g.baseCr += e.valueCr;
     g.entries += 1;
+
+    // Payout is entry-specific (station demand may depend on the entry kind).
+    auto itStub = stubCache.find(e.systemId);
+    if (itStub == stubCache.end()) {
+      const auto& sys = universe.getSystem(e.systemId);
+      itStub = stubCache.emplace(e.systemId, sys.stub).first;
+    }
+    const double mult = brokerMultiplierForEntry(st, saleSystem, saleStation, itStub->second, e);
+    g.payoutCr += e.valueCr * mult;
   }
 
-  // Enrich groups with names/distances/multipliers.
+  // Enrich groups with names/distances/effective multiplier.
   for (auto& g : groups) {
-    const auto& sys = universe.getSystem(g.systemId);
-    g.name = sys.stub.name;
-    g.factionId = sys.stub.factionId;
-    g.distanceLy = (sys.stub.posLy - saleSystem.stub.posLy).length();
-    g.mult = computeBrokerMultiplier(st, saleSystem, saleStation, sys.stub);
-    g.payoutCr = g.baseCr * g.mult;
+    const auto itStub = stubCache.find(g.systemId);
+    const sim::SystemStub& stub = (itStub != stubCache.end()) ? itStub->second : universe.getSystem(g.systemId).stub;
+    g.name = stub.name;
+    g.factionId = stub.factionId;
+    g.distanceLy = (stub.posLy - saleSystem.stub.posLy).length();
+    g.mult = (g.baseCr > 1e-6) ? (g.payoutCr / g.baseCr) : 1.0;
   }
 
   // Sort by base value (descending).
@@ -196,20 +195,43 @@ void drawExplorationDataBrokerPanel(ExplorationDataBrokerState& st,
     return a.name < b.name;
   });
 
-  // Premium settings.
+  // Pricing model.
   ImGui::Separator();
-  if (ImGui::TreeNodeEx("Broker Premium Model", ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::Checkbox("Enable premium payout", &st.enablePremium);
+  if (ImGui::TreeNodeEx("Broker Pricing Model", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enable broker multipliers", &st.enableMultipliers);
     ImGui::SameLine();
     ImGui::Checkbox("Show details", &st.showDetails);
 
-    ImGui::BeginDisabled(!st.enablePremium);
-    ImGui::SliderFloat("Distance scale (ly)", &st.distanceScaleLy, 50.0f, 800.0f, "%.0f");
-    ImGui::SliderFloat("Max distance premium", &st.maxDistancePremium, 0.0f, 0.75f, "+%.0f%%");
-    ImGui::SliderFloat("Same-faction bonus", &st.sameFactionBonus, 0.0f, 0.50f, "+%.0f%%");
-    ImGui::SliderFloat("Other-faction penalty", &st.otherFactionPenalty, 0.0f, 0.50f, "-%.0f%%");
+    ImGui::BeginDisabled(!st.enableMultipliers);
+
+    ImGui::Checkbox("Distance premium", &st.params.enableDistancePremium);
+    float distScaleLy = (float)st.params.distanceScaleLy;
+    if (ImGui::SliderFloat("Distance scale (ly)", &distScaleLy, 50.0f, 800.0f, "%.0f")) {
+      st.params.distanceScaleLy = (double)distScaleLy;
+    }
+    float maxDistPrem = (float)st.params.maxDistancePremium;
+    if (ImGui::SliderFloat("Max distance premium", &maxDistPrem, 0.0f, 0.75f, "+%.0f%%")) {
+      st.params.maxDistancePremium = (double)maxDistPrem;
+    }
+
+    float sameFaction = (float)st.params.sameFactionBonus;
+    if (ImGui::SliderFloat("Same-faction bonus", &sameFaction, 0.0f, 0.50f, "+%.0f%%")) {
+      st.params.sameFactionBonus = (double)sameFaction;
+    }
+    float otherFaction = (float)st.params.otherFactionPenalty;
+    if (ImGui::SliderFloat("Other-faction penalty", &otherFaction, 0.0f, 0.50f, "-%.0f%%")) {
+      st.params.otherFactionPenalty = (double)otherFaction;
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("Station demand shaping", &st.params.enableStationDemand);
+    float demand = (float)st.params.demandStrength;
+    if (ImGui::SliderFloat("Demand strength", &demand, 0.0f, 1.0f, "%.2f")) {
+      st.params.demandStrength = (double)demand;
+    }
+
     ImGui::EndDisabled();
-    ImGui::TextDisabled("Payout = base * premium (clamped). Bank is tracked in base credits for compatibility.");
+    ImGui::TextDisabled("Payout = base × multiplier (distance, faction, demand; clamped). Bank stays in base credits.");
     ImGui::TreePop();
   }
 
@@ -293,22 +315,18 @@ void drawExplorationDataBrokerPanel(ExplorationDataBrokerState& st,
     double baseSold = 0.0;
     double payoutSold = 0.0;
     int soldEntries = 0;
-
-    // Map systemId -> multiplier to avoid repeated universe lookups.
-    std::unordered_map<sim::SystemId, double> multCache;
-    multCache.reserve(groups.size());
-    for (const auto& g : groups) {
-      multCache[g.systemId] = g.mult;
-    }
-
     for (auto& e : logbook) {
       if (e.sold) continue;
       if (e.valueCr <= 0.0) continue;
       if (!sellAll) {
         if (st.selectedSystems.find(e.systemId) == st.selectedSystems.end()) continue;
       }
-      const auto itM = multCache.find(e.systemId);
-      const double mult = (itM != multCache.end()) ? itM->second : 1.0;
+      auto itStub = stubCache.find(e.systemId);
+      if (itStub == stubCache.end()) {
+        const auto& sys = universe.getSystem(e.systemId);
+        itStub = stubCache.emplace(e.systemId, sys.stub).first;
+      }
+      const double mult = brokerMultiplierForEntry(st, saleSystem, saleStation, itStub->second, e);
       baseSold += e.valueCr;
       payoutSold += e.valueCr * mult;
       e.sold = true;
@@ -377,6 +395,226 @@ void drawLogbookWindow(LogbookWindowState& st, const LogbookContext& ctx) {
   if (std::fabs(diff) > 0.5) {
     ImGui::TextColored(ImVec4(1, 0.75f, 0.2f, 1),
                        "Bank/log mismatch (%.0f cr). Older saves won't have per-scan history.", diff);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sell Planner
+  // ---------------------------------------------------------------------------
+  // Ranks nearby stations by predicted payout using the same broker multiplier
+  // as the station-side sale panel. This lets players plan a "data run".
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Sell Planner", ImGuiTreeNodeFlags_DefaultOpen)) {
+    auto& br = st.broker;
+
+    if (!ctx.currentSystem) {
+      ImGui::TextDisabled("No current system loaded yet.");
+    } else {
+      ImGui::Checkbox("Enable broker multipliers##planner", &br.enableMultipliers);
+      ImGui::SameLine();
+      ImGui::TextDisabled("(uses station demand + distance + faction)");
+
+      ImGui::SetNextItemWidth(160.0f);
+      ImGui::SliderFloat("Search radius (ly)", &br.plannerRadiusLy, 25.0f, 2000.0f, "%.0f");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      ImGui::SliderInt("Max systems", &br.plannerMaxSystems, 16, 256);
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      ImGui::SliderInt("Max stations", &br.plannerMaxStations, 8, 256);
+
+      const bool useSelection = !br.selectedSystems.empty();
+      if (useSelection) {
+        ImGui::TextDisabled("Using station-broker selection: %d systems", (int)br.selectedSystems.size());
+      }
+
+      struct BucketKey {
+        sim::SystemId sys{0};
+        sim::LogbookEntryKind kind{sim::LogbookEntryKind::StarScan};
+        core::u8 sub{0};
+        bool operator==(const BucketKey& o) const { return sys == o.sys && kind == o.kind && sub == o.sub; }
+      };
+      struct BucketKeyHash {
+        std::size_t operator()(const BucketKey& k) const {
+          std::size_t h = std::hash<sim::SystemId>{}(k.sys);
+          h ^= (std::size_t)k.kind + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+          h ^= (std::size_t)k.sub + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+          return h;
+        }
+      };
+
+      struct Bucket {
+        BucketKey key{};
+        double baseCr{0.0};
+        int entries{0};
+      };
+
+      std::unordered_map<BucketKey, std::size_t, BucketKeyHash> bucketIdx;
+      std::vector<Bucket> buckets;
+      buckets.reserve(128);
+
+      double baseTotal = 0.0;
+      int entryCount = 0;
+      for (const auto& e : ctx.logbook) {
+        if (e.sold) continue;
+        if (e.valueCr <= 0.0) continue;
+        if (e.systemId == 0) continue;
+        if (useSelection && br.selectedSystems.find(e.systemId) == br.selectedSystems.end()) continue;
+
+        BucketKey k{e.systemId, e.kind, e.subKind};
+        auto it = bucketIdx.find(k);
+        if (it == bucketIdx.end()) {
+          const std::size_t ni = buckets.size();
+          bucketIdx.emplace(k, ni);
+          buckets.push_back(Bucket{});
+          buckets.back().key = k;
+          it = bucketIdx.find(k);
+        }
+        Bucket& b = buckets[it->second];
+        b.baseCr += e.valueCr;
+        b.entries += 1;
+        baseTotal += e.valueCr;
+        entryCount += 1;
+      }
+
+      if (baseTotal <= 1e-6 || buckets.empty()) {
+        ImGui::TextDisabled("No unsold exploration data to plan a sale.");
+      } else {
+        // Cache scan system stubs referenced by buckets.
+        std::unordered_map<sim::SystemId, sim::SystemStub> scanStubCache;
+        scanStubCache.reserve(buckets.size());
+        for (const auto& b : buckets) {
+          if (scanStubCache.find(b.key.sys) == scanStubCache.end()) {
+            const auto& s = ctx.universe.getSystem(b.key.sys);
+            scanStubCache.emplace(b.key.sys, s.stub);
+          }
+        }
+
+        // Candidate station search.
+        const auto nearby = ctx.universe.queryNearby(ctx.currentSystem->stub.posLy, (double)br.plannerRadiusLy,
+                                                     (std::size_t)std::max(1, br.plannerMaxSystems));
+
+        struct Candidate {
+          sim::SystemId sysId{0};
+          sim::StationId stationId{0};
+          econ::StationType type{econ::StationType::Outpost};
+          std::string systemName;
+          std::string stationName;
+          double travelLy{0.0};
+          double payoutCr{0.0};
+        };
+
+        std::vector<Candidate> candidates;
+        candidates.reserve((std::size_t)std::max(8, br.plannerMaxStations));
+
+        auto stationTypeName = [](econ::StationType t) {
+          switch (t) {
+            case econ::StationType::Agricultural: return "Agricultural";
+            case econ::StationType::Mining: return "Mining";
+            case econ::StationType::Refinery: return "Refinery";
+            case econ::StationType::Industrial: return "Industrial";
+            case econ::StationType::Research: return "Research";
+            case econ::StationType::TradeHub: return "Trade Hub";
+            case econ::StationType::Shipyard: return "Shipyard";
+            case econ::StationType::Outpost:
+            default: return "Outpost";
+          }
+        };
+
+        for (const auto& stub : nearby) {
+          const auto& sys = ctx.universe.getSystem(stub.id, &stub);
+          const double travelLy = (sys.stub.posLy - ctx.currentSystem->stub.posLy).length();
+          for (const auto& stn : sys.stations) {
+            double payout = 0.0;
+            for (const auto& b : buckets) {
+              const sim::SystemStub& scanStub = scanStubCache[b.key.sys];
+              const double mult = br.enableMultipliers
+                                    ? sim::explorationDataBrokerMultiplier(br.params, sys.stub, stn, scanStub, b.key.kind, b.key.sub)
+                                    : 1.0;
+              payout += b.baseCr * mult;
+            }
+
+            Candidate c;
+            c.sysId = sys.stub.id;
+            c.stationId = stn.id;
+            c.type = stn.type;
+            c.systemName = sys.stub.name;
+            c.stationName = stn.name;
+            c.travelLy = travelLy;
+            c.payoutCr = payout;
+            candidates.push_back(std::move(c));
+          }
+        }
+
+        if (candidates.empty()) {
+          ImGui::TextDisabled("No candidate stations found in radius.");
+        } else {
+          std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.payoutCr != b.payoutCr) return a.payoutCr > b.payoutCr;
+            if (a.travelLy != b.travelLy) return a.travelLy < b.travelLy;
+            return a.stationName < b.stationName;
+          });
+          if ((int)candidates.size() > br.plannerMaxStations) {
+            candidates.resize((std::size_t)std::max(1, br.plannerMaxStations));
+          }
+
+          const Candidate& best = candidates.front();
+          ImGui::Text("Unsold: %d entries | base %.0f cr", entryCount, baseTotal);
+          ImGui::Text("Best nearby buyer: %s (%s) | payout %.0f cr (x%.2f) | travel %.0f ly",
+                      best.stationName.c_str(), best.systemName.c_str(), best.payoutCr,
+                      (baseTotal > 1e-6) ? (best.payoutCr / baseTotal) : 1.0, best.travelLy);
+
+          const ImGuiTableFlags tflags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
+          if (ImGui::BeginTable("##sell_planner", 7, tflags)) {
+            ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+            ImGui::TableSetupColumn("Station");
+            ImGui::TableSetupColumn("System");
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+            ImGui::TableSetupColumn("Payout", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Mult", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Go", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+            ImGui::TableHeadersRow();
+
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+              const auto& c = candidates[i];
+              ImGui::TableNextRow();
+
+              ImGui::TableSetColumnIndex(0);
+              ImGui::Text("%d", (int)i + 1);
+
+              ImGui::TableSetColumnIndex(1);
+              ImGui::TextUnformatted(c.stationName.c_str());
+
+              ImGui::TableSetColumnIndex(2);
+              ImGui::TextUnformatted(c.systemName.c_str());
+
+              ImGui::TableSetColumnIndex(3);
+              ImGui::TextUnformatted(stationTypeName(c.type));
+
+              ImGui::TableSetColumnIndex(4);
+              ImGui::Text("%.0f", c.payoutCr);
+
+              ImGui::TableSetColumnIndex(5);
+              ImGui::Text("x%.2f", (baseTotal > 1e-6) ? (c.payoutCr / baseTotal) : 1.0);
+
+              ImGui::TableSetColumnIndex(6);
+              const std::string btn = "Plot##plan_" + std::to_string((unsigned long long)c.stationId);
+              if (ImGui::SmallButton(btn.c_str())) {
+                if (ctx.plotRouteToSystem) {
+                  (void)ctx.plotRouteToSystem(c.sysId);
+                }
+                if (ctx.targetStation) {
+                  ctx.targetStation(c.stationId);
+                }
+              }
+              ImGui::SameLine();
+              ImGui::TextDisabled("%.0f ly", c.travelLy);
+            }
+
+            ImGui::EndTable();
+          }
+        }
+      }
+    }
   }
 
   // Controls
