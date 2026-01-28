@@ -150,6 +150,7 @@ bool saveVfxSettingsToFile(const VfxSettings& s, const std::string& path) {
 
   // --- Procedural asteroid meshes ---
   f << "asteroidProcMeshEnabled " << (s.asteroidProcMeshEnabled ? 1 : 0) << "\n";
+  f << "asteroidUseSdfMesher " << (s.asteroidUseSdfMesher ? 1 : 0) << "\n";
   f << "asteroidUseRockyTexture " << (s.asteroidUseRockyTexture ? 1 : 0) << "\n";
   f << "asteroidVariantCount " << s.asteroidVariantCount << "\n";
   f << "asteroidStyleNonce " << (unsigned long long)s.asteroidStyleNonce << "\n";
@@ -170,6 +171,36 @@ bool saveVfxSettingsToFile(const VfxSettings& s, const std::string& path) {
   f << "asteroidCraterRim " << ap.craterRim << "\n";
   f << "asteroidMinRadius " << ap.minRadius << "\n";
   f << "asteroidMaxRadius " << ap.maxRadius << "\n";
+
+  const auto& asp = s.asteroidSdfParams;
+  f << "asteroidSdfResolution " << asp.resolution << "\n";
+  f << "asteroidSdfBounds " << asp.bounds << "\n";
+  f << "asteroidSdfIso " << asp.iso << "\n";
+  f << "asteroidSdfBaseRadius " << asp.baseRadius << "\n";
+  f << "asteroidSdfAxisScaleX " << asp.axisScaleX << "\n";
+  f << "asteroidSdfAxisScaleY " << asp.axisScaleY << "\n";
+  f << "asteroidSdfAxisScaleZ " << asp.axisScaleZ << "\n";
+  f << "asteroidSdfNoise1Frequency " << asp.noise1Frequency << "\n";
+  f << "asteroidSdfNoise1Amplitude " << asp.noise1Amplitude << "\n";
+  f << "asteroidSdfNoise1Octaves " << asp.noise1Octaves << "\n";
+  f << "asteroidSdfNoise1Lacunarity " << asp.noise1Lacunarity << "\n";
+  f << "asteroidSdfNoise1Gain " << asp.noise1Gain << "\n";
+  f << "asteroidSdfNoise2Frequency " << asp.noise2Frequency << "\n";
+  f << "asteroidSdfNoise2Amplitude " << asp.noise2Amplitude << "\n";
+  f << "asteroidSdfNoise2Octaves " << asp.noise2Octaves << "\n";
+  f << "asteroidSdfNoise2Lacunarity " << asp.noise2Lacunarity << "\n";
+  f << "asteroidSdfNoise2Gain " << asp.noise2Gain << "\n";
+  f << "asteroidSdfCraterCount " << asp.craterCount << "\n";
+  f << "asteroidSdfCraterRadiusMinDeg " << asp.craterRadiusMinDeg << "\n";
+  f << "asteroidSdfCraterRadiusMaxDeg " << asp.craterRadiusMaxDeg << "\n";
+  f << "asteroidSdfCraterDepth " << asp.craterDepth << "\n";
+  f << "asteroidSdfCraterSmoothK " << asp.craterSmoothK << "\n";
+  f << "asteroidSdfCutCount " << asp.cutCount << "\n";
+  f << "asteroidSdfCutOffsetMin " << asp.cutOffsetMin << "\n";
+  f << "asteroidSdfCutOffsetMax " << asp.cutOffsetMax << "\n";
+  f << "asteroidSdfGrooveStrength " << asp.grooveStrength << "\n";
+  f << "asteroidSdfGrooveFrequency " << asp.grooveFrequency << "\n";
+  f << "asteroidSdfNormalEps " << asp.normalEps << "\n";
 
   // --- Procedural SDF artifacts ---
   f << "artifactProcEnabled " << (s.artifactProcEnabled ? 1 : 0) << "\n";
@@ -311,6 +342,10 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
       std::string v; ss >> v; bool b = s.asteroidProcMeshEnabled; if (parseBool(v, &b)) s.asteroidProcMeshEnabled = b;
       continue;
     }
+    if (key == "asteroidUseSdfMesher") {
+      std::string v; ss >> v; bool b = s.asteroidUseSdfMesher; if (parseBool(v, &b)) s.asteroidUseSdfMesher = b;
+      continue;
+    }
     if (key == "asteroidUseRockyTexture") {
       std::string v; ss >> v; bool b = s.asteroidUseRockyTexture; if (parseBool(v, &b)) s.asteroidUseRockyTexture = b;
       continue;
@@ -351,6 +386,12 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
     if (key == "asteroidStacks") { ss >> s.asteroidParams.stacks; continue; }
     if (key == "asteroidNoiseOctaves") { ss >> s.asteroidParams.noiseOctaves; continue; }
     if (key == "asteroidCraterCount") { ss >> s.asteroidParams.craterCount; continue; }
+
+    if (key == "asteroidSdfResolution") { ss >> s.asteroidSdfParams.resolution; continue; }
+    if (key == "asteroidSdfNoise1Octaves") { ss >> s.asteroidSdfParams.noise1Octaves; continue; }
+    if (key == "asteroidSdfNoise2Octaves") { ss >> s.asteroidSdfParams.noise2Octaves; continue; }
+    if (key == "asteroidSdfCraterCount") { ss >> s.asteroidSdfParams.craterCount; continue; }
+    if (key == "asteroidSdfCutCount") { ss >> s.asteroidSdfParams.cutCount; continue; }
 
     if (key == "artifactResolution") { ss >> s.artifactParams.resolution; continue; }
     if (key == "artifactNoiseOctaves") { ss >> s.artifactParams.noiseOctaves; continue; }
@@ -429,6 +470,35 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
     if (key == "asteroidMinRadius") { ss >> s.asteroidParams.minRadius; continue; }
     if (key == "asteroidMaxRadius") { ss >> s.asteroidParams.maxRadius; continue; }
 
+    // SDF asteroid params (isosurface mesher)
+    if (key == "asteroidSdfBounds") { ss >> s.asteroidSdfParams.bounds; continue; }
+    if (key == "asteroidSdfIso") { ss >> s.asteroidSdfParams.iso; continue; }
+    if (key == "asteroidSdfBaseRadius") { ss >> s.asteroidSdfParams.baseRadius; continue; }
+    if (key == "asteroidSdfAxisScaleX") { ss >> s.asteroidSdfParams.axisScaleX; continue; }
+    if (key == "asteroidSdfAxisScaleY") { ss >> s.asteroidSdfParams.axisScaleY; continue; }
+    if (key == "asteroidSdfAxisScaleZ") { ss >> s.asteroidSdfParams.axisScaleZ; continue; }
+
+    if (key == "asteroidSdfNoise1Frequency") { ss >> s.asteroidSdfParams.noise1Frequency; continue; }
+    if (key == "asteroidSdfNoise1Amplitude") { ss >> s.asteroidSdfParams.noise1Amplitude; continue; }
+    if (key == "asteroidSdfNoise1Lacunarity") { ss >> s.asteroidSdfParams.noise1Lacunarity; continue; }
+    if (key == "asteroidSdfNoise1Gain") { ss >> s.asteroidSdfParams.noise1Gain; continue; }
+
+    if (key == "asteroidSdfNoise2Frequency") { ss >> s.asteroidSdfParams.noise2Frequency; continue; }
+    if (key == "asteroidSdfNoise2Amplitude") { ss >> s.asteroidSdfParams.noise2Amplitude; continue; }
+    if (key == "asteroidSdfNoise2Lacunarity") { ss >> s.asteroidSdfParams.noise2Lacunarity; continue; }
+    if (key == "asteroidSdfNoise2Gain") { ss >> s.asteroidSdfParams.noise2Gain; continue; }
+
+    if (key == "asteroidSdfCraterRadiusMinDeg") { ss >> s.asteroidSdfParams.craterRadiusMinDeg; continue; }
+    if (key == "asteroidSdfCraterRadiusMaxDeg") { ss >> s.asteroidSdfParams.craterRadiusMaxDeg; continue; }
+    if (key == "asteroidSdfCraterDepth") { ss >> s.asteroidSdfParams.craterDepth; continue; }
+    if (key == "asteroidSdfCraterSmoothK") { ss >> s.asteroidSdfParams.craterSmoothK; continue; }
+
+    if (key == "asteroidSdfCutOffsetMin") { ss >> s.asteroidSdfParams.cutOffsetMin; continue; }
+    if (key == "asteroidSdfCutOffsetMax") { ss >> s.asteroidSdfParams.cutOffsetMax; continue; }
+    if (key == "asteroidSdfGrooveStrength") { ss >> s.asteroidSdfParams.grooveStrength; continue; }
+    if (key == "asteroidSdfGrooveFrequency") { ss >> s.asteroidSdfParams.grooveFrequency; continue; }
+    if (key == "asteroidSdfNormalEps") { ss >> s.asteroidSdfParams.normalEps; continue; }
+
     if (key == "artifactBounds") { ss >> s.artifactParams.bounds; continue; }
     if (key == "artifactIso") { ss >> s.artifactParams.iso; continue; }
     if (key == "artifactBaseRadius") { ss >> s.artifactParams.baseRadius; continue; }
@@ -496,6 +566,36 @@ bool loadVfxSettingsFromFile(const std::string& path, VfxSettings& outSettings) 
   s.asteroidParams.craterRim = std::clamp(s.asteroidParams.craterRim, 0.0f, 1.0f);
   s.asteroidParams.minRadius = std::clamp(s.asteroidParams.minRadius, 0.05f, 10.0f);
   s.asteroidParams.maxRadius = std::max(s.asteroidParams.maxRadius, s.asteroidParams.minRadius);
+
+  s.asteroidSdfParams.resolution = std::clamp(s.asteroidSdfParams.resolution, 12, 192);
+  s.asteroidSdfParams.bounds = std::clamp(s.asteroidSdfParams.bounds, 0.25f, 6.0f);
+  s.asteroidSdfParams.baseRadius = std::clamp(s.asteroidSdfParams.baseRadius, 0.25f, 4.0f);
+  s.asteroidSdfParams.axisScaleX = std::clamp(s.asteroidSdfParams.axisScaleX, 0.15f, 4.0f);
+  s.asteroidSdfParams.axisScaleY = std::clamp(s.asteroidSdfParams.axisScaleY, 0.15f, 4.0f);
+  s.asteroidSdfParams.axisScaleZ = std::clamp(s.asteroidSdfParams.axisScaleZ, 0.15f, 4.0f);
+
+  s.asteroidSdfParams.noise1Octaves = std::clamp(s.asteroidSdfParams.noise1Octaves, 1, 12);
+  s.asteroidSdfParams.noise2Octaves = std::clamp(s.asteroidSdfParams.noise2Octaves, 1, 12);
+  s.asteroidSdfParams.noise1Frequency = std::clamp(s.asteroidSdfParams.noise1Frequency, 0.0f, 24.0f);
+  s.asteroidSdfParams.noise2Frequency = std::clamp(s.asteroidSdfParams.noise2Frequency, 0.0f, 64.0f);
+  s.asteroidSdfParams.noise1Amplitude = std::clamp(s.asteroidSdfParams.noise1Amplitude, 0.0f, 2.0f);
+  s.asteroidSdfParams.noise2Amplitude = std::clamp(s.asteroidSdfParams.noise2Amplitude, 0.0f, 2.0f);
+  s.asteroidSdfParams.noise1Lacunarity = std::clamp(s.asteroidSdfParams.noise1Lacunarity, 1.01f, 4.0f);
+  s.asteroidSdfParams.noise2Lacunarity = std::clamp(s.asteroidSdfParams.noise2Lacunarity, 1.01f, 4.0f);
+  s.asteroidSdfParams.noise1Gain = std::clamp(s.asteroidSdfParams.noise1Gain, 0.05f, 0.95f);
+  s.asteroidSdfParams.noise2Gain = std::clamp(s.asteroidSdfParams.noise2Gain, 0.05f, 0.95f);
+
+  s.asteroidSdfParams.craterCount = std::clamp(s.asteroidSdfParams.craterCount, 0, 48);
+  s.asteroidSdfParams.craterRadiusMinDeg = std::clamp(s.asteroidSdfParams.craterRadiusMinDeg, 0.1f, 60.0f);
+  s.asteroidSdfParams.craterRadiusMaxDeg = std::clamp(s.asteroidSdfParams.craterRadiusMaxDeg, s.asteroidSdfParams.craterRadiusMinDeg, 85.0f);
+  s.asteroidSdfParams.craterDepth = std::clamp(s.asteroidSdfParams.craterDepth, 0.0f, 1.0f);
+  s.asteroidSdfParams.craterSmoothK = std::clamp(s.asteroidSdfParams.craterSmoothK, 0.0f, 0.75f);
+  s.asteroidSdfParams.cutCount = std::clamp(s.asteroidSdfParams.cutCount, 0, 16);
+  s.asteroidSdfParams.cutOffsetMin = std::clamp(s.asteroidSdfParams.cutOffsetMin, 0.0f, 2.5f);
+  s.asteroidSdfParams.cutOffsetMax = std::clamp(s.asteroidSdfParams.cutOffsetMax, s.asteroidSdfParams.cutOffsetMin, 3.5f);
+  s.asteroidSdfParams.grooveStrength = std::clamp(s.asteroidSdfParams.grooveStrength, 0.0f, 1.0f);
+  s.asteroidSdfParams.grooveFrequency = std::clamp(s.asteroidSdfParams.grooveFrequency, 0.0f, 64.0f);
+  s.asteroidSdfParams.normalEps = std::clamp(s.asteroidSdfParams.normalEps, 0.0001f, 0.05f);
 
   s.artifactVariantCount = std::clamp(s.artifactVariantCount, 1, 16);
   s.artifactInstanceCount = std::clamp(s.artifactInstanceCount, 1, 256);

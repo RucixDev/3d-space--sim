@@ -68,11 +68,11 @@ struct SdfNode {
   // Input node indices (use -1 for none).
   // Canonical names: in0 / in1. Legacy aliases: inA / inB.
   union {
-    int in0{-1};
+    int in0;
     int inA;
   };
   union {
-    int in1{-1};
+    int in1;
     int inB;
   };
 
@@ -81,20 +81,31 @@ struct SdfNode {
   // Keep this POD-ish so it copies nicely for async jobs.
   union {
     struct {
-      float p0{0.0f};
-      float p1{0.0f};
-      float p2{0.0f};
-      float p3{0.0f};
-      float p4{0.0f};
-      float p5{0.0f};
-      float p6{0.0f};
-      float p7{0.0f};
+      float p0;
+      float p1;
+      float p2;
+      float p3;
+      float p4;
+      float p5;
+      float p6;
+      float p7;
     };
     float p[8];
   };
 
   // Optional node-local seed tweak (used by noise modifiers).
   core::u64 seed{0};
+
+  // MSVC does not allow default member initializers inside an anonymous struct
+  // that lives within a union (C2926). Keep the memory layout intact by
+  // removing those initializers and explicitly zeroing here.
+  SdfNode() noexcept {
+    op = SdfNodeOp::Sphere;
+    in0 = -1;
+    in1 = -1;
+    for (int i = 0; i < 8; ++i) p[i] = 0.0f;
+    seed = 0;
+  }
 };
 
 

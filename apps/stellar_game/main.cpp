@@ -1607,9 +1607,11 @@ int main(int argc, char** argv) {
   // The sim already spawns asteroid mining nodes; this replaces the placeholder
   // rock spheres with deterministic, noise-displaced meshes.
   bool vfxAsteroidProcMeshEnabled = true;
+  bool vfxAsteroidUseSdfMesher = false;
   bool vfxAsteroidUseRockyTexture = true;
   int vfxAsteroidVariantCount = 8;
   render::AsteroidParams vfxAsteroidParams{};
+  render::AsteroidSdfParams vfxAsteroidSdfParams{};
   core::u64 vfxAsteroidStyleNonce = 1;
 
   // Cache of GPU meshes (one per variant) and their deterministic seeds.
@@ -1772,13 +1774,21 @@ int main(int argc, char** argv) {
     for (int i = 0; i < variants; ++i) {
       const core::u64 mSeed = core::hashCombine(seed,
                                                 core::hashCombine(core::fnv1a64("asteroid_mesh"), (core::u64)i));
-      const auto cpu = render::generateAsteroidMesh(mSeed, vfxAsteroidParams);
-
       asteroidVariantSeeds.push_back(mSeed);
-      asteroidVariantStats.push_back(render::measureAsteroidMesh(cpu));
 
       render::Mesh m;
-      m.upload(cpu.vertices, cpu.indices);
+      if (vfxAsteroidUseSdfMesher) {
+        // Higher fidelity: watertight SDF mesh (craters + faceting + layered noise).
+        const auto cpu = render::generateAsteroidSdfMesh(mSeed, vfxAsteroidSdfParams);
+        asteroidVariantStats.push_back(render::measureAsteroidSdfMesh(cpu));
+        m.upload(cpu.vertices, cpu.indices);
+      } else {
+        // Classic: displaced UV-sphere (fast, stable UVs).
+        const auto cpu = render::generateAsteroidMesh(mSeed, vfxAsteroidParams);
+        asteroidVariantStats.push_back(render::measureAsteroidMesh(cpu));
+        m.upload(cpu.vertices, cpu.indices);
+      }
+
       asteroidVariantMeshes.push_back(std::move(m));
     }
 
@@ -2066,9 +2076,11 @@ int main(int argc, char** argv) {
     vfxSettings.gpuDustAlpha = vfxGpuDustAlpha;
 
     vfxSettings.asteroidProcMeshEnabled = vfxAsteroidProcMeshEnabled;
+    vfxSettings.asteroidUseSdfMesher = vfxAsteroidUseSdfMesher;
     vfxSettings.asteroidUseRockyTexture = vfxAsteroidUseRockyTexture;
     vfxSettings.asteroidVariantCount = vfxAsteroidVariantCount;
     vfxSettings.asteroidParams = vfxAsteroidParams;
+    vfxSettings.asteroidSdfParams = vfxAsteroidSdfParams;
     vfxSettings.asteroidStyleNonce = vfxAsteroidStyleNonce;
 
     vfxSettings.artifactProcEnabled = vfxArtifactProcEnabled;
@@ -2132,9 +2144,11 @@ int main(int argc, char** argv) {
 
     // Procedural asteroid mesh library.
     vfxAsteroidProcMeshEnabled = s.asteroidProcMeshEnabled;
+    vfxAsteroidUseSdfMesher = s.asteroidUseSdfMesher;
     vfxAsteroidUseRockyTexture = s.asteroidUseRockyTexture;
     vfxAsteroidVariantCount = s.asteroidVariantCount;
     vfxAsteroidParams = s.asteroidParams;
+    vfxAsteroidSdfParams = s.asteroidSdfParams;
     vfxAsteroidStyleNonce = s.asteroidStyleNonce;
     asteroidMeshesDirty = true;
 
@@ -2202,6 +2216,37 @@ int main(int argc, char** argv) {
           && feq(x.maxRadius, y.maxRadius);
     };
 
+    auto asteroidSdfEq = [&](const render::AsteroidSdfParams& x, const render::AsteroidSdfParams& y) {
+      return x.resolution == y.resolution
+          && feq(x.bounds, y.bounds)
+          && feq(x.iso, y.iso)
+          && feq(x.baseRadius, y.baseRadius)
+          && feq(x.axisScaleX, y.axisScaleX)
+          && feq(x.axisScaleY, y.axisScaleY)
+          && feq(x.axisScaleZ, y.axisScaleZ)
+          && feq(x.noise1Frequency, y.noise1Frequency)
+          && feq(x.noise1Amplitude, y.noise1Amplitude)
+          && x.noise1Octaves == y.noise1Octaves
+          && feq(x.noise1Lacunarity, y.noise1Lacunarity)
+          && feq(x.noise1Gain, y.noise1Gain)
+          && feq(x.noise2Frequency, y.noise2Frequency)
+          && feq(x.noise2Amplitude, y.noise2Amplitude)
+          && x.noise2Octaves == y.noise2Octaves
+          && feq(x.noise2Lacunarity, y.noise2Lacunarity)
+          && feq(x.noise2Gain, y.noise2Gain)
+          && x.craterCount == y.craterCount
+          && feq(x.craterRadiusMinDeg, y.craterRadiusMinDeg)
+          && feq(x.craterRadiusMaxDeg, y.craterRadiusMaxDeg)
+          && feq(x.craterDepth, y.craterDepth)
+          && feq(x.craterSmoothK, y.craterSmoothK)
+          && x.cutCount == y.cutCount
+          && feq(x.cutOffsetMin, y.cutOffsetMin)
+          && feq(x.cutOffsetMax, y.cutOffsetMax)
+          && feq(x.grooveStrength, y.grooveStrength)
+          && feq(x.grooveFrequency, y.grooveFrequency)
+          && feq(x.normalEps, y.normalEps);
+    };
+
     auto artifactEq = [&](const render::ArtifactParams& x, const render::ArtifactParams& y) {
       return x.resolution == y.resolution
           && feq(x.bounds, y.bounds)
@@ -2266,9 +2311,11 @@ int main(int argc, char** argv) {
         && feq(a.gpuDustIntensity, b.gpuDustIntensity)
         && feq(a.gpuDustAlpha, b.gpuDustAlpha)
         && a.asteroidProcMeshEnabled == b.asteroidProcMeshEnabled
+        && a.asteroidUseSdfMesher == b.asteroidUseSdfMesher
         && a.asteroidUseRockyTexture == b.asteroidUseRockyTexture
         && a.asteroidVariantCount == b.asteroidVariantCount
         && asteroidEq(a.asteroidParams, b.asteroidParams)
+        && asteroidSdfEq(a.asteroidSdfParams, b.asteroidSdfParams)
         && a.asteroidStyleNonce == b.asteroidStyleNonce
         && a.artifactProcEnabled == b.artifactProcEnabled
         && a.artifactUseProceduralTexture == b.artifactUseProceduralTexture
@@ -26210,38 +26257,102 @@ if (showVfx) {
       ImGui::SameLine();
       ImGui::Checkbox("Rocky texture", &vfxAsteroidUseRockyTexture);
 
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Use SDF mesher##asteroids", &vfxAsteroidUseSdfMesher)) {
+        asteroidMeshesDirty = true;
+      }
+
       if (ImGui::SliderInt("Variant count", &vfxAsteroidVariantCount, 1, 32)) {
         asteroidMeshesDirty = true;
       }
 
       bool dirty = false;
 
-      dirty |= ImGui::SliderInt("Slices", &vfxAsteroidParams.slices, 8, 96);
-      dirty |= ImGui::SliderInt("Stacks", &vfxAsteroidParams.stacks, 6, 64);
+      if (!vfxAsteroidUseSdfMesher) {
+        // Classic generator: displaced UV-sphere + analytic crater field.
+        dirty |= ImGui::SliderInt("Slices", &vfxAsteroidParams.slices, 8, 96);
+        dirty |= ImGui::SliderInt("Stacks", &vfxAsteroidParams.stacks, 6, 64);
 
-      dirty |= ImGui::SliderFloat("Noise frequency", &vfxAsteroidParams.noiseFrequency, 0.0f, 8.0f, "%.2f");
-      dirty |= ImGui::SliderFloat("Noise amplitude", &vfxAsteroidParams.noiseAmplitude, 0.0f, 0.75f, "%.2f");
-      dirty |= ImGui::SliderInt("Noise octaves", &vfxAsteroidParams.noiseOctaves, 0, 10);
-      dirty |= ImGui::SliderFloat("Noise gain", &vfxAsteroidParams.noiseGain, 0.15f, 0.85f, "%.2f");
-      dirty |= ImGui::SliderFloat("Noise lacunarity", &vfxAsteroidParams.noiseLacunarity, 1.20f, 3.50f, "%.2f");
+        dirty |= ImGui::SliderFloat("Noise frequency", &vfxAsteroidParams.noiseFrequency, 0.0f, 8.0f, "%.2f");
+        dirty |= ImGui::SliderFloat("Noise amplitude", &vfxAsteroidParams.noiseAmplitude, 0.0f, 0.75f, "%.2f");
+        dirty |= ImGui::SliderInt("Noise octaves", &vfxAsteroidParams.noiseOctaves, 0, 10);
+        dirty |= ImGui::SliderFloat("Noise gain", &vfxAsteroidParams.noiseGain, 0.15f, 0.85f, "%.2f");
+        dirty |= ImGui::SliderFloat("Noise lacunarity", &vfxAsteroidParams.noiseLacunarity, 1.20f, 3.50f, "%.2f");
 
-      ImGui::Separator();
+        ImGui::Separator();
 
-      dirty |= ImGui::SliderInt("Craters", &vfxAsteroidParams.craterCount, 0, 64);
-      dirty |= ImGui::SliderFloat("Crater radius min (deg)", &vfxAsteroidParams.craterRadiusMinDeg, 1.0f, 40.0f, "%.1f");
-      dirty |= ImGui::SliderFloat("Crater radius max (deg)", &vfxAsteroidParams.craterRadiusMaxDeg, 1.0f, 70.0f, "%.1f");
-      if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
-        vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
-      }
+        dirty |= ImGui::SliderInt("Craters", &vfxAsteroidParams.craterCount, 0, 64);
+        dirty |= ImGui::SliderFloat("Crater radius min (deg)", &vfxAsteroidParams.craterRadiusMinDeg, 1.0f, 40.0f, "%.1f");
+        dirty |= ImGui::SliderFloat("Crater radius max (deg)", &vfxAsteroidParams.craterRadiusMaxDeg, 1.0f, 70.0f, "%.1f");
+        if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
+          vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
+        }
 
-      dirty |= ImGui::SliderFloat("Crater depth", &vfxAsteroidParams.craterDepth, 0.0f, 0.35f, "%.3f");
-      dirty |= ImGui::SliderFloat("Crater rim", &vfxAsteroidParams.craterRim, 0.0f, 1.0f, "%.2f");
+        dirty |= ImGui::SliderFloat("Crater depth", &vfxAsteroidParams.craterDepth, 0.0f, 0.35f, "%.3f");
+        dirty |= ImGui::SliderFloat("Crater rim", &vfxAsteroidParams.craterRim, 0.0f, 1.0f, "%.2f");
 
-      ImGui::Separator();
-      dirty |= ImGui::SliderFloat("Clamp min radius", &vfxAsteroidParams.minRadius, 0.10f, 1.00f, "%.2f");
-      dirty |= ImGui::SliderFloat("Clamp max radius", &vfxAsteroidParams.maxRadius, 1.00f, 2.00f, "%.2f");
-      if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
-        vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+        ImGui::Separator();
+        dirty |= ImGui::SliderFloat("Clamp min radius", &vfxAsteroidParams.minRadius, 0.10f, 1.00f, "%.2f");
+        dirty |= ImGui::SliderFloat("Clamp max radius", &vfxAsteroidParams.maxRadius, 1.00f, 2.00f, "%.2f");
+        if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
+          vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+        }
+      } else {
+        // SDF isosurface mesher: watertight topology + boolean craters + faceting.
+        ImGui::TextDisabled("SDF mesher: slower but watertight & more diverse silhouettes");
+
+        dirty |= ImGui::SliderInt("Resolution##ast_sdf", &vfxAsteroidSdfParams.resolution, 12, 128);
+        dirty |= ImGui::SliderFloat("Bounds##ast_sdf", &vfxAsteroidSdfParams.bounds, 0.75f, 3.25f, "%.2f");
+        dirty |= ImGui::SliderFloat("Iso##ast_sdf", &vfxAsteroidSdfParams.iso, -0.25f, 0.25f, "%.3f");
+        dirty |= ImGui::SliderFloat("Base radius##ast_sdf", &vfxAsteroidSdfParams.baseRadius, 0.35f, 2.00f, "%.2f");
+
+        ImGui::Separator();
+        dirty |= ImGui::SliderFloat("Axis scale X##ast_sdf", &vfxAsteroidSdfParams.axisScaleX, 0.35f, 2.25f, "%.2f");
+        dirty |= ImGui::SliderFloat("Axis scale Y##ast_sdf", &vfxAsteroidSdfParams.axisScaleY, 0.35f, 2.25f, "%.2f");
+        dirty |= ImGui::SliderFloat("Axis scale Z##ast_sdf", &vfxAsteroidSdfParams.axisScaleZ, 0.35f, 2.25f, "%.2f");
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Noise (stage 1)");
+        dirty |= ImGui::SliderFloat("Frequency##ast_n1", &vfxAsteroidSdfParams.noise1Frequency, 0.0f, 12.0f, "%.2f");
+        dirty |= ImGui::SliderFloat("Amplitude##ast_n1", &vfxAsteroidSdfParams.noise1Amplitude, 0.0f, 0.75f, "%.3f");
+        dirty |= ImGui::SliderInt("Octaves##ast_n1", &vfxAsteroidSdfParams.noise1Octaves, 1, 10);
+        dirty |= ImGui::SliderFloat("Lacunarity##ast_n1", &vfxAsteroidSdfParams.noise1Lacunarity, 1.20f, 3.50f, "%.2f");
+        dirty |= ImGui::SliderFloat("Gain##ast_n1", &vfxAsteroidSdfParams.noise1Gain, 0.15f, 0.85f, "%.2f");
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Noise (stage 2)");
+        dirty |= ImGui::SliderFloat("Frequency##ast_n2", &vfxAsteroidSdfParams.noise2Frequency, 0.0f, 24.0f, "%.2f");
+        dirty |= ImGui::SliderFloat("Amplitude##ast_n2", &vfxAsteroidSdfParams.noise2Amplitude, 0.0f, 0.35f, "%.3f");
+        dirty |= ImGui::SliderInt("Octaves##ast_n2", &vfxAsteroidSdfParams.noise2Octaves, 1, 10);
+        dirty |= ImGui::SliderFloat("Lacunarity##ast_n2", &vfxAsteroidSdfParams.noise2Lacunarity, 1.20f, 3.50f, "%.2f");
+        dirty |= ImGui::SliderFloat("Gain##ast_n2", &vfxAsteroidSdfParams.noise2Gain, 0.15f, 0.85f, "%.2f");
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Craters");
+        dirty |= ImGui::SliderInt("Count##ast_cr", &vfxAsteroidSdfParams.craterCount, 0, 48);
+        dirty |= ImGui::SliderFloat("Radius min (deg)##ast_cr", &vfxAsteroidSdfParams.craterRadiusMinDeg, 1.0f, 40.0f, "%.1f");
+        dirty |= ImGui::SliderFloat("Radius max (deg)##ast_cr", &vfxAsteroidSdfParams.craterRadiusMaxDeg, 1.0f, 70.0f, "%.1f");
+        if (vfxAsteroidSdfParams.craterRadiusMaxDeg < vfxAsteroidSdfParams.craterRadiusMinDeg) {
+          vfxAsteroidSdfParams.craterRadiusMaxDeg = vfxAsteroidSdfParams.craterRadiusMinDeg;
+        }
+        dirty |= ImGui::SliderFloat("Depth (frac)##ast_cr", &vfxAsteroidSdfParams.craterDepth, 0.0f, 0.60f, "%.3f");
+        dirty |= ImGui::SliderFloat("Smooth K##ast_cr", &vfxAsteroidSdfParams.craterSmoothK, 0.0f, 0.35f, "%.3f");
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Faceting");
+        dirty |= ImGui::SliderInt("Cut planes##ast_cut", &vfxAsteroidSdfParams.cutCount, 0, 12);
+        dirty |= ImGui::SliderFloat("Cut offset min##ast_cut", &vfxAsteroidSdfParams.cutOffsetMin, 0.0f, 1.50f, "%.2f");
+        dirty |= ImGui::SliderFloat("Cut offset max##ast_cut", &vfxAsteroidSdfParams.cutOffsetMax, 0.0f, 2.50f, "%.2f");
+        if (vfxAsteroidSdfParams.cutOffsetMax < vfxAsteroidSdfParams.cutOffsetMin) {
+          vfxAsteroidSdfParams.cutOffsetMax = vfxAsteroidSdfParams.cutOffsetMin;
+        }
+
+        ImGui::Separator();
+        dirty |= ImGui::SliderFloat("Groove strength##ast_g", &vfxAsteroidSdfParams.grooveStrength, 0.0f, 0.20f, "%.3f");
+        dirty |= ImGui::SliderFloat("Groove frequency##ast_g", &vfxAsteroidSdfParams.grooveFrequency, 0.0f, 18.0f, "%.2f");
+
+        ImGui::Separator();
+        dirty |= ImGui::SliderFloat("Normal eps##ast_sdf", &vfxAsteroidSdfParams.normalEps, 0.0008f, 0.020f, "%.4f");
       }
 
       if (dirty) asteroidMeshesDirty = true;
@@ -26256,26 +26367,72 @@ if (showVfx) {
         core::SplitMix64 rr(core::hashCombine(seed, core::hashCombine(core::fnv1a64("astStyle"), vfxAsteroidStyleNonce++)));
 
         vfxAsteroidVariantCount = rr.range(4, 14);
-        vfxAsteroidParams.slices = rr.range(14, 42);
-        vfxAsteroidParams.stacks = rr.range(10, 28);
-        vfxAsteroidParams.noiseFrequency = (float)rr.range(1.60, 4.80);
-        vfxAsteroidParams.noiseAmplitude = (float)rr.range(0.10, 0.40);
-        vfxAsteroidParams.noiseOctaves = rr.range(3, 7);
-        vfxAsteroidParams.noiseGain = (float)rr.range(0.40, 0.65);
-        vfxAsteroidParams.noiseLacunarity = (float)rr.range(1.70, 2.80);
-        vfxAsteroidParams.craterCount = rr.range(6, 28);
-        vfxAsteroidParams.craterRadiusMinDeg = (float)rr.range(4.0, 10.0);
-        vfxAsteroidParams.craterRadiusMaxDeg = (float)rr.range(16.0, 46.0);
-        vfxAsteroidParams.craterDepth = (float)rr.range(0.05, 0.16);
-        vfxAsteroidParams.craterRim = (float)rr.range(0.05, 0.45);
-        vfxAsteroidParams.minRadius = (float)rr.range(0.55, 0.80);
-        vfxAsteroidParams.maxRadius = (float)rr.range(1.15, 1.55);
 
-        if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
-          vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
-        }
-        if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
-          vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+        if (vfxAsteroidUseSdfMesher) {
+          // Randomize the SDF mesher parameters.
+          vfxAsteroidSdfParams.resolution = rr.range(24, 84);
+          vfxAsteroidSdfParams.bounds = (float)rr.range(1.10, 2.20);
+          vfxAsteroidSdfParams.iso = (float)rr.range(-0.03, 0.03);
+          vfxAsteroidSdfParams.baseRadius = (float)rr.range(0.75, 1.10);
+          vfxAsteroidSdfParams.axisScaleX = (float)rr.range(0.70, 1.55);
+          vfxAsteroidSdfParams.axisScaleY = (float)rr.range(0.70, 1.55);
+          vfxAsteroidSdfParams.axisScaleZ = (float)rr.range(0.70, 1.55);
+
+          vfxAsteroidSdfParams.noise1Frequency = (float)rr.range(1.80, 5.20);
+          vfxAsteroidSdfParams.noise1Amplitude = (float)rr.range(0.10, 0.35);
+          vfxAsteroidSdfParams.noise1Octaves = rr.range(3, 7);
+          vfxAsteroidSdfParams.noise1Lacunarity = (float)rr.range(1.70, 2.80);
+          vfxAsteroidSdfParams.noise1Gain = (float)rr.range(0.40, 0.65);
+
+          vfxAsteroidSdfParams.noise2Frequency = (float)rr.range(5.0, 18.0);
+          vfxAsteroidSdfParams.noise2Amplitude = (float)rr.range(0.02, 0.12);
+          vfxAsteroidSdfParams.noise2Octaves = rr.range(2, 5);
+          vfxAsteroidSdfParams.noise2Lacunarity = (float)rr.range(1.80, 2.70);
+          vfxAsteroidSdfParams.noise2Gain = (float)rr.range(0.45, 0.65);
+
+          vfxAsteroidSdfParams.craterCount = rr.range(8, 28);
+          vfxAsteroidSdfParams.craterRadiusMinDeg = (float)rr.range(3.0, 8.0);
+          vfxAsteroidSdfParams.craterRadiusMaxDeg = (float)rr.range(14.0, 42.0);
+          vfxAsteroidSdfParams.craterDepth = (float)rr.range(0.05, 0.22);
+          vfxAsteroidSdfParams.craterSmoothK = (float)rr.range(0.02, 0.14);
+
+          vfxAsteroidSdfParams.cutCount = rr.range(0, 4);
+          vfxAsteroidSdfParams.cutOffsetMin = (float)rr.range(0.15, 0.40);
+          vfxAsteroidSdfParams.cutOffsetMax = (float)rr.range(0.45, 0.95);
+
+          vfxAsteroidSdfParams.grooveStrength = (float)rr.range(0.00, 0.06);
+          vfxAsteroidSdfParams.grooveFrequency = (float)rr.range(4.0, 12.0);
+          vfxAsteroidSdfParams.normalEps = (float)rr.range(0.0015, 0.0075);
+
+          if (vfxAsteroidSdfParams.craterRadiusMaxDeg < vfxAsteroidSdfParams.craterRadiusMinDeg) {
+            vfxAsteroidSdfParams.craterRadiusMaxDeg = vfxAsteroidSdfParams.craterRadiusMinDeg;
+          }
+          if (vfxAsteroidSdfParams.cutOffsetMax < vfxAsteroidSdfParams.cutOffsetMin) {
+            vfxAsteroidSdfParams.cutOffsetMax = vfxAsteroidSdfParams.cutOffsetMin;
+          }
+        } else {
+          // Randomize the classic displaced-sphere parameters.
+          vfxAsteroidParams.slices = rr.range(14, 42);
+          vfxAsteroidParams.stacks = rr.range(10, 28);
+          vfxAsteroidParams.noiseFrequency = (float)rr.range(1.60, 4.80);
+          vfxAsteroidParams.noiseAmplitude = (float)rr.range(0.10, 0.40);
+          vfxAsteroidParams.noiseOctaves = rr.range(3, 7);
+          vfxAsteroidParams.noiseGain = (float)rr.range(0.40, 0.65);
+          vfxAsteroidParams.noiseLacunarity = (float)rr.range(1.70, 2.80);
+          vfxAsteroidParams.craterCount = rr.range(6, 28);
+          vfxAsteroidParams.craterRadiusMinDeg = (float)rr.range(4.0, 10.0);
+          vfxAsteroidParams.craterRadiusMaxDeg = (float)rr.range(16.0, 46.0);
+          vfxAsteroidParams.craterDepth = (float)rr.range(0.05, 0.16);
+          vfxAsteroidParams.craterRim = (float)rr.range(0.05, 0.45);
+          vfxAsteroidParams.minRadius = (float)rr.range(0.55, 0.80);
+          vfxAsteroidParams.maxRadius = (float)rr.range(1.15, 1.55);
+
+          if (vfxAsteroidParams.craterRadiusMaxDeg < vfxAsteroidParams.craterRadiusMinDeg) {
+            vfxAsteroidParams.craterRadiusMaxDeg = vfxAsteroidParams.craterRadiusMinDeg;
+          }
+          if (vfxAsteroidParams.maxRadius < vfxAsteroidParams.minRadius) {
+            vfxAsteroidParams.maxRadius = vfxAsteroidParams.minRadius;
+          }
         }
 
         asteroidMeshesDirty = true;

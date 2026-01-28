@@ -4,6 +4,7 @@
 
 #include "stellar/render/ProceduralArtifact.h"
 #include "stellar/render/ProceduralAsteroid.h"
+#include "stellar/render/ProceduralAsteroidSdf.h"
 #include "stellar/render/ProceduralPlanet.h"
 #include "stellar/render/ProceduralSky.h"
 
@@ -16,7 +17,7 @@ namespace stellar::ui {
 // The VFX Lab started as an experimentation panel; VfxSettings makes those tweaks
 // part of the base game by persisting them to disk.
 struct VfxSettings {
-  int version{4};
+  int version{5};
   bool autoSaveOnExit{true};
 
   // --- Background ---
@@ -69,9 +70,13 @@ struct VfxSettings {
 
   // --- Procedural asteroid meshes ---
   bool asteroidProcMeshEnabled{true};
+  // If true, uses the SDF isosurface mesher instead of the classic displaced
+  // UV-sphere generator.
+  bool asteroidUseSdfMesher{false};
   bool asteroidUseRockyTexture{true};
   int asteroidVariantCount{8};
   render::AsteroidParams asteroidParams{};
+  render::AsteroidSdfParams asteroidSdfParams{};
   core::u64 asteroidStyleNonce{1};
 
   // --- Procedural SDF artifacts ---

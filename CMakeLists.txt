@@ -161,6 +161,7 @@ set(STELLAR_CORE_SOURCES
   src/proc/HyperlaneVulnerability.cpp
   # Procedural geometry generators (CPU-side; safe for headless builds).
   src/render/ProceduralAsteroid.cpp
+  src/render/ProceduralAsteroidSdf.cpp
   src/render/SdfMesher.cpp
   src/render/SdfDualContouring.cpp
   src/render/MeshSimplify.cpp
