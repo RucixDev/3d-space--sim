@@ -149,6 +149,7 @@
 #include "MarketDashboardWindow.h"
 #include "LogbookWindow.h"
 #include "TradePlannerWindow.h"
+#include "MissionControlWindow.h"
 #include "SmugglingDashboardWindow.h"
 #include "ProfilerWindow.h"
 #include "BuildInfoWindow.h"
@@ -3800,6 +3801,7 @@ auto applyLocalSecurityImpulse = [&](double dSecurity, double dPiracy, double dT
   game::MarketDashboardWindowState marketDashboardWindow{};
   game::LogbookWindowState logbookWindow{};
   game::TradePlannerWindowState tradePlannerWindow{};
+  game::MissionControlWindowState missionControlWindow{};
   game::CopilotWindowState copilotWindow{};
   game::SmugglingDashboardWindowState smugglingDashboardWindow{};
   bool showGuide = true;
@@ -4754,6 +4756,8 @@ auto fieldOpsSkipTarget = [&]() {
     uiWindows.add(WindowBinding{WindowDesc{"Trade", "Trade Helper", "Main", 100, true, true}, &showTrade,
                                 {}, {}, [&]() { return chordOrEmpty(controls.actions.toggleTrade); }});
     uiWindows.add(WindowBinding{WindowDesc{"TradePlanner", "Trade Planner", "Main", 95, false, true}, &tradePlannerWindow.open,
+                                {}, {}, {}});
+    uiWindows.add(WindowBinding{WindowDesc{"MissionControl", "Mission Control", "Main", 95, false, true}, &missionControlWindow.open,
                                 {}, {}, {}});
     uiWindows.add(WindowBinding{WindowDesc{"Copilot", "Copilot", "Main", 95, false, true}, &copilotWindow.open,
                                 {}, {}, {}});
@@ -10885,8 +10889,9 @@ progression.unlockWeapon(weaponSecondary);
         }
       }
 
+    } // mouse button down
     } // while (SDL_PollEvent)
-    }
+    } // InputEvents scope
 
 
     // Precompute sim dt for this frame (used by autopilots and the sim step).
@@ -33313,6 +33318,81 @@ ImGui::PopID();
       game::drawLogbookWindow(logbookWindow, lctx);
     }
 
+    // Mission Control (planning + itinerary runner)
+    {
+      // Adapt persistent maps to spans for the window (lifetime scoped to this block).
+      std::vector<sim::FactionReputation> mcRep;
+      mcRep.reserve(repByFaction.size());
+      for (const auto& kv : repByFaction) {
+        mcRep.push_back(sim::FactionReputation{kv.first, kv.second});
+      }
+
+      std::vector<sim::SystemSecurityDeltaState> mcDeltas;
+      mcDeltas.reserve(systemSecurityDeltaBySystem.size());
+      for (const auto& kv : systemSecurityDeltaBySystem) {
+        mcDeltas.push_back(kv.second);
+      }
+
+      game::MissionControlContext mctx{universe};
+      mctx.currentSystem = currentSystem;
+      mctx.timeDays = timeDays;
+      mctx.timeRealSec = timeRealSec;
+      mctx.docked = docked;
+      mctx.dockedStationId = dockedStationId;
+      mctx.maxJumpLy = navConstrainToCurrentFuelRange ? fsdCurrentRangeLy() : fsdBaseRangeLy();
+      mctx.missions = &missions;
+      mctx.trackedMissionId = trackedMissionId;
+      mctx.playerRepWithFaction = mcRep;
+      mctx.securityDeltas = mcDeltas;
+
+      mctx.plotRouteToSystem = [&](sim::SystemId sysId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        return plotRouteToSystem(sysId, /*showToast=*/true);
+      };
+      mctx.routeToStation = [&](sim::SystemId sysId, sim::StationId stId) {
+        galaxySelectedSystemId = sysId;
+        showGalaxy = true;
+        if (plotRouteToSystem(sysId, /*showToast=*/true)) {
+          pendingArrivalTargetStationId = stId;
+          // If already in-system, target immediately.
+          if (currentSystem && sysId == currentSystem->stub.id && stId != 0) {
+            tryTargetStationById(stId);
+          }
+        }
+      };
+
+      mctx.goToStation = [&](sim::SystemId sysId, sim::StationId stId, bool armAutoRun) {
+        game::pushGameAction(gameActions,
+                             game::makeActionGoToStation(timeRealSec,
+                                                        timeDays,
+                                                        "MissionControl",
+                                                        (core::u64)sysId,
+                                                        (core::u64)stId,
+                                                        armAutoRun));
+        if (armAutoRun) {
+          game::pushGameAction(gameActions,
+                               game::makeActionSetCameraRigPreset(timeRealSec,
+                                                                  timeDays,
+                                                                  "MissionControl",
+                                                                  (core::i32)game::CameraRigPreset::Travel));
+        }
+      };
+
+      mctx.setTrackedMission = [&](core::u64 missionId) {
+        game::pushGameAction(gameActions, game::makeActionSetTrackedMission(timeRealSec, timeDays, "MissionControl", missionId));
+      };
+
+      mctx.toast = [&](std::string_view msg, double ttlSec) {
+        toast(toasts, std::string(msg), ttlSec);
+      };
+
+      game::tickMissionControl(missionControlWindow, mctx);
+      if (missionControlWindow.open) {
+        game::drawMissionControlWindow(missionControlWindow, mctx);
+      }
+    }
+
 
     if (copilotWindow.open) {
       game::CopilotContext cctx{universe};
@@ -34912,6 +34992,7 @@ if (showContacts) {
 
     ImGui::End();
   }
+  } // if (showContacts)
     if (showGalaxy) {
       ImGui::Begin("Galaxy / Streaming");
 

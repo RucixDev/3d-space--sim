@@ -273,6 +273,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/NavRouteBatch.cpp
   src/sim/MissionAssist.cpp
   src/sim/MissionBriefing.cpp
+  src/sim/MissionPlanner.cpp
   src/sim/Comms.cpp
   src/sim/GalNet.cpp
   src/sim/MissionLogic.cpp
@@ -402,6 +403,7 @@ if (STELLAR_ENABLE_RENDER AND STELLAR_ENABLE_IMGUI)
     apps/stellar_game/MarketDashboardWindow.cpp
   apps/stellar_game/LogbookWindow.cpp
     apps/stellar_game/TradePlannerWindow.cpp
+    apps/stellar_game/MissionControlWindow.cpp
     apps/stellar_game/SmugglingDashboardWindow.cpp
     apps/stellar_game/ConsoleWindow.cpp
     apps/stellar_game/LogWindow.cpp

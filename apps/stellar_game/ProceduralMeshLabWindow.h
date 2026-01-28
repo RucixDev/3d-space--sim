@@ -170,6 +170,65 @@ struct ProceduralMeshLabWindowState {
   int latestLodJobId{0};
   std::future<LodJobResult> lodJob{};
   bool lodJobRunning{false};
+
+  // ---- Undo / redo history (graph + key settings) ----
+  //
+  // This is a lightweight, CPU-only history intended for tooling iteration.
+  // Snapshots are small value types (graphs + editable settings) so undo/redo is
+  // deterministic and safe to use with async meshing.
+  struct HistorySnapshot {
+    // SDF graph + preset context.
+    render::SdfGraph graph{};
+    render::SdfGraphPreset preset{render::SdfGraphPreset::Asteroid};
+    bool lockToPreset{true};
+    core::u64 seed{0};
+
+    // Mesher knobs.
+    MesherType mesherType{MesherType::MarchingTetrahedra};
+    render::SdfMesherParams mesher{};
+
+    // Dual Contouring extras.
+    float dcQefRegularization{1.0e-6f};
+    bool dcClampToCell{true};
+    bool dcProjectToIso{true};
+    int dcProjectIterations{2};
+
+    // LOD chain knobs.
+    bool buildLods{true};
+    int lodLevels{3};
+    float lodRatioPerLevel{0.5f};
+    int previewLod{0};
+    int exportLod{0};
+    bool exportAllLods{false};
+
+    // Preview mode knobs.
+    bool previewRaymarch{true};
+    render::SdfRaymarchSettings raymarchSettings{};
+
+    // Procedural surface texture knobs.
+    bool useProceduralTexture{true};
+    bool applyTextureToRaymarch{true};
+    render::ProcGraphPreset texPreset{render::ProcGraphPreset::Rocky};
+    bool texLockToPreset{true};
+    core::u64 texSeed{0};
+    int texResolution{512};
+    bool texGenerateMips{true};
+    float texDitherStrength{1.0f};
+    bool texPackHeightInAlpha{false};
+    render::ProcGraph texGraph{};
+  };
+
+  bool historyEnabled{true};
+  int historyMax{64};
+  float historyCoalesceSec{0.35f};
+
+  bool historyBaselineValid{false};
+  bool historyPending{false};
+  float historyPendingSince{0.0f};
+
+  HistorySnapshot historyBaseline{};
+  std::vector<HistorySnapshot> historyUndo{};
+  std::vector<HistorySnapshot> historyRedo{};
 };
 
 using ToastFn = std::function<void(const std::string& msg, double ttlSec)>;

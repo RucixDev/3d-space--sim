@@ -1,3 +1,34 @@
+## Round 142 - Mesh Lab Undo/Redo History + MSVC Build Fixes
+
+This round focuses on **tooling iteration** and **build stability**.
+
+- The **Procedural Mesh Lab** now has a full **Undo/Redo history** for the SDF graph + procedural texture graph (and key mesher/preview knobs), with debounced commits and keyboard shortcuts.
+- Fixed several recent MSVC compile breaks:
+  - Missing `stellar/core/Hash.h` include (`core::hashCombine` / `core::fnv1a64` not found).
+  - Raw OpenGL calls in app code now correctly use loaded `render::gl::*` procs (`glUseProgram` / `glBindVertexArray` / `glBindFramebuffer` not found).
+  - Two missing braces in `apps/stellar_game/main.cpp` (unclosed **InputEvents** profiling scope and **Contacts** window scope).
+
+### 🚀 What shipped
+
+- **Procedural Mesh Lab history**
+  - Snapshot-based history (graphs + knobs), capped to a configurable max.
+  - Debounced *coalesce* window so rapid edits collapse into a single undo step.
+  - Undo/redo buttons plus shortcuts: **Ctrl+Z** undo, **Ctrl+Y / Ctrl+Shift+Z** redo.
+  - Undo first cancels any pending uncommitted edits back to the last stable baseline.
+
+- **Build fixes**
+  - `ProceduralMeshLabWindow.cpp` now includes the missing headers and uses `render::gl::*`.
+  - `main.cpp` brace structure fixed so the main loop compiles again.
+
+### Files changed/added
+
+- `apps/stellar_game/ProceduralMeshLabWindow.h`
+- `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 141 - System Events Now Spawn Real Signals + GalNet Headless Build Fix
 
 This round makes **system events physically manifest in space**: pirate raids, civil unrest, and research breakthroughs now produce extra **distress calls**, **wreckage / derelict salvage signals**, and (for trade booms/busts) **convoy traffic density** changes — driven by the same deterministic SystemEvent layer that powers GalNet bulletins.
@@ -3689,4 +3720,39 @@ This patch focuses on **stability + observability**:
 - `tests/test_harness.h`
 - `tests/test_signal_event_reactivity.cpp`
 - `tests/test_system_event_economy.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 143 - Mission Control: Itinerary Planner + Runner
+
+This patch tackles an **underdeveloped gameplay workflow**: once you've stacked multiple missions,
+it's hard to decide *where to go next* and easy to waste time re-plotting routes.
+
+### New
+
+- **Mission itinerary planner (sim)**: a deterministic, heuristic planner that builds a "best next stops"
+  itinerary for a selected set of active missions.
+  - Plans using either **min-hops** or **min-distance** cost models.
+  - Groups by *station objective* (or optionally by *system*) and scores stops via reward/cost with
+    deadline urgency and risk penalties.
+  - Designed to be fast enough for UI, and safe even when route batch reachability is incomplete
+    (falls back to straight-line hop estimates).
+
+- **Mission Control window (game UI)**:
+  - Mission selection tools (select all/none/tracked) + optional visibility toggles for completed/failed.
+  - Plan summary table with one-click **Route/Go** buttons per stop.
+  - Per-mission **briefing renderer** (markup title/synopsis/bullets) with risk + objective metadata.
+
+- **Itinerary runner** (optional automation):
+  - Arms from the current plan and then advances stops automatically as mission objectives update.
+  - Can auto-plot the next stop and auto-track a representative mission on each leg.
+  - Uses the existing Integration Hub action pipeline for go-to + camera rig travel preset.
+
+### Files changed/added
+
+- `include/stellar/sim/MissionPlanner.h` *(new)*
+- `src/sim/MissionPlanner.cpp` *(new)*
+- `apps/stellar_game/MissionControlWindow.h` *(new)*
+- `apps/stellar_game/MissionControlWindow.cpp` *(new)*
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
 - `PATCH_NOTES.md`

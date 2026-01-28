@@ -1,10 +1,12 @@
 #include "ProceduralMeshLabWindow.h"
 
 #include "stellar/core/Log.h"
+#include "stellar/core/Hash.h"
 #include "stellar/math/Math.h"
 #include "stellar/math/Mat4.h"
 #include "stellar/math/Vec3.h"
 #include "stellar/render/GltfExport.h"
+#include "stellar/render/Gl.h"
 
 #include "Screenshot.h"
 
@@ -24,6 +26,335 @@ namespace stellar::game {
 namespace {
 
 using namespace stellar;
+
+// -----------------------------------------------------------------------------
+// Undo / Redo history helpers
+// -----------------------------------------------------------------------------
+using HistorySnapshot = ProceduralMeshLabWindowState::HistorySnapshot;
+
+static bool sdfNodeEquals(const render::SdfNode& a, const render::SdfNode& b) {
+  if (a.op != b.op) return false;
+  if (a.inA != b.inA) return false;
+  if (a.inB != b.inB) return false;
+  if (a.seed != b.seed) return false;
+  for (int i = 0; i < 8; ++i) {
+    if (a.p[i] != b.p[i]) return false;
+  }
+  return true;
+}
+
+static bool sdfGraphEquals(const render::SdfGraph& a, const render::SdfGraph& b) {
+  if (a.seed != b.seed) return false;
+  if (a.output != b.output) return false;
+  if (a.nodes.size() != b.nodes.size()) return false;
+  for (std::size_t i = 0; i < a.nodes.size(); ++i) {
+    if (!sdfNodeEquals(a.nodes[i], b.nodes[i])) return false;
+  }
+  return true;
+}
+
+static bool procNodeEquals(const render::ProcNode& a, const render::ProcNode& b) {
+  if (a.op != b.op) return false;
+  if (a.inA != b.inA) return false;
+  if (a.inB != b.inB) return false;
+  if (a.seed != b.seed) return false;
+  for (int i = 0; i < 8; ++i) {
+    if (a.p[i] != b.p[i]) return false;
+  }
+  return true;
+}
+
+static bool procPaletteStopEquals(const render::ProcPaletteStop& a, const render::ProcPaletteStop& b) {
+  if (a.t != b.t) return false;
+  for (int i = 0; i < 3; ++i) {
+    if (a.rgb[i] != b.rgb[i]) return false;
+  }
+  return true;
+}
+
+static bool procGraphEquals(const render::ProcGraph& a, const render::ProcGraph& b) {
+  if (a.seed != b.seed) return false;
+  if (a.output != b.output) return false;
+  if (a.usePalette != b.usePalette) return false;
+  if (a.paletteCount != b.paletteCount) return false;
+  for (int i = 0; i < a.paletteCount; ++i) {
+    if (!procPaletteStopEquals(a.palette[i], b.palette[i])) return false;
+  }
+  if (a.nodes.size() != b.nodes.size()) return false;
+  for (std::size_t i = 0; i < a.nodes.size(); ++i) {
+    if (!procNodeEquals(a.nodes[i], b.nodes[i])) return false;
+  }
+  return true;
+}
+
+static bool sdfMesherParamsEquals(const render::SdfMesherParams& a, const render::SdfMesherParams& b) {
+  return a.resolution == b.resolution && a.bounds == b.bounds && a.isoValue == b.isoValue &&
+         a.computeNormals == b.computeNormals && a.generateUv == b.generateUv && a.bakeSdfToUV == b.bakeSdfToUV;
+}
+
+static bool raymarchSettingsEquals(const render::SdfRaymarchSettings& a, const render::SdfRaymarchSettings& b) {
+  if (a.maxSteps != b.maxSteps) return false;
+  if (a.maxDist != b.maxDist) return false;
+  if (a.hitEps != b.hitEps) return false;
+  if (a.normalEps != b.normalEps) return false;
+  if (a.aoSamples != b.aoSamples) return false;
+  if (a.aoStep != b.aoStep) return false;
+  if (a.aoStrength != b.aoStrength) return false;
+  if (a.shadowSteps != b.shadowSteps) return false;
+  if (a.shadowMaxDist != b.shadowMaxDist) return false;
+  if (a.shadowK != b.shadowK) return false;
+  if (a.debug != b.debug) return false;
+  for (int i = 0; i < 3; ++i) {
+    if (a.lightDir[i] != b.lightDir[i]) return false;
+    if (a.lightColor[i] != b.lightColor[i]) return false;
+    if (a.ambientColor[i] != b.ambientColor[i]) return false;
+    if (a.fogColor[i] != b.fogColor[i]) return false;
+  }
+  return true;
+}
+
+static bool historySnapshotEquals(const HistorySnapshot& a, const HistorySnapshot& b) {
+  if (a.preset != b.preset) return false;
+  if (a.lockToPreset != b.lockToPreset) return false;
+  if (a.seed != b.seed) return false;
+
+  if (a.mesherType != b.mesherType) return false;
+  if (!sdfMesherParamsEquals(a.mesher, b.mesher)) return false;
+  if (a.dcQefRegularization != b.dcQefRegularization) return false;
+  if (a.dcClampToCell != b.dcClampToCell) return false;
+  if (a.dcProjectToIso != b.dcProjectToIso) return false;
+  if (a.dcProjectIterations != b.dcProjectIterations) return false;
+
+  if (a.buildLods != b.buildLods) return false;
+  if (a.lodLevels != b.lodLevels) return false;
+  if (a.lodRatioPerLevel != b.lodRatioPerLevel) return false;
+  if (a.previewLod != b.previewLod) return false;
+  if (a.exportLod != b.exportLod) return false;
+  if (a.exportAllLods != b.exportAllLods) return false;
+
+  if (a.previewRaymarch != b.previewRaymarch) return false;
+  if (!raymarchSettingsEquals(a.raymarchSettings, b.raymarchSettings)) return false;
+
+  if (a.useProceduralTexture != b.useProceduralTexture) return false;
+  if (a.applyTextureToRaymarch != b.applyTextureToRaymarch) return false;
+  if (a.texPreset != b.texPreset) return false;
+  if (a.texLockToPreset != b.texLockToPreset) return false;
+  if (a.texSeed != b.texSeed) return false;
+  if (a.texResolution != b.texResolution) return false;
+  if (a.texGenerateMips != b.texGenerateMips) return false;
+  if (a.texDitherStrength != b.texDitherStrength) return false;
+  if (a.texPackHeightInAlpha != b.texPackHeightInAlpha) return false;
+
+  if (!sdfGraphEquals(a.graph, b.graph)) return false;
+  if (!procGraphEquals(a.texGraph, b.texGraph)) return false;
+
+  return true;
+}
+
+static HistorySnapshot makeHistorySnapshot(const ProceduralMeshLabWindowState& st) {
+  HistorySnapshot s;
+  s.graph = st.graph;
+  s.preset = st.preset;
+  s.lockToPreset = st.lockToPreset;
+  s.seed = st.seed;
+
+  s.mesherType = st.mesherType;
+  s.mesher = st.mesher;
+  s.dcQefRegularization = st.dcQefRegularization;
+  s.dcClampToCell = st.dcClampToCell;
+  s.dcProjectToIso = st.dcProjectToIso;
+  s.dcProjectIterations = st.dcProjectIterations;
+
+  s.buildLods = st.buildLods;
+  s.lodLevels = st.lodLevels;
+  s.lodRatioPerLevel = st.lodRatioPerLevel;
+  s.previewLod = st.previewLod;
+  s.exportLod = st.exportLod;
+  s.exportAllLods = st.exportAllLods;
+
+  s.previewRaymarch = st.previewRaymarch;
+  s.raymarchSettings = st.raymarchSettings;
+
+  s.useProceduralTexture = st.useProceduralTexture;
+  s.applyTextureToRaymarch = st.applyTextureToRaymarch;
+  s.texPreset = st.texPreset;
+  s.texLockToPreset = st.texLockToPreset;
+  s.texSeed = st.texSeed;
+  s.texResolution = st.texResolution;
+  s.texGenerateMips = st.texGenerateMips;
+  s.texDitherStrength = st.texDitherStrength;
+  s.texPackHeightInAlpha = st.texPackHeightInAlpha;
+  s.texGraph = st.texGraph;
+
+  return s;
+}
+
+static void applyHistorySnapshot(ProceduralMeshLabWindowState& st, const HistorySnapshot& s) {
+  st.graph = s.graph;
+  st.preset = s.preset;
+  st.lockToPreset = s.lockToPreset;
+  st.seed = s.seed;
+
+  st.mesherType = s.mesherType;
+  st.mesher = s.mesher;
+  st.dcQefRegularization = s.dcQefRegularization;
+  st.dcClampToCell = s.dcClampToCell;
+  st.dcProjectToIso = s.dcProjectToIso;
+  st.dcProjectIterations = s.dcProjectIterations;
+
+  st.buildLods = s.buildLods;
+  st.lodLevels = s.lodLevels;
+  st.lodRatioPerLevel = s.lodRatioPerLevel;
+  st.previewLod = s.previewLod;
+  st.exportLod = s.exportLod;
+  st.exportAllLods = s.exportAllLods;
+
+  st.previewRaymarch = s.previewRaymarch;
+  st.raymarchSettings = s.raymarchSettings;
+
+  st.useProceduralTexture = s.useProceduralTexture;
+  st.applyTextureToRaymarch = s.applyTextureToRaymarch;
+  st.texPreset = s.texPreset;
+  st.texLockToPreset = s.texLockToPreset;
+  st.texSeed = s.texSeed;
+  st.texResolution = s.texResolution;
+  st.texGenerateMips = s.texGenerateMips;
+  st.texDitherStrength = s.texDitherStrength;
+  st.texPackHeightInAlpha = s.texPackHeightInAlpha;
+  st.texGraph = s.texGraph;
+
+  // Prevent "locked preset" auto-apply from clobbering a restored snapshot.
+  st.texAppliedPreset = st.texPreset;
+  st.texAppliedSeed = st.texSeed;
+
+  // Force rebuilds after restoring.
+  st.dirty = true;
+  st.texDirty = true;
+  st.hasMesh = false;
+  st.hasLods = false;
+  st.lastError.clear();
+  st.lodError.clear();
+}
+
+static void historyTrim(std::vector<HistorySnapshot>& v, int maxEntries) {
+  maxEntries = std::max(1, maxEntries);
+  if ((int)v.size() > maxEntries) {
+    const int drop = (int)v.size() - maxEntries;
+    v.erase(v.begin(), v.begin() + drop);
+  }
+}
+
+static void historyEnsureBaseline(ProceduralMeshLabWindowState& st) {
+  if (!st.historyBaselineValid) {
+    st.historyBaseline = makeHistorySnapshot(st);
+    st.historyBaselineValid = true;
+  }
+}
+
+static void historyClear(ProceduralMeshLabWindowState& st, float timeSec) {
+  st.historyUndo.clear();
+  st.historyRedo.clear();
+  st.historyBaseline = makeHistorySnapshot(st);
+  st.historyBaselineValid = true;
+  st.historyPending = false;
+  st.historyPendingSince = timeSec;
+}
+
+static void historyCommit(ProceduralMeshLabWindowState& st, const HistorySnapshot& cur, float timeSec) {
+  historyEnsureBaseline(st);
+  st.historyUndo.push_back(st.historyBaseline);
+  historyTrim(st.historyUndo, st.historyMax);
+  st.historyBaseline = cur;
+  st.historyBaselineValid = true;
+  st.historyPending = false;
+  st.historyPendingSince = timeSec;
+  st.historyRedo.clear();
+}
+
+static bool historyUndo(ProceduralMeshLabWindowState& st, float timeSec) {
+  if (!st.historyEnabled) return false;
+  historyEnsureBaseline(st);
+
+  // If we have uncommitted edits, undo first cancels them back to baseline.
+  if (st.historyPending) {
+    const HistorySnapshot cur = makeHistorySnapshot(st);
+    st.historyRedo.push_back(cur);
+    historyTrim(st.historyRedo, st.historyMax);
+    applyHistorySnapshot(st, st.historyBaseline);
+    st.historyPending = false;
+    st.historyPendingSince = timeSec;
+    return true;
+  }
+
+  if (st.historyUndo.empty()) return false;
+  const HistorySnapshot cur = st.historyBaseline;
+  const HistorySnapshot prev = st.historyUndo.back();
+  st.historyUndo.pop_back();
+
+  st.historyRedo.push_back(cur);
+  historyTrim(st.historyRedo, st.historyMax);
+
+  applyHistorySnapshot(st, prev);
+  st.historyBaseline = prev;
+  st.historyBaselineValid = true;
+  st.historyPending = false;
+  st.historyPendingSince = timeSec;
+  return true;
+}
+
+static bool historyRedo(ProceduralMeshLabWindowState& st, float timeSec) {
+  if (!st.historyEnabled) return false;
+  historyEnsureBaseline(st);
+  if (st.historyRedo.empty()) return false;
+
+  const HistorySnapshot cur = st.historyBaseline;
+  const HistorySnapshot next = st.historyRedo.back();
+  st.historyRedo.pop_back();
+
+  st.historyUndo.push_back(cur);
+  historyTrim(st.historyUndo, st.historyMax);
+
+  applyHistorySnapshot(st, next);
+  st.historyBaseline = next;
+  st.historyBaselineValid = true;
+  st.historyPending = false;
+  st.historyPendingSince = timeSec;
+  return true;
+}
+
+static void historyAutoCommit(ProceduralMeshLabWindowState& st, float timeSec) {
+  historyEnsureBaseline(st);
+
+  // If history is disabled, keep baseline synced and don't record.
+  if (!st.historyEnabled) {
+    st.historyBaseline = makeHistorySnapshot(st);
+    st.historyBaselineValid = true;
+    st.historyPending = false;
+    st.historyPendingSince = timeSec;
+    return;
+  }
+
+  const HistorySnapshot cur = makeHistorySnapshot(st);
+  if (historySnapshotEquals(cur, st.historyBaseline)) {
+    st.historyPending = false;
+    return;
+  }
+
+  if (!st.historyPending) {
+    st.historyPending = true;
+    st.historyRedo.clear(); // new edits invalidate redo chain
+  }
+
+  // Debounce commits while dragging/typing.
+  if (ImGui::IsAnyItemActive()) {
+    st.historyPendingSince = timeSec;
+  }
+
+  const float delay = std::max(0.0f, st.historyCoalesceSec);
+  if (!ImGui::IsAnyItemActive() && (timeSec - st.historyPendingSince) >= delay) {
+    historyCommit(st, cur, timeSec);
+  }
+}
 
 static const char* meshOpHelp(render::SdfNodeOp op) {
   switch (op) {
@@ -453,9 +784,9 @@ static void renderPreview(ProceduralMeshLabWindowState& st, float timeSec) {
   if (!prevCull) glDisable(GL_CULL_FACE);
   if (prevBlend) glEnable(GL_BLEND);
 
-  glUseProgram((GLuint)prevProg);
-  glBindVertexArray((GLuint)prevVao);
-  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+  render::gl::UseProgram((GLuint)prevProg);
+  render::gl::BindVertexArray((GLuint)prevVao);
+  render::gl::BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
   glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
   // Restore polygon mode (OpenGL returns front/back packed on some drivers).
@@ -1222,6 +1553,83 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
 
   ImGui::TextUnformatted("Signed-distance-field (SDF) node graph -> (Marching Tetrahedra | Dual Contouring) mesh -> OBJ export.");
   ImGui::Separator();
+
+  // Tooling History (Undo / Redo)
+  //
+  // The mesh lab is an iteration-heavy tool; having a safe history makes it much
+  // harder to accidentally lose a good shape while experimenting.
+  {
+    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGuiIO& io = ImGui::GetIO();
+    const bool wantText = io.WantTextInput;
+
+    // Keyboard shortcuts (only when this window is focused and we're not typing into a field).
+    if (focused && !wantText && st.historyEnabled) {
+      const bool ctrl = io.KeyCtrl;
+      const bool shift = io.KeyShift;
+
+      if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+        if (shift) {
+          if (historyRedo(st, timeSec)) toast("Redo", 1.0f);
+        } else {
+          if (historyUndo(st, timeSec)) toast("Undo", 1.0f);
+        }
+      } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+        if (historyRedo(st, timeSec)) toast("Redo", 1.0f);
+      }
+    }
+
+    ImGui::SeparatorText("History");
+    const bool canUndo = st.historyEnabled && (st.historyPending || !st.historyUndo.empty());
+    const bool canRedo = st.historyEnabled && !st.historyRedo.empty();
+
+    ImGui::BeginDisabled(!canUndo);
+    if (ImGui::Button("Undo##mesh_lab")) {
+      if (historyUndo(st, timeSec)) toast("Undo", 1.0f);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+
+    ImGui::BeginDisabled(!canRedo);
+    if (ImGui::Button("Redo##mesh_lab")) {
+      if (historyRedo(st, timeSec)) toast("Redo", 1.0f);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+
+    bool enabled = st.historyEnabled;
+    if (ImGui::Checkbox("Enable##mesh_lab_history", &enabled)) {
+      st.historyEnabled = enabled;
+      // Reset stacks on toggle so behavior stays predictable.
+      historyClear(st, timeSec);
+      toast(st.historyEnabled ? "History enabled" : "History disabled", 1.0f);
+    }
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    if (ImGui::DragInt("Max##mesh_lab_history", &st.historyMax, 1.0f, 4, 256)) {
+      st.historyMax = std::clamp(st.historyMax, 4, 256);
+      historyTrim(st.historyUndo, st.historyMax);
+      historyTrim(st.historyRedo, st.historyMax);
+    }
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    if (ImGui::DragFloat("Coalesce##mesh_lab_history", &st.historyCoalesceSec, 0.01f, 0.0f, 2.0f, "%.2f s")) {
+      if (st.historyCoalesceSec < 0.0f) st.historyCoalesceSec = 0.0f;
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##mesh_lab_history")) {
+      historyClear(st, timeSec);
+      toast("History cleared", 1.0f);
+    }
+
+    ImGui::TextDisabled("Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo. (Pending changes commit once you stop editing.)");
+    ImGui::Separator();
+  }
 
   bool needApplyPreset = false;
 
@@ -2201,6 +2609,10 @@ void drawProceduralMeshLabWindow(ProceduralMeshLabWindowState& st, float timeSec
       }
     }
   }
+
+
+  // Auto-commit history changes (undo/redo snapshotting).
+  historyAutoCommit(st, timeSec);
 
   ImGui::End();
 }
