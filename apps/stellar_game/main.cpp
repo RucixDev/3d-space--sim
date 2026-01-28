@@ -2930,8 +2930,27 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   // Progression (feedback + unlock gating)
   // ---------------------------------------------------------------------------
   struct UnlockReq {
-    double creditsHighWaterCr = 0.0;
-    double repHighWater = 0.0;
+	    // Primary fields (used by the progression UI and unlock checks).
+	    double creditsHighWaterCr = 0.0;
+	    double repHighWater = 0.0;
+
+	    // Compatibility aliases for older UI blocks that phrase requirements as
+	    // "creditsRequired" / "reputationRequired".
+	    // (These are intentionally mirrored so either naming scheme stays valid.)
+	    double creditsRequired = 0.0;
+	    double reputationRequired = 0.0;
+
+	    // Optional: associate the requirement with a faction (0 = global).
+	    core::u32 factionId = 0;
+
+	    UnlockReq() = default;
+	    UnlockReq(double creditsHwCr, double repHw, core::u32 fid = 0)
+	        : creditsHighWaterCr(creditsHwCr),
+	          repHighWater(repHw),
+	          creditsRequired(creditsHwCr),
+	          reputationRequired(repHw),
+	          factionId(fid) {
+	    }
   };
 
   // Ship hull unlocks (also require the actual purchase cost to buy).
@@ -15297,6 +15316,29 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               intel.report = rep;
               contactScanIntelById[c.id] = std::move(intel);
 
+	              // Emit an IntegrationHub event so automations / traces can react to scans.
+	              {
+	                std::string evMsg = std::string("Scanned ") + c.name;
+	                evMsg += " | threat " + std::string(scanThreatBandName(rep.threat01));
+	                if (rep.cargoDetected) {
+	                  if (rep.cargoKnown) {
+	                    evMsg += " | cargo ~" + std::to_string((int)std::llround(rep.cargoValueEstCr)) + " cr";
+	                  } else {
+	                    evMsg += " | cargo detected";
+	                  }
+	                }
+	
+	                game::hubPushEvent(integrationHubWindow,
+	                                 game::makeEvent(timeRealSec,
+	                                                timeDays,
+	                                                game::GameEventKind::Gameplay,
+	                                                "ContactScan",
+	                                                evMsg,
+	                                                true,
+	                                                c.ship.positionKm(),
+	                                                (core::u64)c.id));
+	              }
+
               // Prune occasionally to avoid unbounded growth in long sessions.
               if (contactScanIntelById.size() > 512) {
                 const double pruneBefore = timeDays - 8.0;
@@ -20710,7 +20752,6 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         if (showMainMenu || !docked) ImGui::EndDisabled();
 
         ImGui::Separator();
-	        static core::u32 selectedFactionId = 0;
         if (ImGui::MenuItem("Main Menu")) {
           showMainMenu = true;
           mainMenuPage = MainMenuPage::Root;
@@ -33311,15 +33352,19 @@ ImGui::PopID();
           cctx.progression.progress01 = (float)goalProgress(g);
 
           std::string detail;
-          if (req.creditsRequired > 0.0) {
-            detail += "Credits: " + std::to_string((std::int64_t)std::round(credits)) + " / "
-                + std::to_string((std::int64_t)std::round(req.creditsRequired));
-          }
-          if (req.reputationRequired > 0.0 && req.factionId != 0) {
-            if (!detail.empty()) detail += "  |  ";
-            detail += "Rep: " + std::to_string((int)std::round(reputationForFaction(req.factionId))) + " / "
-                + std::to_string((int)std::round(req.reputationRequired));
-          }
+	          if (req.creditsHighWaterCr > 0.0) {
+	            detail += std::string("Credits high-water: ") +
+	                      std::to_string((std::int64_t)std::llround(progression.creditsHighWaterCr)) +
+	                      " / " +
+	                      std::to_string((std::int64_t)std::llround(req.creditsHighWaterCr));
+	          }
+	          if (req.repHighWater > 0.0) {
+	            if (!detail.empty()) detail += "  |  ";
+	            detail += std::string("Rep best: ") +
+	                      std::to_string((int)std::llround(progression.repHighWater)) +
+	                      " / " +
+	                      std::to_string((int)std::llround(req.repHighWater));
+	          }
           cctx.progression.detail = std::move(detail);
         }
       }
@@ -34463,8 +34508,15 @@ if (showContacts) {
       toast(toasts, "Active sensor ping emitted.", 2.0);
 
       // Notify integrations.
-      game::hubPushEvent(integrationHubWindow,
-                         game::GameEvent{game::GameEventKind::Gameplay, "SensorPing", core::u64(timeDays * 86400.0), 0, math::Vec3d{}, ""});
+	      game::hubPushEvent(
+	          integrationHubWindow,
+	          game::makeEvent(timeRealSec,
+	                         timeDays,
+	                         game::GameEventKind::Gameplay,
+	                         "SensorPing",
+	                         "Active sensor ping emitted.",
+	                         true,
+	                         ship.positionKm()));
     }
     ImGui::EndDisabled();
 
@@ -34547,19 +34599,23 @@ if (showContacts) {
 
     // Threat estimate even without a scan (only if the contact is identified).
     if (!hasScanIntel && identified) {
-      sim::ShipScanInput in{};
-      in.hullClass = c.hullClass;
-      in.hull = std::max(0.0, c.hull);
-      in.hullMax = std::max(1.0, c.hullMax);
-      in.shield = std::max(0.0, c.shield);
-      in.shieldMax = std::max(1.0, c.shieldMax);
-      in.weaponPrimaryDmg = weaponDef(c.weapon).dmg;
-      in.weaponSecondaryDmg = weaponDef(c.weaponSecondary).dmg;
-      in.armor01 = std::clamp(c.armor01, 0.0, 1.0);
-      in.shieldResist01 = std::clamp(c.shieldResist01, 0.0, 1.0);
-      in.bountyCr = std::max(0.0, c.bountyCr);
-      in.factionId = c.factionId;
-      threat01 = std::clamp(sim::shipThreatRating01(in), 0.0, 1.0);
+	      sim::ShipScanInput in{};
+	      in.targetId = c.id;
+	      in.hullClass = c.hullClass;
+	      in.thrusterMk = c.thrusterMk;
+	      in.shieldMk = c.shieldMk;
+	      in.distributorMk = c.distributorMk;
+	      in.weapon = c.weapon;
+
+	      const double hullMax = std::max(1.0, c.hullMax);
+	      const double shieldMax = std::max(1.0, c.shieldMax);
+	      in.hullFrac = std::clamp(std::max(0.0, c.hull) / hullMax, 0.0, 1.0);
+	      in.shieldFrac = std::clamp(std::max(0.0, c.shield) / shieldMax, 0.0, 1.0);
+
+	      in.aiSkill01 = std::clamp(c.aiSkill, 0.0, 1.0);
+	      in.scanStrength01 = std::clamp(sr.strength01, 0.0, 1.0);
+
+	      threat01 = std::clamp(sim::shipThreatRating01(in), 0.0, 1.0);
     }
 
     if (sr.visible) {
@@ -34667,9 +34723,6 @@ if (showContacts) {
             ImGui::Text("Hull: %.0f / %.0f", c.hull, c.hullMax);
             ImGui::Text("Shield: %.0f / %.0f", c.shield, c.shieldMax);
             ImGui::Text("Weapon: %s", weaponDef(c.weapon).name);
-            if (weaponDef(c.weaponSecondary).name[0] != '\0') {
-              ImGui::Text("Weapon2: %s", weaponDef(c.weaponSecondary).name);
-            }
             if (c.role == ContactRole::Trader) {
               std::string destName = "?";
               if (currentSystem && c.tradeDestStationIndex < currentSystem->stations.size()) {
@@ -34691,10 +34744,43 @@ if (showContacts) {
             ImGui::TextDisabled("Identify the contact (passive sensors / active ping / scan)");
           }
 
-          if (r.scanIntel) {
-            ImGui::Separator();
-            ImGui::Text("Last scan: %.0fs ago", r.scanAgeSec);
-          }
+	          if (r.scanIntel) {
+	            ImGui::Separator();
+	            ImGui::Text("Last scan: %.0fs ago", r.scanAgeSec);
+	            if (auto it = contactScanIntelById.find(c.id); it != contactScanIntelById.end()) {
+	              const sim::ShipScanReport& rep = it->second.report;
+	              ImGui::Text("Scan quality: %d%%", pct01(rep.quality01));
+	              ImGui::Text("Threat: %s (%d%%)", scanThreatBandName(rep.threat01), pct01(rep.threat01));
+
+	              if (rep.healthKnown) {
+	                ImGui::Text("Hull: %d%%  Shield: %d%%", pct01(rep.hullFrac), pct01(rep.shieldFrac));
+	              } else {
+	                ImGui::TextDisabled("Health: unknown");
+	              }
+
+	              if (rep.cargoDetected) {
+	                if (rep.cargoKnown) {
+	                  const char* cname = stellar::econ::commodityDef(rep.cargoCommodity).name;
+	                  if (rep.cargoCommodityKnown) {
+	                    ImGui::Text("Cargo: ~%.0f cr (%s)", rep.cargoValueEstCr, cname);
+	                  } else {
+	                    ImGui::Text("Cargo: ~%.0f cr", rep.cargoValueEstCr);
+	                  }
+	                  ImGui::TextDisabled("Range: %.0f .. %.0f (conf %d%%)", rep.cargoValueMinCr, rep.cargoValueMaxCr, pct01(rep.cargoConfidence01));
+	                } else {
+	                  ImGui::Text("Cargo: detected (no estimate)");
+	                }
+	              } else {
+	                ImGui::TextDisabled("Cargo: none detected");
+	              }
+
+	              if (rep.jammerDetected) {
+	                ImGui::Text("EW: jammer detected (%d%%)", pct01(rep.jammerStrength01));
+	              } else if (rep.jammerSuspected) {
+	                ImGui::TextDisabled("EW: jammer suspected");
+	              }
+	            }
+	          }
           ImGui::EndTooltip();
         }
 
@@ -34750,7 +34836,6 @@ if (showContacts) {
               scanLockedId = c.id;
               scanProgressSec = 0.0;
               scanDurationSec = 4.0;
-              scanRangeKm = 85000.0;
               scanLabel = std::string("Contact scan: ") + name;
               scanning = true;
               toast(toasts, "Scan initiated. Hold steady for 4 seconds.", 1.8);
@@ -36699,6 +36784,8 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
     if (showFactionsWindow) {
       ImGui::SetNextWindowSize(ImVec2(680, 520), ImGuiCond_FirstUseEver);
       if (ImGui::Begin("Factions / Standing", &showFactionsWindow)) {
+	        // Persistent UI selection state for the window.
+	        static core::u32 selectedFactionId = 0;
         ImGui::TextDisabled("Docking access prototype:");
         ImGui::BulletText("Denied if rep <= %.0f or bounty > %.0f cr.", kDockDenyRep, kDockDenyBountyMinCr);
         ImGui::BulletText("Rep slightly affects clearance grant probability.");

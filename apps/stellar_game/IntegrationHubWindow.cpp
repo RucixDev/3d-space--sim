@@ -887,7 +887,14 @@ bool writeIntegrationTraceJson(const IntegrationHubWindowState& st, const char* 
   w.endObject();
 
   const auto json = w.takeString();
-  return stellar::core::atomicWriteFile(outPath, json, outErr);
+  return stellar::core::atomicWriteFile(
+      outPath,
+      [&](std::ostream& out, std::string* writeErr) -> bool {
+        (void)writeErr;
+        out.write(json.data(), static_cast<std::streamsize>(json.size()));
+        return out.good();
+      },
+      outErr);
 }
 
 void drawIntegrationHubWindow(IntegrationHubWindowState& st, const ToastFn& toast, const IntegrationHubUiHooks* hooks) {

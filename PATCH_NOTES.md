@@ -3652,3 +3652,41 @@ and **replay** recorded actions with timing controls.
   - Timed replay (preserve original trace deltas), speed multiplier, lead-in delay.
   - Filters: exclude Toasts and file-output actions by default.
   - Optional: temporarily disable automations during replay and automatically restore afterwards.
+
+## OpenAI Patch Round 142 - Scan Intel UX + Test Harness Hardening
+
+This patch focuses on **stability + observability**:
+
+### Fixes
+
+- Fixed headless test build breakages by expanding the bespoke test harness:
+  - Added `CHECK_EQ()`.
+  - Fixed missing `failures` counter in `test_signal_event_reactivity`.
+  - Removed the accidental Catch2 dependency in `test_system_event_economy`.
+
+- Fixed `IntegrationHubWindow.cpp` accidentally calling `atomicWriteFile()` with a `std::string`
+  payload (triggered the `WriteFn must be invocable` static assertion).
+
+- Fixed MSVC build errors in the Contacts UI:
+  - Updated threat estimation to use the new `sim::ShipScanInput` shape.
+  - Removed references to stale fields (`weaponSecondary`, armor/resist/bounty scan inputs).
+  - Removed assignment to a `const` local (`scanRangeKm`).
+
+- Fixed missing include for `sim::stationPosKm()` usage in `CopilotWindow.cpp`.
+
+### New
+
+- **Scan intel tooltip expansion**: Contacts now show key scan report fields (quality/threat/health/cargo/EW)
+  directly in the hover tooltip.
+- **Integration Hub event for scans**: Completing a contact scan now emits a `Gameplay/ContactScan` event
+  so the rule engine and exported traces can react to scans.
+
+### Files changed/added
+
+- `apps/stellar_game/main.cpp`
+- `apps/stellar_game/IntegrationHubWindow.cpp`
+- `apps/stellar_game/CopilotWindow.cpp`
+- `tests/test_harness.h`
+- `tests/test_signal_event_reactivity.cpp`
+- `tests/test_system_event_economy.cpp`
+- `PATCH_NOTES.md`

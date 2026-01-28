@@ -4,6 +4,7 @@
 #include "stellar/sim/Mission.h"
 #include "stellar/sim/MissionAssist.h"
 #include "stellar/sim/System.h"
+#include "stellar/sim/Units.h"
 #include "stellar/sim/Universe.h"
 
 #include <imgui.h>
