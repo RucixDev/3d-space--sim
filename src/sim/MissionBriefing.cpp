@@ -82,6 +82,21 @@ static double missionTypeDangerBias(const Mission& m) {
   }
 }
 
+static double missionTypeCombatBias(const Mission& m) {
+  switch (m.type) {
+    case MissionType::Courier: return 0.01;
+    case MissionType::Delivery: return 0.02;
+    case MissionType::MultiDelivery: return 0.03;
+    case MissionType::Passenger: return 0.02;
+    case MissionType::Smuggle: return 0.04;
+    case MissionType::Salvage: return 0.06;
+    case MissionType::Escort: return 0.12;
+    case MissionType::BountyScan: return 0.14;
+    case MissionType::BountyKill: return 0.22;
+    default: return 0.03;
+  }
+}
+
 static std::string contractCodeFromSeed(core::u64 seed) {
   core::SplitMix64 r(seed);
 
@@ -247,6 +262,17 @@ MissionRisk computeMissionRisk(Universe& universe,
   danger += missionTypeDangerBias(mission);
   danger = clamp01(danger);
   r.danger01 = danger;
+
+  // Combat risk: the chance of being forced into a fight/interdiction.
+  // This is used as a UI subcomponent; it intentionally overlaps with the
+  // overall danger score but emphasizes hostile contact probability.
+  double combat = 0.0;
+  combat += 0.62 * r.piracy01;
+  combat += 0.22 * r.contest01;
+  combat += 0.10 * (1.0 - r.security01);
+  combat += 0.06 * dist01;
+  combat += missionTypeCombatBias(mission);
+  r.combatRisk01 = clamp01(combat);
 
   // Legality/customs risk (primarily for smuggling).
   double lawRisk = 0.0;

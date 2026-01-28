@@ -33379,7 +33379,7 @@ ImGui::PopID();
         }
       };
 
-      mctx.setTrackedMission = [&](core::u64 missionId) {
+      mctx.trackMission = [&](core::u64 missionId) {
         game::pushGameAction(gameActions, game::makeActionSetTrackedMission(timeRealSec, timeDays, "MissionControl", missionId));
       };
 
@@ -33517,7 +33517,7 @@ ImGui::PopID();
       cctx.requestDocking = [&](sim::StationId stId) {
         if (!currentSystem || stId == 0) return;
 
-        // Find station by ID (we store targetStation as an index, but Copilot suggests by StationId).
+        // Find station by ID (Copilot suggests by StationId).
         for (const auto& st : currentSystem->stations) {
           if (st.id != stId) continue;
           const double distKm = (ship.positionKm() - sim::stationPosKm(st, timeDays)).length();
@@ -33531,11 +33531,14 @@ ImGui::PopID();
           toast(toasts, "Docking computer: no current system", 2.0);
           return;
         }
-        if (targetStation < 0 || targetStation >= (int)currentSystem->stations.size()) {
+
+        // Docking computer operates on the HUD target.
+        if (target.kind != TargetKind::Station || target.index < 0 || (std::size_t)target.index >= currentSystem->stations.size()) {
           toast(toasts, "Docking computer: no target station", 2.0);
           return;
         }
-        const auto& st = currentSystem->stations[targetStation];
+
+        const auto& st = currentSystem->stations[(std::size_t)target.index];
         auto it = clearances.find(st.id);
         if (it == clearances.end() || !sim::dockingClearanceValid(it->second, timeDays)) {
           toast(toasts, "Docking computer: request docking clearance first", 2.2);

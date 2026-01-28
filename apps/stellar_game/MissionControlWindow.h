@@ -36,6 +36,13 @@ struct MissionControlWindowState {
   double riskWeight{0.45};
   double urgencyWeight{0.35};
 
+  // ETA model (used for deadline-aware urgency + UI analytics).
+  bool etaAwareUrgency{true};
+  double etaSecondsPerJump{45.0};
+  double etaSecondsPerLy{0.0};
+  double etaSecondsPerStop{600.0};
+  double etaSecondsPerSite{420.0};
+
   bool autoRebuild{true};
 
   // Mission selection.

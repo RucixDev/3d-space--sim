@@ -57,8 +57,9 @@ struct MissionRisk {
   double overall01{0.0};
 
   // Component risks (all in [0,1]).
-  double danger01{0.0};   // piracy + contestedness + travel/delivery profile
-  double lawRisk01{0.0};  // customs/enforcement (mostly relevant for smuggling)
+  double danger01{0.0};      // piracy + contestedness + travel/delivery profile
+  double combatRisk01{0.0};  // interdictions/firefights (piracy + contestedness + mission profile)
+  double lawRisk01{0.0};     // customs/enforcement (mostly relevant for smuggling)
 
   // Raw system condition signals (effective).
   double security01{0.5};

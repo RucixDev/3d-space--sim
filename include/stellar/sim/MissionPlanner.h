@@ -4,6 +4,7 @@
 #include "stellar/sim/SaveGame.h"
 #include "stellar/sim/SystemSecurityDynamics.h"
 
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -60,6 +61,21 @@ struct MissionItineraryParams {
   double riskWeight{0.45};
   double urgencyWeight{0.35};
 
+  // ETA model (rough travel-time estimate, in *simulation* seconds).
+  //
+  // This enables deadline-aware scoring to reason about whether an objective is
+  // still feasible given a (very approximate) travel budget.
+  //
+  // Notes:
+  //  - This is NOT a physics-accurate estimator.
+  //  - The defaults intentionally include a per-stop overhead to account for
+  //    in-system travel/menu/docking friction.
+  bool etaAwareUrgency{true};
+  double etaSecondsPerJump{45.0};
+  double etaSecondsPerLy{0.0};
+  double etaSecondsPerStop{600.0};
+  double etaSecondsPerSite{420.0};
+
   // When true, objectives are grouped by system (stationId differences are
   // ignored). This can reduce plan length, but may hide that multiple docks are
   // required inside the same system.
@@ -82,6 +98,14 @@ struct MissionItineraryStop {
   int hopsFromPrev{0};
   double distanceLyFromPrev{0.0};
   double costFromPrev{0.0};
+
+  // ETA analytics (derived from MissionItineraryParams::eta* fields).
+  //
+  // etaDay is an *absolute* simulation timestamp.
+  // etaSlackHours is relative to earliestDeadlineDay (positive = on time).
+  double etaTravelDaysFromPrev{0.0};
+  double etaDay{0.0};
+  double etaSlackHours{std::numeric_limits<double>::infinity()};
 };
 
 struct MissionItineraryResult {

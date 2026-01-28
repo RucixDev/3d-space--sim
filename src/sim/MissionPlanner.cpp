@@ -25,6 +25,28 @@ inline double safeHoursLeft(double deadlineDay, double nowDay) {
   return d;
 }
 
+inline double safeNonNeg(double v) {
+  if (!std::isfinite(v)) return 0.0;
+  return std::max(0.0, v);
+}
+
+inline double etaStopOverheadSec(const MissionObjective& obj, const MissionItineraryParams& params) {
+  // Sites usually imply "scan the signal" or "reach the area" rather than a full
+  // docking/menu flow, so allow a separate overhead knob.
+  if (obj.isSite) {
+    const double s = safeNonNeg(params.etaSecondsPerSite);
+    if (s > 1e-6) return s;
+  }
+  return safeNonNeg(params.etaSecondsPerStop);
+}
+
+inline double etaTravelDays(int hops, double distLy, const MissionObjective& obj, const MissionItineraryParams& params) {
+  const double perJump = safeNonNeg(params.etaSecondsPerJump);
+  const double perLy = safeNonNeg(params.etaSecondsPerLy);
+  const double tSec = (double)std::max(0, hops) * perJump + safeNonNeg(distLy) * perLy + etaStopOverheadSec(obj, params);
+  return tSec / 86400.0;
+}
+
 inline double repForFaction(std::span<const FactionReputation> rep, core::u32 factionId) {
   if (factionId == 0) return 0.0;
   for (const auto& r : rep) {
@@ -228,6 +250,11 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
   const auto& curSys = universe.getSystem(curId, &currentSystem.stub);
   (void)curSys;
 
+  // Deadline scoring needs to account for the fact that earlier itinerary legs
+  // consume time. We model this using a simple ETA accumulator (in simulation
+  // days) rather than assuming all stops can be reached "right now".
+  double etaNowDay = timeDays;
+
   for (int step = 0; step < maxStops; ++step) {
     // Find any remaining.
     bool any = false;
@@ -308,10 +335,16 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
       const double riskFactor = std::clamp(1.0 - std::max(0.0, params.riskWeight) * clamp01(c.riskSum), 0.15, 1.0);
 
       double urgency = 1.0;
-      const double hrsLeft = safeHoursLeft(c.earliestDeadlineDay, timeDays);
+      const double hrsLeft = safeHoursLeft(c.earliestDeadlineDay, etaNowDay);
       if (std::isfinite(hrsLeft)) {
-        if (hrsLeft <= 0.0) urgency = 0.05;
-        else urgency = 1.0 + std::max(0.0, params.urgencyWeight) * (1.0 / (0.5 + hrsLeft));
+        double slackHrs = hrsLeft;
+        if (params.etaAwareUrgency) {
+          const double tDays = etaTravelDays(hops, dist, c.obj, params);
+          slackHrs = hrsLeft - tDays * 24.0;
+        }
+
+        if (slackHrs <= 0.0) urgency = 0.05;
+        else urgency = 1.0 + std::max(0.0, params.urgencyWeight) * (1.0 / (0.5 + slackHrs));
       }
 
       const double denom = 1.0 + std::max(0.0, cost);
@@ -347,6 +380,16 @@ MissionItineraryResult planMissionItinerary(Universe& universe,
     s.hopsFromPrev = bestHops;
     s.distanceLyFromPrev = bestDist;
     s.costFromPrev = bestCost;
+
+    // ETA analytics for this selected leg.
+    s.etaTravelDaysFromPrev = etaTravelDays(bestHops, bestDist, s.objective, params);
+    etaNowDay += s.etaTravelDaysFromPrev;
+    s.etaDay = etaNowDay;
+    if (s.earliestDeadlineDay > 0.0) {
+      s.etaSlackHours = (s.earliestDeadlineDay - s.etaDay) * 24.0;
+    } else {
+      s.etaSlackHours = std::numeric_limits<double>::infinity();
+    }
 
     out.totalCost += bestCost;
     out.totalHops += bestHops;
