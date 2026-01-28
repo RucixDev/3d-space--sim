@@ -16,10 +16,10 @@ using namespace stellar;
 // can make signals "event-reactive" without impacting the baseline deterministic output
 // when conditions are not provided.
 int test_signal_event_reactivity() {
+  int failures = 0;
   const core::u64 seed = 0xC0FFEE1234ULL;
 
   sim::Universe u(seed);
-  u.initGalaxy(sim::GalaxyParams{});
 
   // Pick a real generated system that has at least one station (signals need an anchor).
   std::optional<sim::SystemStub> stubOpt;
@@ -91,5 +91,5 @@ int test_signal_event_reactivity() {
   // PirateRaid: extraDerelictsPerDay = ceil(sev*2) => 2 extra, plus the usual daily derelict.
   CHECK_EQ(boostedDerelicts, 3);
 
-  return 0;
+  return failures;
 }
