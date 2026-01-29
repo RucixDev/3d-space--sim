@@ -95,6 +95,7 @@
 #include "stellar/sim/IndustryService.h"
 #include "stellar/sim/ShipyardService.h"
 #include "stellar/sim/StationServices.h"
+#include "stellar/sim/FieldRepair.h"
 #include "stellar/sim/ShipScan.h"
 #include "stellar/sim/TradeScanner.h"
 #include "stellar/sim/TradeLoopScanner.h"
@@ -2732,6 +2733,32 @@ double weaponAmmoToastSecondaryUntilDays = 0.0;
   double weaponPrimaryCooldown = 0.0;   // simulated seconds
   double weaponSecondaryCooldown = 0.0; // simulated seconds
 
+  // In-flight field repairs (jury-rig hull patching using cargo materials).
+  // This is deliberately capped below 100% so station services still matter.
+  sim::FieldRepairParams fieldRepairParams{};
+
+  struct FieldRepairRuntimeState {
+    bool active{false};
+    bool paused{false};
+    std::string pauseReason;
+
+    double startHull{0.0};
+    double targetHull{0.0};
+
+    // Gross repair accounting (ignores incoming damage so the progress bar is stable).
+    double plannedHullRepair{0.0};
+    double repairedHullGross{0.0};
+
+    // Starting material snapshot (Metals + Machinery).
+    double startMetals{0.0};
+    double startMachinery{0.0};
+
+    double lastStatusToastRealSec{0.0};
+  };
+
+  FieldRepairRuntimeState fieldRepair{};
+
+
   // Missile lock state (player) — missiles require a brief lock before they will home.
   struct MissileLockState {
     core::u64 targetId{0};
@@ -4667,6 +4694,127 @@ auto fieldOpsStart = [&](FieldOpsMode m, std::string onToast) {
 
   toast(toasts, std::move(onToast), 2.2);
 };
+
+// ------------------------------------------------------------------
+// Field Repairs (in-flight hull patching)
+// ------------------------------------------------------------------
+auto fieldRepairStop = [&](std::string reason, bool allowSummary = true) {
+  if (!fieldRepair.active) return;
+
+  // Snapshot deltas before clearing state.
+  const std::size_t metalsIdx = (std::size_t)econ::CommodityId::Metals;
+  const std::size_t machIdx   = (std::size_t)econ::CommodityId::Machinery;
+
+  const double usedMetals = std::max(0.0, fieldRepair.startMetals - cargo[metalsIdx]);
+  const double usedMach   = std::max(0.0, fieldRepair.startMachinery - cargo[machIdx]);
+
+  const double repaired = std::max(0.0, fieldRepair.repairedHullGross);
+
+  fieldRepair.active = false;
+  fieldRepair.paused = false;
+  fieldRepair.pauseReason.clear();
+  fieldRepair.startHull = 0.0;
+  fieldRepair.targetHull = 0.0;
+  fieldRepair.plannedHullRepair = 0.0;
+  fieldRepair.repairedHullGross = 0.0;
+  fieldRepair.startMetals = 0.0;
+  fieldRepair.startMachinery = 0.0;
+  fieldRepair.lastStatusToastRealSec = 0.0;
+
+  if (!reason.empty()) {
+    if (allowSummary && (repaired > 0.25 || usedMetals > 0.25 || usedMach > 0.25)) {
+      reason += fmt::format(" • +{:.0f} hull, Metals -{}u, Machinery -{}u",
+                            repaired,
+                            (long long)std::llround(usedMetals),
+                            (long long)std::llround(usedMach));
+    }
+    toast(toasts, std::move(reason), 2.6);
+  }
+};
+
+auto fieldRepairCanEngage = [&]() -> bool {
+  if (docked) {
+    toast(toasts, "Field repairs unavailable while docked.", 2.0);
+    return false;
+  }
+  if (fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle) {
+    toast(toasts, "Field repairs unavailable in supercruise/FSD.", 2.0);
+    return false;
+  }
+  if (!currentSystem) {
+    toast(toasts, "Field repairs unavailable: no system loaded.", 2.0);
+    return false;
+  }
+  if (playerHull <= 0.0) {
+    toast(toasts, "Field repairs unavailable: ship destroyed.", 2.0);
+    return false;
+  }
+  return true;
+};
+
+auto fieldRepairStart = [&]() {
+  if (!fieldRepairCanEngage()) return;
+
+  // Repairs require radiators open; silently cancel silent running.
+  if (silentRunning) {
+    silentRunning = false;
+    toast(toasts, "Silent running disengaged (Field repairs).", 1.6);
+  }
+
+  // Stop automation that might fight for control.
+  fieldOpsStop(std::string(), /*allowSummary=*/false);
+
+  if (autopilot) {
+    autopilot = false;
+    dockingComputer.reset();
+  }
+  if (navAutoRun) {
+    navAutoRun = false;
+    toast(toasts, "Auto-run canceled (Field repairs).", 2.0);
+  }
+
+  const std::size_t metalsIdx = (std::size_t)econ::CommodityId::Metals;
+  const std::size_t machIdx   = (std::size_t)econ::CommodityId::Machinery;
+
+  sim::FieldRepairInventory inv{};
+  inv.metals = cargo[metalsIdx];
+  inv.machinery = cargo[machIdx];
+
+  const auto q = sim::quoteFieldRepairToCap(inv, playerHull, playerHullMax, fieldRepairParams);
+  if (!q.ok) {
+    const std::string msg = q.reason ? std::string("Field repairs: ") + q.reason : "Field repairs: unavailable";
+    toast(toasts, msg, 2.2);
+    return;
+  }
+
+  fieldRepair.active = true;
+  fieldRepair.paused = false;
+  fieldRepair.pauseReason.clear();
+  fieldRepair.startHull = playerHull;
+  fieldRepair.targetHull = playerHull + q.hullToRepair;
+  fieldRepair.plannedHullRepair = q.hullToRepair;
+  fieldRepair.repairedHullGross = 0.0;
+  fieldRepair.startMetals = cargo[metalsIdx];
+  fieldRepair.startMachinery = cargo[machIdx];
+  fieldRepair.lastStatusToastRealSec = timeRealSec;
+
+  // Drop shields immediately: we're rerouting power and venting heat.
+  playerShield = 0.0;
+
+  std::string msg = fmt::format("Field repairs engaged (+{:.0f} hull, {:.0f}s). Shields offline.",
+                                q.hullToRepair,
+                                q.timeSec);
+  if (q.limitedByStock) {
+    msg += " (Limited by materials)";
+  }
+  toast(toasts, msg, 2.8);
+};
+
+auto toggleFieldRepair = [&]() {
+  if (fieldRepair.active) fieldRepairStop("Field repairs disengaged.");
+  else fieldRepairStart();
+};
+
 
 auto toggleFieldOpsSalvageSweep = [&]() {
   if (fieldOps.mode == FieldOpsMode::SalvageSweep) {
@@ -10607,6 +10755,11 @@ progression.unlockWeapon(weaponSecondary);
           double& ammoToastUntilDay = primary ? weaponAmmoToastPrimaryUntilDays : weaponAmmoToastSecondaryUntilDays;
 
           if (cd <= 0.0 && !docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle) {
+            // Any weapon discharge cancels in-flight repairs (it is not safe to patch hull under fire).
+            if (fieldRepair.active) {
+              fieldRepairStop("Field repairs canceled (weapon discharge).");
+            }
+
             const double capCost = sim::weaponCapacitorCost(w);
             if (distributorState.wep + 1e-9 < capCost) {
               // Not enough weapon capacitor to fire.
@@ -10861,6 +11014,9 @@ progression.unlockWeapon(weaponSecondary);
       }
 
       input.boost = game::holdDown(controls.holds.boost, keys);
+      if (input.boost && fieldRepair.active) {
+        fieldRepairStop("Field repairs canceled (boost).");
+      }
       input.brake = game::holdDown(controls.holds.brake, keys);
 
       static bool dampers = true;
@@ -16614,6 +16770,86 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         toast(toasts, "Silent running disengaged.", 1.4);
       }
 
+      // --- Field repairs (real-time) ---
+      // Uses cargo Metals + Machinery to patch hull up to a soft cap.
+      // Repairs are intentionally vulnerable: shields are forced offline while active.
+      {
+        if (fieldRepair.active) {
+          const bool allowed = (!docked) && (fsdState == FsdState::Idle)
+                            && (supercruiseState == SupercruiseState::Idle)
+                            && currentSystem;
+          if (!allowed) {
+            fieldRepairStop("Field repairs canceled.");
+          } else {
+            // Stay mostly still: drifting at high speed makes precision patching impossible.
+            const double kMaxSpeedKmS = 0.08; // ~80 m/s
+            const double speedKmS = ship.velocityKmS().length();
+            const bool canProgress = (speedKmS <= kMaxSpeedKmS);
+
+            // Status toasts (throttled).
+            const double kStatusToastCooldownSec = 1.0;
+            auto canStatusToast = [&]() {
+              return (timeRealSec - fieldRepair.lastStatusToastRealSec) >= kStatusToastCooldownSec;
+            };
+
+            if (!canProgress) {
+              if (!fieldRepair.paused) {
+                fieldRepair.paused = true;
+                fieldRepair.pauseReason = "Moving too fast";
+                if (canStatusToast()) {
+                  toast(toasts, "Field repairs paused (slow down).", 1.6);
+                  fieldRepair.lastStatusToastRealSec = timeRealSec;
+                }
+              }
+            } else {
+              if (fieldRepair.paused) {
+                fieldRepair.paused = false;
+                fieldRepair.pauseReason.clear();
+                if (canStatusToast()) {
+                  toast(toasts, "Field repairs resumed.", 1.2);
+                  fieldRepair.lastStatusToastRealSec = timeRealSec;
+                }
+              }
+
+              if (dtReal > 1e-9) {
+                const std::size_t metalsIdx = (std::size_t)econ::CommodityId::Metals;
+                const std::size_t machIdx   = (std::size_t)econ::CommodityId::Machinery;
+
+                sim::FieldRepairInventory inv{};
+                inv.metals = cargo[metalsIdx];
+                inv.machinery = cargo[machIdx];
+
+                const auto step = sim::stepFieldRepair(dtReal, playerHullMax, inv, playerHull, fieldRepairParams);
+
+                cargo[metalsIdx] = inv.metals;
+                cargo[machIdx]   = inv.machinery;
+
+                if (step.progressed) {
+                  fieldRepair.repairedHullGross += step.hullRepaired;
+                  heatImpulse += step.heatAdded;
+                }
+
+                if (step.done) {
+                  if (step.reachedCap) {
+                    fieldRepairStop("Field repairs complete (cap reached).");
+                  } else if (step.outOfSupplies) {
+                    fieldRepairStop("Field repairs halted (out of materials).");
+                  } else {
+                    fieldRepairStop("Field repairs complete.");
+                  }
+                } else if (fieldRepair.targetHull > 0.0 && playerHull + 1e-6 >= fieldRepair.targetHull) {
+                  // Session target reached (usually matches cap/stock limits, but keep robust).
+                  fieldRepairStop("Field repairs complete.");
+                }
+              }
+            }
+
+            // Keep shields offline (even while paused).
+            playerShield = 0.0;
+          }
+        }
+      }
+
       // --- Heat model (real-time) ---
       {
         sim::ThermalInputs tin{};
@@ -17472,9 +17708,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       weaponPrimaryCooldown = std::max(0.0, weaponPrimaryCooldown - dtSim);
       weaponSecondaryCooldown = std::max(0.0, weaponSecondaryCooldown - dtSim);
 
-      // Shield regen (slow) + silent running shield suppression
-      if (silentRunning) {
-        // Silent running forces shields offline.
+      // Shield regen (slow) + shield suppression (silent running / field repairs)
+      if (silentRunning || fieldRepair.active) {
+        // Silent running and field repairs both force shields offline.
         playerShield = 0.0;
       } else if (!paused && playerHull > 0.0 && playerShield < playerShieldMax) {
         const double regenMul = sim::shieldRegenMultiplierFromPips(distributorPips.sys);
@@ -24166,6 +24402,53 @@ if (showShipHud) {
 
 
 
+
+
+
+// Field repairs HUD overlay (small, always-on while active).
+if (fieldRepair.active) {
+  const std::size_t metalsIdx = (std::size_t)econ::CommodityId::Metals;
+  const std::size_t machIdx   = (std::size_t)econ::CommodityId::Machinery;
+
+  const double frac = (fieldRepair.plannedHullRepair > 1e-6)
+                        ? std::clamp(fieldRepair.repairedHullGross / fieldRepair.plannedHullRepair, 0.0, 1.0)
+                        : 0.0;
+
+  ImGuiIO& io = ImGui::GetIO();
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                         | ImGuiWindowFlags_NoFocusOnAppearing
+                         | ImGuiWindowFlags_NoNav
+                         | ImGuiWindowFlags_AlwaysAutoResize;
+#ifdef IMGUI_HAS_DOCK
+  flags |= ImGuiWindowFlags_NoDocking;
+#endif
+
+  ImGui::SetNextWindowBgAlpha(0.35f);
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.82f),
+                          ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+
+  if (ImGui::Begin("##field_repairs_overlay", nullptr, flags)) {
+    ImGui::TextUnformatted("FIELD REPAIRS");
+    if (fieldRepair.paused) {
+      ImGui::TextUnformatted("PAUSED: slow down");
+    }
+
+    const std::string pct = fmt::format("{:.0f}%%", 100.0 * frac);
+    ImGui::ProgressBar((float)frac, ImVec2(240, 0), pct.c_str());
+
+    const double capHull = playerHullMax * std::clamp(fieldRepairParams.maxRepairFrac, 0.0, 1.0);
+    ImGui::Text("Hull: %.0f / %.0f (cap %.0f)", playerHull, playerHullMax, capHull);
+
+    ImGui::Text("Metals: %lldu   Machinery: %lldu",
+                (long long)std::llround(cargo[metalsIdx]),
+                (long long)std::llround(cargo[machIdx]));
+
+    if (ImGui::SmallButton("Cancel")) {
+      fieldRepairStop("Field repairs disengaged.");
+    }
+  }
+  ImGui::End();
+}
 
 
 // Tracked trade loop: advance to the next leg when we dock at the expected destination.
@@ -39064,6 +39347,12 @@ addItem("Field Ops: Rescue Assist",
         std::string(), 65,
         [&]() { toggleFieldOpsRescueAssist(); });
 
+
+addItem("Field Repairs: Toggle",
+        std::string("Field Repairs • ") + onOff(fieldRepair.active),
+        std::string(), 63,
+        [&]() { toggleFieldRepair(); });
+
 addItem("Field Ops: Stop",
         std::string("Field Ops • ") + fieldOpsModeLabel(fieldOps.mode),
         std::string(), 62,
@@ -39383,6 +39672,37 @@ const char* pageName =
           std::string("Field Ops • ") + onOffStr(fieldOps.mode == FieldOpsMode::RescueAssist),
           std::string(), rescueEnabled,
           [&]() { toggleFieldOpsRescueAssist(); });
+
+
+  const bool repairEnabled = fieldRepair.active || canAct;
+  std::string repairDetail = std::string("Field Repairs • ") + onOffStr(fieldRepair.active);
+  if (fieldRepair.active) {
+    const double frac = (fieldRepair.plannedHullRepair > 1e-6)
+                          ? std::clamp(fieldRepair.repairedHullGross / fieldRepair.plannedHullRepair, 0.0, 1.0)
+                          : 0.0;
+    repairDetail += fmt::format(" • {:.0f}%%", 100.0 * frac);
+    if (fieldRepair.paused) repairDetail += " • Paused";
+  } else if (canAct) {
+    const std::size_t metalsIdx = (std::size_t)econ::CommodityId::Metals;
+    const std::size_t machIdx   = (std::size_t)econ::CommodityId::Machinery;
+
+    sim::FieldRepairInventory inv{};
+    inv.metals = cargo[metalsIdx];
+    inv.machinery = cargo[machIdx];
+
+    const auto q = sim::quoteFieldRepairToCap(inv, playerHull, playerHullMax, fieldRepairParams);
+    if (q.ok) {
+      repairDetail += fmt::format(" • +{:.0f} hull", q.hullToRepair);
+      if (q.limitedByStock) repairDetail += " (limited)";
+    } else if (q.reason) {
+      repairDetail += std::string(" • ") + q.reason;
+    }
+  }
+
+  addItem("Field Repairs",
+          repairDetail,
+          std::string(), repairEnabled,
+          [&]() { toggleFieldRepair(); });
 
   addItem("Stop Field Ops",
           std::string("Field Ops • ") + fieldOpsModeLabel(fieldOps.mode),
