@@ -1,3 +1,38 @@
+## Round 143 - In-Flight Field Repairs (Jury-Rig Hull Patching)
+
+This round adds a **new survival / exploration mechanic**: you can now perform **in-flight hull repairs** in normal space by consuming basic materials from your cargo hold.
+
+- **Field Repairs** consume **Metals + Machinery** to patch hull in real-time, with a **soft cap** (default: **75% hull**) so full repairs still require station services.
+- While active, **shields are forced offline** (power rerouted + heat venting), making the action risky to do under pressure.
+- Repairs **pause automatically if you’re drifting too fast** (you need to slow down to resume).
+- A compact **HUD overlay** shows progress, current hull/cap, and remaining materials, with a one-click cancel.
+- Implemented as a new deterministic core sim module (**quote + step**) with unit tests for easy balancing.
+
+### 🚀 What shipped
+
+- **Core sim: `sim::FieldRepair`**
+  - Deterministic quote + step functions (cap-aware, supply-aware).
+  - Tunable parameters (rate, recipe, cap, heat-per-hull).
+  - Unit tests covering cap clamping, supply limits, and step behavior.
+
+- **stellar_game integration**
+  - Action Wheel: **Field Ops** page now includes **Field Repairs** toggle with contextual detail.
+  - Command Palette includes **Field Repairs: Toggle**.
+  - Shields suppressed during repairs (like silent running).
+  - Weapon fire / boost immediately **cancels repairs** for safety.
+  - HUD overlay for repair progress + pause status.
+
+### Files changed/added
+
+- `include/stellar/sim/FieldRepair.h`
+- `src/sim/FieldRepair.cpp`
+- `tests/test_field_repair.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 142 - Mesh Lab Undo/Redo History + MSVC Build Fixes
 
 This round focuses on **tooling iteration** and **build stability**.

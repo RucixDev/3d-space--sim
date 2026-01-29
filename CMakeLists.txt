@@ -251,6 +251,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/Warehouse.cpp
   src/sim/ShipyardService.cpp
   src/sim/StationServices.cpp
+  src/sim/FieldRepair.cpp
   src/sim/Insurance.cpp
   src/sim/Logbook.cpp
   src/sim/ExplorationData.cpp
