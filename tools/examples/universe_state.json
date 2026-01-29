@@ -1,0 +1,261 @@
+{
+  "day": 12.25,
+  "max_jump_ly": 8.0,
+  "factions": [
+    {
+      "id": 1,
+      "name": "Helios Combine",
+      "player_rep": 20
+    },
+    {
+      "id": 2,
+      "name": "Orion Protectorate",
+      "player_rep": -35
+    },
+    {
+      "id": 3,
+      "name": "Free Traders Union",
+      "player_rep": 5
+    }
+  ],
+  "systems": [
+    {
+      "id": 10,
+      "name": "Aquila",
+      "pos_ly": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "security": 0.8,
+      "controlling_faction_id": 1,
+      "pirate_activity": 0.05,
+      "anomaly_level": 0.05,
+      "stations": [
+        {
+          "id": 1001,
+          "name": "Aquila Prime Yard",
+          "kind": "shipyard",
+          "economy": "industrial"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "name": "Borealis",
+      "pos_ly": {
+        "x": 6.0,
+        "y": 1.0,
+        "z": 0.5
+      },
+      "security": 0.62,
+      "controlling_faction_id": 3,
+      "pirate_activity": 0.18,
+      "anomaly_level": 0.08,
+      "stations": [
+        {
+          "id": 1101,
+          "name": "Borealis Exchange",
+          "kind": "city",
+          "economy": "mixed"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "name": "Cygnus",
+      "pos_ly": {
+        "x": 11.8,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "security": 0.25,
+      "controlling_faction_id": 2,
+      "pirate_activity": 0.55,
+      "anomaly_level": 0.12,
+      "stations": [
+        {
+          "id": 1201,
+          "name": "Cygnus Ring",
+          "kind": "outpost",
+          "economy": "industrial"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "name": "Draco",
+      "pos_ly": {
+        "x": 4.0,
+        "y": 7.0,
+        "z": -0.2
+      },
+      "security": 0.4,
+      "controlling_faction_id": 0,
+      "pirate_activity": 0.35,
+      "anomaly_level": 0.25,
+      "stations": [
+        {
+          "id": 1301,
+          "name": "Draco Relay",
+          "kind": "outpost",
+          "economy": "research"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "name": "Eos",
+      "pos_ly": {
+        "x": -5.5,
+        "y": 3.0,
+        "z": 0.0
+      },
+      "security": 0.7,
+      "controlling_faction_id": 1,
+      "pirate_activity": 0.12,
+      "anomaly_level": 0.06,
+      "stations": [
+        {
+          "id": 1401,
+          "name": "Eos Habitat",
+          "kind": "city",
+          "economy": "agricultural"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "name": "Fenrir",
+      "pos_ly": {
+        "x": -10.5,
+        "y": 5.0,
+        "z": 1.0
+      },
+      "security": 0.18,
+      "controlling_faction_id": 0,
+      "pirate_activity": 0.62,
+      "anomaly_level": 0.22,
+      "stations": [
+        {
+          "id": 1501,
+          "name": "Fenrir Salvage",
+          "kind": "refinery",
+          "economy": "industrial"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "name": "Gemini",
+      "pos_ly": {
+        "x": -2.0,
+        "y": -6.0,
+        "z": 0.0
+      },
+      "security": 0.52,
+      "controlling_faction_id": 3,
+      "pirate_activity": 0.2,
+      "anomaly_level": 0.1,
+      "stations": [
+        {
+          "id": 1601,
+          "name": "Gemini Port",
+          "kind": "outpost",
+          "economy": "mixed"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "name": "Hadar",
+      "pos_ly": {
+        "x": 3.5,
+        "y": -11.0,
+        "z": 0.7
+      },
+      "security": 0.33,
+      "controlling_faction_id": 2,
+      "pirate_activity": 0.42,
+      "anomaly_level": 0.15,
+      "stations": [
+        {
+          "id": 1701,
+          "name": "Hadar Bastion",
+          "kind": "military",
+          "economy": "military"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "name": "Icarus",
+      "pos_ly": {
+        "x": 9.0,
+        "y": -6.5,
+        "z": -0.1
+      },
+      "security": 0.45,
+      "controlling_faction_id": 1,
+      "pirate_activity": 0.22,
+      "anomaly_level": 0.4,
+      "stations": [
+        {
+          "id": 1801,
+          "name": "Icarus Research Dock",
+          "kind": "outpost",
+          "economy": "research"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "name": "Juno",
+      "pos_ly": {
+        "x": 15.0,
+        "y": -2.0,
+        "z": 0.0
+      },
+      "security": 0.58,
+      "controlling_faction_id": 3,
+      "pirate_activity": 0.15,
+      "anomaly_level": 0.05,
+      "stations": [
+        {
+          "id": 1901,
+          "name": "Juno Freeport",
+          "kind": "city",
+          "economy": "mixed"
+        }
+      ]
+    }
+  ],
+  "events": [
+    {
+      "id": "ev_pirates_cygnus",
+      "kind": "pirate_spike",
+      "system_id": 12,
+      "severity": 0.9,
+      "start_day": 11.8,
+      "duration_days": 2.0,
+      "headline": "Convoy Ambushed in Cygnus Corridor",
+      "details": "GalNet traffic monitors confirm a civilian convoy was ambushed on approach to Cygnus Ring. Several ships were disabled before emergency beacons went dark. Patrol response is ongoing; independent escorts are advised to avoid the corridor or travel in strength."
+    },
+    {
+      "id": "ev_flare_icarus",
+      "kind": "solar_flare",
+      "system_id": 18,
+      "severity": 0.7,
+      "start_day": 12.1,
+      "duration_days": 1.2
+    },
+    {
+      "id": "ev_discovery_draco",
+      "kind": "anomaly_discovery",
+      "system_id": 13,
+      "severity": 0.6,
+      "start_day": 12.0,
+      "duration_days": 3.5
+    }
+  ]
+}
