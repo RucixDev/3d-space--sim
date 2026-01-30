@@ -1,3 +1,31 @@
+## Round 144 - dt-Invariant Ship Dampers + Brake Stability
+
+This round improves **core ship handling** by making the ship's **dampers and brake** behave consistently under variable frame times and time acceleration.
+
+- Dampers now use an *exact* per-step exponential decay model in the unsaturated regime: `v(t+dt) = v(t) * exp(-k*dt)`
+- Implemented via an effective coefficient `kEff = (1 - exp(-k*dt)) / dt`, computed with `expm1` for small-`dt` numerical stability.
+- Works for both **linear velocity relative to the damping frame** and **angular velocity**.
+- Added a unit test that locks in **dt invariance** and correct damping-frame behavior.
+
+### 🚀 What shipped
+
+- **Physics:** `Ship::stepWithExternalForces()`
+  - dt-invariant damping acceleration requests for linear + angular motion.
+  - Brake path upgraded similarly (stronger decay + higher cap).
+
+- **Tests:** `test_ship_dampers.cpp`
+  - One-big-step vs many-small-steps for linear + angular dampers.
+  - Damping-frame convergence check.
+  - Brake-only dt invariance.
+
+### Files changed/added
+
+- `src/sim/Ship.cpp`
+- `tests/test_ship_dampers.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 143 - In-Flight Field Repairs (Jury-Rig Hull Patching)
 
 This round adds a **new survival / exploration mechanic**: you can now perform **in-flight hull repairs** in normal space by consuming basic materials from your cargo hold.
