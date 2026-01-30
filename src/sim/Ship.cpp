@@ -80,6 +80,14 @@ static stellar::math::Vec3d clampComponents(const stellar::math::Vec3d& v, doubl
   };
 }
 
+static double decayKeff(double kPerSec, double dt) {
+  if (!(kPerSec > 0.0) || !(dt > 0.0)) return 0.0;
+  const double x = kPerSec * dt;
+  // Use expm1 for numerical stability when x is tiny.
+  const double oneMinus = -std::expm1(-x);
+  return oneMinus / dt;
+}
+
 void Ship::step(double dtSeconds, const ShipInput& input) {
   stepWithExternalForces(dtSeconds, input, {0, 0, 0}, {0, 0, 0});
 }
@@ -120,16 +128,22 @@ void Ship::stepWithExternalForces(double dtSeconds,
     accelWorld += externalAccelWorldKmS2;
 
     if (in.dampers) {
-      // Dampers attempt to kill velocity (uses thrusters, so cap it).
+      // Dampers attempt to kill velocity relative to the configured reference frame.
+      //
+      // Use a dt-invariant exponential decay in the unsaturated regime:
+      //   v(t+dt) = v(t) * exp(-k*dt)
+      // and convert it into an acceleration request that can still be capped by thruster authority.
       const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
-      const stellar::math::Vec3d damp = clampMagnitude(relVel * (-dampingLinear_), linCap);
+      const double kEff = decayKeff(dampingLinear_, dt);
+      const stellar::math::Vec3d damp = clampMagnitude(relVel * (-kEff), linCap);
       accelWorld += damp;
     }
 
     if (in.brake) {
       const double brakeCap = linCap * 2.0;
       const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
-      const stellar::math::Vec3d brake = clampMagnitude(relVel * (-dampingLinear_ * 6.0), brakeCap);
+      const double kEff = decayKeff(dampingLinear_ * 6.0, dt);
+      const stellar::math::Vec3d brake = clampMagnitude(relVel * (-kEff), brakeCap);
       accelWorld += brake;
     }
 
@@ -145,13 +159,15 @@ void Ship::stepWithExternalForces(double dtSeconds,
     angAccel += externalAngAccelLocalRadS2;
 
     if (in.dampers) {
-      const stellar::math::Vec3d dampW = clampMagnitude(angVelRadS_ * (-dampingAngular_), angCap);
+      const double kEff = decayKeff(dampingAngular_, dt);
+      const stellar::math::Vec3d dampW = clampMagnitude(angVelRadS_ * (-kEff), angCap);
       angAccel += dampW;
     }
 
     if (in.brake) {
       const double brakeCap = angCap * 2.0;
-      const stellar::math::Vec3d brakeW = clampMagnitude(angVelRadS_ * (-dampingAngular_ * 6.0), brakeCap);
+      const double kEff = decayKeff(dampingAngular_ * 6.0, dt);
+      const stellar::math::Vec3d brakeW = clampMagnitude(angVelRadS_ * (-kEff), brakeCap);
       angAccel += brakeW;
     }
 

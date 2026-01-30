@@ -3,11 +3,24 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
 #include <type_traits>
+
+#if defined(_WIN32)
+  // Keep Windows headers as small as possible.
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  // Avoid <windows.h> defining min/max macros.
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+#endif
 
 namespace stellar::core {
 
@@ -15,8 +28,10 @@ namespace detail {
 
 inline std::string pathToUtf8String(const std::filesystem::path& p) {
 #if defined(_WIN32)
-  // On Windows, prefer u8string to avoid mojibake when paths include non-ASCII.
-  return p.generic_string();
+  // On Windows, filesystem::path stores UTF-16. Convert to UTF-8 for logging.
+  // (generic_u8string returns std::u8string, so we copy bytes into std::string.)
+  const auto u8 = p.generic_u8string();
+  return std::string(u8.begin(), u8.end());
 #else
   // On POSIX, string() is typically UTF-8 already.
   return p.string();
@@ -38,6 +53,32 @@ inline std::filesystem::path makeTempSiblingPath(const std::filesystem::path& de
 
   return destPath.parent_path() / tmpName;
 }
+
+#if defined(_WIN32)
+inline bool replaceFileWin32(const std::filesystem::path& srcTmp,
+                             const std::filesystem::path& dest,
+                             std::string* outErr) {
+  // Use MoveFileExW with MOVEFILE_REPLACE_EXISTING to replace the destination
+  // atomically. MOVEFILE_WRITE_THROUGH asks the OS to flush the operation
+  // before returning (best-effort).
+  //
+  // Docs: MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH.
+  // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
+  const DWORD flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+
+  if (MoveFileExW(srcTmp.c_str(), dest.c_str(), flags) != 0) {
+    return true;
+  }
+
+  const DWORD e = GetLastError();
+  std::error_code ec((int)e, std::system_category());
+  if (outErr) {
+    *outErr = "atomicWriteFile: MoveFileExW failed ('" + pathToUtf8String(srcTmp) +
+              "' -> '" + pathToUtf8String(dest) + "'): " + ec.message();
+  }
+  return false;
+}
+#endif
 
 } // namespace detail
 
@@ -85,16 +126,26 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
     std::string writeErr;
     bool ok = true;
 
-    if constexpr (std::is_invocable_r_v<bool, WriteFn, std::ostream&, std::string*>) {
-      ok = writeFn(out, &writeErr);
-    } else if constexpr (std::is_invocable_v<WriteFn, std::ostream&>) {
-      writeFn(out);
-      ok = true;
-    } else {
-      static_assert(std::is_invocable_v<WriteFn, std::ostream&> ||
-                        std::is_invocable_r_v<bool, WriteFn, std::ostream&, std::string*>,
-                    "atomicWriteFile: WriteFn must be invocable as void(std::ostream&) or "
-                    "bool(std::ostream&, std::string*)");
+    // Keep atomicWriteFile exception-safe: if the callback throws, we must
+    // cleanup the temp file and report failure.
+    try {
+      if constexpr (std::is_invocable_r_v<bool, WriteFn, std::ostream&, std::string*>) {
+        ok = writeFn(out, &writeErr);
+      } else if constexpr (std::is_invocable_v<WriteFn, std::ostream&>) {
+        writeFn(out);
+        ok = true;
+      } else {
+        static_assert(std::is_invocable_v<WriteFn, std::ostream&> ||
+                          std::is_invocable_r_v<bool, WriteFn, std::ostream&, std::string*>,
+                      "atomicWriteFile: WriteFn must be invocable as void(std::ostream&) or "
+                      "bool(std::ostream&, std::string*)");
+      }
+    } catch (const std::exception& e) {
+      ok = false;
+      writeErr = std::string("atomicWriteFile: exception in write callback: ") + e.what();
+    } catch (...) {
+      ok = false;
+      writeErr = "atomicWriteFile: unknown exception in write callback";
     }
 
     out.flush();
@@ -133,17 +184,17 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
 
   // Rename temp file into place.
   {
+  #if defined(_WIN32)
+    std::string renameErr;
+    if (!detail::replaceFileWin32(tmpPath, destPath, &renameErr)) {
+      std::error_code cleanupEc;
+      std::filesystem::remove(tmpPath, cleanupEc);
+      if (outErr) *outErr = renameErr;
+      return false;
+    }
+  #else
     std::error_code ec;
     std::filesystem::rename(tmpPath, destPath, ec);
-
-    // Windows: rename fails if destination exists; attempt best-effort replacement.
-    if (ec) {
-      std::error_code removeEc;
-      std::filesystem::remove(destPath, removeEc);
-      ec.clear();
-      std::filesystem::rename(tmpPath, destPath, ec);
-    }
-
     if (ec) {
       std::error_code cleanupEc;
       std::filesystem::remove(tmpPath, cleanupEc);
@@ -154,6 +205,7 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
       }
       return false;
     }
+  #endif
   }
 
   return true;
