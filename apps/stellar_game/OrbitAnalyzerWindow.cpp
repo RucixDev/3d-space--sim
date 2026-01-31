@@ -156,11 +156,11 @@ static void writePlanToNodeControls(const OrbitAnalyzerBindings& bindings,
   writeNodeRtn(bindings, res.timeToNodeSec, res.plan.deltaVWorldKmS, radial, along, normal);
 }
 
-static const char* gravityBodyKindLabel(stellar::sim::GravityBodyKind kind) {
+static const char* gravityBodyKindLabel(stellar::sim::GravityBody::Kind kind) {
   switch (kind) {
-  case stellar::sim::GravityBodyKind::Star:
+  case stellar::sim::GravityBody::Kind::Star:
     return "Star";
-  case stellar::sim::GravityBodyKind::Planet:
+  case stellar::sim::GravityBody::Kind::Planet:
     return "Planet";
   }
   return "?";
@@ -228,11 +228,11 @@ static void recomputeForecast(OrbitAnalyzerWindowState& state,
 } // namespace
 
 void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
+                             const OrbitAnalyzerBindings& bindings,
                              const stellar::sim::StarSystem& sys,
                              double timeDays,
                              const stellar::sim::Ship& ship,
-                             const stellar::sim::GravityParams& gravityParams,
-                             OrbitAnalyzerBindings bindings) {
+                             const stellar::sim::GravityParams& gravityParams) {
   if (!state.open) return;
 
   if (!ImGui::Begin("Orbit Analyzer", &state.open)) {
@@ -509,10 +509,13 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
     const auto& analysis = state.forecastAnalysis;
 
     if (analysis.firstImpact.valid) {
+      const auto& hit = analysis.firstImpact;
+      const double distKm = (hit.posKm - hit.body.posKm).length();
+      const double altKm = distKm - hit.body.radiusKm;
       ImGui::Text("Impact: %s in %s | alt %.1f km",
-                  bodyLabel(analysis.firstImpact.body).c_str(),
-                  formatTime(analysis.firstImpact.tSec).c_str(),
-                  analysis.firstImpact.altitudeKm);
+                  bodyLabel(hit.body).c_str(),
+                  formatTime(hit.tSec).c_str(),
+                  altKm);
     } else {
       ImGui::TextDisabled("Impact: (none within horizon)");
     }
@@ -528,6 +531,17 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
       for (const auto& a : analysis.closestApproachByBody) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
+        if (!a.valid) {
+          ImGui::TextDisabled("-");
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextDisabled("-");
+          ImGui::TableSetColumnIndex(2);
+          ImGui::TextDisabled("-");
+          ImGui::TableSetColumnIndex(3);
+          ImGui::TextDisabled("-");
+          continue;
+        }
+
         ImGui::TextUnformatted(bodyLabel(a.body).c_str());
         ImGui::TableSetColumnIndex(1);
         ImGui::TextUnformatted(formatTime(a.tSec).c_str());

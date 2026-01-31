@@ -43,15 +43,18 @@ struct OrbitAnalyzerWindowState {
 };
 
 struct OrbitAnalyzerBindings {
-  float* maneuverNodeTimeSec{};
-  float* maneuverNodeDirX{};
-  float* maneuverNodeDirY{};
-  float* maneuverNodeDirZ{};
+  // Optional shared reference body selection used by the trajectory preview and
+  // maneuver node RTN frame.
+  // -1 = auto/dominant, 0 = star, 1..N = planet index+1
+  int* refBodyChoice{};
 
-  float* maneuverNodeDvMs{};
-
+  // Optional maneuver node bindings (seconds-from-now + RTN delta-v in m/s).
+  // If any are missing, planner actions are disabled.
   bool* maneuverNodeEnabled{};
-  int* maneuverNodeRefBodyChoice{};
+  float* maneuverNodeTimeSec{};
+  float* dvAlongMS{};
+  float* dvNormalMS{};
+  float* dvRadialMS{};
 };
 
 void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,

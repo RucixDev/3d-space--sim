@@ -17408,16 +17408,28 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                   toast(toasts, "GalNet digest received.", 2.25);
                 }
 
-                // Integration Hub: treat the digest as a single GalNet event.
-                game::IntegrationHubEvent ev{};
-                ev.kind = game::IntegrationHubEvent::Kind::GalNet;
-                ev.systemId = 0;
-                ev.systemName = "Watchlist";
-                ev.timeDays = timeDays;
-                ev.title = ui::textfx::stripMarkup(m.subject);
-                ev.detail = ui::textfx::stripMarkup(m.body);
-                ev.importance01 = r.bulletin.importance01;
-                game::hubPushEvent(integrationHub, std::move(ev));
+                // Integration Hub: treat the digest as a single event for replay / export.
+                {
+                  std::string subj = ui::textfx::stripMarkup(m.subject);
+                  std::string body = ui::textfx::stripMarkup(m.body);
+
+                  std::string msg = "Watchlist digest";
+                  if (!subj.empty()) {
+                    msg += "\n";
+                    msg += subj;
+                  }
+                  if (!body.empty()) {
+                    msg += "\n";
+                    msg += body;
+                  }
+
+                  game::hubPushEvent(integrationHubWindow,
+                                     game::makeEvent(timeRealSec,
+                                                     timeDays,
+                                                     game::GameEventKind::Info,
+                                                     "GalNetDigest",
+                                                     std::move(msg)));
+                }
               }
             }
           }
@@ -18128,7 +18140,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
                 // Auto countermeasures (optional): shares the manual cooldown/inventory.
                 if (hudMissileWarningAutoCountermeasures
-                    && !inSupercruise && !hyperspace
+                    && (supercruiseState == SupercruiseState::Idle) && (fsdState == FsdState::Idle)
                     && timeDays >= countermeasureCooldownUntilDays
                     && hudMissileWarningThreat.ttiSec > 1e-6
                     && hudMissileWarningThreat.ttiSec < hudMissileWarningAutoDeployTtiSec) {
@@ -22766,13 +22778,14 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
     // Orbit analyzer + maneuver planning helpers
     if (currentSystem) {
-      game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, *currentSystem, timeDays, ship, gravityParams,
-                                    game::OrbitAnalyzerBindings{&trajRefBodyChoice,
-                                                               &maneuverNodeEnabled,
-                                                               &maneuverNodeTimeSec,
-                                                               &maneuverDvAlongMS,
-                                                               &maneuverDvNormalMS,
-                                                               &maneuverDvRadialMS});
+      game::OrbitAnalyzerBindings orbitB;
+      orbitB.refBodyChoice = &trajRefBodyChoice;
+      orbitB.maneuverNodeEnabled = &maneuverNodeEnabled;
+      orbitB.maneuverNodeTimeSec = &maneuverNodeTimeSec;
+      orbitB.dvAlongMS = &maneuverDvAlongMS;
+      orbitB.dvNormalMS = &maneuverDvNormalMS;
+      orbitB.dvRadialMS = &maneuverDvRadialMS;
+      game::drawOrbitAnalyzerWindow(orbitAnalyzerWindow, orbitB, *currentSystem, timeDays, ship, gravityParams);
     }
 
 
