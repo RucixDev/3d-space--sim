@@ -199,7 +199,9 @@ set(STELLAR_CORE_SOURCES
   src/sim/TimeTrial.cpp
   src/sim/OrbitalMechanics.cpp
   src/sim/TrajectoryPredictor.cpp
+  src/sim/TimeTrialGhostCodec.cpp
   src/sim/TrajectoryAnalysis.cpp
+  src/sim/TrajectoryEvents.cpp
   src/sim/ManeuverComputer.cpp
   src/sim/ManeuverProgramComputer.cpp
   src/sim/LambertSolver.cpp

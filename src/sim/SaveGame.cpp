@@ -115,6 +115,17 @@ bool saveToFile(const SaveGame& s, const std::string& path) {
     f << "nav " << sysId << "\n";
   }
 
+  // Time Trials (leaderboard + optional best-run ghost recordings).
+  f << "timeTrialBestRecords " << s.timeTrialBest.size() << "\n";
+  for (const auto& r : s.timeTrialBest) {
+    f << "timeTrialBest "
+      << r.courseKey << " "
+      << r.bestTimeSec << " "
+      << r.ghostCodec << " "
+      << (r.ghostB64.empty() ? "~" : r.ghostB64)
+      << "\n";
+  }
+
   // Loadout / progression
   f << "shipHull " << (int)s.shipHull << "\n";
   f << "thrusterMk " << (int)s.thrusterMk << "\n";
@@ -708,6 +719,32 @@ bool loadFromFile(const std::string& path, SaveGame& out) {
         SystemId id = 0;
         if (!(f >> id)) break;
         out.navRoute.push_back(id);
+      }
+    } else if (key == "timeTrialBestRecords") {
+      std::size_t n = 0;
+      f >> n;
+      out.timeTrialBest.clear();
+      out.timeTrialBest.reserve(std::min<std::size_t>(n, 10000));
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::streampos pos = f.tellg();
+        std::string tag;
+        if (!(f >> tag)) break;
+        if (tag != "timeTrialBest") {
+          f.clear();
+          f.seekg(pos);
+          break;
+        }
+
+        TimeTrialBestRecord r{};
+        int codec = 0;
+        std::string b64;
+        if (!(f >> r.courseKey >> r.bestTimeSec >> codec >> b64)) break;
+
+        if (!std::isfinite(r.bestTimeSec) || r.bestTimeSec < 0.0) r.bestTimeSec = 0.0;
+        r.ghostCodec = (core::u32)std::clamp(codec, 0, 1000000);
+        if (b64 != "~") r.ghostB64 = b64;
+
+        out.timeTrialBest.push_back(std::move(r));
       }
     } else if (key == "shipHull") {
       int v = 0;

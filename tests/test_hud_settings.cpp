@@ -55,6 +55,14 @@ int test_hud_settings() {
     s.flightMarkerClampToEdge = false;
     s.flightMarkerSizePx = 33.0f;
 
+    s.missileWarningEnabled = true;
+    s.missileWarningHudIndicator = false;
+    s.missileWarningEvasionArrow = false;
+    s.missileWarningToasts = false;
+    s.missileWarningAutoCountermeasures = true;
+    s.missileWarningAutoDeployTtiSec = 3.5;
+    s.missileWarningPreferHeatSinks = false;
+
     s.tacticalOverlayEnabled = false;
     s.tacticalShowLabels = false;
     s.tacticalRangeKm = 999999.0;
@@ -110,6 +118,14 @@ int test_hud_settings() {
     CHECK(out.flightMarkerClampToEdge == s.flightMarkerClampToEdge);
     CHECK(std::fabs(out.flightMarkerSizePx - s.flightMarkerSizePx) <= 1e-4f);
 
+    CHECK(out.missileWarningEnabled == s.missileWarningEnabled);
+    CHECK(out.missileWarningHudIndicator == s.missileWarningHudIndicator);
+    CHECK(out.missileWarningEvasionArrow == s.missileWarningEvasionArrow);
+    CHECK(out.missileWarningToasts == s.missileWarningToasts);
+    CHECK(out.missileWarningAutoCountermeasures == s.missileWarningAutoCountermeasures);
+    CHECK(feq(out.missileWarningAutoDeployTtiSec, s.missileWarningAutoDeployTtiSec));
+    CHECK(out.missileWarningPreferHeatSinks == s.missileWarningPreferHeatSinks);
+
     CHECK(out.tacticalOverlayEnabled == s.tacticalOverlayEnabled);
     CHECK(out.tacticalShowLabels == s.tacticalShowLabels);
     CHECK(feq(out.tacticalRangeKm, s.tacticalRangeKm));
@@ -142,6 +158,7 @@ int test_hud_settings() {
     f << "reticleSizePx -5\n";          // clamp
     f << "reticleAlpha 123\n";          // clamp
     f << "leadMaxTimeSec -50\n";        // clamp
+    f << "missileWarningAutoDeployTtiSec -50\n";  // clamp
     f << "tacticalRangeKm 99999999\n";  // clamp
     f << "tacticalMaxMarkers -2\n";     // clamp
     f << "overlayBgAlpha -10\n";         // clamp
@@ -158,6 +175,7 @@ int test_hud_settings() {
     CHECK(out.reticleSizePx >= 8.0f - 1e-4f);
     CHECK(out.reticleAlpha <= 1.0f + 1e-4f);
     CHECK(out.leadMaxTimeSec >= 1.0 - 1e-4);
+    CHECK(out.missileWarningAutoDeployTtiSec >= 0.2 - 1e-4);
     CHECK(out.tacticalRangeKm <= 2000000.0 + 1e-4);
     CHECK(out.tacticalMaxMarkers >= 8);
 

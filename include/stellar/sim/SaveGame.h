@@ -329,8 +329,24 @@ struct Mission {
 
 // Persisted automation types live in HubAutomations.h.
 
+// -----------------------------------------------------------------------------
+// Time Trial leaderboard / ghost persistence
+// -----------------------------------------------------------------------------
+//
+// Time trials (stellar_game) maintain per-course best times and an optional
+// best-run "ghost" recording. Persisting these makes the Time Trial loop
+// feel like a first-class progression system across save/load.
+//
+// Ghost recordings are stored as compact Base64 blobs (see TimeTrialGhostCodec).
+struct TimeTrialBestRecord {
+  core::u64 courseKey{0};
+  double bestTimeSec{0.0};
+  core::u32 ghostCodec{0}; // 0 = none, else kTimeTrialGhostCodecVersion
+  std::string ghostB64{};  // empty if none
+};
+
 struct SaveGame {
-  int version{35};
+  int version{36};
 
   core::u64 seed{0};
   double timeDays{0.0};
@@ -426,6 +442,9 @@ struct SaveGame {
   bool navConstrainToCurrentFuelRange{true};
   double navHazardWeight{0.0};
   StationId pendingArrivalStation{0};
+
+  // Time Trials (leaderboard + optional best-run ghost recordings).
+  std::vector<TimeTrialBestRecord> timeTrialBest{};
 
   // Loadout / progression (kept simple for now: small ints, interpreted by gameplay code).
   // These are *not* physics-critical; they tune HUD/combat feel and basic progression loops.

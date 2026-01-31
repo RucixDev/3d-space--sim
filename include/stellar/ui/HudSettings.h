@@ -33,7 +33,8 @@ struct HudSettings {
   // 3: adds procedural Ship HUD settings
   // 4: adds procedural Ship HUD cosmetics (decor/glyphs/microtext/dropouts)
   // 5: adds Ship HUD segment-display readouts (procedural vector text)
-  int version{5};
+  // 6: adds Missile Warning Receiver / defensive aids settings
+  int version{6};
 
   // Persist this file on exit.
   bool autoSaveOnExit{true};
@@ -84,6 +85,22 @@ struct HudSettings {
   bool flightMarkerUseLocalFrame{true};
   bool flightMarkerClampToEdge{true};
   float flightMarkerSizePx{22.0f};
+
+  // --- Missile warning receiver / defensive aids (v6+) ---
+  // Enables incoming-missile detection + HUD indicator for the player.
+  bool missileWarningEnabled{true};
+
+  // Draw a compact warning + evasion guidance near the combat reticle.
+  bool missileWarningHudIndicator{true};
+  bool missileWarningEvasionArrow{true};
+
+  // Show throttled toast notifications when a missile is inbound.
+  bool missileWarningToasts{true};
+
+  // Optional automatic countermeasure deployment when time-to-impact is low.
+  bool missileWarningAutoCountermeasures{false};
+  double missileWarningAutoDeployTtiSec{1.6};
+  bool missileWarningPreferHeatSinks{true};
 
   // --- Tactical overlay ---
   bool tacticalOverlayEnabled{true};

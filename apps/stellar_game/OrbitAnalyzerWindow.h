@@ -3,6 +3,11 @@
 #include "stellar/sim/Gravity.h"
 #include "stellar/sim/Ship.h"
 #include "stellar/sim/System.h"
+#include "stellar/sim/TrajectoryAnalysis.h"
+#include "stellar/sim/TrajectoryEvents.h"
+
+#include <string>
+#include <vector>
 
 namespace stellar::game {
 
@@ -10,7 +15,7 @@ struct OrbitAnalyzerWindowState {
   bool open{false};
 
   // When enabled, multiply mu by gravityParams.scale so readouts match the game's
-  // "effective" gravity strength.
+  // effective gravity strength.
   bool useGravityScale{true};
 
   // Planner targets (altitudes above the reference body's radius).
@@ -19,26 +24,41 @@ struct OrbitAnalyzerWindowState {
 
   // Plane-change planner options.
   bool planeAlignForcePrograde{false};
+
+  // Forecast controls.
+  bool forecastAutoUpdate{false};
+  float forecastAutoUpdateIntervalSec{1.0f};
+  float forecastHorizonMin{60.0f};
+  float forecastStepSec{10.0f};
+  int forecastMaxSamples{900};
+  int forecastRefineDepth{14};
+
+  // Forecast cache.
+  double forecastLastComputeTimeDays{-1.0};
+  bool forecastValid{false};
+  std::string forecastStatus{};
+  std::vector<stellar::sim::TrajectorySample> forecastSamples{};
+  stellar::sim::TrajectoryAnalysisResult forecastAnalysis{};
+  std::vector<stellar::sim::DominantBodyTransition> forecastDominantTransitions{};
 };
 
 struct OrbitAnalyzerBindings {
-  // Optional: share the trajectory preview reference body selection.
-  // -1 = auto (dominant), 0 = star, 1..n = planet index + 1
-  int* refBodyChoice{nullptr};
+  float* maneuverNodeTimeSec{};
+  float* maneuverNodeDirX{};
+  float* maneuverNodeDirY{};
+  float* maneuverNodeDirZ{};
 
-  // Maneuver node controls to write into the existing planner UI.
-  bool* maneuverNodeEnabled{nullptr};
-  float* maneuverNodeTimeSec{nullptr};
-  float* dvAlongMS{nullptr};
-  float* dvNormalMS{nullptr};
-  float* dvRadialMS{nullptr};
+  float* maneuverNodeDvMs{};
+
+  bool* maneuverNodeEnabled{};
+  int* maneuverNodeRefBodyChoice{};
 };
 
 void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
+                            const OrbitAnalyzerBindings& bindings,
                             const stellar::sim::StarSystem& sys,
                             double timeDays,
                             const stellar::sim::Ship& ship,
-                            const stellar::sim::GravityParams& gravityParams,
-                            OrbitAnalyzerBindings bindings);
+                            const stellar::sim::GravityParams& gravityParams);
 
 } // namespace stellar::game

@@ -3,6 +3,7 @@
 #include "stellar/math/Math.h"
 #include "stellar/sim/ManeuverProgramComputer.h"
 #include "stellar/sim/OrbitalMechanics.h"
+#include "stellar/sim/Units.h"
 
 #include "imgui.h"
 
@@ -153,6 +154,75 @@ static void writePlanToNodeControls(const OrbitAnalyzerBindings& bindings,
   stellar::math::Vec3d radial{}, along{}, normal{};
   computeRtnBasis(res.nodeRelPosKm, res.nodeRelVelKmS, radial, along, normal);
   writeNodeRtn(bindings, res.timeToNodeSec, res.plan.deltaVWorldKmS, radial, along, normal);
+}
+
+static const char* gravityBodyKindLabel(stellar::sim::GravityBodyKind kind) {
+  switch (kind) {
+  case stellar::sim::GravityBodyKind::Star:
+    return "Star";
+  case stellar::sim::GravityBodyKind::Planet:
+    return "Planet";
+  }
+  return "?";
+}
+
+static std::string bodyLabel(const stellar::sim::GravityBody& body) {
+  if (!body.name.empty()) {
+    return body.name;
+  }
+  return gravityBodyKindLabel(body.kind);
+}
+
+static void recomputeForecast(OrbitAnalyzerWindowState& state,
+                              const stellar::sim::StarSystem& sys,
+                              double timeDays,
+                              const stellar::sim::Ship& ship,
+                              const stellar::sim::GravityParams& gravityParams) {
+  const double horizonSec = std::max(0.0, static_cast<double>(state.forecastHorizonMin) * 60.0);
+  const double stepSec = std::max(0.05, static_cast<double>(state.forecastStepSec));
+  const int maxSamples = std::clamp(state.forecastMaxSamples, 2, 50000);
+
+  stellar::sim::TrajectoryPredictParams pred{};
+  pred.horizonSec = horizonSec;
+  pred.stepSec = stepSec;
+  pred.maxSamples = maxSamples;
+  pred.includeGravity = true;
+  pred.gravity = gravityParams;
+  if (!state.useGravityScale) {
+    pred.gravity.scale = 1.0;
+  }
+
+  state.forecastSamples =
+      stellar::sim::predictTrajectoryRK4(sys, timeDays, ship.positionKm(), ship.velocityKmS(), pred);
+  state.forecastLastComputeTimeDays = timeDays;
+
+  if (state.forecastSamples.size() < 2) {
+    state.forecastValid = false;
+    state.forecastAnalysis = {};
+    state.forecastDominantTransitions.clear();
+    state.forecastStatus = "Forecast: insufficient samples";
+    return;
+  }
+
+  state.forecastAnalysis = stellar::sim::analyzeTrajectory(sys, timeDays, state.forecastSamples, pred.gravity);
+
+  stellar::sim::DominantBodyTransitionParams domParams{};
+  domParams.refineDepth = std::clamp(state.forecastRefineDepth, 0, 32);
+  domParams.minSeparationSec = 0.0;
+
+  state.forecastDominantTransitions =
+      stellar::sim::detectDominantBodyTransitions(sys, timeDays, state.forecastSamples, pred.gravity, domParams);
+
+  state.forecastValid = true;
+
+  char buf[256];
+  std::snprintf(buf,
+                sizeof(buf),
+                "Forecast: %zu samples (horizon %.0f min, step %.2f s)",
+                state.forecastSamples.size(),
+                static_cast<double>(state.forecastHorizonMin),
+                stepSec);
+  state.forecastStatus = buf;
 }
 
 } // namespace
@@ -390,6 +460,119 @@ void drawOrbitAnalyzerWindow(OrbitAnalyzerWindowState& state,
   } else {
     ImGui::TextDisabled("Planner actions require a bound (elliptic) orbit.");
   }
+
+  ImGui::Spacing();
+  ImGui::SeparatorText("Forecast");
+
+  bool doRecomputeForecast = ImGui::Button("Recompute##orbitForecast");
+  ImGui::SameLine();
+  ImGui::Checkbox("Auto##orbitForecast", &state.forecastAutoUpdate);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(90.0f);
+  ImGui::InputFloat("Interval (sec)##orbitForecast", &state.forecastAutoUpdateIntervalSec, 0.5f, 2.0f, "%.1f");
+
+  ImGui::SetNextItemWidth(120.0f);
+  ImGui::InputFloat("Horizon (min)##orbitForecast", &state.forecastHorizonMin, 5.0f, 30.0f, "%.0f");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(120.0f);
+  ImGui::InputFloat("Step (sec)##orbitForecast", &state.forecastStepSec, 1.0f, 10.0f, "%.1f");
+
+  ImGui::SetNextItemWidth(120.0f);
+  ImGui::InputInt("Max samples##orbitForecast", &state.forecastMaxSamples);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(120.0f);
+  ImGui::InputInt("Refine depth##orbitForecast", &state.forecastRefineDepth);
+
+  state.forecastHorizonMin = std::max(0.0f, state.forecastHorizonMin);
+  state.forecastStepSec = std::max(0.01f, state.forecastStepSec);
+  state.forecastAutoUpdateIntervalSec = std::max(0.1f, state.forecastAutoUpdateIntervalSec);
+  state.forecastMaxSamples = std::max(2, state.forecastMaxSamples);
+  state.forecastRefineDepth = std::clamp(state.forecastRefineDepth, 0, 32);
+
+  if (state.forecastAutoUpdate) {
+    const double lastDays = state.forecastLastComputeTimeDays;
+    const double dtSec = (lastDays < 0.0) ? 1e30 : (timeDays - lastDays) * stellar::sim::kSecondsPerDay;
+    if (dtSec >= static_cast<double>(state.forecastAutoUpdateIntervalSec)) {
+      doRecomputeForecast = true;
+    }
+  }
+
+  if (doRecomputeForecast) {
+    recomputeForecast(state, sys, timeDays, ship, gravityParams);
+  }
+
+  if (!state.forecastStatus.empty()) {
+    ImGui::TextDisabled("%s", state.forecastStatus.c_str());
+  }
+
+  if (state.forecastValid) {
+    const auto& analysis = state.forecastAnalysis;
+
+    if (analysis.firstImpact.valid) {
+      ImGui::Text("Impact: %s in %s | alt %.1f km",
+                  bodyLabel(analysis.firstImpact.body).c_str(),
+                  formatTime(analysis.firstImpact.tSec).c_str(),
+                  analysis.firstImpact.altitudeKm);
+    } else {
+      ImGui::TextDisabled("Impact: (none within horizon)");
+    }
+
+    if (ImGui::BeginTable("orbitForecastApproaches", 4,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+      ImGui::TableSetupColumn("Body");
+      ImGui::TableSetupColumn("Closest in");
+      ImGui::TableSetupColumn("Altitude (km)");
+      ImGui::TableSetupColumn("Distance (km)");
+      ImGui::TableHeadersRow();
+
+      for (const auto& a : analysis.closestApproachByBody) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(bodyLabel(a.body).c_str());
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(formatTime(a.tSec).c_str());
+        ImGui::TableSetColumnIndex(2);
+        ImGui::Text("%.1f", a.altitudeKm);
+        ImGui::TableSetColumnIndex(3);
+        ImGui::Text("%.1f", a.distanceKm);
+      }
+
+      ImGui::EndTable();
+    }
+
+    if (ImGui::BeginTable("orbitForecastDominant", 3,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+      ImGui::TableSetupColumn("t");
+      ImGui::TableSetupColumn("From");
+      ImGui::TableSetupColumn("To");
+      ImGui::TableHeadersRow();
+
+      if (state.forecastDominantTransitions.empty()) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextDisabled("-");
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextDisabled("-");
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextDisabled("-");
+      } else {
+        for (const auto& e : state.forecastDominantTransitions) {
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0);
+          ImGui::TextUnformatted(formatTime(e.tSec).c_str());
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(bodyLabel(e.from).c_str());
+          ImGui::TableSetColumnIndex(2);
+          ImGui::TextUnformatted(bodyLabel(e.to).c_str());
+        }
+      }
+
+      ImGui::EndTable();
+    }
+  } else {
+    ImGui::TextDisabled("Forecast: click Recompute to generate a short-horizon prediction.");
+  }
+
 
   ImGui::End();
 }

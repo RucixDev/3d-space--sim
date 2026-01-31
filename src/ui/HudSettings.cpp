@@ -112,6 +112,15 @@ bool saveHudSettingsToFile(const HudSettings& s, const std::string& path) {
   f << "flightMarkerClampToEdge " << (s.flightMarkerClampToEdge ? 1 : 0) << "\n";
   f << "flightMarkerSizePx " << s.flightMarkerSizePx << "\n";
 
+  // Missile warning receiver / defensive aids (v6+)
+  f << "missileWarningEnabled " << (s.missileWarningEnabled ? 1 : 0) << "\n";
+  f << "missileWarningHudIndicator " << (s.missileWarningHudIndicator ? 1 : 0) << "\n";
+  f << "missileWarningEvasionArrow " << (s.missileWarningEvasionArrow ? 1 : 0) << "\n";
+  f << "missileWarningToasts " << (s.missileWarningToasts ? 1 : 0) << "\n";
+  f << "missileWarningAutoCountermeasures " << (s.missileWarningAutoCountermeasures ? 1 : 0) << "\n";
+  f << "missileWarningAutoDeployTtiSec " << s.missileWarningAutoDeployTtiSec << "\n";
+  f << "missileWarningPreferHeatSinks " << (s.missileWarningPreferHeatSinks ? 1 : 0) << "\n";
+
   // Tactical overlay
   f << "tacticalOverlayEnabled " << (s.tacticalOverlayEnabled ? 1 : 0) << "\n";
   f << "tacticalShowLabels " << (s.tacticalShowLabels ? 1 : 0) << "\n";
@@ -261,6 +270,22 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
     } else if (key == "flightmarkersizepx" || key == "flightmarkersize") {
       ss >> s.flightMarkerSizePx;
 
+    } else if (key == "missilewarningenabled" || key == "mwr" || key == "missilewarning") {
+      s.missileWarningEnabled = readBool(s.missileWarningEnabled);
+    } else if (key == "missilewarninghudindicator" || key == "mwrhudindicator" || key == "mwrindicator") {
+      s.missileWarningHudIndicator = readBool(s.missileWarningHudIndicator);
+    } else if (key == "missilewarningevasionarrow" || key == "mwrevasionarrow" || key == "mwrevasion") {
+      s.missileWarningEvasionArrow = readBool(s.missileWarningEvasionArrow);
+    } else if (key == "missilewarningtoasts" || key == "mwrtoasts") {
+      s.missileWarningToasts = readBool(s.missileWarningToasts);
+
+    } else if (key == "missilewarningautocountermeasures" || key == "mwrautocountermeasures" || key == "mwrauto") {
+      s.missileWarningAutoCountermeasures = readBool(s.missileWarningAutoCountermeasures);
+    } else if (key == "missilewarningautodeployttisec" || key == "mwrautodeployttisec" || key == "mwrautotti") {
+      ss >> s.missileWarningAutoDeployTtiSec;
+    } else if (key == "missilewarningpreferheatsinks" || key == "mwrpreferheatsinks" || key == "mwrheatsinks") {
+      s.missileWarningPreferHeatSinks = readBool(s.missileWarningPreferHeatSinks);
+
     } else if (key == "tacticaloverlayenabled" || key == "tacticaloverlay" || key == "tactical") {
       s.tacticalOverlayEnabled = readBool(s.tacticalOverlayEnabled);
     } else if (key == "tacticalshowlabels" || key == "tacticallabels") {
@@ -320,6 +345,8 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
   s.leadMaxTimeSec = std::clamp(s.leadMaxTimeSec, 1.0, 120.0);
 
   s.flightMarkerSizePx = std::clamp(s.flightMarkerSizePx, 6.0f, 120.0f);
+
+  s.missileWarningAutoDeployTtiSec = std::clamp(s.missileWarningAutoDeployTtiSec, 0.2, 30.0);
 
   s.tacticalRangeKm = std::clamp(s.tacticalRangeKm, 20000.0, 2000000.0);
   s.tacticalMaxMarkers = std::clamp(s.tacticalMaxMarkers, 8, 512);

@@ -69,6 +69,7 @@
 #include "stellar/sim/Aerodynamics.h"
 #include "stellar/sim/OrbitalMechanics.h"
 #include "stellar/sim/TrajectoryPredictor.h"
+#include "stellar/sim/TimeTrialGhostCodec.h"
 #include "stellar/sim/ManeuverComputer.h"
 #include "stellar/sim/LambertSolver.h"
 #include "stellar/sim/LambertPlanner.h"
@@ -807,6 +808,7 @@ struct FieldOpsRuntimeState {
   double nextAutoScanAtRealSec{0.0};
 
   bool engagedNavAssist{false};
+  core::u64 navAssistTargetId{0};
 
   // Activation snapshot for summary toasts.
   std::array<double, econ::kCommodityCount> cargoSnapshot{};
@@ -4102,6 +4104,38 @@ bool focusMissionsWindow = false;
   bool hudFlightMarkerClampToEdge = true;
   float hudFlightMarkerSizePx = 22.0f;
 
+  // Missile warning receiver / defensive aids (player).
+  bool hudMissileWarningEnabled = true;
+  bool hudMissileWarningIndicator = true;
+  bool hudMissileWarningEvasionArrow = true;
+  bool hudMissileWarningToasts = true;
+
+  bool hudMissileWarningAutoCountermeasures = false;
+  double hudMissileWarningAutoDeployTtiSec = 1.6;
+  bool hudMissileWarningPreferHeatSinks = true;
+
+  enum class HudMissileWarningCm : int {
+    None = 0,
+    Flare = 1,
+    Chaff = 2,
+    HeatSink = 3
+  };
+  HudMissileWarningCm hudMissileWarningRecommendedCm = HudMissileWarningCm::None;
+
+  sim::MissileThreatParams hudMissileWarningThreatParams{};
+  hudMissileWarningThreatParams.minApproachCos = 0.10;
+  hudMissileWarningThreatParams.minClosingKmS = 0.02;
+  hudMissileWarningThreatParams.maxConsiderDistKm = 520000.0;
+
+  sim::MissileEvasionParams hudMissileWarningEvasionParams{};
+  hudMissileWarningEvasionParams.minRelSpeedKmS = 0.02;
+  hudMissileWarningEvasionParams.minMissVecKm = 1e-3;
+  hudMissileWarningEvasionParams.enforceLateralToLos = true;
+
+  sim::MissileThreatSummary hudMissileWarningThreat{};
+  math::Vec3d hudMissileWarningEvadeDirWorld{0,0,0};
+  double hudMissileWarningEvadeDirRefreshUntilDays = 0.0;
+
   // Tracks last fired weapon for HUD lead indicator (primary LMB vs secondary RMB).
   bool hudLastFiredPrimary = true;
 
@@ -4176,6 +4210,14 @@ bool focusMissionsWindow = false;
     hudSettings.flightMarkerClampToEdge = hudFlightMarkerClampToEdge;
     hudSettings.flightMarkerSizePx = hudFlightMarkerSizePx;
 
+    hudSettings.missileWarningEnabled = hudMissileWarningEnabled;
+    hudSettings.missileWarningHudIndicator = hudMissileWarningIndicator;
+    hudSettings.missileWarningEvasionArrow = hudMissileWarningEvasionArrow;
+    hudSettings.missileWarningToasts = hudMissileWarningToasts;
+    hudSettings.missileWarningAutoCountermeasures = hudMissileWarningAutoCountermeasures;
+    hudSettings.missileWarningAutoDeployTtiSec = hudMissileWarningAutoDeployTtiSec;
+    hudSettings.missileWarningPreferHeatSinks = hudMissileWarningPreferHeatSinks;
+
     hudSettings.tacticalOverlayEnabled = showTacticalOverlay;
     hudSettings.tacticalShowLabels = tacticalShowLabels;
     hudSettings.tacticalRangeKm = tacticalRangeKm;
@@ -4245,6 +4287,14 @@ bool focusMissionsWindow = false;
     hudFlightMarkerClampToEdge = s.flightMarkerClampToEdge;
     hudFlightMarkerSizePx = s.flightMarkerSizePx;
 
+    hudMissileWarningEnabled = s.missileWarningEnabled;
+    hudMissileWarningIndicator = s.missileWarningHudIndicator;
+    hudMissileWarningEvasionArrow = s.missileWarningEvasionArrow;
+    hudMissileWarningToasts = s.missileWarningToasts;
+    hudMissileWarningAutoCountermeasures = s.missileWarningAutoCountermeasures;
+    hudMissileWarningAutoDeployTtiSec = s.missileWarningAutoDeployTtiSec;
+    hudMissileWarningPreferHeatSinks = s.missileWarningPreferHeatSinks;
+
     showTacticalOverlay = s.tacticalOverlayEnabled;
     tacticalShowLabels = s.tacticalShowLabels;
     tacticalRangeKm = s.tacticalRangeKm;
@@ -4311,6 +4361,13 @@ bool focusMissionsWindow = false;
         && a.flightMarkerUseLocalFrame == b.flightMarkerUseLocalFrame
         && a.flightMarkerClampToEdge == b.flightMarkerClampToEdge
         && feq(a.flightMarkerSizePx, b.flightMarkerSizePx)
+        && a.missileWarningEnabled == b.missileWarningEnabled
+        && a.missileWarningHudIndicator == b.missileWarningHudIndicator
+        && a.missileWarningEvasionArrow == b.missileWarningEvasionArrow
+        && a.missileWarningToasts == b.missileWarningToasts
+        && a.missileWarningAutoCountermeasures == b.missileWarningAutoCountermeasures
+        && deq(a.missileWarningAutoDeployTtiSec, b.missileWarningAutoDeployTtiSec)
+        && a.missileWarningPreferHeatSinks == b.missileWarningPreferHeatSinks
         && a.tacticalOverlayEnabled == b.tacticalOverlayEnabled
         && a.tacticalShowLabels == b.tacticalShowLabels
         && deq(a.tacticalRangeKm, b.tacticalRangeKm)
@@ -4615,6 +4672,7 @@ auto fieldOpsStop = [&](std::string reason, bool allowSummary = true) {
   fieldOps.targetLabel.clear();
   fieldOps.nextAutoScanAtRealSec = 0.0;
   fieldOps.engagedNavAssist = false;
+  fieldOps.navAssistTargetId = 0;
 
   // If the player toggled automation off mid-scan, don't leave the scan state hanging.
   if (scanning) {
@@ -4674,6 +4732,14 @@ auto fieldOpsStart = [&](FieldOpsMode m, std::string onToast) {
     toast(toasts, "Auto-run canceled (Field Ops engaged).", 2.0);
   }
 
+  // Maneuver computer also drives ship input; disengage to avoid conflicts.
+  if (maneuverComputer.active()) {
+    maneuverComputer.disengage();
+    maneuverComputerLast = {};
+    maneuverComputerPrevPhase = maneuverComputer.phase();
+    toast(toasts, "Maneuver computer canceled (Field Ops engaged).", 2.0);
+  }
+
   fieldOps.mode = m;
   fieldOps.paused = false;
   fieldOps.pauseReason.clear();
@@ -4681,6 +4747,7 @@ auto fieldOpsStart = [&](FieldOpsMode m, std::string onToast) {
   fieldOps.targetLabel.clear();
   fieldOps.nextAutoScanAtRealSec = 0.0;
   fieldOps.engagedNavAssist = false;
+  fieldOps.navAssistTargetId = 0;
 
   fieldOps.cargoSnapshot = cargo;
 
@@ -8022,6 +8089,43 @@ auto findMostRecentSavePath = [&]() -> std::optional<std::filesystem::path> {
           s.navHazardWeight = navHazardWeight;
           s.pendingArrivalStation = pendingArrivalTargetStationId;
 
+          // Time Trials: persist per-course best times and optional best-run ghosts.
+          s.timeTrialBest.clear();
+          s.timeTrialBest.reserve(timeTrialWindow.bestTimesSec.size());
+          for (const auto& kv : timeTrialWindow.bestTimesSec) {
+            const core::u64 courseKey = kv.first;
+            const double bestSec = kv.second;
+            if (!(bestSec > 0.0)) continue;
+
+            sim::TimeTrialBestRecord r{};
+            r.courseKey = courseKey;
+            r.bestTimeSec = bestSec;
+
+            auto itGhost = timeTrialWindow.bestGhostSamples.find(courseKey);
+            if (itGhost != timeTrialWindow.bestGhostSamples.end() && !itGhost->second.empty()) {
+              std::vector<sim::TimeTrialGhostSample> samples;
+              samples.reserve(itGhost->second.size());
+              for (const auto& fs : itGhost->second) {
+                sim::TimeTrialGhostSample gs{};
+                gs.tSec = fs.tRealSec;
+                gs.posKm = fs.posKm;
+                gs.orient = fs.orient;
+                samples.push_back(gs);
+              }
+              r.ghostCodec = sim::kTimeTrialGhostCodecVersion;
+              r.ghostB64 = sim::encodeTimeTrialGhostSamplesB64(samples);
+              if (r.ghostB64.empty()) {
+                r.ghostCodec = 0;
+              }
+            }
+
+            s.timeTrialBest.push_back(std::move(r));
+          }
+          std::sort(s.timeTrialBest.begin(), s.timeTrialBest.end(),
+            [](const sim::TimeTrialBestRecord& a, const sim::TimeTrialBestRecord& b) {
+              return a.courseKey < b.courseKey;
+            });
+
           // Loadout
           s.shipHull = (core::u8)std::clamp((int)shipHullClass, 0, 2);
           s.thrusterMk = (core::u8)std::clamp(thrusterMk, 1, 3);
@@ -8724,6 +8828,33 @@ progression.unlockWeapon(weaponSecondary);
 
             // Prevent surprise immediate jumps right after load.
             navAutoRunHoldUntilDays = navAutoRun ? (timeDays + (2.0 / 86400.0)) : 0.0;
+
+            // Time Trials: restore per-course best times and saved ghosts.
+            timeTrialWindow.clearCourse();
+            timeTrialWindow.bestTimesSec.clear();
+            timeTrialWindow.bestGhostSamples.clear();
+            for (const auto& r : s.timeTrialBest) {
+              if (!(r.bestTimeSec > 0.0)) continue;
+              timeTrialWindow.bestTimesSec[r.courseKey] = r.bestTimeSec;
+
+              if (r.ghostCodec == sim::kTimeTrialGhostCodecVersion && !r.ghostB64.empty()) {
+                std::vector<sim::TimeTrialGhostSample> samples;
+                if (sim::decodeTimeTrialGhostSamplesB64(r.ghostB64, &samples) && !samples.empty()) {
+                  std::deque<FlightRecorderSample> dq;
+                  for (const auto& gs : samples) {
+                    FlightRecorderSample fs{};
+                    fs.tRealSec = gs.tSec;
+                    fs.tSimDays = timeDays;
+                    fs.posKm = gs.posKm;
+                    fs.velKmS = math::Vec3d{};
+                    fs.orient = gs.orient;
+                    fs.angVelRadS = math::Vec3d{};
+                    dq.push_back(fs);
+                  }
+                  timeTrialWindow.bestGhostSamples[r.courseKey] = std::move(dq);
+                }
+              }
+            }
 
             scanning = false;
             scanProgressSec = 0.0;
@@ -9628,6 +9759,9 @@ progression.unlockWeapon(weaponSecondary);
               game::hubPushEvent(integrationHubWindow, game::GameEvent{timeRealSec, timeDays, game::GameEventKind::Docking, "DockingComputerDisengaged", "Disengaged (manual)", true, ship.positionKm()});
             }
           } else {
+            if (fieldOps.mode != FieldOpsMode::Off) {
+              fieldOpsStop("Field Ops disengaged (docking computer engaged).");
+            }
             if (docked) {
               toast(toasts, "Already docked.", 1.6);
             } else if (!(currentSystem && target.kind == TargetKind::Station && target.index < currentSystem->stations.size())) {
@@ -9722,99 +9856,126 @@ progression.unlockWeapon(weaponSecondary);
         };
 
         if (key(controls.actions.navAssistApproach) && !io.WantCaptureKeyboard) {
-          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Approach) {
-            navAssist.disengage();
-            navAssistLast = {};
-            toast(toasts, "Nav assist (approach) disengaged.", 1.6);
-          } else {
-            if (docked) {
-              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
-            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
-              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+          const bool fieldOpsWasActive = (fieldOps.mode != FieldOpsMode::Off);
+          const bool navSameMode = fieldOpsWasActive && navAssist.active() && navAssist.mode() == sim::NavAssistMode::Approach;
+          if (fieldOpsWasActive) {
+            fieldOpsStop("Field Ops disengaged (manual nav assist).");
+          }
+
+          // If Field Ops was already driving this same nav assist mode, treat this keypress as a toggle-off.
+          if (!navSameMode) {
+            if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Approach) {
+              navAssist.disengage();
+              navAssistLast = {};
+              toast(toasts, "Nav assist (approach) disengaged.", 1.6);
             } else {
-              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
-              double standoffKm = 0.0;
-              std::string name;
-              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
-                toast(toasts, "No valid target for nav assist.", 1.8);
+              if (docked) {
+                toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+              } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+                toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
               } else {
-                // Docking computer and nav assist fight for control; always disengage docking.
-                if (autopilot) {
-                  autopilot = false;
-                  dockingComputer.reset();
+                math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+                double standoffKm = 0.0;
+                std::string name;
+                if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                  toast(toasts, "No valid target for nav assist.", 1.8);
+                } else {
+                  // Docking computer and nav assist fight for control; always disengage docking.
+                  if (autopilot) {
+                    autopilot = false;
+                    dockingComputer.reset();
+                  }
+                  navAssist.engageApproach(standoffKm);
+                  navAssistLast = {};
+                  toast(toasts,
+                        std::string("Nav assist: approach ") + name + " (hold " +
+                          std::to_string((int)std::llround(standoffKm)) + " km) [" +
+                          game::chordLabel(controls.actions.navAssistApproach) + "]",
+                        2.2);
                 }
-                navAssist.engageApproach(standoffKm);
-                navAssistLast = {};
-                toast(toasts,
-                      std::string("Nav assist: approach ") + name + " (hold " +
-                        std::to_string((int)std::llround(standoffKm)) + " km) [" +
-                        game::chordLabel(controls.actions.navAssistApproach) + "]",
-                      2.2);
               }
             }
           }
         }
 
         if (key(controls.actions.navAssistMatchVelocity) && !io.WantCaptureKeyboard) {
-          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::MatchVelocity) {
-            navAssist.disengage();
-            navAssistLast = {};
-            toast(toasts, "Nav assist (match velocity) disengaged.", 1.6);
-          } else {
-            if (docked) {
-              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
-            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
-              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+          const bool fieldOpsWasActive = (fieldOps.mode != FieldOpsMode::Off);
+          const bool navSameMode = fieldOpsWasActive && navAssist.active() && navAssist.mode() == sim::NavAssistMode::MatchVelocity;
+          if (fieldOpsWasActive) {
+            fieldOpsStop("Field Ops disengaged (manual nav assist).");
+          }
+
+          // If Field Ops was already driving this same nav assist mode, treat this keypress as a toggle-off.
+          if (!navSameMode) {
+            if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::MatchVelocity) {
+              navAssist.disengage();
+              navAssistLast = {};
+              toast(toasts, "Nav assist (match velocity) disengaged.", 1.6);
             } else {
-              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
-              double standoffKm = 0.0;
-              std::string name;
-              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
-                toast(toasts, "No valid target for nav assist.", 1.8);
+              if (docked) {
+                toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+              } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+                toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
               } else {
-                if (autopilot) {
-                  autopilot = false;
-                  dockingComputer.reset();
+                math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+                double standoffKm = 0.0;
+                std::string name;
+                if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                  toast(toasts, "No valid target for nav assist.", 1.8);
+                } else {
+                  if (autopilot) {
+                    autopilot = false;
+                    dockingComputer.reset();
+                  }
+                  navAssist.engageMatchVelocity(ship, tPos);
+                  navAssistLast = {};
+                  toast(toasts,
+                        std::string("Nav assist: match velocity ") + name + " [" +
+                          game::chordLabel(controls.actions.navAssistMatchVelocity) + "]",
+                        2.2);
                 }
-                navAssist.engageMatchVelocity(ship, tPos);
-                navAssistLast = {};
-                toast(toasts,
-                      std::string("Nav assist: match velocity ") + name + " [" +
-                        game::chordLabel(controls.actions.navAssistMatchVelocity) + "]",
-                      2.2);
               }
             }
           }
         }
 
         if (key(controls.actions.navAssistFollow) && !io.WantCaptureKeyboard) {
-          if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Follow) {
-            navAssist.disengage();
-            navAssistLast = {};
-            toast(toasts, "Nav assist (follow) disengaged.", 1.6);
-          } else {
-            if (docked) {
-              toast(toasts, "Cannot engage nav assist while docked.", 1.6);
-            } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
-              toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+          const bool fieldOpsWasActive = (fieldOps.mode != FieldOpsMode::Off);
+          const bool navSameMode = fieldOpsWasActive && navAssist.active() && navAssist.mode() == sim::NavAssistMode::Follow;
+          if (fieldOpsWasActive) {
+            fieldOpsStop("Field Ops disengaged (manual nav assist).");
+          }
+
+          // If Field Ops was already driving this same nav assist mode, treat this keypress as a toggle-off.
+          if (!navSameMode) {
+            if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Follow) {
+              navAssist.disengage();
+              navAssistLast = {};
+              toast(toasts, "Nav assist (follow) disengaged.", 1.6);
             } else {
-              math::Vec3d tPos{0,0,0}, tVel{0,0,0};
-              double standoffKm = 0.0;
-              std::string name;
-              if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
-                toast(toasts, "No valid target for nav assist.", 1.8);
+              if (docked) {
+                toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+              } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+                toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
               } else {
-                if (autopilot) {
-                  autopilot = false;
-                  dockingComputer.reset();
+                math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+                double standoffKm = 0.0;
+                std::string name;
+                if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                  toast(toasts, "No valid target for nav assist.", 1.8);
+                } else {
+                  if (autopilot) {
+                    autopilot = false;
+                    dockingComputer.reset();
+                  }
+                  navAssist.engageFollow(ship, tPos, tVel, standoffKm);
+                  navAssistLast = {};
+                  toast(toasts,
+                        std::string("Nav assist: follow ") + name + " (hold " +
+                          std::to_string((int)std::llround(standoffKm)) + " km behind) [" +
+                          game::chordLabel(controls.actions.navAssistFollow) + "]",
+                        2.3);
                 }
-                navAssist.engageFollow(ship, tPos, tVel, standoffKm);
-                navAssistLast = {};
-                toast(toasts,
-                      std::string("Nav assist: follow ") + name + " (hold " +
-                        std::to_string((int)std::llround(standoffKm)) + " km behind) [" +
-                        game::chordLabel(controls.actions.navAssistFollow) + "]",
-                      2.3);
               }
             }
           }
@@ -9822,10 +9983,19 @@ progression.unlockWeapon(weaponSecondary);
 
         if (key(controls.actions.toggleCargoScoop) && !io.WantCaptureKeyboard) {
           cargoScoopDeployed = !cargoScoopDeployed;
-          toast(toasts,
-                std::string("Cargo scoop ") + (cargoScoopDeployed ? "DEPLOYED" : "RETRACTED") + " (" +
-                  game::chordLabel(controls.actions.toggleCargoScoop) + ")",
-                1.8);
+
+          std::string msg =
+            std::string("Cargo scoop ") + (cargoScoopDeployed ? "DEPLOYED" : "RETRACTED") +
+            " (" + game::chordLabel(controls.actions.toggleCargoScoop) + ")";
+
+          // If Field Ops is running Salvage Sweep with auto-scoop enabled, treat a manual retraction as a
+          // player override and disable auto-deploy for the remainder of this Field Ops session.
+          if (fieldOps.mode == FieldOpsMode::SalvageSweep && !cargoScoopDeployed && fieldOps.autoDeployCargoScoop) {
+            fieldOps.autoDeployCargoScoop = false;
+            msg += " • Field Ops auto-scoop OFF";
+          }
+
+          toast(toasts, msg, 1.8);
         }
 
         if (key(controls.actions.toggleFuelScoop) && !io.WantCaptureKeyboard) {
@@ -10199,6 +10369,9 @@ progression.unlockWeapon(weaponSecondary);
           }
         }
         if (key(controls.actions.targetStationCycle) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
   // cycle station targets
   if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
   if (!currentSystem->stations.empty()) {
@@ -10212,6 +10385,9 @@ progression.unlockWeapon(weaponSecondary);
 }
 
         if (key(controls.actions.targetPlanetCycle) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
   // cycle planet targets
   if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
   if (!currentSystem->planets.empty()) {
@@ -10225,6 +10401,9 @@ progression.unlockWeapon(weaponSecondary);
 }
 
         if (key(controls.actions.targetContactCycle) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
   // cycle contact targets (alive only)
   if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
   if (!contacts.empty()) {
@@ -10245,6 +10424,9 @@ progression.unlockWeapon(weaponSecondary);
 }
 
         if (key(controls.actions.targetStar) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
   // target system primary star (for scanning / nav reference)
   if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
   target.kind = TargetKind::Star;
@@ -10252,6 +10434,9 @@ progression.unlockWeapon(weaponSecondary);
 }
 
         if (key(controls.actions.clearTarget) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
   if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
   target = Target{};
 }
@@ -11309,6 +11494,242 @@ progression.unlockWeapon(weaponSecondary);
       maneuverComputerLast = {};
       maneuverComputerPrevPhase = maneuverComputer.phase();
       toast(toasts, "Maneuver computer disengaged (not in normal space).", 1.6);
+    }
+
+
+    // Field Ops automation (Salvage Sweep / Rescue Assist). Drives nav assist + scanner in normal space.
+    if (fieldOps.mode != FieldOpsMode::Off) {
+      // Safety: If we leave normal space or lose the system context, stop the automation.
+      if (docked || autopilot || fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle || !currentSystem) {
+        fieldOpsStop("Field Ops disengaged (not in normal space).", /*allowSummary=*/true);
+      } else {
+        // Pause conditions: hostiles nearby or cargo bay full.
+        bool wantPause = false;
+        std::string pauseReason;
+
+        if (fieldOps.pauseOnHostiles) {
+          double bestDistKm = 1.0e99;
+          std::string bestName;
+          for (const auto& c : contacts) {
+            if (!c.alive) continue;
+            if (!c.hostileToPlayer) continue;
+            const double dKm = (c.ship.positionKm() - ship.positionKm()).length();
+            if (dKm < fieldOps.hostilePauseRangeKm && dKm < bestDistKm) {
+              bestDistKm = dKm;
+              bestName = c.name;
+            }
+          }
+          if (!bestName.empty()) {
+            wantPause = true;
+            pauseReason = fmt::format("Hostiles nearby: {}", bestName);
+          }
+        }
+
+        if (!wantPause && fieldOps.mode == FieldOpsMode::SalvageSweep) {
+          const double freeKg = cargoCapacityKg - cargoMassKg(cargo);
+          if (freeKg <= 1.0) {
+            wantPause = true;
+            pauseReason = "Cargo hold full.";
+          }
+        }
+
+        if (wantPause) {
+          // Enter or remain paused.
+          fieldOps.pauseReason = pauseReason;
+          if (!fieldOps.paused) {
+            fieldOps.paused = true;
+            toast(toasts, "Field Ops paused: " + fieldOps.pauseReason, 2.2);
+          }
+
+          if (navAssist.active()) {
+            navAssist.disengage();
+            navAssistLast = {};
+          }
+          fieldOps.engagedNavAssist = false;
+          fieldOps.navAssistTargetId = 0;
+        } else {
+          // Resume if we were paused.
+          if (fieldOps.paused) {
+            fieldOps.paused = false;
+            fieldOps.pauseReason.clear();
+            toast(toasts, "Field Ops resumed.", 1.6);
+          }
+
+          // If nav assist was disengaged externally (lost target), clear bookkeeping so we can re-engage.
+          if (!navAssist.active()) {
+            fieldOps.engagedNavAssist = false;
+            fieldOps.navAssistTargetId = 0;
+          }
+
+          if (fieldOps.mode == FieldOpsMode::SalvageSweep) {
+            // Build candidate list from floating cargo.
+            std::vector<sim::SalvagePodCandidate> candidates;
+            candidates.reserve(floatingCargo.size());
+            for (const auto& pod : floatingCargo) {
+              sim::SalvagePodCandidate c{};
+              c.id = pod.id;
+              c.commodity = pod.commodity;
+              c.units = pod.units;
+              c.posKm = pod.posKm;
+              c.velKmS = pod.velKmS;
+              c.missionId = pod.missionId;
+              const auto def = econ::commodityDef(pod.commodity);
+              c.estimatedValueCr = std::max(0.0, pod.units) * def.basePrice;
+              candidates.push_back(c);
+            }
+
+            const auto st = fieldOps.salvage.update(timeRealSec, ship.positionKm(), candidates);
+
+            if (st.hasTarget && st.targetCandidateIndex >= 0 && (std::size_t)st.targetCandidateIndex < floatingCargo.size()) {
+              const std::size_t podIdx = (std::size_t)st.targetCandidateIndex;
+              const auto& pod = floatingCargo[podIdx];
+
+              fieldOps.targetId = st.targetId;
+
+              const auto def = econ::commodityDef(pod.commodity);
+              const long long u = (long long)std::llround(std::max(0.0, pod.units));
+              const long long v = (long long)std::llround(std::max(0.0, pod.units) * def.basePrice);
+              fieldOps.targetLabel = fmt::format("{}  {}u  (~{} cr)", def.name.c_str(), u, v);
+
+              // Drive the global target selection so existing HUD + nav assist logic can use it.
+              target.kind = TargetKind::Cargo;
+              target.index = podIdx;
+
+              // Deploy scoop if requested.
+              if (fieldOps.autoDeployCargoScoop) {
+                cargoScoopDeployed = true;
+              }
+
+              // Engage follow to close distance while matching velocity for safe scooping.
+              const double desiredDistKm = 1200.0;
+              if (!navAssist.active() || !fieldOps.engagedNavAssist || fieldOps.navAssistTargetId != st.targetId ||
+                  navAssist.mode() != sim::NavAssistMode::Follow) {
+                if (navAssist.active()) {
+                  navAssist.disengage();
+                  navAssistLast = {};
+                }
+                navAssist.engageFollow(ship, pod.posKm, pod.velKmS, desiredDistKm);
+                fieldOps.engagedNavAssist = true;
+                fieldOps.navAssistTargetId = st.targetId;
+              }
+            } else {
+              // No viable targets.
+              fieldOps.targetId = 0;
+              fieldOps.targetLabel.clear();
+              fieldOps.engagedNavAssist = false;
+              fieldOps.navAssistTargetId = 0;
+
+              if (navAssist.active()) {
+                navAssist.disengage();
+                navAssistLast = {};
+              }
+            }
+          } else if (fieldOps.mode == FieldOpsMode::RescueAssist) {
+            // Choose a distress target (prefer ones we can help right now).
+            int bestIdx = -1;
+            double bestScore = -1.0e99;
+
+            // If a distress transfer scan is in progress, hold the locked target stable so the scan
+            // isn't canceled by target churn.
+            if (scanning && scanLockedTarget.kind == TargetKind::Contact && scanLockedId != 0) {
+              const std::size_t idx = scanLockedTarget.index;
+              if (idx < contacts.size()) {
+                const auto& locked = contacts[idx];
+                if (locked.alive && locked.id == scanLockedId && locked.distressVictim && locked.distressNeedUnits > 1e-6) {
+                  bestIdx = (int)idx;
+                }
+              }
+            }
+
+
+            if (bestIdx < 0) {
+            auto tryPick = [&](bool requireCargo) {
+              bestIdx = -1;
+              bestScore = -1.0e99;
+              for (int i = 0; i < (int)contacts.size(); ++i) {
+                const auto& c = contacts[(std::size_t)i];
+                if (!c.alive) continue;
+                if (!c.distressVictim) continue;
+                if (c.distressNeedUnits <= 1e-6) continue;
+
+                const bool canHelp = (cargo[(std::size_t)c.distressNeedCommodity] > 0.5);
+                if (requireCargo && !canHelp) continue;
+
+                const double distKm = (c.ship.positionKm() - ship.positionKm()).length();
+                const double reward = std::max(0.0, c.distressRewardCr);
+                const double rewardTerm = std::log1p(reward / 5000.0);
+                const double distTerm = distKm / (distKm + 120000.0);
+                const double s = (canHelp ? 1.0 : 0.0) + 0.35 * rewardTerm - distTerm;
+
+                if (s > bestScore) {
+                  bestScore = s;
+                  bestIdx = i;
+                }
+              }
+            };
+
+            tryPick(/*requireCargo=*/true);
+            if (bestIdx < 0) tryPick(/*requireCargo=*/false);
+            }
+
+            if (bestIdx >= 0 && (std::size_t)bestIdx < contacts.size()) {
+              const auto& c = contacts[(std::size_t)bestIdx];
+              const auto def = econ::commodityDef(c.distressNeedCommodity);
+              const long long needU = (long long)std::llround(std::max(0.0, c.distressNeedUnits));
+              const bool canHelp = (cargo[(std::size_t)c.distressNeedCommodity] > 0.5);
+
+              fieldOps.targetId = c.id;
+              fieldOps.targetLabel = fmt::format("{} • needs {} {}u{}", c.name, def.name.c_str(), needU,
+                                                 canHelp ? "" : " (no cargo)");
+
+              target.kind = TargetKind::Contact;
+              target.index = (std::size_t)bestIdx;
+
+              // Approach into transfer range.
+              const double desiredDistKm = 12000.0;
+              if (!navAssist.active() || !fieldOps.engagedNavAssist || fieldOps.navAssistTargetId != c.id ||
+                  navAssist.mode() != sim::NavAssistMode::Approach) {
+                if (navAssist.active()) {
+                  navAssist.disengage();
+                  navAssistLast = {};
+                }
+                navAssist.engageApproach(desiredDistKm);
+                fieldOps.engagedNavAssist = true;
+                fieldOps.navAssistTargetId = c.id;
+              }
+
+              // Auto-scan once we're in transfer range (and we have something to deliver).
+              if (fieldOps.autoScanDistress && canHelp && !scanning && timeRealSec >= fieldOps.nextAutoScanAtRealSec) {
+                const double distKm = (c.ship.positionKm() - ship.positionKm()).length();
+                const double transferRangeKm = 15000.0;
+                if (distKm <= transferRangeKm) {
+                  scanLockedTarget = target;
+                  scanLockedId = c.id;
+                  scanLabel = "Contact scan: " + c.name;
+                  scanProgressSec = 0.0;
+                  scanDurationSec = 4.0;
+                  scanRangeKm = 85000.0;
+                  scanning = true;
+
+                  fieldOps.nextAutoScanAtRealSec = timeRealSec + 8.0;
+                  toast(toasts, "Auto-scan: " + scanLabel + "...", 2.0);
+                }
+              }
+
+            } else {
+              fieldOps.targetId = 0;
+              fieldOps.targetLabel.clear();
+              fieldOps.engagedNavAssist = false;
+              fieldOps.navAssistTargetId = 0;
+
+              if (navAssist.active()) {
+                navAssist.disengage();
+                navAssistLast = {};
+              }
+            }
+          }
+        }
+      }
     }
 
     // Normal-space nav assist: approach / match velocity to the current target.
@@ -17634,21 +18055,157 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
             }
           }
 
-          // Throttled incoming missile warning.
-          if (!docked && playerHull > 0.0 && timeDays > incomingMissileToastCooldownUntilDays) {
-            bool incoming = false;
-            double closestKm = 1e30;
-            for (const auto& m : missiles) {
-              if (m.ttlSimSec <= 0.0) continue;
-              if (m.fromPlayer) continue;
-              if (!m.hasTarget) continue;
-              if (m.targetKind != sim::CombatTargetKind::Player) continue;
-              incoming = true;
-              closestKm = std::min(closestKm, (m.posKm - ship.positionKm()).length());
-            }
-            if (incoming && closestKm < 350000.0) {
-              toast(toasts, "INCOMING MISSILE", 1.4);
-              incomingMissileToastCooldownUntilDays = timeDays + (4.0 / 86400.0);
+          // Missile warning receiver (player): threat summary + recommended evasion/countermeasures.
+          {
+            hudMissileWarningThreat = sim::MissileThreatSummary{};
+            hudMissileWarningRecommendedCm = HudMissileWarningCm::None;
+
+            if (hudMissileWarningEnabled && !docked && playerHull > 0.0) {
+              hudMissileWarningThreat = sim::nearestInboundMissile(
+                missiles.empty() ? nullptr : missiles.data(),
+                missiles.size(),
+                sim::CombatTargetKind::Player,
+                /*targetId=*/0,
+                ship.positionKm(),
+                ship.velocityKmS(),
+                hudMissileWarningThreatParams
+              );
+
+              if (!hudMissileWarningThreat.inbound || hudMissileWarningThreat.missileIndex >= missiles.size()) {
+                hudMissileWarningEvadeDirWorld = math::Vec3d{0,0,0};
+              } else {
+                const bool radar = (hudMissileWarningThreat.seeker == sim::MissileSeekerType::Radar);
+
+                // Countermeasure recommendation (for HUD + toast + optional auto-CM).
+                if (radar) {
+                  if (cmChaff > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::Chaff;
+                  else if (cmFlares > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::Flare;
+                  else if (cmHeatSinks > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::HeatSink;
+                } else {
+                  const bool wantSink = hudMissileWarningPreferHeatSinks || (heat > 70.0) || (cmFlares <= 0);
+                  if (cmHeatSinks > 0 && wantSink) hudMissileWarningRecommendedCm = HudMissileWarningCm::HeatSink;
+                  else if (cmFlares > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::Flare;
+                  else if (cmHeatSinks > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::HeatSink;
+                  else if (cmChaff > 0) hudMissileWarningRecommendedCm = HudMissileWarningCm::Chaff;
+                }
+
+                // Refresh evasion direction at a stable cadence (reduces jitter).
+                if (hudMissileWarningEvasionArrow && timeDays >= hudMissileWarningEvadeDirRefreshUntilDays) {
+                  const auto& m = missiles[hudMissileWarningThreat.missileIndex];
+                  const core::u64 phase = (core::u64)std::floor((timeDays * 86400.0) / 0.75);
+                  const core::u64 h = core::hashCombine(core::hashCombine(universe.seed(), 0x4d5752504c4159ull),
+                                                        core::hashCombine(m.shooterId, phase));
+                  const auto plan = sim::planMissileEvasion(m, ship.positionKm(), ship.velocityKmS(), h,
+                                                           hudMissileWarningEvasionParams);
+                  hudMissileWarningEvadeDirWorld = plan.valid ? plan.dirWorld : math::Vec3d{0,0,0};
+                  hudMissileWarningEvadeDirRefreshUntilDays = timeDays + (0.35 / 86400.0);
+                }
+
+                // Toast warning (throttled).
+                if (hudMissileWarningToasts && timeDays > incomingMissileToastCooldownUntilDays) {
+                  // Avoid spamming for very long-range missiles.
+                  const bool near = (hudMissileWarningThreat.distKm < 380000.0) || (hudMissileWarningThreat.ttiSec < 10.0);
+                  if (near) {
+                    const char* seeker = radar ? "RADAR" : "HEAT";
+                    const char* cmLbl = "CM";
+                    switch (hudMissileWarningRecommendedCm) {
+                      case HudMissileWarningCm::Chaff: cmLbl = "CHAFF"; break;
+                      case HudMissileWarningCm::Flare: cmLbl = "FLARES"; break;
+                      case HudMissileWarningCm::HeatSink: cmLbl = "HEAT SINK"; break;
+                      default: cmLbl = "CM"; break;
+                    }
+
+                    if (hudMissileWarningThreat.ttiSec > 1e-6) {
+                      toast(toasts,
+                            fmt::format("INCOMING {} MISSILE ({:.1f}s) — {}", seeker, hudMissileWarningThreat.ttiSec, cmLbl),
+                            1.6);
+                    } else {
+                      toast(toasts, fmt::format("INCOMING {} MISSILE — {}", seeker, cmLbl), 1.6);
+                    }
+                    incomingMissileToastCooldownUntilDays = timeDays + (3.0 / 86400.0);
+                  }
+                }
+
+                // Auto countermeasures (optional): shares the manual cooldown/inventory.
+                if (hudMissileWarningAutoCountermeasures
+                    && !inSupercruise && !hyperspace
+                    && timeDays >= countermeasureCooldownUntilDays
+                    && hudMissileWarningThreat.ttiSec > 1e-6
+                    && hudMissileWarningThreat.ttiSec < hudMissileWarningAutoDeployTtiSec) {
+
+                  auto deploy = [&](HudMissileWarningCm cm) -> bool {
+                    if (cm == HudMissileWarningCm::Chaff) {
+                      if (cmChaff <= 0) return false;
+                      sim::CountermeasureBurstParams p{};
+                      p.count = 6;
+                      p.ttlSimSec = 7.0;
+                      p.radiusKm = 0.15;
+                      p.ejectSpeedKmS = 0.12;
+                      p.spread = 0.35;
+                      p.heatStrength = 6.0;
+                      p.radarStrength = 10.0;
+                      sim::spawnCountermeasureBurst(countermeasures, nextCountermeasureId, sim::CountermeasureType::Chaff,
+                                                    ship.positionKm(), ship.velocityKmS(), ship.right(), ship.up(), ship.forward(), p);
+                      cmChaff -= 1;
+                      toast(toasts, "AUTO: CHAFF", 1.2);
+                      return true;
+                    }
+
+                    if (cm == HudMissileWarningCm::HeatSink) {
+                      if (cmHeatSinks <= 0) return false;
+                      // Heat sink: immediately cool ship, then eject a strong hot decoy burst.
+                      heat = std::max(0.0, heat - 65.0);
+                      sim::CountermeasureBurstParams p{};
+                      p.count = 10;
+                      p.ttlSimSec = 11.0;
+                      p.radiusKm = 0.18;
+                      p.ejectSpeedKmS = 0.12;
+                      p.spread = 0.45;
+                      p.heatStrength = 16.0;
+                      p.radarStrength = 4.0;
+                      sim::spawnCountermeasureBurst(countermeasures, nextCountermeasureId, sim::CountermeasureType::Flare,
+                                                    ship.positionKm(), ship.velocityKmS(), ship.right(), ship.up(), ship.forward(), p);
+                      cmHeatSinks -= 1;
+                      toast(toasts, "AUTO: HEAT SINK", 1.2);
+                      return true;
+                    }
+
+                    if (cm == HudMissileWarningCm::Flare) {
+                      if (cmFlares <= 0) return false;
+                      sim::CountermeasureBurstParams p{};
+                      p.count = 8;
+                      p.ttlSimSec = 9.0;
+                      p.radiusKm = 0.16;
+                      p.ejectSpeedKmS = 0.12;
+                      p.spread = 0.40;
+                      p.heatStrength = 10.0;
+                      p.radarStrength = 3.0;
+                      sim::spawnCountermeasureBurst(countermeasures, nextCountermeasureId, sim::CountermeasureType::Flare,
+                                                    ship.positionKm(), ship.velocityKmS(), ship.right(), ship.up(), ship.forward(), p);
+                      cmFlares -= 1;
+                      toast(toasts, "AUTO: FLARES", 1.2);
+                      return true;
+                    }
+
+                    return false;
+                  };
+
+                  bool deployed = false;
+                  if (hudMissileWarningRecommendedCm != HudMissileWarningCm::None) {
+                    deployed = deploy(hudMissileWarningRecommendedCm);
+                  }
+                  if (!deployed) {
+                    // Fallback order.
+                    deployed = deploy(HudMissileWarningCm::Chaff) || deploy(HudMissileWarningCm::HeatSink) || deploy(HudMissileWarningCm::Flare);
+                  }
+
+                  if (deployed) {
+                    countermeasureCooldownUntilDays = timeDays + (1.8 / 86400.0);
+                  }
+                }
+              }
+            } else {
+              hudMissileWarningEvadeDirWorld = math::Vec3d{0,0,0};
             }
           }
 
@@ -22599,6 +23156,63 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 
           drawLock("P", missileLockPrimary, weaponPrimary, (int)weaponAmmoPrimary, -8.0f);
           drawLock("S", missileLockSecondary, weaponSecondary, (int)weaponAmmoSecondary, +8.0f);
+        }
+
+        // Missile warning receiver (player): HUD indicator + recommended jink/countermeasure.
+        if (hudMissileWarningEnabled && hudMissileWarningIndicator && hudMissileWarningThreat.inbound && !docked) {
+          const bool isRadar = (hudMissileWarningThreat.seeker == sim::MissileSeekerType::Radar);
+          const char* seeker = isRadar ? "RADAR" : "HEAT";
+          const char* cmLbl = "CM";
+          switch (hudMissileWarningRecommendedCm) {
+            case HudMissileWarningCm::Chaff: cmLbl = "CHAFF"; break;
+            case HudMissileWarningCm::Flare: cmLbl = "FLARES"; break;
+            case HudMissileWarningCm::HeatSink: cmLbl = "HEAT SINK"; break;
+            default: cmLbl = "CM"; break;
+          }
+
+          const float ttiSec = (float)hudMissileWarningThreat.ttiSec;
+          const float urgency01 = (ttiSec > 1e-3f) ? (1.0f - std::clamp(ttiSec / 8.0f, 0.0f, 1.0f)) : 1.0f;
+          const float pulse = 0.55f + 0.45f * std::sinf((float)timeRealSec * (6.0f + 8.0f * urgency01));
+          const float a = std::clamp(retA * (0.40f + 0.60f * pulse), 0.0f, 1.0f);
+          const ImU32 col = hudU32(hudColorDanger, a);
+
+          const std::string txt = (ttiSec > 1e-3f)
+            ? fmt::format("{} MISSILE • {} • {:.1f}s", seeker, cmLbl, ttiSec)
+            : fmt::format("{} MISSILE • {}", seeker, cmLbl);
+
+          const ImVec2 sz = ImGui::CalcTextSize(txt.c_str());
+          const ImVec2 p(center.x, center.y - baseR - 44.0f);
+          const float padX = 7.0f;
+          const float padY = 4.0f;
+          const ImVec2 tl(p.x - sz.x * 0.5f - padX, p.y - padY);
+          const ImVec2 br(p.x + sz.x * 0.5f + padX, p.y + sz.y + padY);
+
+          draw->AddRectFilled(tl, br, hudU32(hudColorBackground, 0.20f * a), 4.0f);
+          draw->AddRect(tl, br, hudU32(hudColorGrid, 0.55f * a), 4.0f);
+          draw->AddText(ImVec2(p.x - sz.x * 0.5f, p.y), col, txt.c_str());
+
+          if (hudMissileWarningEvasionArrow) {
+            if (hudMissileWarningEvadeDirWorld.lengthSq() > 1e-12) {
+              const math::Vec3d aimKm = ship.positionKm() + hudMissileWarningEvadeDirWorld.normalized() * 80000.0;
+              ImVec2 aimPx;
+              bool off = false;
+              if (projectToScreenAny(toRenderPosU(aimKm), view, proj, w, h, aimPx, off)) {
+                ImVec2 d(aimPx.x - center.x, aimPx.y - center.y);
+                float dl = std::sqrt(d.x * d.x + d.y * d.y);
+                if (dl > 1e-3f) { d.x /= dl; d.y /= dl; }
+                const float r = baseR + 36.0f;
+                const ImVec2 tip(center.x + d.x * r, center.y + d.y * r);
+                const float arrowLen = 16.0f;
+                const float arrowW = 12.0f;
+                const ImVec2 base(tip.x - d.x * arrowLen, tip.y - d.y * arrowLen);
+                const ImVec2 perp(-d.y, d.x);
+                const ImVec2 p1(base.x + perp.x * (arrowW * 0.5f), base.y + perp.y * (arrowW * 0.5f));
+                const ImVec2 p2(base.x - perp.x * (arrowW * 0.5f), base.y - perp.y * (arrowW * 0.5f));
+                draw->AddTriangleFilled(tip, p1, p2, col);
+                draw->AddTriangle(tip, p1, p2, hudU32(hudColorText, 0.35f * a), 1.0f);
+              }
+            }
+          }
         }
 
 
@@ -39074,6 +39688,27 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
             ImGui::Checkbox("Clamp to screen", &hudFlightMarkerClampToEdge);
             ImGui::SetNextItemWidth(260.0f);
             ImGui::SliderFloat("Marker size (px)", &hudFlightMarkerSizePx, 8.0f, 80.0f, "%.0f");
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Missile warning receiver");
+          ImGui::Checkbox("Enable MWR", &hudMissileWarningEnabled);
+          if (hudMissileWarningEnabled) {
+            ImGui::Indent();
+            ImGui::Checkbox("HUD indicator", &hudMissileWarningIndicator);
+            ImGui::Checkbox("Evasion arrow", &hudMissileWarningEvasionArrow);
+            ImGui::Checkbox("Toast warnings", &hudMissileWarningToasts);
+            ImGui::Checkbox("Auto countermeasures", &hudMissileWarningAutoCountermeasures);
+            if (!hudMissileWarningAutoCountermeasures) ImGui::BeginDisabled();
+            {
+              float tti = (float)hudMissileWarningAutoDeployTtiSec;
+              ImGui::SetNextItemWidth(260.0f);
+              ImGui::SliderFloat("Auto deploy threshold (sec)", &tti, 0.3f, 6.0f, "%.1f");
+              hudMissileWarningAutoDeployTtiSec = (double)tti;
+            }
+            if (!hudMissileWarningAutoCountermeasures) ImGui::EndDisabled();
+            ImGui::Checkbox("Prefer heat sinks", &hudMissileWarningPreferHeatSinks);
             ImGui::Unindent();
           }
 

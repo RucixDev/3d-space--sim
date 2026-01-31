@@ -107,7 +107,7 @@ struct TimeTrialWindowState {
   // Records a lightweight ship telemetry trace during runs and replays the
   // best run as an in-world ghost ship + trail so you can race yourself.
   //
-  // This is intentionally in-memory only (not persisted to save files yet).
+  // Best-times + best-ghost data are persisted via SaveGame; live run state is in-memory only.
   bool ghostEnabled{true};
   bool ghostDrawShip{true};
   bool ghostDrawTrail{true};

@@ -24,10 +24,27 @@ namespace stellar::sim {
 
 struct ManeuverNode {
   // Time after the start of the prediction when the burn is applied.
+  //
+  // Semantics depend on `accelKmS2`:
+  //  - accelKmS2 <= 0: an instantaneous delta-v is applied at exactly `timeSec`.
+  //  - accelKmS2 >  0: a finite-duration constant-acceleration burn is simulated.
+  //      Burn start time (seconds) follows ManeuverComputer's centered-burn timing:
+  //        start = timeSec - (0.5 * duration + extraLeadTimeSec)
+  //      where duration = |deltaV| / accelKmS2.
   double timeSec{0.0};
 
-  // Instantaneous delta-v applied in world space.
+  // Desired total delta-v in world space (km/s).
   math::Vec3d deltaVKmS{0, 0, 0};
+
+  // Optional: if > 0, simulate a finite-duration burn with constant acceleration
+  // magnitude (km/s^2) instead of applying an instantaneous delta-v.
+  //
+  // Burn duration is |deltaV| / accelKmS2.
+  double accelKmS2{0.0};
+
+  // Extra lead time applied to the centered-burn start (seconds).
+  // Positive values start earlier; negative values start later.
+  double extraLeadTimeSec{0.0};
 };
 
 struct TrajectorySample {

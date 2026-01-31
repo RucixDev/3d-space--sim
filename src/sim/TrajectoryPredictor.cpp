@@ -5,15 +5,95 @@
 #include <limits>
 
 namespace stellar::sim {
+namespace {
+
+static constexpr double kSecondsPerDay = 86400.0;
+
+inline double clampD(double v, double lo, double hi) {
+  if (!std::isfinite(v)) return lo;
+  return std::clamp(v, lo, hi);
+}
+
+struct BurnProfile {
+  bool active{false};
+  double startSec{0.0};
+  double endSec{0.0};
+  double nodeTimeSec{0.0}; // requested maneuver node time (for sampling)
+  math::Vec3d accelWorldKmS2{0, 0, 0};
+};
+
+static BurnProfile buildBurnProfile(const ManeuverNode* node,
+                                   double horizonSec,
+                                   math::Vec3d& ioStartVelKmS) {
+  BurnProfile out{};
+  if (!node) return out;
+
+  const double accel = node->accelKmS2;
+  if (!(accel > 0.0) || !std::isfinite(accel)) return out;
+
+  const double dvMag = node->deltaVKmS.length();
+  if (!(dvMag > 1e-12)) return out;
+
+  double duration = dvMag / accel;
+  if (!(duration > 1e-9) || !std::isfinite(duration)) return out;
+
+  out.nodeTimeSec = node->timeSec;
+  out.accelWorldKmS2 = node->deltaVKmS * (accel / dvMag);
+
+  // Match ManeuverComputer semantics: start time uses a centered-burn lead
+  // (duration/2) plus an extra lead time.
+  out.startSec = node->timeSec - (duration * 0.5 + node->extraLeadTimeSec);
+  out.endSec = out.startSec + duration;
+
+  // If the burn is entirely before the start of the prediction horizon, best-effort
+  // apply the full delta-v to the initial velocity.
+  if (out.endSec <= 0.0) {
+    ioStartVelKmS += node->deltaVKmS;
+    return BurnProfile{};
+  }
+
+  // If the burn began before t=0, apply the already-completed fraction to the
+  // initial velocity and clamp the remaining burn to start at t=0.
+  if (out.startSec < 0.0) {
+    const double fracDone = std::clamp((-out.startSec) / duration, 0.0, 1.0);
+    ioStartVelKmS += node->deltaVKmS * fracDone;
+
+    const double remainMag = dvMag * (1.0 - fracDone);
+    if (!(remainMag > 1e-12)) return BurnProfile{};
+
+    duration = remainMag / accel;
+    out.startSec = 0.0;
+    out.endSec = out.startSec + duration;
+  }
+
+  if (out.startSec >= horizonSec) return BurnProfile{};
+
+  out.startSec = clampD(out.startSec, 0.0, horizonSec);
+  out.endSec = clampD(out.endSec, 0.0, horizonSec);
+  if (out.endSec <= out.startSec + 1e-9) return BurnProfile{};
+
+  out.active = true;
+  return out;
+}
+
+static math::Vec3d thrustForInterval(const BurnProfile& burn, double t0Sec, double t1Sec) {
+  if (!burn.active) return {0, 0, 0};
+  const double mid = 0.5 * (t0Sec + t1Sec);
+  if (mid >= burn.startSec && mid <= burn.endSec) return burn.accelWorldKmS2;
+  return {0, 0, 0};
+}
 
 static math::Vec3d accelAt(const StarSystem& sys,
                            double startTimeDays,
                            double tSec,
                            const math::Vec3d& posKm,
-                           const TrajectoryPredictParams& params) {
-  if (!params.includeGravity) return {0, 0, 0};
-  const double tDays = startTimeDays + (tSec / 86400.0);
-  return systemGravityAccelKmS2(sys, tDays, posKm, params.gravity);
+                           const TrajectoryPredictParams& params,
+                           const math::Vec3d& thrustAccelKmS2) {
+  math::Vec3d a = thrustAccelKmS2;
+  if (!params.includeGravity) return a;
+  const double tDays = startTimeDays + (tSec / kSecondsPerDay);
+  a += systemGravityAccelKmS2(sys, tDays, posKm, params.gravity);
+  return a;
 }
 
 static void rk4Step(const StarSystem& sys,
@@ -22,35 +102,38 @@ static void rk4Step(const StarSystem& sys,
                     double dt,
                     math::Vec3d& posKm,
                     math::Vec3d& velKmS,
-                    const TrajectoryPredictParams& params) {
+                    const TrajectoryPredictParams& params,
+                    const math::Vec3d& thrustAccelKmS2) {
   // State: x = pos, v = vel
   // dx/dt = v
   // dv/dt = a(t, x)
-  const math::Vec3d a1 = accelAt(sys, startTimeDays, tSec, posKm, params);
+  const math::Vec3d a1 = accelAt(sys, startTimeDays, tSec, posKm, params, thrustAccelKmS2);
   const math::Vec3d k1x = velKmS;
   const math::Vec3d k1v = a1;
 
   const math::Vec3d x2 = posKm + k1x * (dt * 0.5);
   const math::Vec3d v2 = velKmS + k1v * (dt * 0.5);
-  const math::Vec3d a2 = accelAt(sys, startTimeDays, tSec + dt * 0.5, x2, params);
+  const math::Vec3d a2 = accelAt(sys, startTimeDays, tSec + dt * 0.5, x2, params, thrustAccelKmS2);
   const math::Vec3d k2x = v2;
   const math::Vec3d k2v = a2;
 
   const math::Vec3d x3 = posKm + k2x * (dt * 0.5);
   const math::Vec3d v3 = velKmS + k2v * (dt * 0.5);
-  const math::Vec3d a3 = accelAt(sys, startTimeDays, tSec + dt * 0.5, x3, params);
+  const math::Vec3d a3 = accelAt(sys, startTimeDays, tSec + dt * 0.5, x3, params, thrustAccelKmS2);
   const math::Vec3d k3x = v3;
   const math::Vec3d k3v = a3;
 
   const math::Vec3d x4 = posKm + k3x * dt;
   const math::Vec3d v4 = velKmS + k3v * dt;
-  const math::Vec3d a4 = accelAt(sys, startTimeDays, tSec + dt, x4, params);
+  const math::Vec3d a4 = accelAt(sys, startTimeDays, tSec + dt, x4, params, thrustAccelKmS2);
   const math::Vec3d k4x = v4;
   const math::Vec3d k4v = a4;
 
   posKm += (dt / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
   velKmS += (dt / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
 }
+
+} // namespace
 
 std::vector<TrajectorySample> predictTrajectoryRK4(const StarSystem& sys,
                                                    double startTimeDays,
@@ -64,62 +147,84 @@ std::vector<TrajectorySample> predictTrajectoryRK4(const StarSystem& sys,
   const double step = std::max(1e-6, params.stepSec);
   const int maxSamples = std::max(2, params.maxSamples);
 
-  // Worst case: 1 sample per step + initial sample.
-  const int reserve = std::min(maxSamples, 2 + (int)std::ceil(horizon / step));
+  // Worst case: 1 sample per step + event samples.
+  const int reserve = std::min(maxSamples, 2 + (int)std::ceil(horizon / step) + 8);
   out.reserve((std::size_t)reserve);
 
   double t = 0.0;
   math::Vec3d pos = startPosKm;
   math::Vec3d vel = startVelKmS;
 
+  const bool haveNode = (node != nullptr) && (node->timeSec >= 0.0) && (node->timeSec <= horizon);
+  const bool finiteBurn = haveNode && (node->accelKmS2 > 0.0) && (node->deltaVKmS.lengthSq() > 1e-24);
+  const bool impulsive = haveNode && !finiteBurn;
+
+  BurnProfile burn{};
+  if (finiteBurn) {
+    burn = buildBurnProfile(node, horizon, vel);
+  }
+
   out.push_back({t, pos, vel});
 
-  const bool wantNode = (node != nullptr) && (node->timeSec >= 0.0) && (node->timeSec <= horizon);
   bool nodeApplied = false;
+  if (impulsive && std::abs(node->timeSec) <= 1e-12) {
+    vel += node->deltaVKmS;
+    nodeApplied = true;
+    out.push_back({t, pos, vel});
+    if ((int)out.size() >= maxSamples) return out;
+  }
 
   while (t + 1e-9 < horizon && (int)out.size() < maxSamples) {
-    double dt = std::min(step, horizon - t);
-    if (dt <= 0.0) break;
+    double nextEvent = horizon;
 
-    // If a maneuver node falls inside this step, split the step so the burn occurs at
-    // the exact requested time.
-    if (wantNode && !nodeApplied) {
-      const double tn = node->timeSec;
-      if (tn >= t - 1e-9 && tn <= t + dt + 1e-9) {
-        const double dt1 = std::clamp(tn - t, 0.0, dt);
-        const double dt2 = dt - dt1;
-
-        if (dt1 > 1e-9) {
-          rk4Step(sys, startTimeDays, t, dt1, pos, vel, params);
-          t += dt1;
-        } else {
-          // No pre-burn integration needed; we're essentially at the node already.
-          t = tn;
-        }
-
-        // Apply burn.
-        vel += node->deltaVKmS;
-        nodeApplied = true;
-
-        // Emit a sample at the node time (post-burn), so render code can draw a visible kink.
-        out.push_back({t, pos, vel});
-        if ((int)out.size() >= maxSamples) break;
-
-        if (dt2 > 1e-9 && t + 1e-9 < horizon) {
-          rk4Step(sys, startTimeDays, t, dt2, pos, vel, params);
-          t += dt2;
-          out.push_back({t, pos, vel});
-        }
-        continue;
-      }
+    // Impulsive node: always land exactly on node->timeSec.
+    if (impulsive && !nodeApplied) {
+      const double tn = clampD(node->timeSec, 0.0, horizon);
+      if (tn > t + 1e-12) nextEvent = std::min(nextEvent, tn);
     }
 
-    rk4Step(sys, startTimeDays, t, dt, pos, vel, params);
+    // Burn boundaries + optional sampling at node time (for UI kink markers).
+    if (burn.active) {
+      if (burn.startSec > t + 1e-12) nextEvent = std::min(nextEvent, burn.startSec);
+      if (burn.endSec > t + 1e-12) nextEvent = std::min(nextEvent, burn.endSec);
+
+      const double tNode = clampD(burn.nodeTimeSec, 0.0, horizon);
+      if (tNode > t + 1e-12 && tNode < burn.endSec - 1e-12) {
+        nextEvent = std::min(nextEvent, tNode);
+      }
+    } else if (finiteBurn) {
+      // The burn may have been clamped away, but still sample the node time if requested.
+      const double tNode = clampD(node->timeSec, 0.0, horizon);
+      if (tNode > t + 1e-12) nextEvent = std::min(nextEvent, tNode);
+    }
+
+    double dt = step;
+    dt = std::min(dt, horizon - t);
+    dt = std::min(dt, nextEvent - t);
+    if (dt <= 1e-12) {
+      // We're effectively at an event time already. If this is the impulsive node, apply.
+      if (impulsive && !nodeApplied && std::abs(t - node->timeSec) < 1e-9) {
+        vel += node->deltaVKmS;
+        nodeApplied = true;
+        out.push_back({t, pos, vel});
+      }
+      break;
+    }
+
+    const math::Vec3d thrust = thrustForInterval(burn, t, t + dt);
+    rk4Step(sys, startTimeDays, t, dt, pos, vel, params, thrust);
+
     t += dt;
+
+    if (impulsive && !nodeApplied && std::abs(t - node->timeSec) < 1e-6) {
+      vel += node->deltaVKmS;
+      nodeApplied = true;
+    }
+
     out.push_back({t, pos, vel});
   }
 
-  // Ensure last sample is exactly at horizon (within numerical tolerances).
+  // Ensure last sample is clamped to horizon.
   if (!out.empty()) {
     out.back().tSec = std::min(out.back().tSec, horizon);
   }
@@ -143,8 +248,9 @@ static State derivAt(const StarSystem& sys,
                      double startTimeDays,
                      double tSec,
                      const State& y,
-                     const TrajectoryPredictParams& params) {
-  return {y.vel, accelAt(sys, startTimeDays, tSec, y.pos, params)};
+                     const TrajectoryPredictParams& params,
+                     const math::Vec3d& thrustAccelKmS2) {
+  return {y.vel, accelAt(sys, startTimeDays, tSec, y.pos, params, thrustAccelKmS2)};
 }
 
 struct DP45StepResult {
@@ -157,7 +263,8 @@ static DP45StepResult dormandPrince45Step(const StarSystem& sys,
                                          double tSec,
                                          double dt,
                                          const State& y,
-                                         const TrajectoryPredictParams& params) {
+                                         const TrajectoryPredictParams& params,
+                                         const math::Vec3d& thrustAccelKmS2) {
   // Dormand–Prince RK5(4)7 coefficients.
   // Butcher tableau reference:
   //   https://en.wikipedia.org/wiki/Dormand%E2%80%93Prince_method
@@ -213,27 +320,27 @@ static DP45StepResult dormandPrince45Step(const StarSystem& sys,
   constexpr double bs6 = 187.0 / 2100.0;
   constexpr double bs7 = 1.0 / 40.0;
 
-  const State k1 = derivAt(sys, startTimeDays, tSec, y, params);
+  const State k1 = derivAt(sys, startTimeDays, tSec, y, params, thrustAccelKmS2);
 
   const State y2 = y + (dt * a21) * k1;
-  const State k2 = derivAt(sys, startTimeDays, tSec + c2 * dt, y2, params);
+  const State k2 = derivAt(sys, startTimeDays, tSec + c2 * dt, y2, params, thrustAccelKmS2);
 
   const State y3 = y + (dt * a31) * k1 + (dt * a32) * k2;
-  const State k3 = derivAt(sys, startTimeDays, tSec + c3 * dt, y3, params);
+  const State k3 = derivAt(sys, startTimeDays, tSec + c3 * dt, y3, params, thrustAccelKmS2);
 
   const State y4 = y + (dt * a41) * k1 + (dt * a42) * k2 + (dt * a43) * k3;
-  const State k4 = derivAt(sys, startTimeDays, tSec + c4 * dt, y4, params);
+  const State k4 = derivAt(sys, startTimeDays, tSec + c4 * dt, y4, params, thrustAccelKmS2);
 
   const State y5 = y + (dt * a51) * k1 + (dt * a52) * k2 + (dt * a53) * k3 + (dt * a54) * k4;
-  const State k5 = derivAt(sys, startTimeDays, tSec + c5 * dt, y5, params);
+  const State k5 = derivAt(sys, startTimeDays, tSec + c5 * dt, y5, params, thrustAccelKmS2);
 
   const State y6 = y + (dt * a61) * k1 + (dt * a62) * k2 + (dt * a63) * k3 + (dt * a64) * k4 +
                    (dt * a65) * k5;
-  const State k6 = derivAt(sys, startTimeDays, tSec + c6 * dt, y6, params);
+  const State k6 = derivAt(sys, startTimeDays, tSec + c6 * dt, y6, params, thrustAccelKmS2);
 
   const State y7 = y + (dt * a71) * k1 + (dt * a72) * k2 + (dt * a73) * k3 + (dt * a74) * k4 +
                    (dt * a75) * k5 + (dt * a76) * k6;
-  const State k7 = derivAt(sys, startTimeDays, tSec + c7 * dt, y7, params);
+  const State k7 = derivAt(sys, startTimeDays, tSec + c7 * dt, y7, params, thrustAccelKmS2);
 
   const State sol5 = y + dt * (b1 * k1 + b2 * k2 + b3 * k3 + b4 * k4 + b5 * k5 + b6 * k6 + b7 * k7);
   const State sol4 = y + dt * (bs1 * k1 + bs2 * k2 + bs3 * k3 + bs4 * k4 + bs5 * k5 + bs6 * k6 + bs7 * k7);
@@ -272,21 +379,42 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
   const double minStep = std::max(1e-9, params.minStepSec);
   const double maxStep = std::max(minStep, params.maxStepSec);
 
-  // Rough reserve: 1 per output sample + initial + optional node.
-  const int reserve = std::min(maxSamples, 2 + (int)std::ceil(horizon / sampleStep) + 4);
+  // Rough reserve: 1 per output sample + initial + event samples.
+  const int reserve = std::min(maxSamples, 2 + (int)std::ceil(horizon / sampleStep) + 16);
   out.reserve((std::size_t)reserve);
 
   double t = 0.0;
   State y{startPosKm, startVelKmS};
 
-  out.push_back({t, y.pos, y.vel});
-  if (horizon <= 0.0 || (int)out.size() >= maxSamples) return out;
+  const bool haveNode = (node != nullptr) && (node->timeSec >= 0.0) && (node->timeSec <= horizon);
+  const bool finiteBurn = haveNode && (node->accelKmS2 > 0.0) && (node->deltaVKmS.lengthSq() > 1e-24);
+  const bool impulsive = haveNode && !finiteBurn;
 
-  const bool wantNode = (node != nullptr) && (node->timeSec >= 0.0) && (node->timeSec <= horizon);
-  const double tNode = wantNode ? node->timeSec : -1.0;
+  BurnProfile burn{};
+  if (finiteBurn) {
+    burn = buildBurnProfile(node, horizon, y.vel);
+  }
+
   bool nodeApplied = false;
 
-  // Output samples are emitted at this cadence (plus a sample at the node time).
+  out.push_back({t, y.pos, y.vel});
+
+  // Handle an impulsive node at t=0 by emitting a post-burn sample (matches RK4 behavior).
+  if (impulsive && std::abs(node->timeSec) <= 1e-12) {
+    y.vel += node->deltaVKmS;
+    nodeApplied = true;
+    out.push_back({t, y.pos, y.vel});
+  }
+
+  if (horizon <= 0.0 || (int)out.size() >= maxSamples) return out;
+
+  const double tNodeImp = impulsive ? clampD(node->timeSec, 0.0, horizon) : std::numeric_limits<double>::infinity();
+  const double tNodeMark = (haveNode && !impulsive) ? clampD(node->timeSec, 0.0, horizon) : std::numeric_limits<double>::infinity();
+
+  const double tBurnStart = burn.active ? burn.startSec : std::numeric_limits<double>::infinity();
+  const double tBurnEnd = burn.active ? burn.endSec : std::numeric_limits<double>::infinity();
+
+  // Output samples are emitted at this cadence (plus burn boundary samples and node samples).
   double nextSampleT = std::min(sampleStep, horizon);
 
   // Internal step guess (will be adapted).
@@ -301,7 +429,7 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
   int guard = 0;
   const int maxGuard = 2'000'000;
 
-  auto integrateTo = [&](double targetT) {
+  auto integrateTo = [&](double targetT, const math::Vec3d& thrustAccelKmS2) {
     while (t + 1e-12 < targetT && guard < maxGuard) {
       const double remaining = targetT - t;
       if (remaining <= 0.0) {
@@ -323,7 +451,7 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
         break;
       }
 
-      const DP45StepResult sr = dormandPrince45Step(sys, startTimeDays, t, h, y, params);
+      const DP45StepResult sr = dormandPrince45Step(sys, startTimeDays, t, h, y, params, thrustAccelKmS2);
       const State yNew = sr.y5;
       const double errN = errorNorm(y, yNew, sr.err, params);
 
@@ -354,31 +482,52 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
     if (std::abs(t - targetT) < 1e-9) t = targetT;
   };
 
-  while (t + 1e-9 < horizon && (int)out.size() < maxSamples && guard < maxGuard) {
-    // Determine the next event time: either the next output sample, or the maneuver node.
-    double eventT = nextSampleT;
-    bool doSample = true;
-    bool doNode = false;
+  enum class EventKind : int {
+    Sample = 0,
+    NodeImpulsive = 1,
+    BurnStart = 2,
+    BurnEnd = 3,
+    NodeMark = 4,
+  };
 
-    if (wantNode && !nodeApplied) {
-      if (tNode <= eventT + 1e-9) {
-        eventT = std::clamp(tNode, t, horizon);
-        doNode = true;
-        doSample = (std::abs(eventT - nextSampleT) < 1e-6);
+  while (t + 1e-9 < horizon && (int)out.size() < maxSamples && guard < maxGuard) {
+    // Determine the next event time: sample cadence + burn boundaries + optional node sample.
+    double eventT = nextSampleT;
+    EventKind kind = EventKind::Sample;
+
+    auto take = [&](double candT, EventKind candKind, bool preferOnTie) {
+      if (!(candT > t + 1e-12)) return;
+      if (candT < eventT - 1e-9 || (std::abs(candT - eventT) < 1e-9 && preferOnTie)) {
+        eventT = candT;
+        kind = candKind;
       }
+    };
+
+    // Earlier boundaries should win over later sample cadence.
+    take(tBurnStart, EventKind::BurnStart, false);
+    take(tBurnEnd, EventKind::BurnEnd, false);
+    take(tNodeMark, EventKind::NodeMark, false);
+
+    // Impulsive node should win ties so the sample is post-burn.
+    if (impulsive && !nodeApplied) {
+      take(tNodeImp, EventKind::NodeImpulsive, true);
     }
 
-    eventT = std::clamp(eventT, t, horizon);
-    integrateTo(eventT);
+    eventT = clampD(eventT, t, horizon);
+
+    const math::Vec3d thrust = thrustForInterval(burn, t, eventT);
+    integrateTo(eventT, thrust);
 
     if (t + 1e-9 < eventT) {
       // Failed to advance (guard hit). Bail out.
       break;
     }
 
+    const bool doSample = (std::abs(eventT - nextSampleT) < 1e-6);
+
     bool pushed = false;
 
-    if (doNode && wantNode && !nodeApplied) {
+    if (kind == EventKind::NodeImpulsive && impulsive && !nodeApplied) {
       y.vel += node->deltaVKmS;
       nodeApplied = true;
       out.push_back({t, y.pos, y.vel});
@@ -386,12 +535,13 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
       if ((int)out.size() >= maxSamples) break;
     }
 
-    if (doSample) {
-      if (!pushed) {
-        out.push_back({t, y.pos, y.vel});
-        if ((int)out.size() >= maxSamples) break;
-      }
+    if (!pushed) {
+      out.push_back({t, y.pos, y.vel});
+      pushed = true;
+      if ((int)out.size() >= maxSamples) break;
+    }
 
+    if (doSample) {
       // Advance to next sample.
       if (nextSampleT + 1e-9 < horizon) {
         nextSampleT = std::min(nextSampleT + sampleStep, horizon);
@@ -403,6 +553,9 @@ std::vector<TrajectorySample> predictTrajectoryRK45Adaptive(const StarSystem& sy
       if (nextSampleT <= t + 1e-12) {
         nextSampleT = std::min(t + sampleStep, horizon);
       }
+    } else {
+      // If eventT equals the horizon, stop.
+      if (eventT >= horizon - 1e-12) break;
     }
   }
 

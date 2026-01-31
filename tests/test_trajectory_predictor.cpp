@@ -77,6 +77,75 @@ int test_trajectory_predictor() {
     }
   }
 
+
+
+  // --- Maneuver node: finite-duration burn (constant acceleration) ---
+  {
+    stellar::sim::StarSystem sys;
+    sys.stub.id = 6;
+
+    stellar::sim::TrajectoryPredictParams p;
+    p.horizonSec = 10.0;
+    p.stepSec = 1.0;
+    p.includeGravity = false;
+
+    stellar::sim::ManeuverNode node;
+    node.timeSec = 5.0;
+    node.deltaVKmS = {1.0, 0.0, 0.0};
+    node.accelKmS2 = 0.2; // duration 5.0s -> start 2.5s, end 7.5s
+    node.extraLeadTimeSec = 0.0;
+
+    const stellar::math::Vec3d x0{0, 0, 0};
+    const stellar::math::Vec3d v0{0.0, 0.0, 0.0};
+
+    const auto samples = stellar::sim::predictTrajectoryRK4(sys, 0.0, x0, v0, p, &node);
+
+    auto findS = [&](double tq) -> const stellar::sim::TrajectorySample* {
+      for (const auto& s : samples) {
+        if (std::abs(s.tSec - tq) < 1e-6) return &s;
+      }
+      return nullptr;
+    };
+
+    const double tStart = 2.5;
+    const double tMid = 5.0;
+    const double tEnd = 7.5;
+
+    const auto* sStart = findS(tStart);
+    const auto* sMid = findS(tMid);
+    const auto* sEnd = findS(tEnd);
+
+    if (!sStart || !sMid || !sEnd) {
+      std::cerr << "[test_trajectory_predictor] expected burn boundary samples (RK4)\n";
+      ++fails;
+    } else {
+      const double eps = 5e-4;
+      if (!near(sStart->velKmS.x, 0.0, eps) || !near(sStart->velKmS.y, 0.0, eps) || !near(sStart->velKmS.z, 0.0, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK4 burn start velocity mismatch\n";
+        ++fails;
+      }
+      if (!near(sMid->velKmS.x, 0.5, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK4 burn mid velocity mismatch: " << sMid->velKmS.x << "\n";
+        ++fails;
+      }
+      if (!near(sEnd->velKmS.x, 1.0, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK4 burn end velocity mismatch: " << sEnd->velKmS.x << "\n";
+        ++fails;
+      }
+
+      // After burn end, velocity should remain at the full delta-v.
+      const auto* sFinal = findS(10.0);
+      if (!sFinal) {
+        std::cerr << "[test_trajectory_predictor] RK4 missing final sample\n";
+        ++fails;
+      } else if (!near(sFinal->velKmS.x, 1.0, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK4 final velocity mismatch: " << sFinal->velKmS.x << "\n";
+        ++fails;
+      }
+    }
+  }
+
+
   // --- Gravity: near-circular orbit stays near constant radius (RK4 sanity) ---
   {
     stellar::sim::StarSystem sys;
@@ -200,6 +269,66 @@ int test_trajectory_predictor() {
     if (!found) {
       std::cerr << "[test_trajectory_predictor] RK45 expected an exact node sample at t=" << node.timeSec << "\n";
       ++fails;
+    }
+  }
+
+
+
+  // --- Adaptive RK45: finite-duration burn (constant acceleration) ---
+  {
+    stellar::sim::StarSystem sys;
+    sys.stub.id = 7;
+
+    stellar::sim::TrajectoryPredictParams p;
+    p.horizonSec = 10.0;
+    p.stepSec = 2.0; // output cadence, but burn boundaries should still appear
+    p.includeGravity = false;
+
+    p.minStepSec = 1e-3;
+    p.maxStepSec = 2.0;
+    p.relTol = 1e-10;
+    p.absTolPosKm = 1e-12;
+    p.absTolVelKmS = 1e-12;
+
+    stellar::sim::ManeuverNode node;
+    node.timeSec = 5.0;
+    node.deltaVKmS = {1.0, 0.0, 0.0};
+    node.accelKmS2 = 0.2; // duration 5.0s -> start 2.5s, end 7.5s
+    node.extraLeadTimeSec = 0.0;
+
+    const stellar::math::Vec3d x0{0, 0, 0};
+    const stellar::math::Vec3d v0{0.0, 0.0, 0.0};
+
+    const auto samples = stellar::sim::predictTrajectoryRK45Adaptive(sys, 0.0, x0, v0, p, &node);
+
+    auto findS = [&](double tq) -> const stellar::sim::TrajectorySample* {
+      for (const auto& s : samples) {
+        if (std::abs(s.tSec - tq) < 1e-6) return &s;
+      }
+      return nullptr;
+    };
+
+    const auto* sStart = findS(2.5);
+    const auto* sMid = findS(5.0);
+    const auto* sEnd = findS(7.5);
+
+    if (!sStart || !sMid || !sEnd) {
+      std::cerr << "[test_trajectory_predictor] expected burn boundary samples (RK45)\n";
+      ++fails;
+    } else {
+      const double eps = 2e-5;
+      if (!near(sStart->velKmS.x, 0.0, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK45 burn start velocity mismatch: " << sStart->velKmS.x << "\n";
+        ++fails;
+      }
+      if (!near(sMid->velKmS.x, 0.5, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK45 burn mid velocity mismatch: " << sMid->velKmS.x << "\n";
+        ++fails;
+      }
+      if (!near(sEnd->velKmS.x, 1.0, eps)) {
+        std::cerr << "[test_trajectory_predictor] RK45 burn end velocity mismatch: " << sEnd->velKmS.x << "\n";
+        ++fails;
+      }
     }
   }
 
