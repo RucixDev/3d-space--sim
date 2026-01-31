@@ -34,6 +34,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Windows headers define min/max macros by default, which breaks std::min/std::max
+# and std::clamp in several translation units. Apply NOMINMAX globally.
+if (WIN32)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # ---- Dependencies (conditional) ----
 set(STELLAR_SDL_TARGET "")
 set(IMGUI_TARGET "")

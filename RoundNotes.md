@@ -1,10 +1,9 @@
-- Added a **player Missile Warning Receiver (MWR) + Defensive Aids** (HUD + optional automation).
-- New **HUD Settings → Combat symbology** options (persisted in `hud_settings.txt`): MWR enable, HUD indicator, evasion arrow, toast warnings, auto countermeasures + TTI threshold, prefer heat sinks.
-- Combat HUD now shows an inbound-missile banner with **HEAT/RADAR**, **recommended countermeasure**, and **time-to-impact**, plus an optional jink arrow.
-- Optional auto countermeasures share the same inventory + cooldown as manual deployment (prefers CHAFF vs radar seekers; FLARES/HEAT SINK vs heat seekers).
-- Orbit Analyzer: added a **Forecast** panel that runs a short-horizon multi-body trajectory prediction and reports closest approaches, predicted impact, and dominant-gravity transitions (`apps/stellar_game/OrbitAnalyzerWindow.*`, `sim::detectDominantBodyTransitions`).
+- **Round 2:** Fixed Windows build breaks in the new save/menu + UI loop.
+- `CMakeLists.txt`: define `NOMINMAX` (and `WIN32_LEAN_AND_MEAN`) for all Windows targets to prevent `min/max` macro conflicts.
+- `apps/stellar_game/main.cpp`: fix Time Trial ghost restore (qualify `game::FlightRecorderSample`) so the save snapshot loader compiles.
+- `apps/stellar_game/CommsWindow.cpp`: updated to `SystemConditionsSnapshot.event` fields.
+- `apps/stellar_game/LogbookWindow.cpp`, `apps/stellar_game/MarketDashboardWindow.cpp`: explicit `CStrView` → string conversions.
 
 Verify:
-- In combat, provoke incoming missiles at the player: confirm the banner appears; toggle arrow/auto-CM in HUD Settings and confirm behavior changes immediately.
-- Open Orbit Analyzer → Forecast, click Recompute: confirm closest approach table populates and dominant-body transitions appear on close flybys.
-- Tests: run `ctest -R test_hud_settings|test_trajectory_events`.
+- Build the `game-release` preset on Windows.
+- In-game: open Comms during an active system event; save/load (slot or quicksave); confirm Time Trial ghost loads.

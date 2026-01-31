@@ -496,11 +496,11 @@ if (ImGui::CollapsingHeader("Intel", ImGuiTreeNodeFlags_DefaultOpen)) {
     }
 
     // Active system event (if any).
-    if (snap.systemEvent.active && snap.systemEvent.kind != sim::SystemEventKind::None) {
-      const double leftDays = std::max(0.0, snap.systemEvent.endDay - ctx.timeDays);
+    if (snap.event.active && snap.event.kind != sim::SystemEventKind::None) {
+      const double leftDays = std::max(0.0, snap.event.endDay - ctx.timeDays);
       ImGui::Text("Event: %s (severity %.0f%%, %.1f days remaining)",
-                  sim::systemEventKindName(snap.systemEvent.kind),
-                  100.0 * std::clamp(snap.systemEvent.severity01, 0.0, 1.0),
+	                  sim::systemEventKindName(snap.event.kind),
+	                  100.0 * std::clamp(snap.event.severity01, 0.0, 1.0),
                   leftDays);
     } else {
       ImGui::TextDisabled("Event: none");

@@ -460,14 +460,14 @@ void drawMarketDashboardWindow(MarketDashboardWindowState& st, const MarketDashb
   {
     const stellar::econ::CommodityId commodity = clampCommodity(st.commodityIndex);
     const auto& def = stellar::econ::commodityDef(commodity);
-    std::string label = std::string(def.code) + " - " + def.name;
+    std::string label = std::string(def.code) + " - " + def.name.c_str();
 
     if (ImGui::BeginCombo("Commodity", label.c_str())) {
       for (std::size_t i = 0; i < stellar::econ::kCommodityCount; ++i) {
         const auto id = (stellar::econ::CommodityId)i;
         const auto& d = stellar::econ::commodityDef(id);
         const bool sel = (int)i == st.commodityIndex;
-        std::string item = std::string(d.code) + " - " + d.name;
+        std::string item = std::string(d.code) + " - " + d.name.c_str();
         if (ImGui::Selectable(item.c_str(), sel)) {
           st.commodityIndex = (int)i;
         }

@@ -8840,9 +8840,9 @@ progression.unlockWeapon(weaponSecondary);
               if (r.ghostCodec == sim::kTimeTrialGhostCodecVersion && !r.ghostB64.empty()) {
                 std::vector<sim::TimeTrialGhostSample> samples;
                 if (sim::decodeTimeTrialGhostSamplesB64(r.ghostB64, &samples) && !samples.empty()) {
-                  std::deque<FlightRecorderSample> dq;
+	                std::deque<game::FlightRecorderSample> dq;
                   for (const auto& gs : samples) {
-                    FlightRecorderSample fs{};
+	                  game::FlightRecorderSample fs{};
                     fs.tRealSec = gs.tSec;
                     fs.tSimDays = timeDays;
                     fs.posKm = gs.posKm;

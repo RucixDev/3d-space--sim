@@ -78,7 +78,7 @@ static std::string entryTargetLabel(sim::Universe& u, const sim::LogbookEntry& e
     }
     case sim::LogbookEntryKind::AsteroidProspect: {
       const auto& cd = econ::commodityDef(e.commodity);
-      std::string s = cd.name;
+      std::string s = cd.name.c_str();
       if (e.units > 1e-6) {
         s += " (remaining ~";
         s += std::to_string((int)std::llround(e.units));
