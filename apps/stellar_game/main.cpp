@@ -18116,8 +18116,9 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                 // Toast warning (throttled).
                 if (hudMissileWarningToasts && timeDays > incomingMissileToastCooldownUntilDays) {
                   // Avoid spamming for very long-range missiles.
-                  const bool near = (hudMissileWarningThreat.distKm < 380000.0) || (hudMissileWarningThreat.ttiSec < 10.0);
-                  if (near) {
+                  // NOTE: avoid the Windows header macro `near`.
+                  const bool threatIsNear = (hudMissileWarningThreat.distKm < 380000.0) || (hudMissileWarningThreat.ttiSec < 10.0);
+                  if (threatIsNear) {
                     const char* seeker = radar ? "RADAR" : "HEAT";
                     const char* cmLbl = "CM";
                     switch (hudMissileWarningRecommendedCm) {

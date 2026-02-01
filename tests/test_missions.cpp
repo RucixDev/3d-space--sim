@@ -172,16 +172,16 @@ int test_missions() {
     generic.militarism = 0.5;
 
     const auto w0 = computeMissionTypeWeights(p, neutral, generic, /*rep*/0.0);
-    auto near = [](double a, double b, double eps) { return std::abs(a - b) <= eps; };
+    auto approxEq = [](double a, double b, double eps) { return std::abs(a - b) <= eps; };
 
-    if (!near(w0.wCourier, p.wCourier, 1e-9) ||
-        !near(w0.wDelivery, p.wDelivery, 1e-9) ||
-        !near(w0.wMultiDelivery, p.wMultiDelivery, 1e-9) ||
-        !near(w0.wEscort, p.wEscort, 1e-9) ||
-        !near(w0.wSalvage, p.wSalvage, 1e-9) ||
-        !near(w0.wPassenger, p.wPassenger, 1e-9) ||
-        !near(w0.wSmuggle, p.wSmuggle, 1e-9) ||
-        !near(w0.wBountyScan, p.wBountyScan, 1e-9)) {
+    if (!approxEq(w0.wCourier, p.wCourier, 1e-9) ||
+        !approxEq(w0.wDelivery, p.wDelivery, 1e-9) ||
+        !approxEq(w0.wMultiDelivery, p.wMultiDelivery, 1e-9) ||
+        !approxEq(w0.wEscort, p.wEscort, 1e-9) ||
+        !approxEq(w0.wSalvage, p.wSalvage, 1e-9) ||
+        !approxEq(w0.wPassenger, p.wPassenger, 1e-9) ||
+        !approxEq(w0.wSmuggle, p.wSmuggle, 1e-9) ||
+        !approxEq(w0.wBountyScan, p.wBountyScan, 1e-9)) {
       std::cerr << "[test_missions] neutral mission weights should match MissionBoardParams\n";
       ++fails;
     }

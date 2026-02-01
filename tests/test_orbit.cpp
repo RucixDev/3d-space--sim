@@ -5,10 +5,10 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps = 1e-4) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps = 1e-4) { return std::abs(a - b) <= eps; }
 
 static bool near3(const stellar::math::Vec3d& a, const stellar::math::Vec3d& b, double eps = 1e-4) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 int test_orbit() {
@@ -25,13 +25,13 @@ int test_orbit() {
   e.periodDays = 100.0;
 
   auto p0 = stellar::sim::orbitPosition3DAU(e, 0.0);
-  if (!near(p0.x, 1.0) || !near(p0.y, 0.0)) {
+  if (!approxEq(p0.x, 1.0) || !approxEq(p0.y, 0.0)) {
     std::cerr << "[test_orbit] expected (1,0) at t=0, got (" << p0.x << "," << p0.y << ")\n";
     ++fails;
   }
 
   auto p25 = stellar::sim::orbitPosition3DAU(e, 25.0);
-  if (!near(p25.x, 0.0, 5e-3) || !near(p25.y, 1.0, 5e-3)) {
+  if (!approxEq(p25.x, 0.0, 5e-3) || !approxEq(p25.y, 1.0, 5e-3)) {
     std::cerr << "[test_orbit] expected ~ (0,1) at quarter period, got (" << p25.x << "," << p25.y << ")\n";
     ++fails;
   }

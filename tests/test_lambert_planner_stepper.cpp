@@ -6,7 +6,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 int test_lambert_planner_stepper() {
   int fails = 0;
@@ -78,22 +78,22 @@ int test_lambert_planner_stepper() {
     std::cerr << "[test_lambert_planner_stepper] missing best candidates\n";
     ++fails;
   } else {
-    if (!near(res.best[0].tofSec, ref.best[0].tofSec, 1e-12) ||
-        !near(res.best[0].score, ref.best[0].score, 1e-12)) {
+    if (!approxEq(res.best[0].tofSec, ref.best[0].tofSec, 1e-12) ||
+        !approxEq(res.best[0].score, ref.best[0].score, 1e-12)) {
       std::cerr << "[test_lambert_planner_stepper] best candidate mismatch\n";
       ++fails;
     }
 
     // Expected TOF from the canonical scenario.
     const double expTof = period * 0.25;
-    if (!near(res.best[0].tofSec, expTof, 1e-6)) {
+    if (!approxEq(res.best[0].tofSec, expTof, 1e-6)) {
       std::cerr << "[test_lambert_planner_stepper] expected TOF " << expTof << " got " << res.best[0].tofSec << "\n";
       ++fails;
     }
   }
 
   // progress01() should be 1 when done.
-  if (!near(s.progress01(), 1.0, 1e-12)) {
+  if (!approxEq(s.progress01(), 1.0, 1e-12)) {
     std::cerr << "[test_lambert_planner_stepper] progress not 1 when done\n";
     ++fails;
   }

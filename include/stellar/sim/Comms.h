@@ -77,11 +77,20 @@ class CommsLog {
   bool markRead(core::u64 id, bool read = true);
   bool togglePinned(core::u64 id);
 
+  // Explicitly set pinned state (UI convenience).
+  bool markPinned(core::u64 id, bool pinned);
+
   CommsMessage* find(core::u64 id);
   const CommsMessage* find(core::u64 id) const;
 
+  // Alias used by some UI code (matches naming used elsewhere in the project).
+  CommsMessage* findMutable(core::u64 id) { return find(id); }
+
   std::vector<CommsMessage>& items() { return items_; }
   const std::vector<CommsMessage>& items() const { return items_; }
+
+  // Alias used by some UI code (matches naming used elsewhere in the project).
+  std::vector<CommsMessage>& itemsMutable() { return items_; }
 
  private:
   core::u64 nextId_{1};

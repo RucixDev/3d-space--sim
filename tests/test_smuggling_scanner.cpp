@@ -11,7 +11,7 @@
 
 using namespace stellar;
 
-static bool near(double a, double b, double eps = 1e-6) {
+static bool approxEq(double a, double b, double eps = 1e-6) {
   return std::fabs(a - b) <= eps;
 }
 
@@ -134,9 +134,9 @@ int test_smuggling_scanner() {
     CHECK(a.toSystem == b.toSystem);
     CHECK(a.toStation == b.toStation);
     CHECK(a.commodity == b.commodity);
-    CHECK(near(a.scoreCr, b.scoreCr));
-    CHECK(near(a.expectedProfitCr, b.expectedProfitCr));
-    CHECK(near(a.cleanProfitCr, b.cleanProfitCr));
+    CHECK(approxEq(a.scoreCr, b.scoreCr));
+    CHECK(approxEq(a.expectedProfitCr, b.expectedProfitCr));
+    CHECK(approxEq(a.cleanProfitCr, b.cleanProfitCr));
 
     if (a.toSystem == destStub.id && a.toStation == destStation.id && a.commodity == chosenCid) {
       sawChosen = true;

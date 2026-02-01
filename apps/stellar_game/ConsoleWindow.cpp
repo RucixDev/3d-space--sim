@@ -1,6 +1,7 @@
 #include "ConsoleWindow.h"
 
 #include "stellar/core/CVar.h"
+#include "stellar/core/AtomicWriteFile.h"
 
 #include "stellar/ui/FuzzySearch.h"
 
@@ -106,48 +107,16 @@ static std::string trimAscii(std::string_view sv) {
   return std::string(sv.substr(b, e - b));
 }
 
-static bool ensureParentDirs(const std::filesystem::path& p, std::string* outError) {
-  std::error_code ec;
-  const auto parent = p.parent_path();
-  if (parent.empty()) return true;
-  std::filesystem::create_directories(parent, ec);
-  if (ec) {
-    if (outError) *outError = "Failed to create directory: " + parent.string();
-    return false;
-  }
-  return true;
-}
-
-// Write a text file using a simple temp-file + rename strategy.
+// Write a text file atomically using stellar::core::atomicWriteFile.
+//
+// This handles Unicode paths on Windows and uses an atomic replace operation where available.
 static bool writeTextFileAtomic(const std::filesystem::path& path, std::string_view contents, std::string* outError) {
-  if (!ensureParentDirs(path, outError)) return false;
-
-  const std::filesystem::path tmp = path.string() + ".tmp";
-  {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f) {
-      if (outError) *outError = "Failed to write: " + tmp.string();
-      return false;
-    }
-    f.write(contents.data(), (std::streamsize)contents.size());
-    if (!f) {
-      if (outError) *outError = "Failed to write: " + tmp.string();
-      return false;
-    }
-  }
-
-  std::error_code ec;
-  // On Windows, rename() fails if destination exists.
-  std::filesystem::remove(path, ec);
-  ec.clear();
-  std::filesystem::rename(tmp, path, ec);
-  if (ec) {
-    if (outError) *outError = "Failed to rename temp file to: " + path.string();
-    // Best-effort cleanup.
-    std::filesystem::remove(tmp, ec);
-    return false;
-  }
-  return true;
+  return stellar::core::atomicWriteFile(
+      path,
+      [&](std::ostream& out) {
+        out.write(contents.data(), (std::streamsize)contents.size());
+      },
+      outError);
 }
 
 bool consoleSaveHistoryToFile(const ConsoleWindowState& st, const std::string& path, std::string* outError) {
@@ -479,11 +448,11 @@ void consoleAddBuiltins(ConsoleWindowState& st) {
       const core::CVar* v = core::cvars().find(args[0]);
       if (!v) {
         consolePrint(c, core::LogLevel::Warn, "Unknown cvar.");
-        const auto near = core::cvars().list(args[0]);
-        if (!near.empty()) {
+        const auto suggestions = core::cvars().list(args[0]);
+        if (!suggestions.empty()) {
           consolePrint(c, core::LogLevel::Info, "Did you mean:");
-          for (std::size_t i = 0; i < near.size() && i < 8; ++i) {
-            consolePrint(c, core::LogLevel::Info, std::string("  ") + near[i]->name);
+          for (std::size_t i = 0; i < suggestions.size() && i < 8; ++i) {
+            consolePrint(c, core::LogLevel::Info, std::string("  ") + suggestions[i]->name);
           }
         }
         return;

@@ -5,7 +5,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) {
+static bool approxEq(double a, double b, double eps) {
   return std::abs(a - b) <= eps;
 }
 
@@ -54,11 +54,11 @@ int test_trajectory_analysis() {
       if (a.body.id != 0) continue;
       found = true;
 
-      if (!near(a.tSec, 5.0, 1e-6)) {
+      if (!approxEq(a.tSec, 5.0, 1e-6)) {
         std::cerr << "[test_trajectory_analysis] expected t=5s, got t=" << a.tSec << "\n";
         ++fails;
       }
-      if (!near(a.distanceKm, 500.0, 1e-6)) {
+      if (!approxEq(a.distanceKm, 500.0, 1e-6)) {
         std::cerr << "[test_trajectory_analysis] expected d=500km, got d=" << a.distanceKm << "\n";
         ++fails;
       }
@@ -119,7 +119,7 @@ int test_trajectory_analysis() {
         ++fails;
       }
 
-      if (!near(res.firstImpact.tSec, 2.5, 1e-6)) {
+      if (!approxEq(res.firstImpact.tSec, 2.5, 1e-6)) {
         std::cerr << "[test_trajectory_analysis] expected impact at t=2.5s, got t=" << res.firstImpact.tSec << "\n";
         ++fails;
       }

@@ -482,8 +482,8 @@ void drawMarketDashboardWindow(MarketDashboardWindowState& st, const MarketDashb
     bool cur = !st.scopeNearby;
     if (ImGui::RadioButton("Current system", cur)) st.scopeNearby = false;
     ImGui::SameLine();
-    bool near = st.scopeNearby;
-    if (ImGui::RadioButton("Nearby systems", near)) st.scopeNearby = true;
+    bool nearby = st.scopeNearby;
+    if (ImGui::RadioButton("Nearby systems", nearby)) st.scopeNearby = true;
 
     if (st.scopeNearby) {
       const double minLy = 25.0;

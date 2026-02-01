@@ -5,7 +5,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) {
+static bool approxEq(double a, double b, double eps) {
   return std::abs(a - b) <= eps;
 }
 
@@ -58,13 +58,13 @@ int test_maneuver_program_computer() {
       std::cerr << "[test_maneuver_program_computer] expected valid plan, got: " << res.reason << "\n";
       ++fails;
     } else {
-      if (!near(res.timeToNodeSec, tApoExpected, 1e-1)) {
+      if (!approxEq(res.timeToNodeSec, tApoExpected, 1e-1)) {
         std::cerr << "[test_maneuver_program_computer] timeToNodeSec mismatch: got=" << res.timeToNodeSec
                   << " expected=" << tApoExpected << "\n";
         ++fails;
       }
 
-      if (!near(res.dvKmS, std::abs(dvExpected), 1e-3)) {
+      if (!approxEq(res.dvKmS, std::abs(dvExpected), 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] dv mismatch: got=" << res.dvKmS
                   << " expected=" << std::abs(dvExpected) << "\n";
         ++fails;
@@ -110,11 +110,11 @@ int test_maneuver_program_computer() {
         std::cerr << "[test_maneuver_program_computer] expected ~0 dv, got dv=" << res.dvKmS << "\n";
         ++fails;
       }
-      if (!near(res.timeToNodeSec, 0.0, 1e-12)) {
+      if (!approxEq(res.timeToNodeSec, 0.0, 1e-12)) {
         std::cerr << "[test_maneuver_program_computer] expected immediate node, got t=" << res.timeToNodeSec << "\n";
         ++fails;
       }
-      if (!near(res.plan.nodeTimeDays, nowDays, 1e-12)) {
+      if (!approxEq(res.plan.nodeTimeDays, nowDays, 1e-12)) {
         std::cerr << "[test_maneuver_program_computer] expected nodeTimeDays==now\n";
         ++fails;
       }
@@ -147,18 +147,18 @@ int test_maneuver_program_computer() {
       std::cerr << "[test_maneuver_program_computer] expected valid set-apo plan, got: " << res.reason << "\n";
       ++fails;
     } else {
-      if (!near(res.timeToNodeSec, 0.0, 1e-9)) {
+      if (!approxEq(res.timeToNodeSec, 0.0, 1e-9)) {
         std::cerr << "[test_maneuver_program_computer] expected periapsis node now, got t=" << res.timeToNodeSec << "\n";
         ++fails;
       }
 
-      if (!near(res.targetRadiusKm, raTarget, 1e-6)) {
+      if (!approxEq(res.targetRadiusKm, raTarget, 1e-6)) {
         std::cerr << "[test_maneuver_program_computer] target apo radius mismatch: got=" << res.targetRadiusKm
                   << " expected=" << raTarget << "\n";
         ++fails;
       }
 
-      if (!near(res.dvKmS, std::abs(dvExpected), 1e-3)) {
+      if (!approxEq(res.dvKmS, std::abs(dvExpected), 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] set-apo dv mismatch: got=" << res.dvKmS
                   << " expected=" << std::abs(dvExpected) << "\n";
         ++fails;
@@ -205,18 +205,18 @@ int test_maneuver_program_computer() {
       std::cerr << "[test_maneuver_program_computer] expected valid set-peri plan, got: " << res.reason << "\n";
       ++fails;
     } else {
-      if (!near(res.timeToNodeSec, 0.0, 1e-9)) {
+      if (!approxEq(res.timeToNodeSec, 0.0, 1e-9)) {
         std::cerr << "[test_maneuver_program_computer] expected apoapsis node now, got t=" << res.timeToNodeSec << "\n";
         ++fails;
       }
 
-      if (!near(res.targetRadiusKm, rpTarget, 1e-6)) {
+      if (!approxEq(res.targetRadiusKm, rpTarget, 1e-6)) {
         std::cerr << "[test_maneuver_program_computer] target peri radius mismatch: got=" << res.targetRadiusKm
                   << " expected=" << rpTarget << "\n";
         ++fails;
       }
 
-      if (!near(res.dvKmS, std::abs(dvExpected), 1e-3)) {
+      if (!approxEq(res.dvKmS, std::abs(dvExpected), 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] set-peri dv mismatch: got=" << res.dvKmS
                   << " expected=" << std::abs(dvExpected) << "\n";
         ++fails;
@@ -256,11 +256,11 @@ int test_maneuver_program_computer() {
       std::cerr << "[test_maneuver_program_computer] expected valid escape plan, got: " << res.reason << "\n";
       ++fails;
     } else {
-      if (!near(res.timeToNodeSec, 0.0, 1e-12)) {
+      if (!approxEq(res.timeToNodeSec, 0.0, 1e-12)) {
         std::cerr << "[test_maneuver_program_computer] expected escape node now, got t=" << res.timeToNodeSec << "\n";
         ++fails;
       }
-      if (!near(res.dvKmS, dvExpected, 1e-3)) {
+      if (!approxEq(res.dvKmS, dvExpected, 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] escape dv mismatch: got=" << res.dvKmS
                   << " expected=" << dvExpected << "\n";
         ++fails;
@@ -293,7 +293,7 @@ int test_maneuver_program_computer() {
       std::cerr << "[test_maneuver_program_computer] expected valid plane-align plan, got: " << res.reason << "\n";
       ++fails;
     } else {
-      if (!near(res.timeToNodeSec, 0.0, 1e-6)) {
+      if (!approxEq(res.timeToNodeSec, 0.0, 1e-6)) {
         std::cerr << "[test_maneuver_program_computer] expected AN node now, got t=" << res.timeToNodeSec << "\n";
         ++fails;
       }
@@ -303,7 +303,7 @@ int test_maneuver_program_computer() {
       const double dvZ = -vCirc * std::sin(incRad);
       const double dvExpected = std::sqrt(dvY * dvY + dvZ * dvZ);
 
-      if (!near(res.dvKmS, dvExpected, 1e-3)) {
+      if (!approxEq(res.dvKmS, dvExpected, 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] plane-align dv mismatch: got=" << res.dvKmS
                   << " expected=" << dvExpected << "\n";
         ++fails;
@@ -320,7 +320,7 @@ int test_maneuver_program_computer() {
         ++fails;
       }
 
-      if (!near(res.plan.deltaVWorldKmS.y, dvY, 1e-3) || !near(res.plan.deltaVWorldKmS.z, dvZ, 1e-3)) {
+      if (!approxEq(res.plan.deltaVWorldKmS.y, dvY, 1e-3) || !approxEq(res.plan.deltaVWorldKmS.z, dvZ, 1e-3)) {
         std::cerr << "[test_maneuver_program_computer] plane-align dv components mismatch: got ("
                   << res.plan.deltaVWorldKmS.y << "," << res.plan.deltaVWorldKmS.z
                   << ") expected (" << dvY << "," << dvZ << ")\n";

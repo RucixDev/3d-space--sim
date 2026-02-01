@@ -13,6 +13,8 @@
 
 #include "stellar/core/Types.h"
 
+#include "stellar/core/PathUtf8.h"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -20,10 +22,18 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
+#include <map>
+#include <set>
+#include <unordered_set>
+#include <span>
+#include <optional>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace stellar::ui {
@@ -34,6 +44,10 @@ namespace stellar::ui {
 
 inline std::string toString(bool v) {
   return v ? "true" : "false";
+}
+
+inline std::string toString(const std::filesystem::path& p) {
+  return stellar::core::pathToUtf8String(p);
 }
 
 template <typename T>
@@ -55,9 +69,22 @@ toString(T v) {
     return "null";
   }
 
-  // Use a compact, round-trippable-ish format.
-  // - float: 9 significant digits
-  // - double: 17 significant digits
+  // Prefer std::to_chars for locale-independent formatting.
+  if constexpr (requires(char* first, char* last, T x) {
+    std::to_chars(first, last, x, std::chars_format::general, std::numeric_limits<T>::max_digits10);
+  }) {
+    std::array<char, 128> buf{};
+    const auto res = std::to_chars(buf.data(),
+                                   buf.data() + buf.size(),
+                                   v,
+                                   std::chars_format::general,
+                                   std::numeric_limits<T>::max_digits10);
+    if (res.ec == std::errc{}) {
+      return std::string(buf.data(), (std::size_t)(res.ptr - buf.data()));
+    }
+  }
+
+  // Fallback: snprintf.
   const char* fmt = (sizeof(T) <= sizeof(float)) ? "%.9g" : "%.17g";
   std::array<char, 128> buf{};
   const int n = std::snprintf(buf.data(), buf.size(), fmt, (double)v);
@@ -256,13 +283,166 @@ public:
     out_->append("null");
   }
 
+  // Avoid overload ambiguity between value(bool) and value(const char*) when a
+  // user passes `nullptr` (e.g. writer.member("field", nullptr)).
+  void value(decltype(nullptr)) {
+    nullValue();
+  }
+
+  void value(std::nullopt_t) {
+    nullValue();
+  }
+
+  template <typename T>
+  void value(const std::optional<T>& v) {
+    if (v) {
+      value(*v);
+    } else {
+      nullValue();
+    }
+  }
+
+
+  template <typename T>
+  void value(const std::vector<T>& v) {
+    beginArray();
+    for (const auto& e : v) {
+      value(e);
+    }
+    endArray();
+  }
+
+template <typename T, std::size_t N>
+void value(const std::array<T, N>& v) {
+  beginArray();
+  for (const auto& e : v) {
+    value(e);
+  }
+  endArray();
+}
+
+template <typename T, std::size_t Extent>
+void value(std::span<T, Extent> v) {
+  beginArray();
+  for (const auto& e : v) {
+    value(e);
+  }
+  endArray();
+}
+
+template <typename T, typename Compare, typename Alloc>
+void value(const std::set<T, Compare, Alloc>& s) {
+  beginArray();
+  for (const auto& e : s) {
+    value(e);
+  }
+  endArray();
+}
+
+template <typename T, typename Hash, typename KeyEq, typename Alloc>
+void value(const std::unordered_set<T, Hash, KeyEq, Alloc>& s) {
+  // Keep output deterministic when possible: sort by value if `T` is comparable.
+  if constexpr (requires(const T& a, const T& b) { a < b; }) {
+    std::vector<const T*> items;
+    items.reserve(s.size());
+    for (const auto& e : s) {
+      items.push_back(&e);
+    }
+    std::sort(items.begin(), items.end(), [](const T* a, const T* b) { return *a < *b; });
+
+    beginArray();
+    for (const T* e : items) {
+      value(*e);
+    }
+    endArray();
+  } else {
+    // Fallback: preserve the container's iteration order (may be non-deterministic).
+    beginArray();
+    for (const auto& e : s) {
+      value(e);
+    }
+    endArray();
+  }
+}
+
+
+  // Tuple-like containers as JSON arrays.
+  template <typename A, typename B>
+  void value(const std::pair<A, B>& p) {
+    beginArray();
+    value(p.first);
+    value(p.second);
+    endArray();
+  }
+
+  template <typename... Ts>
+  void value(const std::tuple<Ts...>& t) {
+    beginArray();
+    std::apply([&](const auto&... elems) { (value(elems), ...); }, t);
+    endArray();
+  }
+
+  // Variant-like containers: write the held alternative.
+  void value(std::monostate) { nullValue(); }
+
+  template <typename... Ts>
+  void value(const std::variant<Ts...>& v) {
+    if (v.valueless_by_exception()) {
+      nullValue();
+      return;
+    }
+    std::visit([&](const auto& alt) { value(alt); }, v);
+  }
+
+
+  // Map-like containers as JSON objects.
+  //
+  // NOTE: std::unordered_map has non-deterministic iteration order; we sort by
+  // key to keep output stable across runs.
+  template <typename V, typename Compare, typename Alloc>
+  void value(const std::map<std::string, V, Compare, Alloc>& m) {
+    beginObject();
+    for (const auto& kv : m) {
+      member(kv.first, kv.second);
+    }
+    endObject();
+  }
+
+  template <typename V, typename Hash, typename KeyEq, typename Alloc>
+  void value(const std::unordered_map<std::string, V, Hash, KeyEq, Alloc>& m) {
+    beginObject();
+    using Map = std::unordered_map<std::string, V, Hash, KeyEq, Alloc>;
+    using Pair = typename Map::value_type;
+    std::vector<const Pair*> items;
+    items.reserve(m.size());
+    for (const auto& kv : m) {
+      items.push_back(&kv);
+    }
+    std::sort(items.begin(), items.end(), [](const Pair* a, const Pair* b) {
+      return a->first < b->first;
+    });
+    for (const Pair* kv : items) {
+      member(kv->first, kv->second);
+    }
+    endObject();
+  }
+
   void value(std::string_view v) {
     beginValue_();
     appendJsonString_(*out_, v);
   }
 
   void value(const char* v) {
-    value(std::string_view(v ? v : ""));
+    // Treat null c-strings as JSON null (common when serializing optional fields).
+    if (!v) {
+      nullValue();
+      return;
+    }
+    value(std::string_view(v));
+  }
+
+  void value(const std::filesystem::path& p) {
+    value(stellar::core::pathToUtf8String(p));
   }
 
   void value(bool v) {
@@ -292,7 +472,25 @@ public:
       return;
     }
     beginValue_();
-    // Use a compact representation.
+
+    // Prefer std::to_chars for locale-independent formatting.
+    // (C stdio formatting can be locale-sensitive via LC_NUMERIC.)
+    if constexpr (requires(char* first, char* last, T x) {
+      std::to_chars(first, last, x, std::chars_format::general, std::numeric_limits<T>::max_digits10);
+    }) {
+      std::array<char, 128> buf{};
+      const auto res = std::to_chars(buf.data(),
+                                     buf.data() + buf.size(),
+                                     v,
+                                     std::chars_format::general,
+                                     std::numeric_limits<T>::max_digits10);
+      if (res.ec == std::errc{}) {
+        out_->append(buf.data(), (std::size_t)(res.ptr - buf.data()));
+        return;
+      }
+    }
+
+    // Fallback: snprintf (kept for older libstdc++/libc++ builds that may lack float to_chars).
     const char* fmt = (sizeof(T) <= sizeof(float)) ? "%.9g" : "%.17g";
     std::array<char, 128> buf{};
     const int n = std::snprintf(buf.data(), buf.size(), fmt, (double)v);
@@ -303,11 +501,101 @@ public:
     out_->append(buf.data(), (std::size_t)std::min<int>(n, (int)buf.size() - 1));
   }
 
+
   template <typename V>
   void member(std::string_view k, const V& v) {
     key(k);
     value(v);
   }
+
+
+  // Only emit a member when a value is present (omit instead of writing null).
+  template <typename V>
+  void memberIf(std::string_view k, const std::optional<V>& v) {
+    if (v) {
+      member(k, *v);
+    }
+  }
+
+  // Pointer overload for non-char types (C-strings have their own overload).
+  template <typename V,
+            typename std::enable_if_t<!std::is_same_v<std::remove_cv_t<V>, char>, int> = 0>
+  void memberIf(std::string_view k, const V* v) {
+    if (v) {
+      member(k, *v);
+    }
+  }
+
+  void memberIf(std::string_view k, const char* v) {
+    if (v) {
+      member(k, v);
+    }
+  }
+
+  // -------------------------------
+  // RAII scopes (exception-safe)
+  // -------------------------------
+  class ObjectScope {
+  public:
+    explicit ObjectScope(JsonWriter& w) : w_(&w) { w_->beginObject(); }
+    ObjectScope(JsonWriter& w, std::string_view key) : w_(&w) {
+      w_->key(key);
+      w_->beginObject();
+    }
+
+    ObjectScope(ObjectScope&& other) noexcept : w_(other.w_) { other.w_ = nullptr; }
+    ObjectScope& operator=(ObjectScope&& other) noexcept {
+      if (this == &other) return *this;
+      if (w_) w_->endObject();
+      w_ = other.w_;
+      other.w_ = nullptr;
+      return *this;
+    }
+
+    ~ObjectScope() {
+      if (w_) w_->endObject();
+    }
+
+    ObjectScope(const ObjectScope&) = delete;
+    ObjectScope& operator=(const ObjectScope&) = delete;
+
+  private:
+    JsonWriter* w_ = nullptr;
+  };
+
+  class ArrayScope {
+  public:
+    explicit ArrayScope(JsonWriter& w) : w_(&w) { w_->beginArray(); }
+    ArrayScope(JsonWriter& w, std::string_view key) : w_(&w) {
+      w_->key(key);
+      w_->beginArray();
+    }
+
+    ArrayScope(ArrayScope&& other) noexcept : w_(other.w_) { other.w_ = nullptr; }
+    ArrayScope& operator=(ArrayScope&& other) noexcept {
+      if (this == &other) return *this;
+      if (w_) w_->endArray();
+      w_ = other.w_;
+      other.w_ = nullptr;
+      return *this;
+    }
+
+    ~ArrayScope() {
+      if (w_) w_->endArray();
+    }
+
+    ArrayScope(const ArrayScope&) = delete;
+    ArrayScope& operator=(const ArrayScope&) = delete;
+
+  private:
+    JsonWriter* w_ = nullptr;
+  };
+
+  [[nodiscard]] ObjectScope scopedObject() { return ObjectScope(*this); }
+  [[nodiscard]] ObjectScope scopedObject(std::string_view k) { return ObjectScope(*this, k); }
+  [[nodiscard]] ArrayScope scopedArray() { return ArrayScope(*this); }
+  [[nodiscard]] ArrayScope scopedArray(std::string_view k) { return ArrayScope(*this, k); }
+
 
 private:
   enum class Kind { Object, Array };

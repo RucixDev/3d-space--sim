@@ -6,7 +6,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
 
 int test_gravity() {
   int fails = 0;
@@ -17,7 +17,7 @@ int test_gravity() {
     const double rKm = 7000.0;
     const auto a = stellar::sim::gravityAccelFromBodyKmS2({0,0,0}, mu, {rKm,0,0}, /*minRadiusKm=*/0.0);
     const double expectedAx = -mu / (rKm * rKm);
-    if (!near(a.x, expectedAx, 1e-12) || !near(a.y, 0.0, 1e-12) || !near(a.z, 0.0, 1e-12)) {
+    if (!approxEq(a.x, expectedAx, 1e-12) || !approxEq(a.y, 0.0, 1e-12) || !approxEq(a.z, 0.0, 1e-12)) {
       std::cerr << "[test_gravity] accel mismatch: got (" << a.x << "," << a.y << "," << a.z
                 << ") expected (" << expectedAx << ",0,0)\n";
       ++fails;
@@ -41,23 +41,23 @@ int test_gravity() {
       std::cerr << "[test_gravity] expected near-circular e~0, got e=" << orb.eccentricity << "\n";
       ++fails;
     }
-    if (!near(orb.semiMajorAxisKm, rKm, 1e-3)) {
+    if (!approxEq(orb.semiMajorAxisKm, rKm, 1e-3)) {
       std::cerr << "[test_gravity] expected a~" << rKm << " km, got a=" << orb.semiMajorAxisKm << "\n";
       ++fails;
     }
 
     const double expectedPeriod = 2.0 * stellar::math::kPi * std::sqrt((rKm * rKm * rKm) / mu);
-    if (!near(orb.periodSec, expectedPeriod, 1e-3)) {
+    if (!approxEq(orb.periodSec, expectedPeriod, 1e-3)) {
       std::cerr << "[test_gravity] expected period~" << expectedPeriod << " s, got " << orb.periodSec << " s\n";
       ++fails;
     }
 
     // With our circular convention, current position is treated as periapsis.
-    if (!near(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
+    if (!approxEq(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
       std::cerr << "[test_gravity] expected timeToPeriapsis=0 for circular convention, got " << orb.timeToPeriapsisSec << "\n";
       ++fails;
     }
-    if (!near(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+    if (!approxEq(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
       std::cerr << "[test_gravity] expected timeToApoapsis~" << (0.5 * expectedPeriod) << " s, got " << orb.timeToApoapsisSec << " s\n";
       ++fails;
     }
@@ -77,26 +77,26 @@ int test_gravity() {
 
     const double expectedPeriod = 2.0 * stellar::math::kPi * std::sqrt((a * a * a) / mu);
 
-    if (!near(orb.semiMajorAxisKm, a, 1e-2)) {
+    if (!approxEq(orb.semiMajorAxisKm, a, 1e-2)) {
       std::cerr << "[test_gravity] expected a~" << a << " km, got a=" << orb.semiMajorAxisKm << "\n";
       ++fails;
     }
-    if (!near(orb.eccentricity, e, 2e-4)) {
+    if (!approxEq(orb.eccentricity, e, 2e-4)) {
       std::cerr << "[test_gravity] expected e~" << e << ", got e=" << orb.eccentricity << "\n";
       ++fails;
     }
-    if (!near(orb.periapsisKm, rp, 1e-2) || !near(orb.apoapsisKm, ra, 1e-2)) {
+    if (!approxEq(orb.periapsisKm, rp, 1e-2) || !approxEq(orb.apoapsisKm, ra, 1e-2)) {
       std::cerr << "[test_gravity] expected rp/ra (" << rp << "," << ra << ") got (" << orb.periapsisKm
                 << "," << orb.apoapsisKm << ")\n";
       ++fails;
     }
 
     // At periapsis, time to periapsis should be 0 and time to apoapsis ~ period/2.
-    if (!near(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
+    if (!approxEq(orb.timeToPeriapsisSec, 0.0, 1e-6)) {
       std::cerr << "[test_gravity] expected timeToPeriapsis=0 at periapsis, got " << orb.timeToPeriapsisSec << "\n";
       ++fails;
     }
-    if (!near(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+    if (!approxEq(orb.timeToApoapsisSec, 0.5 * expectedPeriod, 1e-3)) {
       std::cerr << "[test_gravity] expected timeToApoapsis~" << (0.5 * expectedPeriod) << " s, got " << orb.timeToApoapsisSec << " s\n";
       ++fails;
     }
@@ -104,11 +104,11 @@ int test_gravity() {
     // Validate apoapsis phase.
     const double va = std::sqrt(mu * (2.0 / ra - 1.0 / a));
     const auto orbApo = stellar::sim::solveTwoBodyOrbit({-ra, 0, 0}, {0, -va, 0}, mu);
-    if (!near(orbApo.timeToApoapsisSec, 0.0, 1e-6)) {
+    if (!approxEq(orbApo.timeToApoapsisSec, 0.0, 1e-6)) {
       std::cerr << "[test_gravity] expected timeToApoapsis=0 at apoapsis, got " << orbApo.timeToApoapsisSec << "\n";
       ++fails;
     }
-    if (!near(orbApo.timeToPeriapsisSec, 0.5 * expectedPeriod, 1e-3)) {
+    if (!approxEq(orbApo.timeToPeriapsisSec, 0.5 * expectedPeriod, 1e-3)) {
       std::cerr << "[test_gravity] expected timeToPeriapsis~" << (0.5 * expectedPeriod) << " s, got " << orbApo.timeToPeriapsisSec << " s\n";
       ++fails;
     }

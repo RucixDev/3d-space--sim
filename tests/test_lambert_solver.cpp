@@ -7,10 +7,10 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 static bool nearVec(const stellar::math::Vec3d& a, const stellar::math::Vec3d& b, double eps) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 int test_lambert_solver() {
@@ -57,7 +57,7 @@ int test_lambert_solver() {
         ++fails;
       }
 
-      if (!near(sol.transferAngleRad, stellar::math::kPi * 0.5, 1e-3)) {
+      if (!approxEq(sol.transferAngleRad, stellar::math::kPi * 0.5, 1e-3)) {
         std::cerr << "[test_lambert_solver] short-way: expected transfer angle ~90 deg, got "
                   << stellar::math::radToDeg(sol.transferAngleRad) << " deg\n";
         ++fails;
@@ -95,7 +95,7 @@ int test_lambert_solver() {
         ++fails;
       }
 
-      if (!near(sol.transferAngleRad, stellar::math::kPi * 1.5, 1e-3)) {
+      if (!approxEq(sol.transferAngleRad, stellar::math::kPi * 1.5, 1e-3)) {
         std::cerr << "[test_lambert_solver] long-way: expected transfer angle ~270 deg, got "
                   << stellar::math::radToDeg(sol.transferAngleRad) << " deg\n";
         ++fails;

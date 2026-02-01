@@ -4,12 +4,12 @@
 #include <iostream>
 #include <unordered_map>
 
-static bool near(double a, double b, double eps = 1e-6) {
+static bool approxEq(double a, double b, double eps = 1e-6) {
   return std::abs(a - b) <= eps;
 }
 
 static bool near3(const stellar::math::Vec3d& a, const stellar::math::Vec3d& b, double eps = 1e-6) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 int test_resource_field() {
@@ -61,8 +61,8 @@ int test_resource_field() {
       std::cerr << "[test_resource_field] determinism: field basis mismatch at i=" << i << "\n";
       ++fails;
     }
-    if (!near(a.majorRadiusKm, b.majorRadiusKm, 1e-6) || !near(a.minorRadiusKm, b.minorRadiusKm, 1e-6) ||
-        !near(a.arcRad, b.arcRad, 1e-6) || !near(a.arcCenterRad, b.arcCenterRad, 1e-6)) {
+    if (!approxEq(a.majorRadiusKm, b.majorRadiusKm, 1e-6) || !approxEq(a.minorRadiusKm, b.minorRadiusKm, 1e-6) ||
+        !approxEq(a.arcRad, b.arcRad, 1e-6) || !approxEq(a.arcCenterRad, b.arcCenterRad, 1e-6)) {
       std::cerr << "[test_resource_field] determinism: field layout params mismatch at i=" << i << "\n";
       ++fails;
     }
@@ -75,8 +75,8 @@ int test_resource_field() {
     const double xz = stellar::math::dot(a.basisX, a.basisZ);
     const double yz = stellar::math::dot(a.basisY, a.basisZ);
 
-    if (!near(lx, 1.0, 1e-6) || !near(ly, 1.0, 1e-6) || !near(lz, 1.0, 1e-6) ||
-        !near(xy, 0.0, 1e-5) || !near(xz, 0.0, 1e-5) || !near(yz, 0.0, 1e-5)) {
+    if (!approxEq(lx, 1.0, 1e-6) || !approxEq(ly, 1.0, 1e-6) || !approxEq(lz, 1.0, 1e-6) ||
+        !approxEq(xy, 0.0, 1e-5) || !approxEq(xz, 0.0, 1e-5) || !approxEq(yz, 0.0, 1e-5)) {
       std::cerr << "[test_resource_field] basis not orthonormal-ish at i=" << i << "\n";
       ++fails;
     }
@@ -100,8 +100,8 @@ int test_resource_field() {
       ++fails;
       break;
     }
-    if (!near(a.angleRad, b.angleRad, 1e-12) || !near(a.width, b.width, 1e-12) || !near(a.strength01, b.strength01, 1e-12) ||
-        !near(a.param, b.param, 1e-12) || !near3(a.localPos, b.localPos, 1e-12)) {
+    if (!approxEq(a.angleRad, b.angleRad, 1e-12) || !approxEq(a.width, b.width, 1e-12) || !approxEq(a.strength01, b.strength01, 1e-12) ||
+        !approxEq(a.param, b.param, 1e-12) || !near3(a.localPos, b.localPos, 1e-12)) {
       std::cerr << "[test_resource_field] determinism: feature params mismatch at i=" << i << "\n";
       ++fails;
       break;
@@ -192,7 +192,7 @@ int test_resource_field() {
         break;
       }
       const double d01 = stellar::sim::resourceFieldDensity01(*f, p0.features, a.posKm);
-      if (!near(a.density01, d01, 1e-9)) {
+      if (!approxEq(a.density01, d01, 1e-9)) {
         std::cerr << "[test_resource_field] asteroid density01 mismatch vs density function\n";
         ++fails;
         break;

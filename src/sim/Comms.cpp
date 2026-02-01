@@ -146,6 +146,14 @@ bool CommsLog::togglePinned(core::u64 id) {
   return false;
 }
 
+bool CommsLog::markPinned(core::u64 id, bool pinned) {
+  if (CommsMessage* m = find(id)) {
+    m->pinned = pinned;
+    return true;
+  }
+  return false;
+}
+
 static std::string firstLine(const std::string& s) {
   const std::size_t n = s.find_first_of("\r\n");
   if (n == std::string::npos) return s;

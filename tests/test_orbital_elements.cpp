@@ -7,12 +7,12 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
 
 static bool near3(const stellar::math::Vec3d& a,
                   const stellar::math::Vec3d& b,
                   double eps = 1e-6) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 static double wrapTwoPi(double a) {
@@ -145,11 +145,11 @@ int test_orbital_elements() {
       std::cerr << "[test_orbital_elements] solveClassicalOrbitElements failed to classify ellipse\n";
       ++fails;
     } else {
-      if (!near(solved.semiMajorAxisKm, a, 1e-3)) {
+      if (!approxEq(solved.semiMajorAxisKm, a, 1e-3)) {
         std::cerr << "[test_orbital_elements] a mismatch got " << solved.semiMajorAxisKm << " expected " << a << "\n";
         ++fails;
       }
-      if (!near(solved.eccentricity, e, 3e-6)) {
+      if (!approxEq(solved.eccentricity, e, 3e-6)) {
         std::cerr << "[test_orbital_elements] e mismatch got " << solved.eccentricity << " expected " << e << "\n";
         ++fails;
       }

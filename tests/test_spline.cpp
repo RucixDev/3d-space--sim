@@ -5,12 +5,12 @@
 #include <cmath>
 #include <vector>
 
-static bool near(double a, double b, double eps = 1e-8) {
+static bool approxEq(double a, double b, double eps = 1e-8) {
   return std::abs(a - b) <= eps;
 }
 
 static bool nearVec(const stellar::math::Vec3d& a, const stellar::math::Vec3d& b, double eps = 1e-8) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 static double coeffVar(const std::vector<double>& v) {

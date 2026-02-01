@@ -3,7 +3,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 int test_maneuver_computer() {
   int fails = 0;
@@ -46,7 +46,7 @@ int test_maneuver_computer() {
     }
 
     const auto v = ship.velocityKmS();
-    if (!near(v.z, 0.5, 0.006) || std::abs(v.x) > 0.006 || std::abs(v.y) > 0.006) {
+    if (!approxEq(v.z, 0.5, 0.006) || std::abs(v.x) > 0.006 || std::abs(v.y) > 0.006) {
       std::cerr << "[test_maneuver_computer] dv reached (" << v.x << "," << v.y << "," << v.z
                 << ") km/s; expected ~ (0,0,0.5)\n";
       ++fails;

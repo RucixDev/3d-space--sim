@@ -6,7 +6,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 int test_lambert_planner() {
   int fails = 0;
@@ -74,7 +74,7 @@ int test_lambert_planner() {
     }
 
     const double expTof = period * 0.25;
-    if (!near(best.tofSec, expTof, 1e-6)) {
+    if (!approxEq(best.tofSec, expTof, 1e-6)) {
       std::cerr << "[test_lambert_planner] expected TOF " << expTof << " got " << best.tofSec << "\n";
       ++fails;
     }
@@ -91,8 +91,8 @@ int test_lambert_planner() {
   // Determinism: same query -> same best result.
   const auto res2 = stellar::sim::searchLambertPorkchop(0.0, dep, arr, mu, p);
   if (!res.best.empty() && !res2.best.empty()) {
-    if (!near(res.best[0].tofSec, res2.best[0].tofSec, 1e-12) ||
-        !near(res.best[0].score, res2.best[0].score, 1e-12)) {
+    if (!approxEq(res.best[0].tofSec, res2.best[0].tofSec, 1e-12) ||
+        !approxEq(res.best[0].score, res2.best[0].score, 1e-12)) {
       std::cerr << "[test_lambert_planner] nondeterministic result\n";
       ++fails;
     }

@@ -15,9 +15,14 @@ static std::string readAllBytes(const std::filesystem::path& p) {
 
 static bool hasTmpFiles(const std::filesystem::path& dir) {
   namespace fs = std::filesystem;
+
+  // Avoid lossy/pathological wide<->narrow conversions on Windows when test files
+  // include non-ASCII names (use native string type instead of .string()).
+  const auto needle = fs::path(".tmp.").native();
+
   for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-    const std::string name = entry.path().filename().string();
-    if (name.find(".tmp.") != std::string::npos) return true;
+    const auto name = entry.path().filename().native();
+    if (name.find(needle) != decltype(name)::npos) return true;
   }
   return false;
 }
@@ -116,6 +121,32 @@ int test_atomic_write_file() {
     CHECK(okDeep);
     CHECK(err.empty());
     CHECK(readAllBytes(deepPath) == "deep");
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Unicode filename: ensure atomicWriteFile works for non-ASCII paths.
+  // ---------------------------------------------------------------------------
+  {
+#if defined(_WIN32)
+    const fs::path uniPath = dir / fs::path(L"\u30e6\u30cb\u30b3\u30fc\u30c9.txt");
+#else
+    // "ユニコード.txt" as explicit UTF-8 bytes (avoids source-encoding surprises).
+    const fs::path uniPath = dir / "\xE3\x83\xA6\xE3\x83\x8B\xE3\x82\xB3\xE3\x83\xBC\xE3\x83\x89.txt";
+#endif
+
+    err.clear();
+    const bool okUni = stellar::core::atomicWriteFile(
+        uniPath,
+        [&](std::ostream& out) {
+          out << "unicode";
+        },
+        &err);
+
+    CHECK(okUni);
+    CHECK(err.empty());
+    CHECK(readAllBytes(uniPath) == "unicode");
+    CHECK(!hasTmpFiles(dir));
   }
 
   // Ensure we didn't leave temp files behind.

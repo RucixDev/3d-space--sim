@@ -5,7 +5,7 @@
 
 using namespace stellar;
 
-static bool near(double a, double b, double eps) {
+static bool approxEq(double a, double b, double eps) {
   return std::abs(a - b) <= eps;
 }
 
@@ -52,9 +52,9 @@ int test_intercept_course() {
     math::Vec3d relN = rel;
     if (relN.lengthSq() > 1e-18) relN = relN.normalized();
 
-    if (!near(relN.x, expectedLead.x, 0.03) ||
-        !near(relN.y, expectedLead.y, 0.03) ||
-        !near(relN.z, expectedLead.z, 0.03)) {
+    if (!approxEq(relN.x, expectedLead.x, 0.03) ||
+        !approxEq(relN.y, expectedLead.y, 0.03) ||
+        !approxEq(relN.z, expectedLead.z, 0.03)) {
       std::cerr << "[test_intercept_course] lead direction mismatch. got=("
                 << relN.x << "," << relN.y << "," << relN.z << ") expected=("
                 << expectedLead.x << "," << expectedLead.y << "," << expectedLead.z << ")\n";

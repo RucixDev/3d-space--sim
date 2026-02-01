@@ -3,7 +3,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
 
 int test_atmosphere() {
   int fails = 0;
@@ -81,7 +81,7 @@ int test_atmosphere() {
       std::cerr << "[test_atmosphere] expected vacuum at high altitude, got inAtmosphere=true\n";
       ++fails;
     }
-    if (!near(s.dynamicPressurePa, 0.0, 1e-9) && s.dynamicPressurePa > 0.0) {
+    if (!approxEq(s.dynamicPressurePa, 0.0, 1e-9) && s.dynamicPressurePa > 0.0) {
       std::cerr << "[test_atmosphere] expected q ~= 0 in vacuum, got " << s.dynamicPressurePa << "\n";
       ++fails;
     }

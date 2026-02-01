@@ -7,10 +7,10 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 static bool nearVec(const stellar::math::Vec3d& a, const stellar::math::Vec3d& b, double eps) {
-  return near(a.x, b.x, eps) && near(a.y, b.y, eps) && near(a.z, b.z, eps);
+  return approxEq(a.x, b.x, eps) && approxEq(a.y, b.y, eps) && approxEq(a.z, b.z, eps);
 }
 
 int test_lambert_solver_multirev() {
@@ -65,7 +65,7 @@ int test_lambert_solver_multirev() {
     // sanity: sqrt(z) should be near (2π + π/2) for a circular M=1 quarter-phase
     const double s = std::sqrt(std::max(0.0, sol.z));
     const double sExp = 2.5 * stellar::math::kPi;
-    if (!near(s, sExp, 1e-2)) {
+    if (!approxEq(s, sExp, 1e-2)) {
       std::cerr << "[test_lambert_solver_multirev] M=1: expected sqrt(z) ~ " << sExp << ", got " << s << "\n";
       ++fails;
     }

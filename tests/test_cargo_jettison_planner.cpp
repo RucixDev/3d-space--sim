@@ -3,7 +3,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) {
+static bool approxEq(double a, double b, double eps) {
   return std::abs(a - b) <= eps;
 }
 
@@ -40,7 +40,7 @@ int test_cargo_jettison_planner() {
       std::cerr << "[test_cargo_jettison_planner] expected usedReserved=false\n";
       ++fails;
     }
-    if (!near(plan.plannedValueCr, 600.0, 1e-6)) {
+    if (!approxEq(plan.plannedValueCr, 600.0, 1e-6)) {
       std::cerr << "[test_cargo_jettison_planner] plannedValueCr mismatch: got=" << plan.plannedValueCr << "\n";
       ++fails;
     }
@@ -68,7 +68,7 @@ int test_cargo_jettison_planner() {
       std::cerr << "[test_cargo_jettison_planner] expected failure without reserved cargo\n";
       ++fails;
     }
-    if (!near(plan.plannedValueCr, 600.0, 1e-6)) {
+    if (!approxEq(plan.plannedValueCr, 600.0, 1e-6)) {
       std::cerr << "[test_cargo_jettison_planner] expected plannedValueCr==600 (dump all free), got "
                 << plan.plannedValueCr << "\n";
       ++fails;
@@ -101,7 +101,7 @@ int test_cargo_jettison_planner() {
       std::cerr << "[test_cargo_jettison_planner] expected usedReserved=true\n";
       ++fails;
     }
-    if (!near(plan.plannedValueCr, 900.0, 1e-6)) {
+    if (!approxEq(plan.plannedValueCr, 900.0, 1e-6)) {
       std::cerr << "[test_cargo_jettison_planner] plannedValueCr mismatch: got=" << plan.plannedValueCr << "\n";
       ++fails;
     }
@@ -130,7 +130,7 @@ int test_cargo_jettison_planner() {
       ++fails;
     }
     // Best achievable is 210 via 6 Fuel.
-    if (!near(plan.plannedValueCr, 210.0, 1e-6)) {
+    if (!approxEq(plan.plannedValueCr, 210.0, 1e-6)) {
       std::cerr << "[test_cargo_jettison_planner] expected plannedValueCr==210, got " << plan.plannedValueCr << "\n";
       ++fails;
     }
@@ -164,7 +164,7 @@ int test_cargo_jettison_planner() {
       ++fails;
     }
     // Smallest reachable >=200 is 204.
-    if (!near(plan.plannedValueCr, 204.0, 1e-6)) {
+    if (!approxEq(plan.plannedValueCr, 204.0, 1e-6)) {
       std::cerr << "[test_cargo_jettison_planner] expected plannedValueCr==204, got " << plan.plannedValueCr << "\n";
       ++fails;
     }

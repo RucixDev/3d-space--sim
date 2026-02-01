@@ -25,10 +25,10 @@ int test_fuel_scoop() {
   assert(h4.starHeatPerSec > 0.0);
 
   // Out of scoop range: no fuel even if deployed.
-  const auto far = sim::computeFuelScoopRates(star, rKm * 20.0, 3, true, p);
-  assert(!far.inRange);
-  assert(!far.active);
-  assert(far.fuelPerSimSec == 0.0);
+  const auto outOfRange = sim::computeFuelScoopRates(star, rKm * 20.0, 3, true, p);
+  assert(!outOfRange.inRange);
+  assert(!outOfRange.active);
+  assert(outOfRange.fuelPerSimSec == 0.0);
 
   // In range but not deployed: no fuel.
   const auto notDeployed = sim::computeFuelScoopRates(star, rKm * 2.0, 3, false, p);

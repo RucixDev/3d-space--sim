@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stellar/core/PathUtf8.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -7,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 
@@ -20,23 +23,21 @@
     #define NOMINMAX
   #endif
   #include <windows.h>
+
+  // The Windows SDK can still define legacy `near`/`far` macros (from 16-bit era)
+  // which can break otherwise valid code that uses these identifiers.
+  // Undefine them here to keep this header from polluting downstream translation units.
+  #ifdef near
+    #undef near
+  #endif
+  #ifdef far
+    #undef far
+  #endif
 #endif
 
 namespace stellar::core {
 
 namespace detail {
-
-inline std::string pathToUtf8String(const std::filesystem::path& p) {
-#if defined(_WIN32)
-  // On Windows, filesystem::path stores UTF-16. Convert to UTF-8 for logging.
-  // (generic_u8string returns std::u8string, so we copy bytes into std::string.)
-  const auto u8 = p.generic_u8string();
-  return std::string(u8.begin(), u8.end());
-#else
-  // On POSIX, string() is typically UTF-8 already.
-  return p.string();
-#endif
-}
 
 inline std::filesystem::path makeTempSiblingPath(const std::filesystem::path& destPath) {
   static std::atomic<std::uint64_t> counter{0};
@@ -45,13 +46,24 @@ inline std::filesystem::path makeTempSiblingPath(const std::filesystem::path& de
   const auto now = static_cast<std::uint64_t>(
       std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
-  std::string tmpName = destPath.filename().generic_string();
-  tmpName += ".tmp.";
-  tmpName += std::to_string(now);
-  tmpName += ".";
-  tmpName += std::to_string(seq);
+  // Build the temp filename using the path's native string type to avoid lossy
+  // wide<->narrow conversions on Windows when destPath contains Unicode.
+  using NativeStr = std::filesystem::path::string_type;
+  NativeStr tmpName = destPath.filename().native();
 
-  return destPath.parent_path() / tmpName;
+  auto appendAscii = [](NativeStr& out, std::string_view ascii) {
+    out.reserve(out.size() + ascii.size());
+    for (unsigned char c : ascii) {
+      out.push_back((NativeStr::value_type)c);
+    }
+  };
+
+  appendAscii(tmpName, ".tmp.");
+  appendAscii(tmpName, std::to_string(now));
+  appendAscii(tmpName, ".");
+  appendAscii(tmpName, std::to_string(seq));
+
+  return destPath.parent_path() / std::filesystem::path(tmpName);
 }
 
 #if defined(_WIN32)
@@ -103,7 +115,7 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
       if (ec) {
         if (outErr) {
           *outErr = "atomicWriteFile: failed to create parent directories for '" +
-                    detail::pathToUtf8String(destPath) + "': " + ec.message();
+                    pathToUtf8String(destPath) + "': " + ec.message();
         }
         return false;
       }
@@ -118,7 +130,7 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
     if (!out.is_open()) {
       if (outErr) {
         *outErr = "atomicWriteFile: failed to open temp file for write: '" +
-                  detail::pathToUtf8String(tmpPath) + "'";
+                  pathToUtf8String(tmpPath) + "'";
       }
       return false;
     }
@@ -176,7 +188,7 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
       std::filesystem::remove(tmpPath, ec);
       if (outErr) {
         *outErr = "atomicWriteFile: stream failure while writing temp file: '" +
-                  detail::pathToUtf8String(tmpPath) + "'";
+                  pathToUtf8String(tmpPath) + "'";
       }
       return false;
     }
@@ -200,8 +212,8 @@ bool atomicWriteFile(const std::filesystem::path& destPath, WriteFn&& writeFn, s
       std::filesystem::remove(tmpPath, cleanupEc);
       if (outErr) {
         *outErr = "atomicWriteFile: failed to rename temp file into place ('" +
-                  detail::pathToUtf8String(tmpPath) + "' -> '" +
-                  detail::pathToUtf8String(destPath) + "'): " + ec.message();
+                  pathToUtf8String(tmpPath) + "' -> '" +
+                  pathToUtf8String(destPath) + "'): " + ec.message();
       }
       return false;
     }

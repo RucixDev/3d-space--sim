@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <iostream>
 
-static bool near(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <= eps; }
 
 int test_time_trial_ghost_codec() {
   int fails = 0;
@@ -38,7 +38,7 @@ int test_time_trial_ghost_codec() {
       const double posEps = 1e-4;
       const double tEps = 1e-6;
       for (std::size_t i = 0; i < in.size(); ++i) {
-        if (!near(out[i].tSec, in[i].tSec, tEps)) {
+        if (!approxEq(out[i].tSec, in[i].tSec, tEps)) {
           std::cerr << "[test_time_trial_ghost_codec] t mismatch at i=" << i << "\n";
           ++fails;
           break;
@@ -88,7 +88,7 @@ int test_time_trial_ghost_codec() {
         ++fails;
       } else {
         const auto& rr = out.timeTrialBest[0];
-        if (rr.courseKey != r.courseKey || !near(rr.bestTimeSec, r.bestTimeSec, 1e-9) || rr.ghostCodec != r.ghostCodec) {
+        if (rr.courseKey != r.courseKey || !approxEq(rr.bestTimeSec, r.bestTimeSec, 1e-9) || rr.ghostCodec != r.ghostCodec) {
           std::cerr << "[test_time_trial_ghost_codec] best record mismatch\n";
           ++fails;
         }

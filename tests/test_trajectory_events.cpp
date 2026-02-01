@@ -6,7 +6,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps) {
+static bool approxEq(double a, double b, double eps) {
   return std::abs(a - b) <= eps;
 }
 
@@ -87,7 +87,7 @@ int test_trajectory_events() {
       }
 
       const double expectedTSec = (xTransition - x0) / v;
-      if (!near(e.tSec, expectedTSec, 1.0)) {
+      if (!approxEq(e.tSec, expectedTSec, 1.0)) {
         std::cerr << "[test_trajectory_events] expected t~" << expectedTSec << "s, got t=" << e.tSec << "s\n";
         ++fails;
       }

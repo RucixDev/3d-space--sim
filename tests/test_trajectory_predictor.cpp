@@ -5,7 +5,7 @@
 #include <cmath>
 #include <iostream>
 
-static bool near(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
+static bool approxEq(double a, double b, double eps = 1e-6) { return std::abs(a - b) <= eps; }
 
 int test_trajectory_predictor() {
   int fails = 0;
@@ -120,15 +120,15 @@ int test_trajectory_predictor() {
       ++fails;
     } else {
       const double eps = 5e-4;
-      if (!near(sStart->velKmS.x, 0.0, eps) || !near(sStart->velKmS.y, 0.0, eps) || !near(sStart->velKmS.z, 0.0, eps)) {
+      if (!approxEq(sStart->velKmS.x, 0.0, eps) || !approxEq(sStart->velKmS.y, 0.0, eps) || !approxEq(sStart->velKmS.z, 0.0, eps)) {
         std::cerr << "[test_trajectory_predictor] RK4 burn start velocity mismatch\n";
         ++fails;
       }
-      if (!near(sMid->velKmS.x, 0.5, eps)) {
+      if (!approxEq(sMid->velKmS.x, 0.5, eps)) {
         std::cerr << "[test_trajectory_predictor] RK4 burn mid velocity mismatch: " << sMid->velKmS.x << "\n";
         ++fails;
       }
-      if (!near(sEnd->velKmS.x, 1.0, eps)) {
+      if (!approxEq(sEnd->velKmS.x, 1.0, eps)) {
         std::cerr << "[test_trajectory_predictor] RK4 burn end velocity mismatch: " << sEnd->velKmS.x << "\n";
         ++fails;
       }
@@ -138,7 +138,7 @@ int test_trajectory_predictor() {
       if (!sFinal) {
         std::cerr << "[test_trajectory_predictor] RK4 missing final sample\n";
         ++fails;
-      } else if (!near(sFinal->velKmS.x, 1.0, eps)) {
+      } else if (!approxEq(sFinal->velKmS.x, 1.0, eps)) {
         std::cerr << "[test_trajectory_predictor] RK4 final velocity mismatch: " << sFinal->velKmS.x << "\n";
         ++fails;
       }
@@ -317,15 +317,15 @@ int test_trajectory_predictor() {
       ++fails;
     } else {
       const double eps = 2e-5;
-      if (!near(sStart->velKmS.x, 0.0, eps)) {
+      if (!approxEq(sStart->velKmS.x, 0.0, eps)) {
         std::cerr << "[test_trajectory_predictor] RK45 burn start velocity mismatch: " << sStart->velKmS.x << "\n";
         ++fails;
       }
-      if (!near(sMid->velKmS.x, 0.5, eps)) {
+      if (!approxEq(sMid->velKmS.x, 0.5, eps)) {
         std::cerr << "[test_trajectory_predictor] RK45 burn mid velocity mismatch: " << sMid->velKmS.x << "\n";
         ++fails;
       }
-      if (!near(sEnd->velKmS.x, 1.0, eps)) {
+      if (!approxEq(sEnd->velKmS.x, 1.0, eps)) {
         std::cerr << "[test_trajectory_predictor] RK45 burn end velocity mismatch: " << sEnd->velKmS.x << "\n";
         ++fails;
       }
