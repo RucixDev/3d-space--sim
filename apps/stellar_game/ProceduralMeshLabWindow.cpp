@@ -1288,10 +1288,6 @@ static void ensurePreviewSize(ProceduralMeshLabWindowState& st) {
   st.previewTarget.ensureSize(st.previewResolution, st.previewResolution);
 }
 
-static void matToFloat(const math::Mat4d& m, float out16[16]) {
-  for (int i = 0; i < 16; ++i) out16[i] = (float)m.m[i];
-}
-
 static void renderPreview(ProceduralMeshLabWindowState& st, float timeSec) {
   if (!st.previewInited || !st.hasMesh || st.previewMesh.indexCount() == 0) return;
 
@@ -1358,8 +1354,8 @@ static void renderPreview(ProceduralMeshLabWindowState& st, float timeSec) {
 
   float viewF[16];
   float projF[16];
-  matToFloat(view, viewF);
-  matToFloat(proj, projF);
+  view.toFloat(viewF);
+  proj.toFloat(projF);
 
   st.previewRenderer.setViewProj(viewF, projF);
   st.previewRenderer.setCameraPos((float)eye.x, (float)eye.y, (float)eye.z);

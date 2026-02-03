@@ -66,20 +66,6 @@ void Ship::setMaxAngularAccelBoostRadS2(double a) {
   customAngBoost_ = true;
 }
 
-static stellar::math::Vec3d clampMagnitude(const stellar::math::Vec3d& v, double maxLen) {
-  const double len = v.length();
-  if (len <= maxLen || len <= 1e-12) return v;
-  return v * (maxLen / len);
-}
-
-static stellar::math::Vec3d clampComponents(const stellar::math::Vec3d& v, double lo, double hi) {
-  return {
-    std::clamp(v.x, lo, hi),
-    std::clamp(v.y, lo, hi),
-    std::clamp(v.z, lo, hi),
-  };
-}
-
 static double decayKeff(double kPerSec, double dt) {
   if (!(kPerSec > 0.0) || !(dt > 0.0)) return 0.0;
   const double x = kPerSec * dt;
@@ -106,8 +92,14 @@ void Ship::stepWithExternalForces(double dtSeconds,
 
   // Clamp user/control inputs defensively. (AI/autopilot may feed slightly out-of-range values.)
   ShipInput in = input;
-  in.thrustLocal = clampComponents(in.thrustLocal, -1.0, 1.0);
-  in.torqueLocal = clampComponents(in.torqueLocal, -1.0, 1.0);
+  in.thrustLocal = stellar::math::clampComponents(in.thrustLocal, -1.0, 1.0);
+  in.torqueLocal = stellar::math::clampComponents(in.torqueLocal, -1.0, 1.0);
+
+  // Also clamp vector magnitude so diagonal inputs can't exceed the configured
+  // acceleration caps. This keeps maxLinAccel/maxAngAccel semantics intuitive
+  // (caps apply to total thruster authority, not per-axis sums).
+  in.thrustLocal = stellar::math::clampMagnitude(in.thrustLocal, 1.0);
+  in.torqueLocal = stellar::math::clampMagnitude(in.torqueLocal, 1.0);
 
   // Sub-step integration to keep the simple Euler-ish integrator stable under large dt.
   // This matters when the game uses time acceleration (timeScale) or frames hitch.
@@ -135,7 +127,7 @@ void Ship::stepWithExternalForces(double dtSeconds,
       // and convert it into an acceleration request that can still be capped by thruster authority.
       const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
       const double kEff = decayKeff(dampingLinear_, dt);
-      const stellar::math::Vec3d damp = clampMagnitude(relVel * (-kEff), linCap);
+      const stellar::math::Vec3d damp = stellar::math::clampMagnitude(relVel * (-kEff), linCap);
       accelWorld += damp;
     }
 
@@ -143,7 +135,7 @@ void Ship::stepWithExternalForces(double dtSeconds,
       const double brakeCap = linCap * 2.0;
       const stellar::math::Vec3d relVel = velKmS_ - dampingFrameVelKmS_;
       const double kEff = decayKeff(dampingLinear_ * 6.0, dt);
-      const stellar::math::Vec3d brake = clampMagnitude(relVel * (-kEff), brakeCap);
+      const stellar::math::Vec3d brake = stellar::math::clampMagnitude(relVel * (-kEff), brakeCap);
       accelWorld += brake;
     }
 
@@ -160,14 +152,14 @@ void Ship::stepWithExternalForces(double dtSeconds,
 
     if (in.dampers) {
       const double kEff = decayKeff(dampingAngular_, dt);
-      const stellar::math::Vec3d dampW = clampMagnitude(angVelRadS_ * (-kEff), angCap);
+      const stellar::math::Vec3d dampW = stellar::math::clampMagnitude(angVelRadS_ * (-kEff), angCap);
       angAccel += dampW;
     }
 
     if (in.brake) {
       const double brakeCap = angCap * 2.0;
       const double kEff = decayKeff(dampingAngular_ * 6.0, dt);
-      const stellar::math::Vec3d brakeW = clampMagnitude(angVelRadS_ * (-kEff), brakeCap);
+      const stellar::math::Vec3d brakeW = stellar::math::clampMagnitude(angVelRadS_ * (-kEff), brakeCap);
       angAccel += brakeW;
     }
 

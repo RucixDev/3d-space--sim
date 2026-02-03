@@ -7,71 +7,8 @@
 
 namespace stellar::sim {
 
-static math::Vec3d clampMagnitude(const math::Vec3d& v, double maxLen) {
-  const double len = v.length();
-  if (len <= maxLen || len <= 1e-12) return v;
-  return v * (maxLen / len);
-}
-
-static math::Vec3d clampComponents(const math::Vec3d& v, double lo, double hi) {
-  return {
-    std::clamp(v.x, lo, hi),
-    std::clamp(v.y, lo, hi),
-    std::clamp(v.z, lo, hi),
-  };
-}
-
 static double safeSqrt(double x) {
   return (x <= 0.0) ? 0.0 : std::sqrt(x);
-}
-
-// Build a quaternion from an orthonormal basis.
-// The basis maps ship-local axes to world axes:
-//   local +X -> rightW, local +Y -> upW, local +Z -> fwdW.
-static math::Quatd quatFromBasis(const math::Vec3d& rightW,
-                                 const math::Vec3d& upW,
-                                 const math::Vec3d& fwdW) {
-  // Column-major rotation matrix.
-  const double m00 = rightW.x;
-  const double m01 = upW.x;
-  const double m02 = fwdW.x;
-  const double m10 = rightW.y;
-  const double m11 = upW.y;
-  const double m12 = fwdW.y;
-  const double m20 = rightW.z;
-  const double m21 = upW.z;
-  const double m22 = fwdW.z;
-
-  const double trace = m00 + m11 + m22;
-  math::Quatd q{1, 0, 0, 0};
-
-  if (trace > 0.0) {
-    const double s = std::sqrt(trace + 1.0) * 2.0;
-    q.w = 0.25 * s;
-    q.x = (m21 - m12) / s;
-    q.y = (m02 - m20) / s;
-    q.z = (m10 - m01) / s;
-  } else if ((m00 > m11) && (m00 > m22)) {
-    const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
-    q.w = (m21 - m12) / s;
-    q.x = 0.25 * s;
-    q.y = (m01 + m10) / s;
-    q.z = (m02 + m20) / s;
-  } else if (m11 > m22) {
-    const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
-    q.w = (m02 - m20) / s;
-    q.x = (m01 + m10) / s;
-    q.y = 0.25 * s;
-    q.z = (m12 + m21) / s;
-  } else {
-    const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
-    q.w = (m10 - m01) / s;
-    q.x = (m02 + m20) / s;
-    q.y = (m12 + m21) / s;
-    q.z = 0.25 * s;
-  }
-
-  return q.normalized();
 }
 
 static math::Vec3d attitudeTorqueLocal(const Ship& ship,
@@ -102,7 +39,7 @@ static math::Vec3d attitudeTorqueLocal(const Ship& ship,
     rightW = rightW.normalized();
     const math::Vec3d upW = math::cross(fwdW, rightW).normalized();
 
-    const math::Quatd qDes = quatFromBasis(rightW, upW, fwdW);
+    const math::Quatd qDes = math::Quatd::fromBasis(rightW, upW, fwdW);
 
     // Body-frame orientation error.
     math::Quatd qErr = ship.orientation().conjugate() * qDes;
@@ -184,10 +121,10 @@ FlightControlOutput approachTarget(const Ship& ship,
   out.input.boost = useBoost;
   out.input.brake = false;
 
-  const math::Vec3d aCmd = clampMagnitude(aWanted, capUsed);
+  const math::Vec3d aCmd = math::clampMagnitude(aWanted, capUsed);
   const math::Vec3d thrustWorld = (capUsed > 1e-12) ? (aCmd / capUsed) : math::Vec3d{0, 0, 0};
   const math::Vec3d thrustLocal = ship.orientation().conjugate().rotate(thrustWorld);
-  out.input.thrustLocal = clampComponents(thrustLocal, -1.0, 1.0);
+  out.input.thrustLocal = math::clampComponents(thrustLocal, -1.0, 1.0);
 
   // --- Attitude ---
   // Use a quaternion-based controller when aligning both forward + up (avoids
@@ -279,10 +216,10 @@ FlightControlOutput approachTargetIntercept(const Ship& ship,
   out.input.boost = useBoost;
   out.input.brake = false;
 
-  const math::Vec3d aCmd = clampMagnitude(aWanted, capUsed);
+  const math::Vec3d aCmd = math::clampMagnitude(aWanted, capUsed);
   const math::Vec3d thrustWorld = (capUsed > 1e-12) ? (aCmd / capUsed) : math::Vec3d{0, 0, 0};
   const math::Vec3d thrustLocal = ship.orientation().conjugate().rotate(thrustWorld);
-  out.input.thrustLocal = clampComponents(thrustLocal, -1.0, 1.0);
+  out.input.thrustLocal = math::clampComponents(thrustLocal, -1.0, 1.0);
 
   // --- Attitude ---
   out.input.torqueLocal = attitudeTorqueLocal(ship, desiredForwardWorld, attitude, desiredUpWorld);

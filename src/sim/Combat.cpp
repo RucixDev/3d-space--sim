@@ -1,5 +1,7 @@
 #include "stellar/sim/Combat.h"
 
+#include "stellar/math/Geometry.h"
+#include "stellar/math/Math.h"
 #include "stellar/sim/Ballistics.h"
 
 #include <algorithm>
@@ -12,20 +14,13 @@ bool raySphereIntersectKm(const math::Vec3d& originKm,
                           const math::Vec3d& centerKm,
                           double radiusKm,
                           double& outTEnterKm) {
-  radiusKm = std::max(0.0, radiusKm);
-  const math::Vec3d oc = centerKm - originKm;
-  const double tProj = math::dot(oc, dirNormalized);
-  const double dist2 = oc.lengthSq();
-  const double d2 = dist2 - tProj * tProj;
-  const double r2 = radiusKm * radiusKm;
-  if (d2 > r2) return false;
-
-  const double thc = std::sqrt(std::max(0.0, r2 - d2));
-  double tEnter = tProj - thc;
-  // If we start inside the sphere, tEnter can be negative; clamp to 0.
-  if (tEnter < 0.0) tEnter = 0.0;
-  outTEnterKm = tEnter;
-  return true;
+  // Delegate the actual math to the shared geometry helper so ray/sphere behavior
+  // stays consistent across sim modules.
+  return math::raySphereIntersectEnter(originKm,
+                                       dirNormalized,
+                                       centerKm,
+                                       std::max(0.0, radiusKm),
+                                       outTEnterKm);
 }
 
 RaycastHit raycastNearestSphereKm(const math::Vec3d& originKm,
@@ -87,26 +82,74 @@ bool segmentHitsSphereKm(const math::Vec3d& aKm,
                          const math::Vec3d& bKm,
                          const math::Vec3d& centerKm,
                          double radiusKm) {
-  const math::Vec3d ab = bKm - aKm;
-  const double abLenSq = ab.lengthSq();
-  const double r2 = radiusKm * radiusKm;
-  if (abLenSq < 1e-12) {
-    return (aKm - centerKm).lengthSq() <= r2;
+  return math::segmentHitsSphere(aKm, bKm, centerKm, std::max(0.0, radiusKm));
+}
+
+static bool occludedByAsteroidSpheres(const math::Vec3d& fromKm,
+                                     const math::Vec3d& toKm,
+                                     const SphereTarget* targets,
+                                     std::size_t targetCount,
+                                     double radiusPadKm) {
+  if (!targets || targetCount == 0) return false;
+
+  const double pad = std::max(0.0, radiusPadKm);
+
+  for (std::size_t i = 0; i < targetCount; ++i) {
+    const SphereTarget& t = targets[i];
+    if (t.kind != CombatTargetKind::Asteroid) continue;
+
+    const double r = std::max(0.0, t.radiusKm) + pad;
+    if (r <= 0.0) continue;
+
+    if (math::segmentHitsSphere(fromKm, toKm, t.centerKm, r)) {
+      return true;
+    }
   }
 
-  const double t = std::clamp(math::dot(centerKm - aKm, ab) / abLenSq, 0.0, 1.0);
-  const math::Vec3d closest = aKm + ab * t;
-  return (closest - centerKm).lengthSq() <= r2;
+  return false;
+}
+static bool blastOccludedByAsteroidSpheres(const math::Vec3d& fromKm,
+                                          const math::Vec3d& toKm,
+                                          const SphereTarget* targets,
+                                          std::size_t targetCount,
+                                          double radiusPadKm,
+                                          core::u64 ignoreAsteroidId) {
+  if (!targets || targetCount == 0) return false;
+
+  const double pad = std::max(0.0, radiusPadKm);
+  constexpr double kEps = 1.0e-6;
+
+  for (std::size_t i = 0; i < targetCount; ++i) {
+    const SphereTarget& t = targets[i];
+    if (t.kind != CombatTargetKind::Asteroid) continue;
+    if (ignoreAsteroidId != 0 && t.id == ignoreAsteroidId) continue;
+
+    const double r = std::max(0.0, t.radiusKm) + pad;
+    if (r <= 0.0) continue;
+
+    double tEnter01 = 0.0;
+    double tExit01 = 0.0;
+    if (!math::segmentSphereIntersectionT(fromKm, toKm, t.centerKm, r, tEnter01, tExit01)) {
+      continue;
+    }
+
+    // Treat as an occluder only when the segment actually passes through a
+    // non-trivial portion of the asteroid volume (not just touching at an
+    // endpoint).
+    const double e = std::clamp(tEnter01, 0.0, 1.0);
+    const double x = std::clamp(tExit01, 0.0, 1.0);
+
+    if (x <= kEps) continue;            // touch at start
+    if (e >= 1.0 - kEps) continue;      // touch at end
+    if (x - e <= kEps) continue;        // tangent / negligible thickness
+
+    return true;
+  }
+
+  return false;
 }
 
-static double segmentClosestT(const math::Vec3d& aKm,
-                              const math::Vec3d& bKm,
-                              const math::Vec3d& pKm) {
-  const math::Vec3d ab = bKm - aKm;
-  const double abLenSq = ab.lengthSq();
-  if (abLenSq < 1e-12) return 0.0;
-  return std::clamp(math::dot(pKm - aKm, ab) / abLenSq, 0.0, 1.0);
-}
+
 
 static math::Vec3d rotateTowards(const math::Vec3d& fromDir,
                                  const math::Vec3d& toDir,
@@ -139,15 +182,341 @@ static math::Vec3d rotateTowards(const math::Vec3d& fromDir,
   return (v * ca + v2 * sa).normalized();
 }
 
+static math::Vec3d rotateAroundAxis(const math::Vec3d& v,
+                                   const math::Vec3d& axisUnit,
+                                   double angleRad) {
+  // Rodrigues rotation formula; assumes axisUnit is normalized.
+  const double ca = std::cos(angleRad);
+  const double sa = std::sin(angleRad);
+  const math::Vec3d a = axisUnit;
+  const math::Vec3d v2 = math::cross(a, v);
+  return (v * ca + v2 * sa + a * (math::dot(a, v) * (1.0 - ca)));
+}
+
+static double effectiveTurnRateRadS(const Missile& m, double speedKmS) {
+  double tr = std::max(0.0, m.turnRateRadS);
+  if (tr <= 0.0) return 0.0;
+
+  const double maxLat = std::max(0.0, m.maxLateralAccelKmS2);
+  if (maxLat > 0.0 && speedKmS > 1e-9) {
+    tr = std::min(tr, maxLat / speedKmS);
+  }
+  return tr;
+}
+
+static double guidanceSpeedKmS(const Missile& m, double currentSpeedKmS) {
+  double s = std::max(0.0, currentSpeedKmS);
+  const double accel = std::max(0.0, m.thrustAccelKmS2);
+  const double maxSpeed = std::max(0.0, m.maxSpeedKmS);
+  const double burn = std::max(0.0, m.motorBurnRemainingSimSec);
+
+  if (accel > 0.0 && burn > 0.0 && maxSpeed > s + 1e-12) {
+    // Small look-ahead so lead pursuit doesn't consistently over-lead missiles
+    // that will accelerate immediately after launch.
+    const double horizon = std::min(burn, 1.0);
+    s = std::min(maxSpeed, s + accel * horizon);
+  }
+  return s;
+}
+
+static math::Vec3d applyAsteroidAvoidanceDir(const Missile& m,
+                                              const math::Vec3d& missilePosKm,
+                                              const math::Vec3d& vHat,
+                                              double speedKmS,
+                                              double turnRateRadS,
+                                              double dtSim,
+                                              const math::Vec3d& cmdDir,
+                                              const SphereTarget* targets,
+                                              std::size_t targetCount) {
+  const double strength = std::max(0.0, m.asteroidAvoidanceStrength);
+  if (strength <= 0.0) return cmdDir;
+  if (!targets || targetCount == 0) return cmdDir;
+
+  // Don't avoid the target if the missile is explicitly aimed at an asteroid.
+  const bool targetIsAsteroid = (m.hasTarget && m.targetKind == CombatTargetKind::Asteroid);
+
+  // Prediction horizon: default to ~1s when not specified.
+  double horizonSim = m.asteroidAvoidanceLookaheadSimSec;
+  if (!(horizonSim > 0.0)) horizonSim = 1.0;
+  horizonSim = std::max(horizonSim, std::max(0.0, dtSim));
+
+  speedKmS = std::max(0.0, speedKmS);
+  const double lookDistKm = speedKmS * horizonSim;
+  if (!(lookDistKm > 1e-9)) return cmdDir;
+
+  const double pad = std::max(0.0, m.asteroidAvoidancePadKm);
+  const double missileR = std::max(0.0, m.radiusKm);
+
+  math::Vec3d accum{0, 0, 0};
+
+  // A small, deterministic repulsion field: for asteroids that lie close to the
+  // current velocity ray within the lookahead distance, accumulate a lateral
+  // "push" direction away from the sphere.
+  for (std::size_t i = 0; i < targetCount; ++i) {
+    const SphereTarget& t = targets[i];
+    if (t.kind != CombatTargetKind::Asteroid) continue;
+    if (targetIsAsteroid && t.id == m.targetId) continue;
+
+    const double r = std::max(0.0, t.radiusKm) + pad + missileR;
+    if (!(r > 0.0)) continue;
+
+    const math::Vec3d rel = t.centerKm - missilePosKm;
+
+    // Project onto the missile's current travel ray.
+    const double along = math::dot(rel, vHat);
+    if (!(along > 0.0)) continue;
+    if (along > lookDistKm + r) continue;
+
+    const math::Vec3d lateral = rel - vHat * along;
+    const double d2 = lateral.lengthSq();
+    const double r2 = r * r;
+    if (d2 > r2) continue;
+
+    const double d = std::sqrt(std::max(0.0, d2));
+    const double invR = 1.0 / std::max(1e-6, r);
+
+    // Weight grows rapidly as we approach the collision tube.
+    const double kDist = std::clamp(1.0 - d * invR, 0.0, 1.0);
+    const double kAlong = std::clamp(1.0 - along / std::max(1e-6, lookDistKm + r), 0.0, 1.0);
+    const double w = (kDist * kDist) * (0.25 + 0.75 * kAlong);
+    if (!(w > 0.0)) continue;
+
+    // Away direction is perpendicular to the travel ray when possible.
+    math::Vec3d away = {-lateral.x, -lateral.y, -lateral.z};
+    if (!(away.lengthSq() > 1e-18)) {
+      // Degenerate: if we're aimed dead-center, choose a stable perpendicular.
+      away = math::cross(vHat, cmdDir);
+      if (!(away.lengthSq() > 1e-18)) away = math::cross(vHat, math::Vec3d{0, 1, 0});
+      if (!(away.lengthSq() > 1e-18)) away = math::cross(vHat, math::Vec3d{1, 0, 0});
+    }
+    away = math::safeNormalized(away, math::Vec3d{1, 0, 0});
+
+    accum = accum + away * w;
+  }
+
+  if (!(accum.lengthSq() > 1e-18)) return cmdDir;
+
+  const math::Vec3d push = accum.normalized();
+  math::Vec3d base = cmdDir;
+  if (!(base.lengthSq() > 1e-18)) base = vHat;
+  base = base.normalized();
+
+  // Blend toward a direction that includes a lateral push.
+  math::Vec3d desired = base + push * strength;
+  if (!(desired.lengthSq() > 1e-18)) return base;
+  desired = desired.normalized();
+
+  // Re-limit by max turn for stability.
+  const double maxTurn = std::max(0.0, turnRateRadS) * std::max(0.0, dtSim);
+  if (maxTurn <= 0.0) return vHat;
+
+  return rotateTowards(vHat, desired, maxTurn);
+}
+
+struct MissileSwarmSnapshot {
+  bool alive{false};
+  bool fromPlayer{false};
+  core::u64 shooterId{0};
+
+  bool hasTarget{false};
+  CombatTargetKind targetKind{CombatTargetKind::Ship};
+  core::u64 targetId{0};
+
+  math::Vec3d posKm{0, 0, 0};
+  math::Vec3d velDir{0, 0, 1};
+};
+
+static math::Vec3d applySwarmBiasDir(const Missile& m,
+                                    std::size_t missileIndex,
+                                    const std::vector<MissileSwarmSnapshot>& snap,
+                                    const math::Vec3d& vHat,
+                                    const math::Vec3d& cmdDir,
+                                    double turnRateRadS,
+                                    double dtSim) {
+  const double sepStrength = std::max(0.0, m.swarmSeparationStrength);
+  const double cohStrength = std::max(0.0, m.swarmCohesionStrength);
+  const double aliStrength = std::max(0.0, m.swarmAlignmentStrength);
+  if (sepStrength <= 0.0 && cohStrength <= 0.0 && aliStrength <= 0.0) return cmdDir;
+
+  const double sepKm = std::max(0.0, m.swarmSeparationKm);
+  if (sepStrength > 0.0 && sepKm <= 1e-12) {
+    // No meaningful separation distance configured.
+    return cmdDir;
+  }
+
+  double neighborRangeKm = std::max(0.0, m.swarmNeighborRangeKm);
+  if (!(neighborRangeKm > 0.0)) {
+    neighborRangeKm = (sepKm > 0.0) ? (4.0 * sepKm) : 0.0;
+  }
+  if (!(neighborRangeKm > 0.0)) return cmdDir;
+
+  if (!m.hasTarget) return cmdDir;
+  if (missileIndex >= snap.size()) return cmdDir;
+
+  const MissileSwarmSnapshot& self = snap[missileIndex];
+  if (!self.alive) return cmdDir;
+
+  math::Vec3d sep{0, 0, 0};
+  math::Vec3d sumPos{0, 0, 0};
+  math::Vec3d sumVel{0, 0, 0};
+  int count = 0;
+
+  const double n2 = neighborRangeKm * neighborRangeKm;
+  const double s2 = sepKm * sepKm;
+
+  for (std::size_t j = 0; j < snap.size(); ++j) {
+    if (j == missileIndex) continue;
+    const MissileSwarmSnapshot& other = snap[j];
+    if (!other.alive) continue;
+
+    // Only coordinate with missiles from the same shooter when possible.
+    if (m.shooterId != 0 && other.shooterId != 0) {
+      if (other.shooterId != m.shooterId) continue;
+    } else {
+      if (other.fromPlayer != m.fromPlayer) continue;
+    }
+
+    // Only coordinate when pursuing the same target (prevents cross-target coupling).
+    if (!other.hasTarget) continue;
+    if (other.targetKind != m.targetKind) continue;
+    if (other.targetId != m.targetId) continue;
+
+    const math::Vec3d d = self.posKm - other.posKm;
+    const double distSq = d.lengthSq();
+    if (distSq < 1e-18) continue;
+    if (distSq > n2) continue;
+
+    ++count;
+    sumPos = sumPos + other.posKm;
+    sumVel = sumVel + other.velDir;
+
+    if (sepStrength > 0.0 && distSq < s2) {
+      const double dist = std::sqrt(distSq);
+      const double k = std::clamp(1.0 - dist / std::max(1e-9, sepKm), 0.0, 1.0);
+      sep = sep + (d / dist) * k;
+    }
+  }
+
+  if (count <= 0) return cmdDir;
+
+  math::Vec3d bias{0, 0, 0};
+
+  if (sepStrength > 0.0 && sep.lengthSq() > 1e-18) {
+    bias = bias + sep.normalized() * sepStrength;
+  }
+
+  if (cohStrength > 0.0) {
+    const math::Vec3d center = sumPos * (1.0 / (double)count);
+    math::Vec3d toCenter = center - self.posKm;
+    toCenter = toCenter - vHat * math::dot(toCenter, vHat);
+    if (toCenter.lengthSq() > 1e-18) {
+      bias = bias + toCenter.normalized() * cohStrength;
+    }
+  }
+
+  if (aliStrength > 0.0 && sumVel.lengthSq() > 1e-18) {
+    math::Vec3d align = sumVel.normalized();
+    align = align - vHat * math::dot(align, vHat);
+    if (align.lengthSq() > 1e-18) {
+      bias = bias + align.normalized() * aliStrength;
+    }
+  }
+
+  // Keep bias lateral so it doesn't act like a speed change.
+  bias = bias - vHat * math::dot(bias, vHat);
+  if (!(bias.lengthSq() > 1e-18)) return cmdDir;
+
+  math::Vec3d base = cmdDir;
+  if (!(base.lengthSq() > 1e-18)) base = vHat;
+  base = base.normalized();
+
+  math::Vec3d desired = base + bias;
+  if (!(desired.lengthSq() > 1e-18)) return base;
+  desired = desired.normalized();
+
+  double maxSteer = m.swarmMaxSteerRad;
+  if (!(maxSteer > 0.0)) {
+    // Default: use a fraction of per-step turn capability so it doesn't dominate guidance.
+    maxSteer = 0.45 * std::max(0.0, turnRateRadS) * std::max(0.0, dtSim);
+  }
+  if (!(maxSteer > 0.0)) return base;
+
+  return rotateTowards(base, desired, maxSteer);
+}
+
+static double estimateBoostCoastTtlSimSec(double rangeKm,
+                                         double speed0KmS,
+                                         double accelKmS2,
+                                         double maxSpeedKmS,
+                                         double burnTimeSimSec) {
+  rangeKm = std::max(0.0, rangeKm);
+  speed0KmS = std::max(1e-6, speed0KmS);
+  accelKmS2 = std::max(0.0, accelKmS2);
+  maxSpeedKmS = std::max(0.0, maxSpeedKmS);
+  burnTimeSimSec = std::max(0.0, burnTimeSimSec);
+
+  if (rangeKm <= 0.0) return 0.0;
+
+  // Default: constant speed.
+  if (accelKmS2 <= 0.0 || burnTimeSimSec <= 0.0 || maxSpeedKmS <= speed0KmS + 1e-12) {
+    return rangeKm / speed0KmS;
+  }
+
+  const double tb = burnTimeSimSec;
+  const double tToMax = std::max(0.0, (maxSpeedKmS - speed0KmS) / accelKmS2);
+
+  // Accelerate up to either max speed or the end of burn.
+  const double tAccel = std::min(tb, tToMax);
+  const double dAccel = speed0KmS * tAccel + 0.5 * accelKmS2 * tAccel * tAccel;
+
+  double dBurn = dAccel;
+  double speedEnd = speed0KmS + accelKmS2 * tAccel;
+
+  // If we hit max speed before burn ends, cruise at max speed for the remainder of the burn.
+  if (tToMax < tb) {
+    speedEnd = maxSpeedKmS;
+    dBurn += maxSpeedKmS * (tb - tToMax);
+  }
+
+  // Range reached during burn.
+  if (rangeKm <= dBurn + 1e-9) {
+    // Within the acceleration portion.
+    if (rangeKm <= dAccel + 1e-9) {
+      // Solve: 0.5*a*t^2 + v0*t - range = 0
+      const double a = 0.5 * accelKmS2;
+      const double b = speed0KmS;
+      const double c = -rangeKm;
+      const double disc = b * b - 4.0 * a * c;
+      if (disc <= 0.0) return 0.0;
+      const double t = (-b + std::sqrt(disc)) / (2.0 * a);
+      return std::max(0.0, t);
+    }
+
+    // Within the max-speed cruise portion of the burn.
+    // This only happens when we reach max speed.
+    const double remainKm = std::max(0.0, rangeKm - dAccel);
+    return tToMax + remainKm / maxSpeedKmS;
+  }
+
+  // Coast after burn.
+  const double remainKm = rangeKm - dBurn;
+  return tb + remainKm / std::max(1e-6, speedEnd);
+}
+
 // Simple 3D proportional navigation steering step.
 //
 // This is an "energy conserving" PN variant that produces an acceleration command
 // normal to the missile velocity (good fit for our constant-speed steering model).
 //
 // Reference (notation):
-//  - Omega = (R x Vr) / |R|^2  (line-of-sight rotation vector)
-//  - a = -N * |Vr| * (Vm_hat x Omega)
-// where R = Rt - Rm and Vr = Vt - Vm.
+//  - R = Rt - Rm
+//  - Vr = Vt - Vm
+//  - Omega = (R x Vr) / |R|^2   (line-of-sight rotation vector)
+//  - Vc = -dot(R, Vr) / |R|     (closing speed along LOS; positive when closing)
+//  - a = N * Vc * (Omega x Vm_hat)
+//
+// When the PN geometry becomes degenerate (opening targets / tiny range / etc),
+// we fall back to a simple turn toward the provided fallback aim direction.
 static math::Vec3d proNavSteerDir(const math::Vec3d& vHat,
                                  const math::Vec3d& missileVelKmS,
                                  double missileSpeedKmS,
@@ -155,38 +524,105 @@ static math::Vec3d proNavSteerDir(const math::Vec3d& vHat,
                                  double dtSim,
                                  const math::Vec3d& missilePosKm,
                                  const SphereTarget& target,
-                                 double navConstant) {
+                                 double navConstant,
+                                 const math::Vec3d& targetAccelKmS2,
+                                 double apnTargetAccelGain,
+                                 double apnMaxTargetAccelKmS2,
+                                 const math::Vec3d& fallbackAimDir) {
   const double sp = std::max(1e-9, missileSpeedKmS);
   const double N = std::clamp(navConstant, 0.0, 12.0);
-  if (N <= 0.0) return vHat;
+
+  // Normalize the fallback direction defensively.
+  math::Vec3d fb = fallbackAimDir;
+  if (fb.lengthSq() < 1e-12) fb = vHat;
+  fb = fb.normalized();
+
+  // No steering authority -> keep current heading.
+  const double maxTurnRate = std::max(0.0, turnRateRadS);
+  if (!(dtSim > 0.0) || maxTurnRate <= 0.0) {
+    return vHat;
+  }
+
+  const double maxTurn = maxTurnRate * dtSim;
+
+  // PN disabled -> just turn toward the fallback aim direction.
+  if (N <= 0.0) {
+    return rotateTowards(vHat, fb, maxTurn);
+  }
 
   const math::Vec3d R = target.centerKm - missilePosKm;
   const double r2 = R.lengthSq();
-  if (r2 < 1e-9) return vHat;
+  if (!(r2 > 1e-9)) {
+    return rotateTowards(vHat, fb, maxTurn);
+  }
+  const double r = std::sqrt(r2);
 
   const math::Vec3d Vr = target.velKmS - missileVelKmS;
-  const double vrMag = Vr.length();
-  if (vrMag < 1e-9) return vHat;
+  const double closing = -math::dot(R, Vr) / r;  // positive when range is decreasing
+
+  // Opening targets (or near-zero closing) are numerically ugly for PN; fall back to
+  // a simple lead/pursuit direction.
+  if (!(closing > 1e-9)) {
+    return rotateTowards(vHat, fb, maxTurn);
+  }
 
   // Line-of-sight rotation vector.
   const math::Vec3d omega = math::cross(R, Vr) / r2;
 
   // Energy-conserving PN acceleration (normal to missile velocity).
-  math::Vec3d aCmd = math::cross(vHat, omega) * (-N * vrMag);
+  // a = N * Vc * (Omega x Vm_hat)
+  math::Vec3d aCmd = math::cross(omega, vHat) * (N * closing);
+
+  // Optional APN (augmented proportional navigation) feed-forward:
+  // add a component proportional to the estimated target acceleration that is
+  // perpendicular to the current line-of-sight, projected to remain normal
+  // to the missile velocity (energy-conserving steering).
+  const double apnGain = std::clamp(apnTargetAccelGain, 0.0, 24.0);
+  if (apnGain > 0.0 && math::isFinite(targetAccelKmS2)) {
+    const math::Vec3d losHat = R / r;
+    // Remove LOS-parallel component (does not affect cross-range miss).
+    math::Vec3d aPerp = targetAccelKmS2 - losHat * math::dot(targetAccelKmS2, losHat);
+    // Keep steering energy-conserving: remove any component along the missile velocity.
+    aPerp -= vHat * math::dot(aPerp, vHat);
+    const double maxA = std::max(0.0, apnMaxTargetAccelKmS2);
+    if (maxA > 0.0) aPerp = math::clampMagnitude(aPerp, maxA);
+    aCmd += aPerp * apnGain;
+  }
 
   // Convert to heading rate (rad/s): dvHat/dt = aCmd / |Vm|.
   math::Vec3d dvHatDt = aCmd / sp;
 
-  // Clamp turn rate.
-  const double maxTurn = std::max(0.0, turnRateRadS);
+  // Clamp to the missile's steering limit.
   const double turn = dvHatDt.length();
-  if (maxTurn > 0.0 && turn > maxTurn) {
-    dvHatDt *= (maxTurn / turn);
+  if (turn > maxTurnRate) {
+    dvHatDt *= (maxTurnRate / turn);
   }
 
   math::Vec3d vNew = vHat + dvHatDt * dtSim;
   if (vNew.lengthSq() < 1e-12) return vHat;
   return vNew.normalized();
+}
+
+static bool movingSphereSegmentIntersectionEnter01(const math::Vec3d& segA,
+                                                   const math::Vec3d& segB,
+                                                   const SphereTarget& target,
+                                                   double hitRadiusKm,
+                                                   double dtSim,
+                                                   double& outTEnter01) {
+  outTEnter01 = 0.0;
+
+  // Linear relative motion: subtract target's swept center from the projectile segment.
+  const math::Vec3d c0 = target.centerKm;
+  const math::Vec3d c1 = target.centerKm + target.velKmS * dtSim;
+
+  const math::Vec3d relA = segA - c0;
+  const math::Vec3d relB = segB - c1;
+
+  return math::segmentSphereIntersectionEnterT(relA,
+                                               relB,
+                                               /*center=*/math::Vec3d{0, 0, 0},
+                                               std::max(0.0, hitRadiusKm),
+                                               outTEnter01);
 }
 
 void stepProjectiles(std::vector<Projectile>& projectiles,
@@ -216,6 +652,10 @@ void stepProjectiles(std::vector<Projectile>& projectiles,
     const bool allowHitShips = true;
     const bool allowHitAsteroids = p.fromPlayer; // fun: player slugs can smack rocks
 
+    // Pick the earliest intersection along the segment (prevents order-dependent hits).
+    double bestT = 2.0; // [0,1]
+    const SphereTarget* bestTarget = nullptr;
+
     for (std::size_t ti = 0; ti < targetCount; ++ti) {
       const SphereTarget& t = targets[ti];
 
@@ -227,24 +667,36 @@ void stepProjectiles(std::vector<Projectile>& projectiles,
       if (p.shooterId != 0 && t.id != 0 && t.id == p.shooterId) continue;
 
       const double hitRadiusKm = std::max(0.0, t.radiusKm) + std::max(0.0, p.radiusKm);
-      if (!segmentHitsSphereKm(a, b, t.centerKm, hitRadiusKm)) continue;
 
-      const double tt = segmentClosestT(a, b, t.centerKm);
-      const math::Vec3d hitPoint = a + (b - a) * tt;
+      double tEnter01 = 0.0;
+      if (!movingSphereSegmentIntersectionEnter01(a, b, t, hitRadiusKm, dtSim, tEnter01)) continue;
 
-      ProjectileHit h{};
-      h.kind = t.kind;
-      h.targetIndex = t.index;
-      h.targetId = t.id;
-      h.pointKm = hitPoint;
-      h.dmg = p.dmg;
-      h.fromPlayer = p.fromPlayer;
-      h.shooterId = p.shooterId;
-      outHits.push_back(h);
+      if (tEnter01 < bestT) {
+        bestT = tEnter01;
+        bestTarget = &t;
 
-      p.ttlSimSec = 0.0;
-      break;
+        // Can't do better than an immediate hit.
+        if (bestT <= 0.0) break;
+      }
     }
+
+    if (!bestTarget) continue;
+
+    const math::Vec3d hitPoint = a + (b - a) * bestT;
+
+    ProjectileHit h{};
+    h.kind = bestTarget->kind;
+    h.targetIndex = bestTarget->index;
+    h.targetId = bestTarget->id;
+    h.pointKm = hitPoint;
+    h.dmg = p.dmg;
+    h.fromPlayer = p.fromPlayer;
+    h.shooterId = p.shooterId;
+    outHits.push_back(h);
+
+    // Consume the projectile and keep its end position consistent with the hit.
+    p.posKm = hitPoint;
+    p.ttlSimSec = 0.0;
   }
 }
 
@@ -260,8 +712,33 @@ void stepMissiles(std::vector<Missile>& missiles,
   outDetonations.clear();
   outHits.clear();
 
-  for (auto& m : missiles) {
+  // Snapshot missile state at the start of the step for deterministic
+  // swarm/formation steering. This avoids order dependence inside the
+  // per-missile integration loop.
+  std::vector<MissileSwarmSnapshot> swarmSnap;
+  swarmSnap.reserve(missiles.size());
+  for (const auto& m : missiles) {
+    MissileSwarmSnapshot s{};
+    s.alive = (m.ttlSimSec > 0.0);
+    s.fromPlayer = m.fromPlayer;
+    s.shooterId = m.shooterId;
+    s.hasTarget = m.hasTarget;
+    s.targetKind = m.targetKind;
+    s.targetId = m.targetId;
+    s.posKm = m.posKm;
+    math::Vec3d v = m.velKmS;
+    if (v.lengthSq() < 1e-12) v = {0, 0, 1};
+    s.velDir = v.normalized();
+    swarmSnap.push_back(s);
+  }
+
+  for (std::size_t mi = 0; mi < missiles.size(); ++mi) {
+    auto& m = missiles[mi];
     if (m.ttlSimSec <= 0.0) continue;
+
+    const double ageStart = std::max(0.0, m.ageSimSec);
+    const double activateAfter = std::max(0.0, m.seekerActivationSimSec);
+    const bool seekerActive = (activateAfter <= 0.0) || (ageStart >= activateAfter);
 
     const math::Vec3d a = m.posKm;
 
@@ -274,8 +751,69 @@ void stepMissiles(std::vector<Missile>& missiles,
     }
 
     math::Vec3d desiredDir = v.normalized();
-    const SphereTarget* tgt = nullptr;
+    // When missiles have a motor model, their speed can increase during dtSim. When we also
+    // have a lateral-acceleration ("G") cap, we must compute the effective turn rate using a
+    // conservative (high) speed estimate so we don't violate the cap after accelerating.
+    double speedForTurn = speed;
+    {
+      const double accel = std::max(0.0, m.thrustAccelKmS2);
+      const double maxSpeed = std::max(0.0, m.maxSpeedKmS);
+      const double burnRem = std::max(0.0, m.motorBurnRemainingSimSec);
+
+      if (accel > 0.0 && burnRem > 0.0 && maxSpeed > speedForTurn + 1e-12) {
+        const double burnDt = std::min(dtSim, burnRem);
+        speedForTurn = std::min(maxSpeed, speedForTurn + accel * burnDt);
+      }
+    }
+
+    const double turnRateRadS = effectiveTurnRateRadS(m, speedForTurn);
     const SphereTarget* guide = nullptr;
+
+    // Optional: decoy commitment ("minimum dwell") timer.
+    if (m.decoyCommitRemainingSimSec > 0.0) {
+      m.decoyCommitRemainingSimSec = std::max(0.0, m.decoyCommitRemainingSimSec - dtSim);
+    }
+
+    // --- Target lock, seeker FOV, and target memory ---
+    const math::Vec3d fwd = v.normalized();
+    const double seekerFovCos = std::clamp(m.seekerFovCos, -1.0, 1.0);
+
+    // Age / expire the last-known target memory.
+    {
+      const double memMax = std::max(0.0, m.targetMemorySimSec);
+      if (m.hasLastKnownTarget) {
+        m.lastKnownTargetAgeSimSec = std::max(0.0, m.lastKnownTargetAgeSimSec + dtSim);
+        if (memMax <= 0.0 || m.lastKnownTargetAgeSimSec > memMax) {
+          m.hasLastKnownTarget = false;
+        }
+      }
+    }
+
+    // Optional APN (augmented proportional navigation) state updates.
+    //
+    // We keep a finite-difference estimate of the target acceleration from
+    // direct velocity samples, and decay it toward zero when we don't have
+    // fresh measurements.
+    if (m.apnTargetAccelGain > 0.0) {
+      if (m.hasTargetVelSample) {
+        m.targetVelSampleAgeSimSec = std::min(5.0, std::max(0.0, m.targetVelSampleAgeSimSec + dtSim));
+      }
+      const double hl = std::max(0.0, m.apnAccelHalfLifeSimSec);
+      if (hl > 0.0) {
+        const double decay = math::halfLifeDecayFactor(dtSim, hl);
+        m.targetAccelEstKmS2 *= decay;
+      } else {
+        // Without smoothing, treat the estimate as per-step only.
+        m.targetAccelEstKmS2 = {0, 0, 0};
+      }
+    }
+
+    const SphereTarget* lockedTarget = nullptr;
+
+    // Base target guide: either the currently trackable locked target, or a synthetic
+    // memory target if tracking is temporarily lost.
+    SphereTarget memoryTarget{};
+    const SphereTarget* baseTarget = nullptr;
 
     // "Lock" score used to compare against decoys (inverse-square falloff).
     double targetScore = 0.0;
@@ -285,60 +823,501 @@ void stepMissiles(std::vector<Missile>& missiles,
         const SphereTarget& t = targets[i];
         if (t.kind != m.targetKind) continue;
         if (t.id != m.targetId) continue;
-        tgt = &t;
+        lockedTarget = &t;
         break;
       }
+    }
 
-      if (tgt) {
-        const math::Vec3d toTgt = tgt->centerKm - m.posKm;
-        targetScore = 1.0 / (toTgt.lengthSq() + 1.0e-9);
+    // Track the locked target.
+    //
+    // When the seeker is inactive (activation delay), the missile can optionally receive
+    // midcourse target updates via a simple "datalink" model (range + optional LOS).
+    // If datalinkRangeKm is 0, behavior matches the legacy perfect-update midcourse.
+    // Once active, we enforce the seeker's FOV and allow decoys to override.
+    if (lockedTarget) {
+      const math::Vec3d toTgt = lockedTarget->centerKm - m.posKm;
+      const double distSq = toTgt.lengthSq();
+      if (distSq > 1e-12) {
+        const double dist = std::sqrt(distSq);
+        const math::Vec3d toDir = toTgt / dist;
+        const double cosAng = math::dot(fwd, toDir);
+
+        bool trackable = false;
+
+        if (seekerActive) {
+          trackable = (cosAng >= seekerFovCos);
+        } else {
+          // Midcourse (pre-activation): either legacy "perfect" updates (datalinkRangeKm==0),
+          // or a range/LOS gated datalink from the launching platform.
+          const double dlRangeKm = std::max(0.0, m.datalinkRangeKm);
+          if (dlRangeKm <= 0.0) {
+            trackable = true;
+          } else if (targets && targetCount > 0) {
+            const SphereTarget* shooter = nullptr;
+            for (std::size_t si = 0; si < targetCount; ++si) {
+              const SphereTarget& s = targets[si];
+              if (s.id != m.shooterId) continue;
+              if (s.kind != CombatTargetKind::Ship && s.kind != CombatTargetKind::Player) continue;
+              shooter = &s;
+              break;
+            }
+
+            if (shooter) {
+              const double dlRangeSq = dlRangeKm * dlRangeKm;
+              const double distLinkSq = (lockedTarget->centerKm - shooter->centerKm).lengthSq();
+              if (distLinkSq <= dlRangeSq + 1.0e-9) {
+                trackable = true;
+
+                if (m.datalinkRequireLineOfSight) {
+                  const double pad = std::max(0.0, m.datalinkOcclusionPadKm);
+                  if (occludedByAsteroidSpheres(shooter->centerKm,
+                                               lockedTarget->centerKm,
+                                               targets,
+                                               targetCount,
+                                               pad)) {
+                    trackable = false;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Optional LOS + (radar) doppler notch filters apply only during the active seeker phase.
+        if (trackable && seekerActive) {
+          if (m.requireLineOfSight) {
+            const double pad = std::max(0.0, m.lineOfSightOcclusionPadKm);
+            if (occludedByAsteroidSpheres(m.posKm, lockedTarget->centerKm, targets, targetCount, pad)) {
+              trackable = false;
+            }
+          }
+
+          if (trackable && m.seeker == MissileSeekerType::Radar) {
+            const double notch = std::max(0.0, m.radarDopplerNotchKmS);
+            if (notch > 0.0) {
+              // Radial velocity along the line-of-sight. Near-zero magnitude implies a "beam"/notch.
+              const double vrKmS = math::dot(lockedTarget->velKmS - v, toDir);
+              if (std::fabs(vrKmS) < notch) {
+                trackable = false;
+              }
+            }
+          }
+        }
+
+        if (trackable) {
+          // Seed / maintain an internal seeker pointing direction.
+          //
+          // During the pre-activation phase (midcourse datalink), keep this aligned to the locked
+          // target so the active seeker can "come up" already pointed near the correct track.
+          if (!m.hasSeekerDir) {
+            m.hasSeekerDir = true;
+            m.seekerDirWorld = toDir;
+          } else if (!seekerActive) {
+            m.seekerDirWorld = toDir;
+          }
+
+          // Update target memory even if a decoy later overrides guidance.
+          m.hasLastKnownTarget = true;
+          m.lastKnownTargetPosKm = lockedTarget->centerKm;
+          m.lastKnownTargetVelKmS = lockedTarget->velKmS;
+          m.lastKnownTargetAgeSimSec = 0.0;
+
+          // APN target acceleration estimation (optional):
+          // finite-difference acceleration from direct velocity samples.
+          if (m.apnTargetAccelGain > 0.0) {
+            if (!m.hasTargetVelSample) {
+              m.hasTargetVelSample = true;
+              m.targetVelSampleKmS = lockedTarget->velKmS;
+              m.targetVelSampleAgeSimSec = 0.0;
+              m.targetAccelEstKmS2 = {0, 0, 0};
+            } else {
+              const double dtSample = std::max(1e-6, m.targetVelSampleAgeSimSec);
+              math::Vec3d aRaw = (lockedTarget->velKmS - m.targetVelSampleKmS) / dtSample;
+              const double maxA = std::max(0.0, m.apnMaxTargetAccelKmS2);
+              if (maxA > 0.0) aRaw = math::clampMagnitude(aRaw, maxA);
+              const double hl = std::max(0.0, m.apnAccelHalfLifeSimSec);
+              if (hl > 0.0) {
+                const double alpha = math::halfLifeAlpha(dtSim, hl);
+                m.targetAccelEstKmS2 = math::lerp(m.targetAccelEstKmS2, aRaw, alpha);
+              } else {
+                m.targetAccelEstKmS2 = aRaw;
+              }
+              m.targetVelSampleKmS = lockedTarget->velKmS;
+              m.targetVelSampleAgeSimSec = 0.0;
+            }
+          }
+
+          baseTarget = lockedTarget;
+          targetScore = 1.0 / (distSq + 1.0e-9);
+        }
+      }
+    }
+
+    // If the target is temporarily untrackable (e.g. leaves the seeker cone), fall back to
+    // a simple inertial-memory prediction for a short window.
+    if (!baseTarget && m.hasLastKnownTarget) {
+      memoryTarget.kind = m.targetKind;
+      memoryTarget.index = 0;
+      memoryTarget.id = m.targetId;
+      memoryTarget.centerKm = m.lastKnownTargetPosKm + m.lastKnownTargetVelKmS * m.lastKnownTargetAgeSimSec;
+      memoryTarget.velKmS = m.lastKnownTargetVelKmS;
+      memoryTarget.radiusKm = 0.0;
+
+      baseTarget = &memoryTarget;
+
+      const math::Vec3d toMem = memoryTarget.centerKm - m.posKm;
+      targetScore = 1.0 / (toMem.lengthSq() + 1.0e-9);
+    }
+
+    // --- Seeker track quality (optional) ---
+    //
+    // Track quality rises while we have a direct measurement of the locked target and
+    // decays while guiding on memory or without a track. It is used to modulate decoy
+    // resistance so countermeasures become more effective after a lock break.
+    if (m.enableTrackQuality && seekerActive) {
+      m.trackQuality = std::clamp(m.trackQuality, 0.0, 1.0);
+
+      const double riseHl = std::max(0.0, m.trackQualityRiseHalfLifeSimSec);
+      const double fallHl = std::max(0.0, m.trackQualityFallHalfLifeSimSec);
+
+      // Measurement quality in [0,1].
+      //
+      // With seeker slew enabled, lock quality can drop even while the target remains inside the
+      // FOV: high line-of-sight rates (close merges / sharp maneuvers) can outpace the seeker.
+      // This reduces decoy resistance and makes evasive flying + countermeasures matter.
+      double measQ = 0.0;
+      const bool directTrack = (lockedTarget && baseTarget == lockedTarget);
+      if (directTrack) {
+        // Default (no slew): behave like a perfect lock.
+        measQ = 1.0;
+
+        if (m.seekerSlewRateRadS > 0.0) {
+          const math::Vec3d to = lockedTarget->centerKm - m.posKm;
+          if (to.lengthSq() > 1e-12) {
+            const math::Vec3d toDir = to.normalized();
+
+            // If the state wasn't seeded (e.g. missiles spawned mid-flight), assume it starts aligned.
+            if (!m.hasSeekerDir) {
+              m.hasSeekerDir = true;
+              m.seekerDirWorld = toDir;
+            }
+
+            math::Vec3d sDir = m.seekerDirWorld;
+            if (sDir.lengthSq() < 1e-12) sDir = toDir;
+            else sDir = sDir.normalized();
+
+            const double align = std::clamp(math::dot(sDir, toDir), -1.0, 1.0);
+            const double denom = std::max(1e-6, 1.0 - seekerFovCos);
+            measQ = std::clamp((align - seekerFovCos) / denom, 0.0, 1.0);
+          }
+        }
       }
 
-      // --- Countermeasure / decoy attraction ---
-      const SphereTarget* bestDecoy = nullptr;
-      double bestDecoyScore = 0.0;
+      const bool rising = (measQ >= m.trackQuality);
+      const double hl = rising ? riseHl : fallHl;
+      const double alpha = math::halfLifeAlpha(dtSim, hl);
+      m.trackQuality = std::clamp(math::lerp(m.trackQuality, measQ, alpha), 0.0, 1.0);
+    } else {
+      // Clamp defensively so callers can safely read the value.
+      m.trackQuality = std::clamp(m.trackQuality, 0.0, 1.0);
+    }
 
-      if (targetScore > 0.0) {
-        const math::Vec3d fwd = v.normalized();
-        const double fovCos = std::clamp(m.seekerFovCos, -1.0, 1.0);
+    // Effective decoy resistance can be reduced when track quality is poor.
+    double effectiveDecoyResistance = std::max(0.0, m.decoyResistance);
+    if (m.enableTrackQuality && seekerActive) {
+      const double floor = std::clamp(m.trackQualityResistFloor, 0.0, 1.0);
+      effectiveDecoyResistance *= math::lerp(floor, 1.0, m.trackQuality);
+    }
+
+    // --- Countermeasure / decoy attraction ---
+    const SphereTarget* candidateGuide = baseTarget;
+
+    const SphereTarget* bestDecoy = nullptr;
+    double bestDecoyScore = 0.0;
+
+    // Only consider decoys when we have a meaningful locked target score (real or memory)
+    // *and* the seeker's active phase has begun.
+    if (seekerActive && targetScore > 0.0 && targets && targetCount > 0) {
+
+      // Optional range/angle/doppler discrimination gates around the currently tracked target.
+      // These help (radar) seekers ignore decoys that are obviously not part of the true track.
+      const double angleGateCos = std::clamp(m.decoyAngleGateCos, -1.0, 1.0);
+      const double rangeGateKm = std::max(0.0, m.decoyRangeGateKm);
+      const double dopplerGateKmS = std::max(0.0, m.decoyDopplerGateKmS);
+
+      bool haveGateRef = false;
+      math::Vec3d toTargetDir{0, 0, 1};
+      double targetRangeKm = 0.0;
+      double targetVrKmS = 0.0;
+
+      if (baseTarget) {
+        const math::Vec3d toTgt = baseTarget->centerKm - m.posKm;
+        const double r2 = toTgt.lengthSq();
+        if (r2 > 1e-12) {
+          targetRangeKm = std::sqrt(r2);
+          toTargetDir = toTgt / targetRangeKm;
+
+          // Positive vr means the track is opening (range increasing).
+          targetVrKmS = math::dot(baseTarget->velKmS - m.velKmS, toTargetDir);
+          haveGateRef = true;
+        }
+      }
+
+      // Optional close-range burn-through: reduce decoy attraction when the
+      // missile is near its current target track.
+      double burnThroughFactor = 1.0;
+      if (m.seeker == MissileSeekerType::Radar) {
+        const double btRange = std::max(0.0, m.decoyBurnThroughRangeKm);
+        if (btRange > 1e-9 && haveGateRef) {
+          const double minF = std::clamp(m.decoyBurnThroughMinFactor, 0.0, 1.0);
+          const double t = std::clamp(targetRangeKm / btRange, 0.0, 1.0);
+          burnThroughFactor = minF * (1.0 - t) + t;
+        }
+      }
+
+      for (std::size_t i = 0; i < targetCount; ++i) {
+        const SphereTarget& t = targets[i];
+        if (t.kind != CombatTargetKind::Decoy) continue;
+
+        const double strength = (m.seeker == MissileSeekerType::Radar) ? t.decoyRadar : t.decoyHeat;
+        if (strength <= 0.0) continue;
+
+        const math::Vec3d to = t.centerKm - m.posKm;
+        const double distSq = to.lengthSq();
+        if (distSq < 1e-12) continue;
+
+        const double dist = std::sqrt(distSq);
+        const math::Vec3d toDir = to / dist;
+
+        const double cosAng = math::dot(fwd, toDir);
+        if (cosAng < seekerFovCos) continue;
+
+        if (m.requireLineOfSight) {
+          const double pad = std::max(0.0, m.lineOfSightOcclusionPadKm);
+          if (occludedByAsteroidSpheres(m.posKm, t.centerKm, targets, targetCount, pad)) {
+            continue;
+          }
+        }
+
+        double score = (strength * std::max(0.0, cosAng)) / (distSq + 1.0e-9);
+
+        // Burn-through is applied after basic geometry and FOV checks.
+        score *= burnThroughFactor;
+
+        // Apply optional gates relative to the locked track (if available).
+        if (haveGateRef) {
+          if (angleGateCos > -0.5) {
+            const double sepCos = math::dot(toTargetDir, toDir);
+            if (sepCos < angleGateCos) continue;
+          }
+
+          if (rangeGateKm > 0.0) {
+            const double sep = std::fabs(dist - targetRangeKm);
+            const double k = 1.0 - sep / rangeGateKm;
+            if (k <= 0.0) continue;
+            score *= std::clamp(k, 0.0, 1.0);
+          }
+
+          if (dopplerGateKmS > 0.0) {
+            const double vr = math::dot(t.velKmS - m.velKmS, toDir);
+            const double dv = std::fabs(vr - targetVrKmS);
+            const double k = 1.0 - dv / dopplerGateKmS;
+            if (k <= 0.0) continue;
+            score *= std::clamp(k, 0.0, 1.0);
+          }
+        }
+
+        if (score > bestDecoyScore) {
+          bestDecoyScore = score;
+          bestDecoy = &t;
+        }
+      }
+
+      const double resist = effectiveDecoyResistance;
+      if (bestDecoy && bestDecoyScore > targetScore * resist) {
+        candidateGuide = bestDecoy;
+      }
+    }
+
+    // --- Autonomous target acquisition (optional) ---
+    //
+    // If we don't have a trackable target (real or memory) and the seeker is active, allow
+    // the missile to acquire a new Ship/Player target within a limited range.
+    if (!candidateGuide && seekerActive) {
+      const double acquireRangeKm = std::max(0.0, m.autoAcquireRangeKm);
+      if (acquireRangeKm > 0.0 && targets && targetCount > 0) {
+        const bool allowPlayer = !m.fromPlayer;
+
+        const SphereTarget* best = nullptr;
+        double bestScore = 0.0;
 
         for (std::size_t i = 0; i < targetCount; ++i) {
           const SphereTarget& t = targets[i];
-          if (t.kind != CombatTargetKind::Decoy) continue;
-
-          const double strength = (m.seeker == MissileSeekerType::Radar) ? t.decoyRadar : t.decoyHeat;
-          if (strength <= 0.0) continue;
+          if (t.kind != CombatTargetKind::Ship && t.kind != CombatTargetKind::Player) continue;
+          if (!allowPlayer && t.kind == CombatTargetKind::Player) continue;
+          if (m.shooterId != 0 && t.id != 0 && t.id == m.shooterId) continue;
 
           const math::Vec3d to = t.centerKm - m.posKm;
           const double distSq = to.lengthSq();
           if (distSq < 1e-12) continue;
 
-          const math::Vec3d toDir = to.normalized();
-          const double cosAng = math::dot(fwd, toDir);
-          if (cosAng < fovCos) continue;
+          const double dist = std::sqrt(distSq);
+          if (dist > acquireRangeKm) continue;
 
-          const double score = (strength * std::max(0.0, cosAng)) / (distSq + 1.0e-9);
-          if (score > bestDecoyScore) {
-            bestDecoyScore = score;
-            bestDecoy = &t;
+          const math::Vec3d toDir = to / dist;
+          const double cosAng = math::dot(fwd, toDir);
+
+          double req = seekerFovCos;
+          if (t.minAimCos > -0.5) req = std::max(req, t.minAimCos);
+          if (cosAng < req) continue;
+
+          if (m.requireLineOfSight) {
+            const double pad = std::max(0.0, m.lineOfSightOcclusionPadKm);
+            if (occludedByAsteroidSpheres(m.posKm, t.centerKm, targets, targetCount, pad)) {
+              continue;
+            }
+          }
+
+          if (m.seeker == MissileSeekerType::Radar) {
+            const double notch = std::max(0.0, m.radarDopplerNotchKmS);
+            if (notch > 0.0) {
+              const double vrKmS = math::dot(t.velKmS - v, toDir);
+              if (std::fabs(vrKmS) < notch) {
+                continue;
+              }
+            }
+          }
+
+          // Prefer targets close to boresight and nearby.
+          const double score = std::max(0.0, cosAng) / (distSq + 1.0e-9);
+          if (score > bestScore) {
+            bestScore = score;
+            best = &t;
+          }
+        }
+
+        if (best) {
+          // Capture the new lock.
+          m.hasTarget = true;
+          m.targetKind = best->kind;
+          m.targetId = best->id;
+
+          // Refresh memory and seed score for potential decoy comparison.
+          m.hasLastKnownTarget = true;
+          m.lastKnownTargetPosKm = best->centerKm;
+          m.lastKnownTargetVelKmS = best->velKmS;
+          m.lastKnownTargetAgeSimSec = 0.0;
+
+          // Reset APN estimator state for the new lock (avoids cross-target spikes).
+          m.hasTargetVelSample = false;
+          m.targetVelSampleAgeSimSec = 0.0;
+          m.targetAccelEstKmS2 = {0, 0, 0};
+
+          candidateGuide = best;
+          targetScore = 1.0 / ((best->centerKm - m.posKm).lengthSq() + 1.0e-9);
+        }
+      }
+    }
+
+    // Optional: if we recently switched to a decoy, keep guiding to it for a minimum
+    // time window (prevents rapid thrashing and makes countermeasures "commit" the missile).
+    const SphereTarget* committedDecoy = nullptr;
+    if (m.decoyCommitRemainingSimSec > 0.0 && m.committedDecoyId != 0 && targets && targetCount > 0) {
+
+      for (std::size_t i = 0; i < targetCount; ++i) {
+        const SphereTarget& t = targets[i];
+        if (t.kind != CombatTargetKind::Decoy) continue;
+        if (t.id != m.committedDecoyId) continue;
+
+        const math::Vec3d to = t.centerKm - m.posKm;
+        if (to.lengthSq() < 1e-12) {
+          committedDecoy = &t;
+          break;
+        }
+
+        const math::Vec3d toDir = to.normalized();
+        const double cosAng = math::dot(fwd, toDir);
+        if (cosAng >= seekerFovCos) {
+          bool visible = true;
+          if (m.requireLineOfSight) {
+            const double pad = std::max(0.0, m.lineOfSightOcclusionPadKm);
+            if (occludedByAsteroidSpheres(m.posKm, t.centerKm, targets, targetCount, pad)) {
+              visible = false;
+            }
+          }
+          if (visible) {
+            committedDecoy = &t;
+          }
+        }
+        break;
+      }
+
+      if (!committedDecoy) {
+        // Lost the committed decoy (expired/out of FOV): clear the latch early.
+        m.decoyCommitRemainingSimSec = 0.0;
+        m.committedDecoyId = 0;
+      }
+    }
+
+    guide = committedDecoy ? committedDecoy : candidateGuide;
+
+    // Start a new commitment window when we first switch to a decoy.
+    if (seekerActive && !committedDecoy && guide && guide->kind == CombatTargetKind::Decoy) {
+      const double hold = std::max(0.0, m.decoyCommitSimSec);
+      if (hold > 0.0 && guide->id != m.committedDecoyId) {
+        m.committedDecoyId = guide->id;
+        m.decoyCommitRemainingSimSec = hold;
+      }
+    }
+
+    // If we're not guiding to a decoy and no commitment is active, clear the latch so a
+    // future decoy can start a fresh commitment window.
+    if (!committedDecoy && (!guide || guide->kind != CombatTargetKind::Decoy) && m.decoyCommitRemainingSimSec <= 0.0) {
+      m.committedDecoyId = 0;
+    }
+
+
+    // --- Seeker gimbal dynamics (optional) ---
+    //
+    // Maintain an internal seeker pointing direction that slews toward the currently guided target.
+    // This direction feeds into track quality (next frame) and helps model lock breaks during
+    // high-LOS-rate situations.
+    if (!m.hasSeekerDir) {
+      m.hasSeekerDir = true;
+      m.seekerDirWorld = fwd;
+    }
+    if (m.seekerDirWorld.lengthSq() < 1e-12) m.seekerDirWorld = fwd;
+    else m.seekerDirWorld = m.seekerDirWorld.normalized();
+
+    if (seekerActive && guide) {
+      const math::Vec3d to = guide->centerKm - m.posKm;
+      if (to.lengthSq() > 1e-12) {
+        const math::Vec3d toDir = to.normalized();
+
+        // Only slew when the guide is within the seeker cone. Memory guidance can point anywhere,
+        // but the seeker itself should not "snap" to off-FOV predictions.
+        const double cosAng = math::dot(fwd, toDir);
+        if (cosAng >= seekerFovCos) {
+          const double slew = std::max(0.0, m.seekerSlewRateRadS);
+          if (slew <= 0.0) {
+            m.seekerDirWorld = toDir;
+          } else {
+            m.seekerDirWorld = rotateTowards(m.seekerDirWorld, toDir, slew * dtSim);
+            if (m.seekerDirWorld.lengthSq() < 1e-12) m.seekerDirWorld = toDir;
+            else m.seekerDirWorld = m.seekerDirWorld.normalized();
           }
         }
       }
-
-      const double resist = std::max(0.0, m.decoyResistance);
-      guide = (bestDecoy && bestDecoyScore > targetScore * resist) ? bestDecoy : tgt;
     }
-
-    // If we didn't find the locked target, keep flying forward.
-    if (!guide) guide = tgt;
 
     // Desired direction used by LeadPursuit mode (and as a fallback).
     if (guide) {
+      const double leadSpeed = guidanceSpeedKmS(m, speed);
       const auto lead = solveProjectileLead(m.posKm,
                                             /*shooterVelKmS=*/{0, 0, 0},
                                             guide->centerKm,
                                             guide->velKmS,
-                                            speed,
+                                            leadSpeed,
                                             /*maxTimeSec=*/1.0e6,
                                             /*minTimeSec=*/1.0e-3);
       if (lead && lead->aimDirWorld.lengthSq() > 1e-12) {
@@ -351,37 +1330,176 @@ void stepMissiles(std::vector<Missile>& missiles,
 
 
     const math::Vec3d vHat = v.normalized();
-    const bool allowProNav = (m.guidance == MissileGuidance::ProNav) && guide && (guide->kind != CombatTargetKind::Decoy);
+    const bool allowProNav =
+        (m.guidance == MissileGuidance::ProNav) && guide && (guide->kind != CombatTargetKind::Decoy);
+
+    // Compute the commanded direction as if the missile could instantly achieve the required turn
+    // within this time step. If maxTurnAccelRadS2 > 0, an additional "autopilot lag" model will
+    // limit how fast the missile can actually change turn rate.
+    math::Vec3d newDirCmd = vHat;
     if (allowProNav) {
-      const math::Vec3d newDir = proNavSteerDir(vHat,
-                                               /*missileVelKmS=*/m.velKmS,
-                                               /*missileSpeedKmS=*/speed,
-                                               /*turnRateRadS=*/m.turnRateRadS,
-                                               dtSim,
-                                               m.posKm,
-                                               *guide,
-                                               m.navConstant);
-      m.velKmS = newDir * speed;
+      const math::Vec3d apnAccelKmS2 = m.targetAccelEstKmS2;
+      double apnGain = std::max(0.0, m.apnTargetAccelGain);
+      if (m.enableTrackQuality && seekerActive) apnGain *= m.trackQuality;
+      const double apnMaxA = std::max(0.0, m.apnMaxTargetAccelKmS2);
+      newDirCmd = proNavSteerDir(vHat,
+                                /*missileVelKmS=*/m.velKmS,
+                                /*missileSpeedKmS=*/speed,
+                                /*turnRateRadS=*/turnRateRadS,
+                                dtSim,
+                                m.posKm,
+                                *guide,
+                                m.navConstant,
+                                /*targetAccelKmS2=*/apnAccelKmS2,
+                                /*apnTargetAccelGain=*/apnGain,
+                                /*apnMaxTargetAccelKmS2=*/apnMaxA,
+                                /*fallbackAimDir=*/desiredDir);
     } else {
-      const double maxTurn = std::max(0.0, m.turnRateRadS) * dtSim;
-      const math::Vec3d newDir = rotateTowards(vHat, desiredDir, maxTurn);
-      m.velKmS = newDir * speed;
+      const double maxTurn = std::max(0.0, turnRateRadS) * dtSim;
+      newDirCmd = rotateTowards(vHat, desiredDir, maxTurn);
     }
 
-    const math::Vec3d b = m.posKm + m.velKmS * dtSim;
+    // Optional: deterministic swarm/formation coordination.
+    // Apply a small bounded heading bias derived from nearby friendly missiles
+    // pursuing the same target (reduces stacking and creates multi-axis attacks).
+    newDirCmd = applySwarmBiasDir(m, mi, swarmSnap, vHat, newDirCmd, turnRateRadS, dtSim);
+
+    // Optional: deterministic asteroid avoidance. Bias the commanded direction
+    // away from impending asteroid collisions inside a short look-ahead horizon.
+    newDirCmd = applyAsteroidAvoidanceDir(m,
+                                         m.posKm,
+                                         vHat,
+                                         speedForTurn,
+                                         turnRateRadS,
+                                         dtSim,
+                                         newDirCmd,
+                                         targets,
+                                         targetCount);
+
+    const double maxTurnAccel = std::max(0.0, m.maxTurnAccelRadS2);
+    if (maxTurnAccel > 0.0 && dtSim > 1e-9) {
+      if (!m.hasTurnOmega) {
+        m.hasTurnOmega = true;
+        m.turnOmegaWorld = {0, 0, 0};
+      }
+
+      // Convert the commanded direction into an angular-velocity command over this frame.
+      const double c = std::clamp(math::dot(vHat, newDirCmd), -1.0, 1.0);
+      const double ang = std::acos(c);
+      math::Vec3d omegaCmd{0, 0, 0};
+      if (ang > 1e-9) {
+        math::Vec3d axis = math::cross(vHat, newDirCmd);
+        const double al2 = axis.lengthSq();
+        if (al2 > 1e-18) {
+          axis = axis / std::sqrt(al2);
+          omegaCmd = axis * (ang / dtSim);
+        }
+      }
+
+      // Clamp commanded turn rate to the (possibly g-limited) maximum.
+      const double maxTR = std::max(0.0, turnRateRadS);
+      const double oc = omegaCmd.length();
+      if (oc > maxTR && oc > 1e-12) omegaCmd *= (maxTR / oc);
+
+      // Apply a per-frame angular acceleration limit.
+      math::Vec3d omega = m.turnOmegaWorld;
+      const math::Vec3d dOmega = omegaCmd - omega;
+      const double dMag = dOmega.length();
+      const double maxDelta = maxTurnAccel * dtSim;
+      if (dMag > maxDelta && dMag > 1e-12) {
+        omega += dOmega * (maxDelta / dMag);
+      } else {
+        omega = omegaCmd;
+      }
+
+      // Safety: clamp the resulting turn rate again.
+      const double om = omega.length();
+      if (om > maxTR && om > 1e-12) omega *= (maxTR / om);
+
+      m.turnOmegaWorld = omega;
+
+      // Integrate direction by applying the angular velocity.
+      const double omegaMag = omega.length();
+      math::Vec3d newDir = vHat;
+      if (omegaMag > 1e-12) {
+        const math::Vec3d axis = omega / omegaMag;
+        newDir = rotateAroundAxis(vHat, axis, omegaMag * dtSim);
+        if (newDir.lengthSq() < 1e-12) newDir = newDirCmd;
+        else newDir = newDir.normalized();
+      } else {
+        newDir = newDirCmd;
+      }
+
+      m.velKmS = newDir * speed;
+    } else {
+      // If the lag model is disabled, keep behavior fully deterministic and clear state.
+      m.hasTurnOmega = false;
+      m.turnOmegaWorld = {0, 0, 0};
+      m.velKmS = newDirCmd * speed;
+    }
+
+    // --- Motor model (optional) ---
+    // Treat this as a 1D boost/coast along the current velocity direction.
+    // Guidance determines direction; motor determines distance and next-frame speed.
+    math::Vec3d dir = m.velKmS.normalized();
+    if (dir.lengthSq() < 1e-12) dir = {0, 0, 1};
+
+    const double accel = std::max(0.0, m.thrustAccelKmS2);
+    const double maxSpeed = std::max(0.0, m.maxSpeedKmS);
+    double burnRem = std::max(0.0, m.motorBurnRemainingSimSec);
+
+    double stepDistKm = speed * dtSim;
+    double speedEnd = speed;
+
+    if (accel > 0.0 && burnRem > 0.0 && maxSpeed > speed + 1e-12) {
+      const double burnDt = std::min(dtSim, burnRem);
+      const double coastDt = dtSim - burnDt;
+
+      // Distance traveled during the burn.
+      const double tToMax = std::max(0.0, (maxSpeed - speed) / accel);
+      if (tToMax >= burnDt) {
+        // Never reaches max speed during this burn interval.
+        speedEnd = speed + accel * burnDt;
+        stepDistKm = speed * burnDt + 0.5 * accel * burnDt * burnDt;
+      } else {
+        // Accelerate until max speed, then cruise at max speed.
+        speedEnd = maxSpeed;
+        stepDistKm = speed * tToMax + 0.5 * accel * tToMax * tToMax;
+        stepDistKm += maxSpeed * (burnDt - tToMax);
+      }
+
+      // Coast after the burn (if the burn ends before dtSim).
+      if (coastDt > 0.0) {
+        stepDistKm += speedEnd * coastDt;
+      }
+
+      burnRem -= burnDt;
+      m.motorBurnRemainingSimSec = burnRem;
+    }
+
+    const math::Vec3d b = m.posKm + dir * stepDistKm;
+    m.velKmS = dir * speedEnd;
 
     m.prevKm = a;
     m.posKm = b;
     m.ttlSimSec -= dtSim;
+    m.ageSimSec = ageStart + dtSim;
 
     // --- Collision & detonation ---
     bool detonated = false;
+    double detT = 1.0; // normalized time along [a,b] where the detonation occurs
     math::Vec3d detPoint = b;
+
+    const SphereTarget* detTarget = nullptr;
+    bool detOnContact = false;
 
     if (targets && targetCount > 0) {
       const bool allowHitPlayer = !m.fromPlayer;
       const bool allowHitShips = true;
       const bool allowHitAsteroids = true;
+
+
+      const double fuseExtraKm = std::max(0.0, m.proximityFuseKm);
 
       double bestT = 2.0; // [0,1]
 
@@ -395,14 +1513,73 @@ void stepMissiles(std::vector<Missile>& missiles,
         // Avoid immediate self-hits when the shooter has a real id.
         if (m.shooterId != 0 && t.id != 0 && t.id == m.shooterId) continue;
 
-        const double hitRadiusKm = std::max(0.0, t.radiusKm) + std::max(0.0, m.radiusKm);
-        if (!segmentHitsSphereKm(a, b, t.centerKm, hitRadiusKm)) continue;
+        const double baseHitRadiusKm = std::max(0.0, t.radiusKm) + std::max(0.0, m.radiusKm);
 
-        const double tt = segmentClosestT(a, b, t.centerKm);
-        if (tt < bestT) {
-          bestT = tt;
-          detonated = true;
-          detPoint = a + (b - a) * tt;
+        // Linear relative motion: subtract target's swept center from the missile segment.
+        const math::Vec3d c0 = t.centerKm;
+        const math::Vec3d c1 = t.centerKm + t.velKmS * dtSim;
+
+        const math::Vec3d relA = a - c0;
+        const math::Vec3d relB = b - c1;
+
+        // ---- Direct collision ----
+        double tEnter = 0.0;
+        double tExit = 0.0;
+        if (math::segmentSphereIntersectionT(relA,
+                                            relB,
+                                            /*center=*/math::Vec3d{0, 0, 0},
+                                            baseHitRadiusKm,
+                                            tEnter,
+                                            tExit)) {
+          if (tEnter < bestT) {
+            bestT = tEnter;
+            detonated = true;
+            detT = tEnter;
+            detTarget = &t;
+            detOnContact = true;
+            if (bestT <= 0.0) break;
+          }
+          continue;
+        }
+
+        // ---- Proximity fuse (standoff detonation) ----
+        if (fuseExtraKm > 0.0) {
+          const double fuseRadiusKm = baseHitRadiusKm + fuseExtraKm;
+
+          if (math::segmentSphereIntersectionT(relA,
+                                              relB,
+                                              /*center=*/math::Vec3d{0, 0, 0},
+                                              fuseRadiusKm,
+                                              tEnter,
+                                              tExit)) {
+            // Detonate near closest approach (inside the intersection window) for maximum effect.
+            double tClosest = math::segmentClosestT(relA, relB, math::Vec3d{0, 0, 0});
+            const double tDet = std::clamp(tClosest, tEnter, tExit);
+
+            if (tDet < bestT) {
+              bestT = tDet;
+              detonated = true;
+              detT = tDet;
+              detTarget = &t;
+              detOnContact = false;
+              if (bestT <= 0.0) break;
+            }
+          }
+        }
+      }
+
+      if (detonated) {
+        const math::Vec3d missileAtDet = a + (b - a) * detT;
+
+        if (detTarget && detOnContact) {
+          // For direct collisions, place the detonation on the target surface (instead of at the
+          // missile center) so contact hits deliver full damage to the impacted target.
+          const math::Vec3d centerAtDet = detTarget->centerKm + detTarget->velKmS * (dtSim * detT);
+          const math::Vec3d toMissile = missileAtDet - centerAtDet;
+          const math::Vec3d dir = math::safeNormalized(toMissile, math::Vec3d{0, 0, 1}, 1e-18);
+          detPoint = centerAtDet + dir * std::max(0.0, detTarget->radiusKm);
+        } else {
+          detPoint = missileAtDet;
         }
       }
     }
@@ -430,6 +1607,15 @@ void stepMissiles(std::vector<Missile>& missiles,
       const bool allowHitShips = true;
       const bool allowHitAsteroids = true;
 
+      const math::Vec3d detFwd = math::safeNormalized(dir, math::Vec3d{0, 0, 1}, 1e-12);
+      const double dirStrength = std::clamp(m.blastDirectionalStrength, 0.0, 1.0);
+      const double dirMin = std::clamp(m.blastDirectionalMinFactor, 0.0, 1.0);
+
+      const bool blastLos = m.blastRequireLineOfSight;
+      const double blastPad = std::max(0.0, m.blastLineOfSightOcclusionPadKm);
+      const double blastOccFactor = std::clamp(m.blastOccludedFactor, 0.0, 1.0);
+
+
       for (std::size_t ti = 0; ti < targetCount; ++ti) {
         const SphereTarget& t = targets[ti];
 
@@ -440,10 +1626,32 @@ void stepMissiles(std::vector<Missile>& missiles,
         // Avoid self splash when shooter has a real id.
         if (m.shooterId != 0 && t.id != 0 && t.id == m.shooterId) continue;
 
-        const double dist = (t.centerKm - detPoint).length();
+        const math::Vec3d centerAtDet = t.centerKm + t.velKmS * (dtSim * detT);
+        const math::Vec3d toVec = centerAtDet - detPoint;
+        const double dist = toVec.length();
         const double surface = std::max(0.0, dist - std::max(0.0, t.radiusKm));
-        const double k = std::clamp(1.0 - surface / det.blastRadiusKm, 0.0, 1.0);
+        double k = std::clamp(1.0 - surface / det.blastRadiusKm, 0.0, 1.0);
         if (k <= 0.0) continue;
+
+        // Directional blast shaping (optional).
+        if (dirStrength > 1e-9 && dist > 1e-9) {
+          const math::Vec3d toDir = toVec / dist;
+          const double cosAng = std::clamp(math::dot(detFwd, toDir), -1.0, 1.0);
+          const double forward01 = std::clamp(0.5 * (1.0 + cosAng), 0.0, 1.0);
+          const double shaped = dirMin + (1.0 - dirMin) * forward01;
+          const double factor = std::clamp((1.0 - dirStrength) + dirStrength * shaped, 0.0, 1.0);
+          k *= factor;
+          if (k <= 0.0) continue;
+        }
+
+        // Asteroid line-of-sight occlusion for blast damage (optional).
+        if (blastLos && dist > 1e-9) {
+          const core::u64 ignoreAsteroidId = (t.kind == CombatTargetKind::Asteroid) ? t.id : 0;
+          if (blastOccludedByAsteroidSpheres(detPoint, centerAtDet, targets, targetCount, blastPad, ignoreAsteroidId)) {
+            k *= blastOccFactor;
+            if (k <= 0.0) continue;
+          }
+        }
 
         MissileHit h{};
         h.kind = t.kind;
@@ -517,7 +1725,6 @@ FireResult tryFireWeapon(Ship& shooter,
   if (w.guided) {
     const double muzzleSpeedKmS = std::max(1e-6, w.projSpeedKmS);
     const double rangeKm = std::max(0.0, w.rangeKm);
-    const double ttlSim = rangeKm / muzzleSpeedKmS;
 
     math::Vec3d fwd = shooter.forward();
     if (fwd.lengthSq() < 1e-12) fwd = {0, 0, 1};
@@ -573,29 +1780,169 @@ FireResult tryFireWeapon(Ship& shooter,
     m.r = w.r;
     m.g = w.g;
     m.b = w.b;
-    m.ttlSimSec = ttlSim;
     m.radiusKm = 760.0;
     m.dmg = w.dmg;
     m.blastRadiusKm = std::max(0.0, w.blastRadiusKm);
+    // Default proximity fuse: detonate slightly before direct impact when we have a blast radius.
+    // This makes near-misses meaningful without changing pure direct-hit weapons.
+    m.proximityFuseKm = (m.blastRadiusKm > 0.0) ? (0.45 * m.blastRadiusKm) : 0.0;
+
+    // Warhead shaping: optional directional fragmentation + asteroid shadowing for blast damage.
+    if (m.blastRadiusKm > 0.0) {
+      // Allow asteroids to fully block splash damage (gameplay: "hide behind rocks").
+      m.blastRequireLineOfSight = true;
+      m.blastLineOfSightOcclusionPadKm = 0.0;
+      m.blastOccludedFactor = 0.0;
+
+      // Mild forward fragmentation bias (directional warhead approximation).
+      if (weapon == WeaponType::RadarMissile) {
+        m.blastDirectionalStrength = 0.65;
+        m.blastDirectionalMinFactor = 0.20;
+      } else {
+        m.blastDirectionalStrength = 0.45;
+        m.blastDirectionalMinFactor = 0.25;
+      }
+    }
     m.turnRateRadS = std::max(0.0, w.turnRateRadS);
+
+    // Motor model: short boost phase (boost/coast) for a snappier intercept.
+    // Defaults are conservative; missiles remain fully deterministic.
+    if (weapon == WeaponType::RadarMissile) {
+      m.thrustAccelKmS2 = 45.0;
+      m.motorBurnRemainingSimSec = 1.40;
+      const math::Vec3d maxVel = shooter.velocityKmS() + fwd * (muzzleSpeedKmS * 1.35);
+      m.maxSpeedKmS = std::max(m.velKmS.length(), maxVel.length());
+    } else {
+      m.thrustAccelKmS2 = 35.0;
+      m.motorBurnRemainingSimSec = 1.10;
+      const math::Vec3d maxVel = shooter.velocityKmS() + fwd * (muzzleSpeedKmS * 1.25);
+      m.maxSpeedKmS = std::max(m.velKmS.length(), maxVel.length());
+    }
+
+    // Turning "G-limit": as the missile accelerates, cap turn rate so lateral
+    // acceleration doesn't implicitly grow with speed.
+    m.maxLateralAccelKmS2 = muzzleSpeedKmS * m.turnRateRadS;
+
+    // Autopilot lag: limit turn acceleration so missiles do not snap to max turn rate
+    // instantly. This makes close-range evasive maneuvers (jink/beam) more meaningful.
+    //
+    // The value is expressed as rad/s^2 and scales with the missile's max turn rate.
+    m.maxTurnAccelRadS2 = m.turnRateRadS * ((weapon == WeaponType::RadarMissile) ? 18.0 : 12.0);
+
+    // Lifetime is computed from the motor profile so range remains stable even
+    // when missiles accelerate.
+    m.ttlSimSec = estimateBoostCoastTtlSimSec(rangeKm,
+                                             std::max(1e-6, m.velKmS.length()),
+                                             m.thrustAccelKmS2,
+                                             m.maxSpeedKmS,
+                                             m.motorBurnRemainingSimSec);
 
     // Seeker tuning (decoys + field-of-view).
     // Heat seekers can be lured by flares; radar seekers by chaff.
     // These parameters intentionally remain simple and deterministic.
     if (weapon == WeaponType::RadarMissile) {
       m.seeker = MissileSeekerType::Radar;
+      // Simple two-phase behavior: midcourse (datalink) then terminal active seeker.
+      // While the seeker is inactive, the missile ignores decoys and does not enforce FOV.
+      m.seekerActivationSimSec = 0.35;
+      // Midcourse datalink: while the active seeker is inactive, continue to receive
+      // target updates from the launching platform (range + optional LOS gate).
+      m.datalinkRangeKm = rangeKm;
+      m.datalinkRequireLineOfSight = true;
+      m.datalinkOcclusionPadKm = 0.0;
+      // Once active, allow limited autonomous reacquisition if the original lock is lost.
+      m.autoAcquireRangeKm = rangeKm;
       // Narrower seeker cone (radians -> cosine).
       m.seekerFovCos = std::cos(0.80);
+
+      // Seeker gimbal slew: fast but not instantaneous.
+      m.seekerSlewRateRadS = 9.0;
       // Slightly resistant to chaff, but can still be fooled.
       m.decoyResistance = 0.92;
+
+      // LOS + radar notch: simple deterministic terrain-masking hooks.
+      m.requireLineOfSight = true;
+      m.lineOfSightOcclusionPadKm = 0.0;
+      // Targets with very low radial velocity can be "notched" / beamed.
+      m.radarDopplerNotchKmS = 0.75;
+
+      // Optional decoy discrimination gates: approximate range/angle/doppler track gates.
+      // Radar seekers are fairly good at rejecting decoys not close to the true track.
+      m.decoyAngleGateCos = std::cos(0.35);
+      m.decoyRangeGateKm = 15000.0;
+      m.decoyDopplerGateKmS = 3.0;
+
+      // Track quality: makes chaff more effective after a lock break (e.g. notch/terrain).
+      m.enableTrackQuality = true;
+      m.trackQuality = 1.0;
+      m.trackQualityRiseHalfLifeSimSec = 0.18;
+      m.trackQualityFallHalfLifeSimSec = 0.35;
+      m.trackQualityResistFloor = 0.35;
+
+      // Close-range burn-through: at short range, chaff/jamming becomes less
+      // effective as the seeker can better discriminate the true target.
+      m.decoyBurnThroughRangeKm = 0.12 * rangeKm;
+      m.decoyBurnThroughMinFactor = 0.05;
+
+      // Asteroid avoidance: deterministic steering bias away from imminent collisions.
+      // Keeps missiles from suiciding into dense asteroid belts without a full path planner.
+      m.asteroidAvoidanceStrength = 0.85;
+      m.asteroidAvoidanceLookaheadSimSec = 1.0;
+      m.asteroidAvoidancePadKm = 0.0;
+
+      // Swarm coordination: encourage multi-axis attacks and avoid missiles
+      // stacking perfectly on the same path.
+      m.swarmSeparationStrength = 0.85;
+      m.swarmCohesionStrength = 0.12;
+      m.swarmAlignmentStrength = 0.18;
+      m.swarmSeparationKm = 3.0 * std::max(0.0, m.radiusKm);
+      m.swarmNeighborRangeKm = 14.0 * std::max(0.0, m.radiusKm);
     } else {
       // Default guided weapon: heat seeker.
       m.seeker = MissileSeekerType::Heat;
+      m.seekerActivationSimSec = 0.0;
+      // Heat seekers require a clean launch lock; no autonomous reacquisition by default.
+      m.autoAcquireRangeKm = 0.0;
       // Wider cone than radar.
       m.seekerFovCos = std::cos(0.95);
+
+      // Heat seekers typically have a slower gimbal than active radar.
+      m.seekerSlewRateRadS = 6.0;
       // Easier to decoy with flares.
       m.decoyResistance = 0.80;
+
+      // Heat seekers still need a clear LOS to maintain track.
+      m.requireLineOfSight = true;
+      m.lineOfSightOcclusionPadKm = 0.0;
+
+      // Track quality: makes flares more effective after brief FOV/LOS breaks.
+      m.enableTrackQuality = true;
+      m.trackQuality = 1.0;
+      m.trackQualityRiseHalfLifeSimSec = 0.12;
+      m.trackQualityFallHalfLifeSimSec = 0.22;
+      m.trackQualityResistFloor = 0.20;
+
+      // Asteroid avoidance: heat seekers are a bit less aggressive.
+      m.asteroidAvoidanceStrength = 0.65;
+      m.asteroidAvoidanceLookaheadSimSec = 0.8;
+      m.asteroidAvoidancePadKm = 0.0;
+
+      // Swarm coordination: lighter than radar missiles (heat seekers are more
+      // easily decoyed and shouldn't over-coordinate).
+      m.swarmSeparationStrength = 0.55;
+      m.swarmCohesionStrength = 0.08;
+      m.swarmAlignmentStrength = 0.10;
+      m.swarmSeparationKm = 2.6 * std::max(0.0, m.radiusKm);
+      m.swarmNeighborRangeKm = 11.0 * std::max(0.0, m.radiusKm);
     }
+
+    // Decoy commitment: once fooled by a countermeasure, keep steering toward it
+    // for a short, weapon-tuned minimum time window (prevents jittery lock switching).
+    m.decoyCommitSimSec = (weapon == WeaponType::RadarMissile) ? 0.15 : 0.45;
+
+    // Target memory window (inertial midcourse): if the locked target briefly leaves
+    // the seeker cone, keep guiding toward the last known kinematics for a short time.
+    m.targetMemorySimSec = (weapon == WeaponType::RadarMissile) ? 2.25 : 0.85;
 
     // Guidance: radar missiles use proportional navigation for cleaner intercepts
     // against maneuvering targets, while heat seekers keep the older lead-pursuit
@@ -603,6 +1950,13 @@ FireResult tryFireWeapon(Ship& shooter,
     if (weapon == WeaponType::RadarMissile) {
       m.guidance = MissileGuidance::ProNav;
       m.navConstant = 4.0;
+
+      // APN (augmented proportional navigation): target-acceleration feed-forward
+      // improves intercept quality against hard-turning targets. Classical scaling
+      // is ~N/2; we also filter/clamp the finite-difference estimate for stability.
+      m.apnTargetAccelGain = 0.5 * m.navConstant;
+      m.apnMaxTargetAccelKmS2 = 2.5;
+      m.apnAccelHalfLifeSimSec = 0.12;
     } else {
       m.guidance = MissileGuidance::LeadPursuit;
       m.navConstant = 3.5;

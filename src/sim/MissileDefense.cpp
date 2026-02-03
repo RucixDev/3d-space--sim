@@ -9,11 +9,6 @@
 
 namespace stellar::sim {
 
-static math::Vec3d safeNormalized(const math::Vec3d& v, const math::Vec3d& fallback) {
-  if (v.lengthSq() < 1e-12) return fallback;
-  return v.normalized();
-}
-
 MissileThreatSummary nearestInboundMissile(const Missile* missiles,
                                           std::size_t missileCount,
                                           CombatTargetKind targetKind,
@@ -42,8 +37,8 @@ MissileThreatSummary nearestInboundMissile(const Missile* missiles,
     const double distKm = toTarget.length();
     if (distKm > maxDist) continue;
 
-    const math::Vec3d toDir = safeNormalized(toTarget, math::Vec3d{0, 0, 1});
-    const math::Vec3d mvDir = safeNormalized(m.velKmS, math::Vec3d{0, 0, 1});
+    const math::Vec3d toDir = math::safeNormalized(toTarget, math::Vec3d{0, 0, 1}, 1e-12);
+    const math::Vec3d mvDir = math::safeNormalized(m.velKmS, math::Vec3d{0, 0, 1}, 1e-12);
     const double approachCos = math::dot(mvDir, toDir);
     if (approachCos < minCos) continue;
 
@@ -90,7 +85,7 @@ static math::Vec3d unitPerpFromSeed(const math::Vec3d& axisIn, core::u64 seed) {
   const double ang = rng.range(0.0, 2.0 * std::numbers::pi);
   const double cs = std::cos(ang);
   const double sn = std::sin(ang);
-  return safeNormalized(b * cs + c * sn, b);
+  return math::safeNormalized(b * cs + c * sn, b, 1e-12);
 }
 
 MissileEvasionPlan planMissileEvasion(const Missile& missile,
@@ -106,7 +101,7 @@ MissileEvasionPlan planMissileEvasion(const Missile& missile,
 
   const double distSq = r.lengthSq();
   const double dist = std::sqrt(std::max(0.0, distSq));
-  const math::Vec3d los = safeNormalized(r, math::Vec3d{0, 0, 1});
+  const math::Vec3d los = math::safeNormalized(r, math::Vec3d{0, 0, 1}, 1e-12);
 
   const double vSq = v.lengthSq();
   const double vLen = std::sqrt(std::max(0.0, vSq));
@@ -151,12 +146,53 @@ MissileEvasionPlan planMissileEvasion(const Missile& missile,
     dir = unitPerpFromSeed(v, seed);
   }
 
+  // Optional: radar "beaming" bias.
+  //
+  // If the inbound missile is a radar seeker that models a doppler notch, bias the
+  // jink direction toward rotating the target's velocity into the plane perpendicular
+  // to the current line-of-sight. This increases LOS rate / reduces range-rate in a
+  // deterministic way and synergizes with the notch mechanic.
+  if (params.enableRadarBeaming && missile.seeker == MissileSeekerType::Radar) {
+    const double notch = std::max(0.0, missile.radarDopplerNotchKmS);
+    const double blend = std::clamp(params.radarBeamBlend, 0.0, 1.0);
+    const double engageMul = std::max(0.0, params.radarBeamEngageNotchMultiple);
+    if (notch > 0.0 && blend > 0.0) {
+      // LOS from missile to target.
+      const math::Vec3d toDir = -los;
+      const double vrKmS = math::dot(targetVelKmS - missile.velKmS, toDir);
+      const double absVr = std::fabs(vrKmS);
+
+      if (absVr > notch * engageMul) {
+        // Desired velocity direction: current velocity projected into the LOS-perpendicular plane.
+        const double vT = targetVelKmS.length();
+
+        math::Vec3d vPerp = targetVelKmS - toDir * math::dot(targetVelKmS, toDir);
+        if (vPerp.lengthSq() < 1e-12) {
+          // Degenerate (already LOS-aligned or nearly zero speed): pick any perpendicular direction.
+          const math::Vec3d u = unitPerpFromSeed(toDir, seed ^ 0x6d4f2e31b7a3c0d5ull);
+          vPerp = (vT > 1e-9) ? (u * vT) : u;
+        } else {
+          vPerp = vPerp.normalized() * std::max(0.0, vT);
+        }
+
+        const math::Vec3d deltaV = vPerp - targetVelKmS;
+        const math::Vec3d fallback = unitPerpFromSeed(toDir, seed ^ 0x9e3779b97f4a7c15ull);
+        const math::Vec3d beamDir = math::safeNormalized(deltaV, fallback, 1e-12);
+
+        // Engagement weight ramps up as we exceed the notch threshold.
+        const double w = std::clamp((absVr - notch) / std::max(absVr, 1e-9), 0.0, 1.0) * blend;
+
+        dir = math::safeNormalized(dir * (1.0 - w) + beamDir * w, dir, 1e-12);
+      }
+    }
+  }
+
   if (params.enforceLateralToLos) {
     // Project into the plane perpendicular to LOS (lateral jink).
     dir = dir - los * math::dot(dir, los);
-    dir = safeNormalized(dir, unitPerpFromSeed(los, seed ^ 0x9e3779b97f4a7c15ull));
+    dir = math::safeNormalized(dir, unitPerpFromSeed(los, seed ^ 0x9e3779b97f4a7c15ull), 1e-12);
   } else {
-    dir = safeNormalized(dir, unitPerpFromSeed(los, seed ^ 0x9e3779b97f4a7c15ull));
+    dir = math::safeNormalized(dir, unitPerpFromSeed(los, seed ^ 0x9e3779b97f4a7c15ull), 1e-12);
   }
 
   out.dirWorld = dir;

@@ -1,25 +1,11 @@
 #include "stellar/sim/TimeTrial.h"
 
+#include "stellar/math/Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 
 namespace stellar::sim {
-
-static math::Vec3d safeNormalize(const math::Vec3d& v, const math::Vec3d& fallback) {
-  const double ls = v.lengthSq();
-  if (ls < 1e-18) return fallback;
-  return v / std::sqrt(ls);
-}
-
-static math::Vec3d anyPerpendicularUnit(const math::Vec3d& n) {
-  // Pick a reference vector that is unlikely to be parallel to n.
-  const math::Vec3d ref = (std::abs(n.x) < 0.6) ? math::Vec3d{1,0,0} : math::Vec3d{0,1,0};
-  math::Vec3d u = math::cross(n, ref);
-  if (u.lengthSq() < 1e-18) {
-    u = math::cross(n, {0,0,1});
-  }
-  return safeNormalize(u, {1,0,0});
-}
 
 core::u64 hashPosKmQuantized(const math::Vec3d& pKm, double quantumKm) {
   const double q = (quantumKm <= 0.0) ? 1.0 : quantumKm;
@@ -102,14 +88,14 @@ TimeTrialCourse generateTimeTrialCourseStationSlalomKm(const math::Vec3d& anchor
     }
 
     out.gates[i].posKm = a;
-    out.gates[i].normal = safeNormalize(dir, fwd);
+    out.gates[i].normal = math::safeNormalized(dir, fwd, 1e-18);
     out.gates[i].radiusKm = gateR;
   }
 
   // If the last gate isn't part of a loop, give it a reasonable normal so the
   // player has a direction to fly through.
   if (!p.closedLoop && n >= 2) {
-    out.gates[n - 1].normal = safeNormalize(out.gates[n - 1].normal, out.gates[n - 2].normal);
+    out.gates[n - 1].normal = math::safeNormalized(out.gates[n - 1].normal, out.gates[n - 2].normal, 1e-18);
   }
 
   return out;
@@ -120,27 +106,21 @@ bool timeTrialGatePassed(const TimeTrialGate& g,
                          const math::Vec3d& posKm,
                          const math::Vec3d& velKmS,
                          double* outTHit) {
-  const math::Vec3d n = safeNormalize(g.normal, {0,0,1});
+  const math::Vec3d n = math::safeNormalized(g.normal, {0,0,1}, 1e-18);
 
-  const math::Vec3d a = prevPosKm - g.posKm;
-  const math::Vec3d b = posKm - g.posKm;
-
-  const double d0 = math::dot(a, n);
-  const double d1 = math::dot(b, n);
+  const double d0 = math::planeSignedDistance(prevPosKm, g.posKm, n);
+  const double d1 = math::planeSignedDistance(posKm, g.posKm, n);
 
   // Must cross from negative to positive side (forward direction).
   if (!(d0 < 0.0 && d1 >= 0.0)) return false;
 
-  // Segment intersection with plane: prev + t*(pos-prev)
-  const double denom = (d0 - d1);
   double t = 0.0;
-  if (std::abs(denom) > 1e-12) {
-    t = d0 / denom; // in [0,1] for segment
+  math::Vec3d p{};
+  if (!math::segmentPlaneIntersection(prevPosKm, posKm, g.posKm, n, t, p)) {
+    return false;
   }
-  t = std::clamp(t, 0.0, 1.0);
 
   if (outTHit) *outTHit = t;
-  const math::Vec3d p = prevPosKm + (posKm - prevPosKm) * t;
 
   const double r2 = g.radiusKm * g.radiusKm;
   if ((p - g.posKm).lengthSq() > r2) return false;

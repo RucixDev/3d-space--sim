@@ -119,5 +119,29 @@ int test_ship_dampers() {
     CHECK(approxVec(vA, vB, 1e-9));
   }
 
+  // ---- Orientation integration should be dt-invariant for constant angular velocity. ----
+  {
+    sim::ShipInput no{};
+    no.thrustLocal = {0.0, 0.0, 0.0};
+    no.torqueLocal = {0.0, 0.0, 0.0};
+    no.dampers = false;
+    no.brake = false;
+    no.boost = false;
+
+    sim::Ship a = makeTestShip();
+    a.setAngularVelocityRadS({0.2, -0.4, 1.0});
+    a.step(0.1, no);
+    const auto fA = a.orientation().rotate({0.0, 0.0, 1.0});
+
+    sim::Ship b = makeTestShip();
+    b.setAngularVelocityRadS({0.2, -0.4, 1.0});
+    for (int i = 0; i < 10; ++i) {
+      b.step(0.01, no);
+    }
+    const auto fB = b.orientation().rotate({0.0, 0.0, 1.0});
+
+    CHECK(approxVec(fA, fB, 1e-9));
+  }
+
   return failures;
 }

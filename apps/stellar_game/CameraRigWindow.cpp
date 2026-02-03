@@ -1,6 +1,7 @@
 #include "CameraRigWindow.h"
 
 #include "stellar/math/Math.h"
+#include "stellar/math/Vec3.h"
 #include "stellar/math/Fov.h"
 #include "stellar/sim/Gravity.h"
 #include "stellar/sim/Ship.h"
@@ -116,126 +117,11 @@ void applyCameraRigPreset(CameraRigWindowState& st, CameraRigPreset preset, cons
 
 namespace {
 
-constexpr double kLN2 = 0.693147180559945309417232121458176568;
-
-static double halfLifeAlpha(double halfLifeSec, double dtSec) {
-  if (halfLifeSec <= 1e-6 || dtSec <= 0.0) return 1.0;
-  return 1.0 - std::exp(-kLN2 * dtSec / halfLifeSec);
-}
-
-static double quatDot(const math::Quatd& a, const math::Quatd& b) {
-  return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
 static double clampDeg(double v, double lo, double hi) {
   return std::max(lo, std::min(hi, v));
 }
 
-static math::Vec3d safeNormalized(const math::Vec3d& v, const math::Vec3d& fallback) {
-  const double lsq = v.lengthSq();
-  if (lsq <= 1e-18) return fallback;
-  return v * (1.0 / std::sqrt(lsq));
-}
-
-static math::Quatd quatFromBasis(const math::Vec3d& right,
-                                 const math::Vec3d& up,
-                                 const math::Vec3d& forward) {
-  // Columns are the world-space axes of the local basis.
-  const double m00 = right.x;
-  const double m01 = up.x;
-  const double m02 = forward.x;
-
-  const double m10 = right.y;
-  const double m11 = up.y;
-  const double m12 = forward.y;
-
-  const double m20 = right.z;
-  const double m21 = up.z;
-  const double m22 = forward.z;
-
-  const double trace = m00 + m11 + m22;
-  double w = 1.0, x = 0.0, y = 0.0, z = 0.0;
-
-  if (trace > 0.0) {
-    const double s = std::sqrt(trace + 1.0) * 2.0;
-    w = 0.25 * s;
-    x = (m21 - m12) / s;
-    y = (m02 - m20) / s;
-    z = (m10 - m01) / s;
-  } else if (m00 > m11 && m00 > m22) {
-    const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
-    w = (m21 - m12) / s;
-    x = 0.25 * s;
-    y = (m01 + m10) / s;
-    z = (m02 + m20) / s;
-  } else if (m11 > m22) {
-    const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
-    w = (m02 - m20) / s;
-    x = (m01 + m10) / s;
-    y = 0.25 * s;
-    z = (m12 + m21) / s;
-  } else {
-    const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
-    w = (m10 - m01) / s;
-    x = (m02 + m20) / s;
-    y = (m12 + m21) / s;
-    z = 0.25 * s;
-  }
-
-  return math::Quatd{w, x, y, z}.normalized();
-}
-
-static math::Quatd quatLookRotation(const math::Vec3d& forwardDir,
-                                    const math::Vec3d& upHint) {
-  const math::Vec3d f = safeNormalized(forwardDir, {0.0, 0.0, 1.0});
-  math::Vec3d u = safeNormalized(upHint, {0.0, 1.0, 0.0});
-
-  // If up is nearly parallel to forward, pick a fallback up.
-  if (std::abs(math::dot(u, f)) > 0.999) {
-    u = (std::abs(f.y) < 0.999) ? math::Vec3d{0.0, 1.0, 0.0} : math::Vec3d{1.0, 0.0, 0.0};
-  }
-
-  math::Vec3d r = math::cross(u, f);
-  r = safeNormalized(r, {1.0, 0.0, 0.0});
-  const math::Vec3d u2 = math::cross(f, r);
-
-  return quatFromBasis(r, u2, f);
-}
-
-static math::Quatd expSmoothQuat(const math::Quatd& current,
-                                 const math::Quatd& target,
-                                 double alpha) {
-  // Blend in axis-angle space so we get consistent angular response.
-  if (alpha >= 1.0) return target;
-
-  math::Quatd t = target;
-  math::Quatd c = current;
-
-  // Ensure shortest arc (avoid sudden flips when w crosses 0).
-  if (quatDot(t, c) < 0.0) {
-    t.w = -t.w;
-    t.x = -t.x;
-    t.y = -t.y;
-    t.z = -t.z;
-  }
-
-  const math::Quatd dq = t * c.conjugate();
-
-  double angle = 2.0 * std::acos(std::max(-1.0, std::min(1.0, dq.w)));
-  if (angle < 1e-8) return t;
-
-  // Map angle into [-pi, pi] for stability.
-  if (angle > math::kPi) angle -= 2.0 * math::kPi;
-
-  const double s = std::sqrt(std::max(0.0, 1.0 - dq.w * dq.w));
-  math::Vec3d axis{1.0, 0.0, 0.0};
-  if (s > 1e-8) {
-    axis = math::Vec3d{dq.x / s, dq.y / s, dq.z / s};
-  }
-
-  const math::Quatd step = math::Quatd::fromAxisAngle(axis, angle * alpha);
-  return (step * c).normalized();
-}
+using math::safeNormalized;
 
 static math::Vec3d computeReferenceUp(const sim::Ship& ship,
                                       const sim::StarSystem* system,
@@ -482,7 +368,7 @@ CameraRigFrame computeCameraRigFrame(CameraRigWindowState& st,
 
     const bool lookAt = cinematicLookAtShip;
     if (lookAt) {
-      desiredOrient = quatLookRotation(shipPosU - desiredPosU, refUp);
+      desiredOrient = math::Quatd::lookRotation(shipPosU - desiredPosU, refUp);
     } else {
       desiredOrient = ship.orientation();
     }
@@ -492,7 +378,7 @@ CameraRigFrame computeCameraRigFrame(CameraRigWindowState& st,
     const math::Vec3d off = st.chaseOffsetLocalU;
     desiredPosU = shipPosU + shipR * off.x + shipU * off.y + shipF * off.z;
     if (st.chaseLookAtShip) {
-      desiredOrient = quatLookRotation(shipPosU - desiredPosU, st.chaseUseReferenceUp ? refUp : shipU);
+      desiredOrient = math::Quatd::lookRotation(shipPosU - desiredPosU, st.chaseUseReferenceUp ? refUp : shipU);
     } else {
       desiredOrient = ship.orientation();
     }
@@ -534,7 +420,7 @@ CameraRigFrame computeCameraRigFrame(CameraRigWindowState& st,
       lookTargetU = lookTargetU + lead;
     }
 
-    desiredOrient = quatLookRotation(lookTargetU - desiredPosU, st.orbitUseReferenceUp ? refUp : shipU);
+    desiredOrient = math::Quatd::lookRotation(lookTargetU - desiredPosU, st.orbitUseReferenceUp ? refUp : shipU);
     desiredFovDeg = (double)st.baseFovDeg;
   }
 
@@ -588,12 +474,12 @@ CameraRigFrame computeCameraRigFrame(CameraRigWindowState& st,
     // Clamp dt to avoid huge camera jumps after a breakpoint / tab-out.
     const double dt = std::clamp(dtRealSec, 0.0, 0.25);
 
-    const double alphaPos = halfLifeAlpha((double)st.posHalfLifeSec, dt);
-    const double alphaRot = halfLifeAlpha((double)st.rotHalfLifeSec, dt);
-    const double alphaFov = halfLifeAlpha((double)st.fovHalfLifeSec, dt);
+    const double alphaPos = math::halfLifeAlpha(dt, (double)st.posHalfLifeSec);
+    const double alphaRot = math::halfLifeAlpha(dt, (double)st.rotHalfLifeSec);
+    const double alphaFov = math::halfLifeAlpha(dt, (double)st.fovHalfLifeSec);
 
     st.smoothPosU = st.smoothPosU * (1.0 - alphaPos) + desiredPosU * alphaPos;
-    st.smoothOrient = expSmoothQuat(st.smoothOrient, desiredOrient, alphaRot);
+    st.smoothOrient = math::Quatd::slerp(st.smoothOrient, desiredOrient, alphaRot);
     st.smoothFovDeg = st.smoothFovDeg * (1.0 - alphaFov) + desiredFovDeg * alphaFov;
   }
 
@@ -614,15 +500,15 @@ CameraRigFrame computeCameraRigFrame(CameraRigWindowState& st,
   math::Quatd finalOrient = st.smoothOrient;
   if (useCinematic) {
     if (cinematicLookAtShip) {
-      finalOrient = quatLookRotation(shipPosU - finalPosU, refUp);
+      finalOrient = math::Quatd::lookRotation(shipPosU - finalPosU, refUp);
     }
   } else if (st.mode == CameraRigMode::Chase) {
     if (st.chaseLookAtShip) {
-      finalOrient = quatLookRotation(shipPosU - finalPosU, st.chaseUseReferenceUp ? refUp : shipU);
+      finalOrient = math::Quatd::lookRotation(shipPosU - finalPosU, st.chaseUseReferenceUp ? refUp : shipU);
     }
   } else {
     // Orbit
-    finalOrient = quatLookRotation(lookTargetU - finalPosU, st.orbitUseReferenceUp ? refUp : shipU);
+    finalOrient = math::Quatd::lookRotation(lookTargetU - finalPosU, st.orbitUseReferenceUp ? refUp : shipU);
   }
 
   out.posU = finalPosU;

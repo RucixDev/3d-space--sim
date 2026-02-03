@@ -92,3 +92,55 @@ add_test(NAME stellar_tests COMMAND stellar_tests)
 set_target_properties(stellar_tests PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
+
+
+# ---- Fast math-only test runner ----
+#
+# Building the full stellar library can take a while, but a large subset of our
+# math tests are header-only. This lightweight runner gives contributors a quick
+# "sanity check" loop without compiling the whole simulation.
+option(STELLAR_BUILD_MATH_TESTS "Build a lightweight test runner that only compiles header-only math tests" ON)
+
+if (STELLAR_BUILD_MATH_TESTS)
+  set(STELLAR_MATH_TEST_SOURCES ${STELLAR_TEST_SOURCES})
+  list(FILTER STELLAR_MATH_TEST_SOURCES INCLUDE REGEX "test_(quat_.*|math_.*|fov_math|spline|vec3_utils|mat4_.*|geometry_.*)\\.cpp$")
+
+  set(STELLAR_MATH_TEST_REGISTRY_CPP "${STELLAR_TEST_GEN_DIR}/generated_math_test_registry.cpp")
+
+  set(_math_registry "#include \"test_registry.h\"\n\n#include <cstddef>\n\n")
+
+  foreach(src ${STELLAR_MATH_TEST_SOURCES})
+    get_filename_component(name "${src}" NAME_WE)
+    string(APPEND _math_registry "int ${name}();\n")
+  endforeach()
+
+  string(APPEND _math_registry "\nnamespace stellar::test {\n\n")
+
+  string(APPEND _math_registry "static const Case kCases[] = {\n")
+  foreach(src ${STELLAR_MATH_TEST_SOURCES})
+    get_filename_component(name "${src}" NAME_WE)
+    string(APPEND _math_registry "  {\"${name}\", &::${name}},\n")
+  endforeach()
+  string(APPEND _math_registry "};\n\nconst Case* cases(std::size_t* outCount) {\n  if (outCount) *outCount = sizeof(kCases) / sizeof(kCases[0]);\n  return kCases;\n}\n\n} // namespace stellar::test\n")
+
+  file(WRITE "${STELLAR_MATH_TEST_REGISTRY_CPP}" "${_math_registry}")
+
+  add_executable(stellar_math_tests
+    main.cpp
+    ${STELLAR_MATH_TEST_SOURCES}
+    ${STELLAR_MATH_TEST_REGISTRY_CPP}
+  )
+
+  target_include_directories(stellar_math_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
+  )
+
+  target_compile_features(stellar_math_tests PRIVATE cxx_std_20)
+
+  add_test(NAME stellar_math_tests COMMAND stellar_math_tests)
+
+  set_target_properties(stellar_math_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+  )
+endif()

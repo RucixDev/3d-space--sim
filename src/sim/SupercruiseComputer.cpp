@@ -8,12 +8,6 @@
 
 namespace stellar::sim {
 
-static math::Vec3d clampMagnitude(const math::Vec3d& v, double maxLen) {
-  const double len = v.length();
-  if (len <= maxLen || len <= 1e-12) return v;
-  return v * (maxLen / len);
-}
-
 static double safeAcos(double x) {
   return std::acos(std::clamp(x, -1.0, 1.0));
 }
@@ -213,7 +207,7 @@ SupercruiseGuidanceResult guideSupercruise(const Ship& ship,
     const double tau = std::max(0.05, params.velTimeConstantSec);
     const double denom = std::max(1e-6, params.accelCapKmS2 * tau);
     thrustWorld = dv / denom;
-    thrustWorld = clampMagnitude(thrustWorld, 1.0);
+    thrustWorld = math::clampMagnitude(thrustWorld, 1.0);
   }
   out.input.thrustLocal = ship.orientation().conjugate().rotate(thrustWorld);
 

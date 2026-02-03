@@ -11,14 +11,6 @@ static double clamp01(double v) { return std::clamp(v, 0.0, 1.0); }
 
 static double clampD(double v, double lo, double hi) { return std::clamp(v, lo, hi); }
 
-static math::Vec3d clampComponents(const math::Vec3d& v, double lo, double hi) {
-  return {
-    std::clamp(v.x, lo, hi),
-    std::clamp(v.y, lo, hi),
-    std::clamp(v.z, lo, hi),
-  };
-}
-
 static double radToDeg(double r) { return r * (180.0 / kPi); }
 
 // Minimal "face a direction" controller.
@@ -51,7 +43,7 @@ static math::Vec3d torqueToFaceForward(const Ship& ship,
   // PD-lite: use angle as error; rely on ship's built-in angular dampers for D term.
   const math::Vec3d cmd = axisLocal * (ang * faceGain);
 
-  return clampComponents(cmd, -1.0, 1.0);
+  return math::clampComponents(cmd, -1.0, 1.0);
 }
 
 void ManeuverComputer::disengage() {

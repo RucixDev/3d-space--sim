@@ -29,26 +29,6 @@ static double recordingDurationSec(const FlightRecorderWindowState& st) {
   return std::max(0.0, st.samples.back().tRealSec);
 }
 
-static double quatDot(const math::Quatd& a, const math::Quatd& b) {
-  return a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-// Normalized linear interpolation (nlerp) with shortest-arc handling.
-// Good enough for smooth debug ghost playback without pulling in a full slerp.
-static math::Quatd quatNlerp(const math::Quatd& a, const math::Quatd& bIn, double t) {
-  math::Quatd b = bIn;
-  if (quatDot(a, b) < 0.0) {
-    b.w = -b.w; b.x = -b.x; b.y = -b.y; b.z = -b.z;
-  }
-
-  math::Quatd q{
-    a.w * (1.0 - t) + b.w * t,
-    a.x * (1.0 - t) + b.x * t,
-    a.y * (1.0 - t) + b.y * t,
-    a.z * (1.0 - t) + b.z * t
-  };
-  return q.normalized();
-}
 
 static bool sampleAtTime(const std::deque<FlightRecorderSample>& samples,
                          double tSec,
@@ -91,7 +71,7 @@ static bool sampleAtTime(const std::deque<FlightRecorderSample>& samples,
   s.tSimDays = a.tSimDays * (1.0 - u) + b.tSimDays * u;
   s.posKm = a.posKm * (1.0 - u) + b.posKm * u;
   s.velKmS = a.velKmS * (1.0 - u) + b.velKmS * u;
-  s.orient = quatNlerp(a.orient, b.orient, u);
+  s.orient = math::Quatd::nlerp(a.orient, b.orient, u);
   s.angVelRadS = a.angVelRadS * (1.0 - u) + b.angVelRadS * u;
 
   *out = s;

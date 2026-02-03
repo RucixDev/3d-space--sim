@@ -23,8 +23,8 @@ int test_fov_math() {
     // Round-trip stability.
     CHECK(std::abs(radToDeg(fovYRad2) - fovYDeg) < 1.0e-10);
 
-    // Known value: fovX = 2*atan(tan(45deg)*16/9) ~= 120.51deg
-    CHECK(std::abs(radToDeg(fovXRad) - 120.510) < 0.02);
+    // Known value: fovX = 2*atan(tan(45deg)*16/9) ~= 121.28deg
+    CHECK(std::abs(radToDeg(fovXRad) - 121.284) < 0.02);
   }
 
   // --- Dolly zoom (keep projected size constant) ---

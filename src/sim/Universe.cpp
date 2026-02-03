@@ -5,6 +5,7 @@
 #include "stellar/core/Hash.h"
 #include "stellar/core/Log.h"
 #include "stellar/core/Random.h"
+#include "stellar/math/Geometry.h"
 #include "stellar/proc/NameGenerator.h"
 #include "stellar/proc/SystemGenerator.h"
 #include "stellar/econ/Economy.h"
@@ -18,6 +19,20 @@
 #include <sstream>
 
 namespace stellar::sim {
+
+// Lower bound on squared distance from posLy to any point in a sector cube.
+// Used by query logic to prune sectors that cannot possibly intersect the query sphere.
+static double minDist2ToSectorCube(const math::Vec3d& posLy,
+                                  const proc::SectorCoord& c,
+                                  double sectorSizeLy) {
+  const double s = sectorSizeLy;
+  const double x0 = static_cast<double>(c.x) * s;
+  const double y0 = static_cast<double>(c.y) * s;
+  const double z0 = static_cast<double>(c.z) * s;
+
+  const math::Aabb3d box{{x0, y0, z0}, {x0 + s, y0 + s, z0 + s}};
+  return box.distanceSqToPoint(posLy);
+}
 
 static proc::SectorCoord decodeSector(SystemId id, core::u32& outLocalIndex) {
   const auto unbias = [](core::u16 b) -> core::i32 { return static_cast<core::i32>(b) - 32768; };
@@ -153,27 +168,10 @@ std::vector<SystemStub> Universe::queryNearby(const math::Vec3d& posLy,
            c.z >= minC.z && c.z <= maxC.z;
   };
 
-  const auto axisDist = [](double v, double lo, double hi) {
-    if (v < lo) return lo - v;
-    if (v > hi) return v - hi;
-    return 0.0;
-  };
-
   // Lower bound on the distance from posLy to *any point* in a sector cube.
   // Used for best-first sector expansion + safe early-out when maxResults is reached.
   const auto minDist2ToSector = [&](const proc::SectorCoord& c) -> double {
-    const double x0 = static_cast<double>(c.x) * s;
-    const double y0 = static_cast<double>(c.y) * s;
-    const double z0 = static_cast<double>(c.z) * s;
-
-    const double x1 = x0 + s;
-    const double y1 = y0 + s;
-    const double z1 = z0 + s;
-
-    const double dx = axisDist(posLy.x, x0, x1);
-    const double dy = axisDist(posLy.y, y0, y1);
-    const double dz = axisDist(posLy.z, z0, z1);
-    return dx*dx + dy*dy + dz*dz;
+    return minDist2ToSectorCube(posLy, c, s);
   };
 
   struct SectorItem {
@@ -311,27 +309,10 @@ std::vector<SystemStub> Universe::queryNearbyParallel(core::JobSystem& jobs,
     static_cast<core::i32>(std::floor((posLy.z + radiusLy) / s)),
   };
 
-  const auto axisDist = [](double v, double lo, double hi) {
-    if (v < lo) return lo - v;
-    if (v > hi) return v - hi;
-    return 0.0;
-  };
-
   // Lower bound on distance from posLy to any point in a sector cube.
   // Used to prune sectors that cannot possibly intersect the query sphere.
   const auto minDist2ToSector = [&](const proc::SectorCoord& c) -> double {
-    const double x0 = static_cast<double>(c.x) * s;
-    const double y0 = static_cast<double>(c.y) * s;
-    const double z0 = static_cast<double>(c.z) * s;
-
-    const double x1 = x0 + s;
-    const double y1 = y0 + s;
-    const double z1 = z0 + s;
-
-    const double dx = axisDist(posLy.x, x0, x1);
-    const double dy = axisDist(posLy.y, y0, y1);
-    const double dz = axisDist(posLy.z, z0, z1);
-    return dx*dx + dy*dy + dz*dz;
+    return minDist2ToSectorCube(posLy, c, s);
   };
 
   // Enumerate the candidate sectors (AABB intersects sphere).

@@ -1,3 +1,220 @@
+## Round 155 - AABB Geometry Helpers + Universe Sector Distance Cleanup
+
+This round introduces a small `Aabb3d` helper to centralize point/box distance math and removes duplicated sector-distance code in universe queries.
+
+- **Math:** added `Aabb3d` (contains/clamp/distance-to-point/sphere intersection/expand).
+- **Sim:** refactored `Universe` sector-distance pruning to use the shared `Aabb3d` distance helper.
+- **Tests:** added `test_geometry_aabb` and wired it into `stellar_math_tests`.
+
+### Files changed/added
+
+- `include/stellar/math/Geometry.h` *(new)*
+- `src/sim/Universe.cpp`
+- `tests/test_geometry_aabb.cpp` *(new)*
+- `tests/CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 154 - Mat4 Float Upload Helper
+
+This round removes duplicated `matToFloat()` helpers across the game/lab code by centralizing float-conversion on `Mat4d`.
+
+- **Math:** added `Mat4d::toFloat(float[16])` for easy OpenGL uniform uploads.
+- **Game:** refactored several windows to use `Mat4d::toFloat()` and removed local conversion helpers.
+
+### Files changed/added
+
+- `include/stellar/math/Mat4.h`
+- `apps/stellar_game/main.cpp`
+- `apps/stellar_game/GaussianSurfelReconstructionLabWindow.cpp`
+- `apps/stellar_game/ProceduralMeshLabWindow.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 153 - Mat4 TRS Convenience + Rotation Extraction
+
+This round reduces repeated transform boilerplate and makes it easier to move between matrices and quaternions.
+
+- **Math:** added `Mat4d::rigidTransform()` and `Mat4d::trs()` helpers to construct `T*R` and `T*R*S` in one call.
+- **Math:** added `Mat4d::translationPart()` and `Mat4d::rotationPart()` to extract components (rotation extraction normalizes columns to tolerate scale).
+- **Render:** camera view matrix now uses `rigidTransform()` for clarity.
+- **Tests:** added a small regression test covering TRS equivalence and rotation extraction.
+
+### Files changed/added
+
+- `include/stellar/math/Mat4.h`
+- `src/render/Camera.cpp`
+- `tests/test_mat4_trs.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 152 - Mat4 Rigid Inverse + Vec4 Helpers
+
+This round adds a small Vec4 type and expands the Mat4 helpers with common transform operations.
+
+- **Math:** added `Vec4d` and `Mat4d::mul()`/`mulPoint()` for centralized matrix-vector multiplies.
+- **Math:** added `Mat4d::transposed()` and `Mat4d::inverseRigid()` for fast rigid-body inverses.
+- **Render:** camera view matrix now uses `inverseRigid()` for clarity and reuse.
+- **Tests:** added a rigid-inverse regression test (translation, rotation+translation, rotation transpose identity).
+
+### Files changed/added
+
+- `include/stellar/math/Vec4.h` *(new)*
+- `include/stellar/math/Mat4.h`
+- `src/render/Camera.cpp`
+- `tests/test_mat4_inverse.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 151 - Mat4 Camera Matrix Robustness
+
+This round hardens the camera matrix helpers against degenerate inputs so we avoid NaNs / all-zero view matrices.
+
+- **Math:** `Mat4d::lookAt()` now handles `eye == center` and up-parallel cases with stable fallbacks.
+- **Math:** `Mat4d::perspective()` defensively clamps aspect/FOV/near/far to avoid invalid projections.
+- **Tests:** added a small lookAt regression test and included it in the fast `stellar_math_tests` target.
+
+### Files changed/added
+
+- `include/stellar/math/Mat4.h`
+- `tests/test_mat4_lookat.cpp` *(new)*
+- `tests/CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 150 - Quaternion fromTo Small-Angle Robustness
+
+This round fixes a subtle but important math edge case: `Quatd::fromTo()` could snap to identity for nearly-parallel vectors.
+That meant tiny orientation corrections were silently ignored.
+
+- **Math:** rewrote `Quatd::fromTo()` using a robust `q = [1 + dot(f,t), cross(f,t)]` construction (normalized) and only special-casing the 180° flip.
+- **Tests:** added a near-parallel regression test (theta ~ 1e-3 rad) to ensure small-angle rotations are preserved.
+- **Tests:** corrected the 16:9 vertical→horizontal FOV known-value check (the previous constant was off).
+
+### Files changed/added
+
+- `include/stellar/math/Quat.h`
+- `tests/test_quat_fromto.cpp`
+- `tests/test_fov_math.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 149 - Vec3 Utility Consolidation
+
+This round centralizes a few common Vec3 operations so gameplay/sim code stops re-implementing them.
+
+- **Math:** added `isFinite()`, `safeNormalized()`, `clampComponents()`, and `clampMagnitude()` to `Vec3.h`.
+- **Refactor:** replaced several local helper copies in ship/supercruise/flight control and missile/countermeasure code.
+- **Refactor:** flight controller now uses `Quatd::fromBasis()` instead of a duplicate basis->quat implementation.
+- **Tests:** added coverage for the new Vec3 helpers.
+- **Build/Test:** added optional `stellar_math_tests` target (header-only) for fast sanity checking without compiling the full sim.
+
+### Files changed/added
+
+- `include/stellar/math/Vec3.h`
+- `include/stellar/math/Quat.h`
+- `apps/stellar_game/CameraRigWindow.cpp`
+- `src/sim/Ship.cpp`
+- `src/sim/FlightController.cpp`
+- `src/sim/SupercruiseComputer.cpp`
+- `src/sim/ManeuverComputer.cpp`
+- `src/sim/Countermeasures.cpp`
+- `src/sim/MissileDefense.cpp`
+- `tests/test_vec3_utils.cpp` *(new)*
+- `tests/CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 148 - Quaternion Rotation Robustness
+
+This round makes quaternion vector rotation **more robust** (handles non-unit quaternions safely) and tightens axis-angle construction.
+
+- **Math:** `Quatd::rotate()` is now scale-invariant (`q * v * q^-1`), so accidental quaternion drift/scale won't skew rotated vectors.
+- **Math:** `Quatd::fromAxisAngle()` now returns identity for degenerate axes and normalizes defensively.
+- **Tests:** added coverage for rotate scale invariance and degenerate axis behavior.
+
+### Files changed/added
+
+- `include/stellar/math/Quat.h`
+- `tests/test_quat_rotate.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 147 - Half-Life Smoothing Utilities + Dedup
+
+This round centralizes the project's "half-life" exponential smoothing math so it is **consistent, dt-invariant, and reusable** across sim + UI.
+
+- **Math:** added `kLn2`, `halfLifeDecayFactor()` and `halfLifeAlpha()` helpers.
+- **Game/UI:** camera smoothing now uses the shared half-life helpers and `Quatd::slerp()` (removes local quaternion smoothing helpers).
+- **Sim:** sensor tracking + system security dynamics now share the same half-life math.
+- **Tests:** added coverage for half-life factor/alpha semantics (dt=0, dt==halfLife, defensive negatives).
+
+### Files changed/added
+
+- `include/stellar/math/Math.h`
+- `apps/stellar_game/CameraRigWindow.cpp`
+- `src/sim/SensorModel.cpp`
+- `src/sim/SystemSecurityDynamics.cpp`
+- `tests/test_math_half_life.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 146 - Quaternion Utilities + Helper Dedup
+
+This round adds a few **missing quaternion utilities** (interpolation + direction alignment) and removes duplicated helper code across game tools.
+
+- **Math:** added `Quatd::dot()`, `nlerp()`, `slerp()`, `fromTo()`, `fromBasis()`, and `lookRotation()`.
+- **Game:** refactored camera + replay helpers to use the shared quaternion utilities.
+- **Tests:** added coverage for `fromTo()` and `slerp()` behavior (including shortest-arc handling).
+
+### Files changed/added
+
+- `include/stellar/math/Quat.h`
+- `apps/stellar_game/CameraRigWindow.cpp`
+- `apps/stellar_game/FlightRecorderWindow.cpp`
+- `apps/stellar_game/TimeTrialWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_quat_fromto.cpp` *(new)*
+- `tests/test_quat_slerp.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 145 - Exact Quaternion Integration + Input Clamp
+
+This round improves **numerical stability** and **control consistency** in the core ship sim.
+
+- `Quatd::integrateAngular()` now uses an **exact exponential-map** update for constant body-frame angular velocity:
+  `q(t+dt) = q(t) * exp(0.5 * ω * dt)`.
+  This reduces drift and makes orientation updates far more **dt-invariant** under time acceleration and hitches.
+- Ship `thrustLocal` and `torqueLocal` inputs are now clamped to **unit magnitude** (after per-component clamps), so diagonal inputs cannot exceed the configured acceleration caps.
+
+### 🚀 What shipped
+
+- **Math:** exact quaternion angular integration (stable small-angle path).
+- **Physics:** ship control inputs now respect total cap semantics.
+- **Tests:** new coverage for quaternion dt invariance and ship input vector clamping.
+
+### Files changed/added
+
+- `include/stellar/math/Quat.h`
+- `src/sim/Ship.cpp`
+- `tests/test_ship_dampers.cpp`
+- `tests/test_ship_input_clamp.cpp`
+- `tests/test_quat_integrate.cpp`
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 144 - dt-Invariant Ship Dampers + Brake Stability
 
 This round improves **core ship handling** by making the ship's **dampers and brake** behave consistently under variable frame times and time acceleration.
@@ -3818,4 +4035,571 @@ it's hard to decide *where to go next* and easy to waste time re-plotting routes
 - `apps/stellar_game/MissionControlWindow.cpp` *(new)*
 - `apps/stellar_game/main.cpp`
 - `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 156 - Geometry: Ray/Sphere correctness + shared helpers
+
+This patch strengthens the shared math layer and fixes an easy-to-miss ray/sphere edge case
+in combat utilities.
+
+### New
+
+- `math::Geometry.h` now includes small, reusable primitives:
+  - `segmentClosestT()`
+  - `segmentHitsSphere()`
+  - `raySphereIntersect()` / `raySphereIntersectEnter()`
+
+### Fixes
+
+- `sim::raySphereIntersectKm()` now correctly rejects spheres that only intersect the *backwards*
+  extension of the ray (previously could incorrectly report a hit at t=0).
+
+### Tests
+
+- Added geometry-level regression tests for ray/sphere + segment/sphere.
+- Extended combat tests with behind-ray + non-normalized direction coverage.
+
+### Files changed/added
+
+- `include/stellar/math/Geometry.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `tests/test_geometry_raycast.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 157 - Geometry: Segment/Plane helpers + TimeTrial usage
+
+This patch expands the shared geometry helpers with a small plane API and uses it to
+simplify time trial gate detection.
+
+### New
+
+- `math::planeSignedDistance()`
+- `math::segmentPlaneIntersectionT()` / `math::segmentPlaneIntersection()`
+
+### Refactors
+
+- `sim::timeTrialGatePassed()` now uses the shared segment/plane helper and `math::safeNormalized()`.
+
+### Tests
+
+- Added a small geometry regression test for segment/plane intersection.
+
+### Files changed/added
+
+- `include/stellar/math/Geometry.h`
+- `src/sim/TimeTrial.cpp`
+- `tests/test_geometry_plane.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 158 - Combat CCD: Swept sphere hits + Segment/Sphere intersection params
+
+This patch improves hit detection for fast-moving projectiles/missiles against moving targets by
+using a relative-motion swept sphere test. It also adds a small geometry helper that returns
+segment/sphere entry+exit parameters.
+
+### New
+
+- `math::segmentSphereIntersectionT()` / `math::segmentSphereIntersectionEnterT()` (returns entry/exit `t` in [0,1]).
+
+### Improvements
+
+- Projectiles now select the earliest impact along their segment (order-independent) and account for moving targets.
+- Missiles use the same swept-sphere collision test; splash distance now evaluates target centers at the detonation time.
+
+### Tests
+
+- Added regression coverage for segment/sphere entry/exit params.
+- Added a combat test for a moving target crossing a projectile path.
+
+### Files changed/added
+
+- `include/stellar/math/Geometry.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `tests/test_geometry_segment_sphere.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 159 - Missiles: Proximity fuse standoff detonation + Contact point detonation
+
+This patch makes missile detonations feel more "real" and less binary by adding optional proximity
+fuses (detonate on near-miss) and by placing contact detonations on the target surface so direct
+hits deliver full damage.
+
+### New
+
+- `Missile::proximityFuseKm` (optional standoff distance for detonation).
+
+### Improvements
+
+- Missiles can detonate without direct collision when they come within
+  `(target.radius + missile.radius + proximityFuseKm)` of a target.
+- Proximity detonation time is chosen near closest approach during the step (not at first entry),
+  so near-misses don't explode prematurely.
+- Direct collision detonations now occur on the target surface (instead of at missile center),
+  restoring full damage for true impacts.
+
+### Tests
+
+- Added a combat regression test for proximity fuse behavior (near-miss detonation).
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 160 - Missiles: Decoy commitment dwell window (countermeasure lock stability)
+
+This patch adds an optional "minimum commitment" window for missile seekers: when a missile is fooled by a decoy,
+its guidance can remain latched to that decoy for a short time before it is allowed to switch back.
+
+### New
+
+- `Missile::decoyCommitSimSec` (optional minimum time to remain committed to a decoy after it overrides the true target).
+
+### Improvements
+
+- Reduces rapid decoy/target thrashing when scores are close.
+- Makes countermeasures feel more meaningful and deterministic.
+- Default tuning in `tryFireWeapon`:
+  - Radar missiles: `decoyCommitSimSec = 0.15`
+  - Heat missiles: `decoyCommitSimSec = 0.45`
+
+### Tests
+
+- Added a combat regression test that verifies decoy commitment holds guidance briefly and then releases.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 161 - Missiles: Boost/coast motor model + G-limited turning
+
+This patch adds an optional missile motor model (simple boost/coast) and a lateral-acceleration ("G") limit
+to keep turning behavior consistent as missiles accelerate.
+
+### New
+
+- `Missile::thrustAccelKmS2` (optional forward acceleration during motor burn)
+- `Missile::maxSpeedKmS` (optional top speed cap for the motor)
+- `Missile::motorBurnRemainingSimSec` (remaining burn time)
+- `Missile::maxLateralAccelKmS2` (optional lateral acceleration cap; limits effective turn rate as speed increases)
+
+### Improvements
+
+- `stepMissiles` now supports deterministic boost/coast kinematics (distance integration + velocity update).
+- Lead-pursuit guidance uses a small look-ahead speed estimate when a missile is actively accelerating.
+- `tryFireWeapon` now configures a conservative boost profile for radar/heat missiles and computes TTL from the
+  motor profile so range stays stable even with acceleration.
+
+### Tests
+
+- Added combat regression tests covering motor acceleration and max-speed clamping.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+## OpenAI Patch Round 162 - Missiles: ProNav robustness + G-limit uses end-of-step speed
+
+This patch improves proportional navigation (ProNav) guidance robustness and fixes a subtle G-limit issue
+for accelerating missiles.
+
+### Improvements
+
+- ProNav now falls back to the missile’s pursuit/lead aim direction when closing geometry becomes degenerate (opening targets, tiny range, etc.).
+- The ProNav acceleration scale uses line-of-sight closing speed (Vc) and remains turn-rate limited.
+- G-limited turning now computes effective turn rate using a conservative end-of-step speed estimate when the missile is accelerating (prevents exceeding the lateral-accel cap after motor boost).
+
+### Tests
+
+- Updated the ProNav regression test expectations to match the improved guidance scaling.
+- Added a new regression test ensuring G-limited turning respects end-of-step speed during motor acceleration.
+
+### Files changed/added
+
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+## OpenAI Patch Round 163 - Missiles: seeker FOV gating + inertial target memory
+
+This patch makes missile seekers more realistic by enforcing their field-of-view for target tracking and adding a short,
+deterministic "target memory" window (inertial midcourse) so brief lock breaks aren't fully binary.
+
+### Improvements
+
+- Missile seeker FOV now applies to tracking the locked target (not just decoy selection). Targets outside the seeker cone
+  won't be actively guided toward.
+- Added optional missile target-memory window: when a locked target becomes temporarily untrackable, missiles can continue
+  guiding toward the last known target position/velocity for a short duration.
+- `tryFireWeapon` now configures tuned target-memory windows for radar vs heat missiles.
+
+### Tests
+
+- Added regression tests for seeker-FOV target gating and target-memory expiration behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 164 - Missiles: seeker activation delay + autonomous reacquisition
+
+This patch adds two more optional "smart missile" behaviors to make engagements feel less binary and more tactical.
+
+### Improvements
+
+- Added optional seeker activation delay to model a simple two-phase missile profile:
+  midcourse guidance first, then terminal active seeker with FOV limits + decoy susceptibility.
+- Added optional autonomous target reacquisition: if a missile has no trackable target (and memory is expired),
+  it can acquire a new Ship/Player target within a configured range and within seeker FOV.
+- `tryFireWeapon` now gives radar missiles a short activation delay and enables limited reacquisition.
+
+### Tests
+
+- Added regression tests covering seeker activation (decoys ignored until active) and auto-acquire behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 165 - Missiles: decoy discrimination gates (range/angle/doppler)
+
+This patch adds optional, deterministic “track gate” style discrimination so seekers can ignore decoys that are obviously not part of the true target track.
+
+### Improvements
+
+- Added optional missile decoy discrimination gates:
+  - angle gate (target-vs-decoy line-of-sight separation)
+  - range gate (target-vs-decoy range separation)
+  - doppler/radial-velocity gate (target-vs-decoy closing-rate separation)
+- Decoy scoring now applies these gates when configured.
+- `tryFireWeapon` now enables reasonable gate defaults for radar missiles.
+
+### Tests
+
+- Added a regression test ensuring the gates reject an implausible decoy while still allowing a plausible one.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 166 - Missiles: terrain masking (LOS) + radar doppler notch
+
+This patch introduces two deterministic seeker limitations that add new tactical counterplay:
+using asteroids for cover and "beaming" radar missiles to notch their doppler tracking.
+
+### Improvements
+
+- Added optional missile seeker line-of-sight tracking:
+  - when enabled, asteroids (CombatTargetKind::Asteroid) can occlude seeker tracking and decoy attraction.
+  - auto-acquire respects LOS as well.
+- Added optional radar doppler notch threshold:
+  - when enabled for radar seekers, targets with near-zero radial velocity relative to the missile are considered untrackable.
+  - auto-acquire respects the notch threshold.
+- `tryFireWeapon` now enables LOS for both missile types and enables a small doppler-notch threshold for radar missiles.
+
+### Tests
+
+- Added regression tests covering LOS occlusion behavior and radar doppler notch tracking behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 167 - Missiles: deterministic track-quality model
+
+This patch adds a small deterministic "track quality" scalar to seekers. Track quality rises
+while the missile has a direct, trackable lock and decays when guiding on target memory/no track.
+It modulates effective decoy resistance so countermeasures become more effective after a lock break
+(FOV break, LOS masking, radar notch) while leaving well-established locks mostly unchanged.
+
+### Improvements
+
+- Added optional `Missile` track-quality parameters:
+  - `enableTrackQuality`, `trackQuality`
+  - rise/fall half-life tuning
+  - `trackQualityResistFloor` for minimum decoy-resistance scaling
+- `stepMissiles` updates track quality during the active seeker phase and uses it to scale the
+  effective decoy resistance used by countermeasure scoring.
+- `tryFireWeapon` enables track-quality tuning for both radar and heat missiles.
+
+### Tests
+
+- Added a regression test ensuring that after a lock break (but with target memory), decoys can
+  override more readily once track quality decays.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 168 - Missiles: augmented ProNav (APN) target-acceleration feed-forward
+
+This patch adds an optional Augmented Proportional Navigation (APN) term for radar missiles.
+When enabled, the missile estimates target acceleration from successive velocity samples and
+adds a feed-forward component (perpendicular to LOS, energy-conserving) to improve intercept
+quality against hard-turning targets.
+
+### Improvements
+
+- Added optional APN parameters/state to `Missile`:
+  - `apnTargetAccelGain`, `apnMaxTargetAccelKmS2`, `apnAccelHalfLifeSimSec`
+  - internal velocity/acceleration estimate state
+- `stepMissiles` maintains a filtered target-acceleration estimate during direct track.
+- `ProNav` guidance optionally applies the APN feed-forward term (scaled by track quality when enabled).
+- `tryFireWeapon` enables APN defaults for radar missiles.
+
+### Tests
+
+- Added a regression test asserting APN increases lateral turn response when the target experiences a lateral acceleration.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 169 - NPC defenses: radar beaming + smarter countermeasure timing
+
+This patch improves NPC defensive behavior against inbound missiles:
+
+- Adds an optional deterministic *radar beaming* bias to missile evasion planning when the
+  inbound missile is a radar seeker with a doppler-notch model.
+- Prevents NPCs from wasting countermeasures long before a missile's seeker becomes active.
+
+### Improvements
+
+- `MissileDefense`: added radar-beaming tuning parameters to `MissileEvasionParams` and implemented
+  a blended "jink + beam" evasion heuristic for radar missiles.
+- `stellar_game`: NPC evasion planning now scales beaming skill with pilot AI skill.
+- `stellar_game`: countermeasure deployment now considers seeker activation delay; NPCs hold chaff/flares
+  until near the active seeker phase (with an emergency early-deploy when TTI is extremely short).
+
+### Tests
+
+- Added a regression test asserting the radar-beaming bias changes the evasion direction in a
+  controlled geometry.
+
+### Files changed/added
+
+- `include/stellar/sim/MissileDefense.h`
+- `src/sim/MissileDefense.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_missile_defense_beaming.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 170 - Missiles: seeker gimbal slew + lock-quality degradation
+
+This patch makes missile seeker tracking more dynamic by modeling a simple *gimbal slew limit*.
+When enabled, the seeker maintains an internal pointing direction that can only rotate so fast.
+Large/fast line-of-sight changes (close merges, sharp turns, or decoy pulls) can temporarily reduce
+track quality, making evasive maneuvers + countermeasures more effective and believable.
+
+### Improvements
+
+- `Missile`: added optional seeker gimbal state/params:
+  - `seekerSlewRateRadS`
+  - internal `seekerDirWorld` + `hasSeekerDir`
+- `stepMissiles`: track quality now optionally accounts for seeker pointing alignment when
+  `seekerSlewRateRadS > 0`.
+- `tryFireWeapon`: enabled weapon-tuned default gimbal slew rates:
+  - radar missiles slew faster than heat seekers.
+
+### Tests
+
+- Added a regression test asserting the seeker direction slews by a bounded amount and that
+  track quality decays after an abrupt LOS jump.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 171 - Missiles: turn acceleration limiting (autopilot lag)
+
+This patch adds an optional *turn acceleration limit* for missiles. When enabled, missiles do not
+instantly jump to their commanded turn rate; they ramp turn rate over time using a simple internal
+angular-velocity state. This makes close-range evasive maneuvers (jink/beam) more meaningful and
+reduces "snap" steering.
+
+### Improvements
+
+- `Missile`: added optional turn acceleration limiting:
+  - `maxTurnAccelRadS2`
+  - internal `turnOmegaWorld` + `hasTurnOmega`
+- `stepMissiles`: if `maxTurnAccelRadS2 > 0`, steer using an accel-limited angular-velocity model.
+- `tryFireWeapon`: enabled tuned defaults for missile turn acceleration limiting.
+
+### Tests
+
+- Added a regression test asserting accel-limited steering ramps turn authority across frames.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 172 - Missiles: midcourse datalink range/LOS gating
+
+This patch adds an optional midcourse *datalink gating* model for missiles with an activation delay.
+When enabled, the missile only receives pre-activation target updates if the launching platform is
+within a configured range (and can optionally require clear line-of-sight to the target). This adds
+counterplay: terrain masking can break midcourse updates before the terminal seeker comes alive.
+
+### Improvements
+
+- `Missile`: added optional datalink parameters:
+  - `datalinkRangeKm`
+  - `datalinkRequireLineOfSight`
+  - `datalinkOcclusionPadKm`
+- `stepMissiles`: during the pre-activation phase, target updates are:
+  - legacy-perfect if `datalinkRangeKm == 0`
+  - otherwise range/LOS gated by `shooterId` → locked target.
+- `tryFireWeapon`: enabled datalink gating defaults for radar missiles.
+
+### Tests
+
+- Added a regression test asserting that an LOS break prevents midcourse target velocity updates.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 173 - Missiles: radar "burn-through" close-range decoy falloff
+
+This patch adds an optional close-range "burn-through" effect for radar seekers.
+When enabled, decoy attraction is reduced as the missile approaches the currently
+tracked target, making chaff/jamming less effective at short range.
+
+### Improvements
+
+- `Missile`: added `decoyBurnThroughRangeKm` and `decoyBurnThroughMinFactor`.
+- `stepMissiles`: applies burn-through scaling to radar decoy scoring.
+- `tryFireWeapon`: enabled tuned burn-through defaults for radar missiles.
+
+### Tests
+
+- Added a regression test that asserts far-range decoy attraction but close-range decoy rejection when burn-through is enabled.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 174 - Missiles: deterministic asteroid avoidance steering
+
+This patch adds optional asteroid avoidance for missiles: a short-horizon collision prediction
+against asteroid spheres and a deterministic repulsion-style steering bias. The goal is to reduce
+"belt suicides" without introducing random behavior or a heavy path planner.
+
+### Improvements
+
+- `Missile`: added asteroid avoidance parameters:
+  - `asteroidAvoidanceStrength` (0 disables)
+  - `asteroidAvoidanceLookaheadSimSec`
+  - `asteroidAvoidancePadKm`
+- `stepMissiles`: biases the commanded direction away from imminent asteroid collisions (before
+  applying turn-acceleration limiting), keeping the behavior compatible with autopilot lag.
+- `tryFireWeapon`: enabled tuned asteroid-avoidance defaults for both radar and heat missiles.
+
+### Tests
+
+- Added a regression test that asserts a lateral steering bias appears when avoidance is enabled.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 175 - Missiles: directional blast + asteroid blast shadowing
+
+This patch adds optional warhead shaping and explosion occlusion for missile splash damage:
+- a directional fragmentation bias based on missile travel direction at detonation
+- asteroid line-of-sight attenuation so ships can "hide" behind rocks from nearby blasts
+
+### Improvements
+
+- `Missile`: added optional splash-damage tuning controls:
+  - `blastDirectionalStrength` and `blastDirectionalMinFactor`
+  - `blastRequireLineOfSight`, `blastLineOfSightOcclusionPadKm`, and `blastOccludedFactor`
+- `stepMissiles`: applies directionality and asteroid LOS occlusion when computing splash hits.
+- `tryFireWeapon`: enabled tuned defaults for missile weapons (mild forward bias + blast occlusion).
+
+### Tests
+
+- Added regression tests for (1) rear-hemisphere directional damage reduction and (2) asteroid blast occlusion behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 176 - Missiles: deterministic swarm coordination (formation bias)
+
+This patch adds an optional, deterministic "swarm" steering layer for missiles chasing the same target.
+It reduces missile stacking and encourages multi-axis attacks without adding randomness.
+
+### Improvements
+
+- `Missile`: added optional swarm steering parameters:
+  - `swarmSeparationStrength`, `swarmCohesionStrength`, `swarmAlignmentStrength`
+  - `swarmSeparationKm`, `swarmNeighborRangeKm`, `swarmMaxSteerRad`
+- `stepMissiles`: snapshots missile state at the start of the step and applies a bounded flocking-style heading bias before obstacle avoidance.
+- `tryFireWeapon`: enables tuned swarm defaults for radar and heat missiles.
+
+### Tests
+
+- Added a regression test that confirms separation bias deterministically splits two missiles laterally.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
 - `PATCH_NOTES.md`

@@ -5,11 +5,6 @@
 
 namespace stellar::sim {
 
-static math::Vec3d safeNormalized(const math::Vec3d& v, const math::Vec3d& fallback) {
-  if (v.lengthSq() < 1e-12) return fallback;
-  return v.normalized();
-}
-
 void spawnCountermeasureBurst(std::vector<Countermeasure>& ioCountermeasures,
                               core::u64& ioNextId,
                               CountermeasureType type,
@@ -22,9 +17,9 @@ void spawnCountermeasureBurst(std::vector<Countermeasure>& ioCountermeasures,
   const int n = std::max(0, params.count);
   if (n == 0) return;
 
-  const math::Vec3d r = safeNormalized(shipRight, {1, 0, 0});
-  const math::Vec3d u = safeNormalized(shipUp, {0, 1, 0});
-  const math::Vec3d f = safeNormalized(shipForward, {0, 0, 1});
+  const math::Vec3d r = math::safeNormalized(shipRight, {1, 0, 0}, 1e-12);
+  const math::Vec3d u = math::safeNormalized(shipUp, {0, 1, 0}, 1e-12);
+  const math::Vec3d f = math::safeNormalized(shipForward, {0, 0, 1}, 1e-12);
 
   const double spread = std::max(0.0, params.spread);
   const double ttl = std::max(0.0, params.ttlSimSec);

@@ -1,5 +1,6 @@
 #include "stellar/sim/SystemSecurityDynamics.h"
 
+#include "stellar/math/Math.h"
 #include "stellar/sim/SecurityModel.h"
 
 #include <algorithm>
@@ -7,8 +8,6 @@
 
 namespace stellar::sim {
 namespace {
-
-constexpr double kLn2 = 0.693147180559945309417232121458176568;
 
 static double clampAbs(double v, double maxAbs) {
   const double m = std::max(0.0, maxAbs);
@@ -27,9 +26,7 @@ static double safeDt(double nowDays, double lastUpdateDay) {
 } // namespace
 
 double decayFactorDays(double dtDays, double halfLifeDays) {
-  if (dtDays <= 0.0) return 1.0;
-  if (halfLifeDays <= 0.0) return 0.0;
-  return std::exp(-kLn2 * dtDays / halfLifeDays);
+  return math::halfLifeDecayFactor(dtDays, halfLifeDays);
 }
 
 SystemSecurityDeltaState decayedSystemSecurityDelta(const SystemSecurityDeltaState& st,

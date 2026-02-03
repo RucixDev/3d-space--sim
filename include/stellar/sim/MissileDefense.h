@@ -73,6 +73,35 @@ struct MissileEvasionParams {
   // If true, project the output onto the plane perpendicular to the current
   // line-of-sight (produces a more "lateral jink" that tends to increase LOS rate).
   bool enforceLateralToLos{true};
+
+  // --- Radar-specific evasion tuning ---
+  //
+  // When a radar seeker models a doppler notch (see Missile::radarDopplerNotchKmS),
+  // targets can sometimes break lock by driving the geometry toward low range-rate.
+  //
+  // This struct optionally enables a simple deterministic "beaming" bias for NPCs:
+  // blend the classic closest-approach "jink" direction with a direction that tends
+  // to rotate the ship's velocity toward being perpendicular to the current LOS.
+  //
+  // NOTE:
+  //   This is not a full aircraft energy model; it is a gameplay-oriented heuristic
+  //   that interacts with the seeker notch mechanic in a stable way.
+
+  // Enable the radar beaming bias when the inbound missile is a radar seeker.
+  bool enableRadarBeaming{true};
+
+  // Blend factor in [0,1] that controls how strongly the beaming direction is mixed
+  // into the classic miss-distance jink.
+  //
+  // 0.0 -> pure jink (original behavior)
+  // 1.0 -> pure beaming direction
+  double radarBeamBlend{0.65};
+
+  // Only engage the beaming bias when the absolute radial velocity exceeds
+  //   radarBeamEngageNotchMultiple * missile.radarDopplerNotchKmS.
+  //
+  // This avoids over-steering when the target is already nearly notched.
+  double radarBeamEngageNotchMultiple{1.10};
 };
 
 // Compute a suggested evasion direction against a specific missile/target pair.

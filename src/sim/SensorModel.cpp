@@ -1,5 +1,7 @@
 #include "stellar/sim/SensorModel.h"
 
+#include "stellar/math/Math.h"
+
 #include <cmath>
 
 namespace stellar::sim {
@@ -29,17 +31,6 @@ double computeSensorStrength01(double distKm,
   return clamp01(strength);
 }
 
-static inline double expSmoothingAlpha(double dtSec, double halfLifeSec) {
-  dtSec = std::max(0.0, dtSec);
-  halfLifeSec = std::max(1e-6, halfLifeSec);
-
-  // For y += a*(x-y) with constant x, choosing:
-  //   a = 1 - exp(-dt/tau), tau = halfLife/ln(2)
-  // ensures y reaches half the gap after 'halfLife' seconds.
-  const double tau = halfLifeSec / std::log(2.0);
-  return 1.0 - std::exp(-dtSec / tau);
-}
-
 SensorTrackResult updateSensorTrack(SensorTrack& track,
                                     double dtSec,
                                     double measuredStrength01,
@@ -50,7 +41,7 @@ SensorTrackResult updateSensorTrack(SensorTrack& track,
                             ? params.riseHalfLifeSec
                             : params.fallHalfLifeSec;
 
-  const double a = expSmoothingAlpha(dtSec, halfLife);
+  const double a = math::halfLifeAlpha(dtSec, halfLife);
   track.strength01 += a * (measuredStrength01 - track.strength01);
   track.strength01 = clamp01(track.strength01);
 

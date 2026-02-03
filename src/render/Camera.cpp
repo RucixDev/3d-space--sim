@@ -7,11 +7,10 @@ void Camera::setPerspective(double fovYRad, double aspect, double zNear, double 
 }
 
 stellar::math::Mat4d Camera::viewMatrix() const {
-  // View = R^-1 * T^-1
-  const stellar::math::Quatd inv = orient_.conjugate();
-  const auto rot = stellar::math::Mat4d::rotation(inv);
-  const auto tr = stellar::math::Mat4d::translation({-pos_.x, -pos_.y, -pos_.z});
-  return rot * tr;
+  // View = (T * R)^-1 where world = T(pos) * R(orient).
+  // Using inverseRigid keeps the intent clear and centralizes the math.
+  const auto world = stellar::math::Mat4d::rigidTransform(pos_, orient_);
+  return world.inverseRigid();
 }
 
 } // namespace stellar::render

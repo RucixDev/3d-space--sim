@@ -306,10 +306,6 @@ static sim::TrafficTransitTradeParams trafficTransitParamsFromCVars() {
   return p;
 }
 
-static void matToFloat(const math::Mat4d& m, float out[16]) {
-  for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(m.m[i]);
-}
-
 static const char* starClassName(sim::StarClass c) {
   switch (c) {
     case sim::StarClass::O: return "O";
@@ -431,31 +427,13 @@ static math::Vec3d toRenderPosU(const math::Vec3d& posKm) { return (posKm - gRen
 static math::Vec3d toRenderVelU(const math::Vec3d& velKmS) { return velKmS * kINV_RENDER_UNIT_KM; }
 
 
-static math::Quatd quatFromTo(const math::Vec3d& from, const math::Vec3d& to) {
-  math::Vec3d f = from.normalized();
-  math::Vec3d t = to.normalized();
-  const double c = std::clamp(math::dot(f, t), -1.0, 1.0);
-
-  if (c > 0.999999) return math::Quatd::identity();
-
-  if (c < -0.999999) {
-    math::Vec3d axis = math::cross({1,0,0}, f);
-    if (axis.lengthSq() < 1e-12) axis = math::cross({0,1,0}, f);
-    return math::Quatd::fromAxisAngle(axis, math::kPi);
-  }
-
-  const math::Vec3d axis = math::cross(f, t);
-  const double s = std::sqrt((1.0 + c) * 2.0);
-  const double invs = 1.0 / s;
-  return math::Quatd{ s * 0.5, axis.x * invs, axis.y * invs, axis.z * invs }.normalized();
-}
 
 static math::Quatd stationOrient(const sim::Station& st, const math::Vec3d& posKm, double timeDays) {
   // Station local +Z points outward from the slot.
   // We point it away from the star (radial outward) for intuitive docking.
   math::Vec3d outward = posKm.normalized();
   if (outward.lengthSq() < 1e-12) outward = {0,0,1};
-  math::Quatd base = quatFromTo({0,0,1}, outward);
+  math::Quatd base = math::Quatd::fromTo({0,0,1}, outward);
 
   // Add a small spin to make orientation/geometry feel alive.
   // Spin around the station's local +Z axis.
@@ -5231,7 +5209,7 @@ auto fieldOpsSkipTarget = [&]() {
     ship.setVelocityKmS(sim::stationVelKmS(st, timeDays));
     ship.setAngularVelocityRadS({0,0,0});
     // face toward the slot (into station)
-    ship.setOrientation(quatFromTo({0,0,1}, -axis));
+    ship.setOrientation(math::Quatd::fromTo({0,0,1}, -axis));
   };
 
   auto allocWorldId = [&]() -> core::u64 {
@@ -10529,7 +10507,7 @@ progression.unlockWeapon(weaponSecondary);
               ship.setPositionKm(stPos + axis * (st.radiusKm * 1.8));
               ship.setVelocityKmS(sim::stationVelKmS(st, timeDays));
               ship.setAngularVelocityRadS({0,0,0});
-              ship.setOrientation(quatFromTo({0,0,1}, axis));
+              ship.setOrientation(math::Quatd::fromTo({0,0,1}, axis));
 
               const sim::StationId undockedFromStationId = dockedStationId;
               docked = false;
@@ -13142,7 +13120,7 @@ for (const auto& c : contacts) {
       const double distKm = rng.range(60000.0, 130000.0);
       outShip.setPositionKm(ship.positionKm() + d * distKm);
       outShip.setVelocityKmS(ship.velocityKmS());
-      outShip.setOrientation(quatFromTo({0,0,1}, (-d).normalized()));
+      outShip.setOrientation(math::Quatd::fromTo({0,0,1}, (-d).normalized()));
       return;
     }
     stIdx = std::min(stIdx, currentSystem->stations.size() - 1);
@@ -13156,7 +13134,7 @@ for (const auto& c : contacts) {
     const math::Vec3d p = stPos + axis * distKm + tangent * rng.range(-st.radiusKm*2.0, st.radiusKm*2.0);
     outShip.setPositionKm(p);
     outShip.setVelocityKmS(sim::stationVelKmS(st, timeDays));
-    outShip.setOrientation(quatFromTo({0,0,1}, (stPos - p).normalized()));
+    outShip.setOrientation(math::Quatd::fromTo({0,0,1}, (stPos - p).normalized()));
   };
 
   // Pick a different station index in the current system (best-effort).
@@ -13338,7 +13316,7 @@ auto spawnPiratePack = [&](int maxCount) -> int {
     p.ship.setVelocityKmS(ship.velocityKmS());
 
     const math::Vec3d toP = ship.positionKm() - p.ship.positionKm();
-    p.ship.setOrientation(quatFromTo({0,0,1}, (toP.lengthSq() > 1e-9) ? toP.normalized() : math::Vec3d{0,0,1}));
+    p.ship.setOrientation(math::Quatd::fromTo({0,0,1}, (toP.lengthSq() > 1e-9) ? toP.normalized() : math::Vec3d{0,0,1}));
 
     contacts.push_back(std::move(p));
   }
@@ -13692,13 +13670,13 @@ auto spawnPolicePack = [&](int maxCount) -> int {
           tgt.ship.setPositionKm(p);
           tgt.ship.setVelocityKmS(stVel);
           const math::Vec3d toSt = (stPos - p);
-          tgt.ship.setOrientation(quatFromTo({0,0,1}, (toSt.lengthSq() > 1e-9) ? toSt.normalized() : math::Vec3d{0,0,1}));
+          tgt.ship.setOrientation(math::Quatd::fromTo({0,0,1}, (toSt.lengthSq() > 1e-9) ? toSt.normalized() : math::Vec3d{0,0,1}));
         } else {
           const math::Vec3d d = randDir();
           const double distKm = brng.range(65000.0, 150000.0);
           tgt.ship.setPositionKm(ship.positionKm() + d * distKm);
           tgt.ship.setVelocityKmS(ship.velocityKmS());
-          tgt.ship.setOrientation(quatFromTo({0,0,1}, (-d).normalized()));
+          tgt.ship.setOrientation(math::Quatd::fromTo({0,0,1}, (-d).normalized()));
         }
 
         tgt.ship.setAngularVelocityRadS({0,0,0});
@@ -14299,7 +14277,14 @@ auto spawnPolicePack = [&](int maxCount) -> int {
         const core::u64 h = core::hashCombine(core::hashCombine(universe.seed(), c.id),
                                               core::hashCombine(m.shooterId, phase));
 
-        const auto plan = sim::planMissileEvasion(m, c.ship.positionKm(), c.ship.velocityKmS(), h);
+        sim::MissileEvasionParams evadeParams{};
+        // Skilled pilots are better at deliberately "beaming" radar missiles into a notch,
+        // while less skilled pilots mostly just jink.
+        evadeParams.enableRadarBeaming = true;
+        evadeParams.radarBeamBlend = 0.20 + 0.70 * std::clamp(c.aiSkill, 0.0, 1.0);
+        evadeParams.radarBeamEngageNotchMultiple = 1.10;
+
+        const auto plan = sim::planMissileEvasion(m, c.ship.positionKm(), c.ship.velocityKmS(), h, evadeParams);
         c.evadeDirWorld = plan.valid ? plan.dirWorld : math::Vec3d{0, 0, 0};
 
         const double refreshSec = 0.55 + 1.05 * (1.0 - c.aiSkill);
@@ -14308,7 +14293,32 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 
       // Countermeasure deployment: skilled pilots deploy earlier.
       const double deployTtiSec = 0.85 + 2.35 * c.aiSkill;
-      if (c.cmBursts > 0 && timeDays >= c.cmCooldownUntilDays && missileThreat.ttiSec > 1e-6 && missileThreat.ttiSec < deployTtiSec) {
+      bool shouldDeployCm = (c.cmBursts > 0)
+                            && (timeDays >= c.cmCooldownUntilDays)
+                            && (missileThreat.ttiSec > 1e-6)
+                            && (missileThreat.ttiSec < deployTtiSec);
+
+      // If the inbound missile has a seeker activation delay, don't waste countermeasures
+      // long before the active seeker phase begins.
+      if (shouldDeployCm && missileThreat.missileIndex < missiles.size()) {
+        const auto& inbound = missiles[missileThreat.missileIndex];
+        const double activateAfter = std::max(0.0, inbound.seekerActivationSimSec);
+        if (activateAfter > 0.0) {
+          const double age = std::max(0.0, inbound.ageSimSec);
+          const bool seekerActive = (age >= activateAfter);
+          const double tToActive = std::max(0.0, activateAfter - age);
+
+          // Less skilled NPCs tend to deploy slightly early; skilled NPCs deploy closer to activation.
+          const double leadSec = 0.10 + 0.20 * (1.0 - std::clamp(c.aiSkill, 0.0, 1.0));
+
+          if (!seekerActive) {
+            // Allow emergency deployment if time-to-impact is extremely short.
+            shouldDeployCm = (tToActive <= leadSec) || (missileThreat.ttiSec < 0.35);
+          }
+        }
+      }
+
+      if (shouldDeployCm) {
         sim::CountermeasureType type = sim::CountermeasureType::Flare;
         if (missileThreat.seeker == sim::MissileSeekerType::Radar && c.cmHasChaff) type = sim::CountermeasureType::Chaff;
 
@@ -14657,7 +14667,7 @@ auto spawnPolicePack = [&](int maxCount) -> int {
               c.ship.setPositionKm(c.ship.positionKm() + n * stepKm);
               c.ship.setVelocityKmS(stVel);
               c.ship.setAngularVelocityRadS({0,0,0});
-              c.ship.setOrientation(quatFromTo({0,0,1}, n));
+              c.ship.setOrientation(math::Quatd::fromTo({0,0,1}, n));
 
               // We already moved this frame.
               dtStep = 0.0;
@@ -16839,7 +16849,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
                         c.ship.setVelocityKmS(baseVel + spec.velOffsetKmS);
 
                         if (spec.role == sim::TrafficEncounterNpcRole::Trader) {
-                          c.ship.setOrientation(quatFromTo({0, 0, 1}, s.trafficState.dir));
+                          c.ship.setOrientation(math::Quatd::fromTo({0, 0, 1}, s.trafficState.dir));
                         }
 
                         contacts.push_back(std::move(c));
@@ -18580,8 +18590,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     const math::Mat4d proj = cam.projectionMatrix();
 
     float viewF[16], projF[16];
-    matToFloat(view, viewF);
-    matToFloat(proj, projF);
+    view.toFloat(viewF);
+    proj.toFloat(projF);
 
     meshRenderer.setViewProj(viewF, projF);
 
@@ -18877,7 +18887,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           }
 
           // Rotate the ring mesh's +Y normal onto the target plane normal.
-          math::Quatd q = quatFromTo({0, 1, 0}, n);
+          math::Quatd q = math::Quatd::fromTo({0, 1, 0}, n);
           // Random spin around the normal (useful if the texture has azimuthal features).
           const double spin = rrng.range(0.0, 2.0 * math::kPi);
           q = math::Quatd::fromAxisAngle(n, spin) * q;
@@ -40439,8 +40449,8 @@ const char* pageName =
       hangarCam.setOrientation(math::Quatd::identity());
 
       float viewF[16], projF[16];
-      matToFloat(hangarCam.viewMatrix(), viewF);
-      matToFloat(hangarCam.projectionMatrix(), projF);
+      hangarCam.viewMatrix().toFloat(viewF);
+      hangarCam.projectionMatrix().toFloat(projF);
       meshRenderer.setViewProj(viewF, projF);
 
       {

@@ -25,10 +25,6 @@ bool isFutureReady(std::future<T>& f) {
   return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 }
 
-void matToFloat(const math::Mat4d& m, float out[16]) {
-  for (int i = 0; i < 16; ++i) out[i] = (float)m.m[i];
-}
-
 math::Vec3d orbitCameraPos(double yawDeg, double pitchDeg, double dist) {
   const double yaw = math::degToRad(yawDeg);
   const double pitch = math::degToRad(pitchDeg);
@@ -176,8 +172,8 @@ void renderPreview(GaussianSurfelReconstructionLabWindowState& s, float timeSec)
 
   float viewF[16];
   float projF[16];
-  matToFloat(viewM, viewF);
-  matToFloat(projM, projF);
+  viewM.toFloat(viewF);
+  projM.toFloat(projF);
 
   s.preview.begin();
   glViewport(0, 0, w, h);
