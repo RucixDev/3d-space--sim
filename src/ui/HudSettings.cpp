@@ -107,6 +107,14 @@ bool saveHudSettingsToFile(const HudSettings& s, const std::string& path) {
   f << "leadSizePx " << s.leadSizePx << "\n";
   f << "leadMaxTimeSec " << s.leadMaxTimeSec << "\n";
 
+  f << "projectileAimAssist " << (s.projectileAimAssist ? 1 : 0) << "\n";
+  f << "projectileAimAssistConeDeg " << s.projectileAimAssistConeDeg << "\n";
+  f << "projectileAimAssistMaxLeadTimeSec " << s.projectileAimAssistMaxLeadTimeSec << "\n";
+
+  f << "fireControlUseSensorTrack " << (s.fireControlUseSensorTrack ? 1 : 0) << "\n";
+  f << "fireControlMaxAgeSec " << s.fireControlMaxAgeSec << "\n";
+  f << "fireControlMaxSigmaKm " << s.fireControlMaxSigmaKm << "\n";
+
   f << "showFlightPathMarker " << (s.showFlightPathMarker ? 1 : 0) << "\n";
   f << "flightMarkerUseLocalFrame " << (s.flightMarkerUseLocalFrame ? 1 : 0) << "\n";
   f << "flightMarkerClampToEdge " << (s.flightMarkerClampToEdge ? 1 : 0) << "\n";
@@ -120,6 +128,26 @@ bool saveHudSettingsToFile(const HudSettings& s, const std::string& path) {
   f << "missileWarningAutoCountermeasures " << (s.missileWarningAutoCountermeasures ? 1 : 0) << "\n";
   f << "missileWarningAutoDeployTtiSec " << s.missileWarningAutoDeployTtiSec << "\n";
   f << "missileWarningPreferHeatSinks " << (s.missileWarningPreferHeatSinks ? 1 : 0) << "\n";
+
+  // Collision warning predictor (v7+)
+  f << "collisionWarningEnabled " << (s.collisionWarningEnabled ? 1 : 0) << "\n";
+  f << "collisionWarningHudIndicator " << (s.collisionWarningHudIndicator ? 1 : 0) << "\n";
+  f << "collisionWarningAvoidanceArrow " << (s.collisionWarningAvoidanceArrow ? 1 : 0) << "\n";
+  f << "collisionWarningToasts " << (s.collisionWarningToasts ? 1 : 0) << "\n";
+  f << "collisionWarningAssumeBoostBrake " << (s.collisionWarningAssumeBoostBrake ? 1 : 0) << "\n";
+  f << "collisionWarningHorizonSec " << s.collisionWarningHorizonSec << "\n";
+  f << "collisionWarningCautionTtiSec " << s.collisionWarningCautionTtiSec << "\n";
+  f << "collisionWarningDangerTtiSec " << s.collisionWarningDangerTtiSec << "\n";
+
+  // Defensive assist (Threat Avoidance) (v10+)
+  f << "threatAssistEnabled " << (s.threatAssistEnabled ? 1 : 0) << "\n";
+  f << "threatAssistHudIndicator " << (s.threatAssistHudIndicator ? 1 : 0) << "\n";
+  f << "threatAssistAutoApply " << (s.threatAssistAutoApply ? 1 : 0) << "\n";
+  f << "threatAssistStrength " << s.threatAssistStrength << "\n";
+  f << "threatAssistMaxThrust01 " << s.threatAssistMaxThrust01 << "\n";
+  f << "threatAssistMissileEngageTtiSec " << s.threatAssistMissileEngageTtiSec << "\n";
+  f << "threatAssistPreferLateralJink " << (s.threatAssistPreferLateralJink ? 1 : 0) << "\n";
+  f << "threatAssistAllowBoost " << (s.threatAssistAllowBoost ? 1 : 0) << "\n";
 
   // Tactical overlay
   f << "tacticalOverlayEnabled " << (s.tacticalOverlayEnabled ? 1 : 0) << "\n";
@@ -261,6 +289,20 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
     } else if (key == "leadmaxtimesec" || key == "leadmaxtime") {
       ss >> s.leadMaxTimeSec;
 
+    } else if (key == "projectileaimassist" || key == "projectileassist" || key == "guncomputer") {
+      s.projectileAimAssist = readBool(s.projectileAimAssist);
+    } else if (key == "projectileaimassistconedeg" || key == "projectileassistconedeg" || key == "projectileassistcone") {
+      ss >> s.projectileAimAssistConeDeg;
+    } else if (key == "projectileaimassistmaxleadtimesec" || key == "projectileassistmaxleadtimesec" || key == "projectileassistmaxtime") {
+      ss >> s.projectileAimAssistMaxLeadTimeSec;
+
+    } else if (key == "firecontrolusesensortrack" || key == "firecontrolsensortrack" || key == "usesensorfirecontrol") {
+      s.fireControlUseSensorTrack = readBool(s.fireControlUseSensorTrack);
+    } else if (key == "firecontrolmaxagesec" || key == "firecontrolmaxage") {
+      ss >> s.fireControlMaxAgeSec;
+    } else if (key == "firecontrolmaxsigmakm" || key == "firecontrolmaxsigma" || key == "firecontrolsigma") {
+      ss >> s.fireControlMaxSigmaKm;
+
     } else if (key == "showflightpathmarker" || key == "flightpathmarker" || key == "velocitymarker") {
       s.showFlightPathMarker = readBool(s.showFlightPathMarker);
     } else if (key == "flightmarkeruselocalframe" || key == "flightmarkerlocal") {
@@ -285,6 +327,40 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
       ss >> s.missileWarningAutoDeployTtiSec;
     } else if (key == "missilewarningpreferheatsinks" || key == "mwrpreferheatsinks" || key == "mwrheatsinks") {
       s.missileWarningPreferHeatSinks = readBool(s.missileWarningPreferHeatSinks);
+
+    } else if (key == "collisionwarningenabled" || key == "collisionwarning" || key == "collision") {
+      s.collisionWarningEnabled = readBool(s.collisionWarningEnabled);
+    } else if (key == "collisionwarninghudindicator" || key == "collisionwarningindicator" || key == "collisionindicator") {
+      s.collisionWarningHudIndicator = readBool(s.collisionWarningHudIndicator);
+    } else if (key == "collisionwarningavoidancearrow" || key == "collisionwarningarrow" || key == "collisionarrow") {
+      s.collisionWarningAvoidanceArrow = readBool(s.collisionWarningAvoidanceArrow);
+    } else if (key == "collisionwarningtoasts" || key == "collisiontoasts") {
+      s.collisionWarningToasts = readBool(s.collisionWarningToasts);
+    } else if (key == "collisionwarningassumeboostbrake" || key == "collisionassumeboostbrake" || key == "collisionassumeboost") {
+      s.collisionWarningAssumeBoostBrake = readBool(s.collisionWarningAssumeBoostBrake);
+    } else if (key == "collisionwarninghorizonsec" || key == "collisionhorizonsec" || key == "collisionhorizon") {
+      ss >> s.collisionWarningHorizonSec;
+    } else if (key == "collisionwarningcautionttisec" || key == "collisioncautionttisec" || key == "collisioncaution") {
+      ss >> s.collisionWarningCautionTtiSec;
+    } else if (key == "collisionwarningdangerttisec" || key == "collisiondangerttisec" || key == "collisiondanger") {
+      ss >> s.collisionWarningDangerTtiSec;
+
+    } else if (key == "threatassistenabled" || key == "defensiveassistenabled" || key == "threatavoidanceenabled" || key == "defensiveassist") {
+      s.threatAssistEnabled = readBool(s.threatAssistEnabled);
+    } else if (key == "threatassisthudindicator" || key == "threatassistindicator" || key == "defensiveassistindicator") {
+      s.threatAssistHudIndicator = readBool(s.threatAssistHudIndicator);
+    } else if (key == "threatassistautoapply" || key == "threatassistauto" || key == "defensiveassistauto") {
+      s.threatAssistAutoApply = readBool(s.threatAssistAutoApply);
+    } else if (key == "threatassiststrength" || key == "defensiveassiststrength") {
+      ss >> s.threatAssistStrength;
+    } else if (key == "threatassistmaxthrust01" || key == "threatassistmaxthrust" || key == "defensiveassistmaxthrust") {
+      ss >> s.threatAssistMaxThrust01;
+    } else if (key == "threatassistmissileengagettisec" || key == "threatassistengagettisec" || key == "threatassistmissiletti") {
+      ss >> s.threatAssistMissileEngageTtiSec;
+    } else if (key == "threatassistpreferlateraljink" || key == "threatassistlateral" || key == "defensiveassistlateral") {
+      s.threatAssistPreferLateralJink = readBool(s.threatAssistPreferLateralJink);
+    } else if (key == "threatassistallowboost" || key == "defensiveassistallowboost") {
+      s.threatAssistAllowBoost = readBool(s.threatAssistAllowBoost);
 
     } else if (key == "tacticaloverlayenabled" || key == "tacticaloverlay" || key == "tactical") {
       s.tacticalOverlayEnabled = readBool(s.tacticalOverlayEnabled);
@@ -344,9 +420,28 @@ bool loadHudSettingsFromFile(const std::string& path, HudSettings& out) {
   s.leadSizePx = std::clamp(s.leadSizePx, 6.0f, 120.0f);
   s.leadMaxTimeSec = std::clamp(s.leadMaxTimeSec, 1.0, 120.0);
 
+  s.projectileAimAssistConeDeg = std::clamp(s.projectileAimAssistConeDeg, 0.25, 25.0);
+  s.projectileAimAssistMaxLeadTimeSec = std::clamp(s.projectileAimAssistMaxLeadTimeSec, 1.0, 120.0);
+
+  s.fireControlMaxAgeSec = std::clamp(s.fireControlMaxAgeSec, 0.1, 30.0);
+  s.fireControlMaxSigmaKm = std::clamp(s.fireControlMaxSigmaKm, 0.01, 5000.0);
+
   s.flightMarkerSizePx = std::clamp(s.flightMarkerSizePx, 6.0f, 120.0f);
 
   s.missileWarningAutoDeployTtiSec = std::clamp(s.missileWarningAutoDeployTtiSec, 0.2, 30.0);
+
+  // Collision warning predictor (v7+)
+  s.collisionWarningHorizonSec = std::clamp(s.collisionWarningHorizonSec, 2.0, 300.0);
+  s.collisionWarningDangerTtiSec = std::clamp(s.collisionWarningDangerTtiSec, 0.2, s.collisionWarningHorizonSec);
+  s.collisionWarningCautionTtiSec = std::clamp(s.collisionWarningCautionTtiSec, 0.2, s.collisionWarningHorizonSec);
+  if (s.collisionWarningCautionTtiSec < s.collisionWarningDangerTtiSec + 1e-3) {
+    s.collisionWarningCautionTtiSec = std::min(s.collisionWarningHorizonSec, s.collisionWarningDangerTtiSec + 0.5);
+  }
+
+  // Defensive assist (Threat Avoidance) (v10+)
+  s.threatAssistStrength = std::clamp(s.threatAssistStrength, 0.0, 1.0);
+  s.threatAssistMaxThrust01 = std::clamp(s.threatAssistMaxThrust01, 0.1, 1.0);
+  s.threatAssistMissileEngageTtiSec = std::clamp(s.threatAssistMissileEngageTtiSec, 1.0, 60.0);
 
   s.tacticalRangeKm = std::clamp(s.tacticalRangeKm, 20000.0, 2000000.0);
   s.tacticalMaxMarkers = std::clamp(s.tacticalMaxMarkers, 8, 512);

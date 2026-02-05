@@ -769,6 +769,10 @@ void stepMissiles(std::vector<Missile>& missiles,
     const double turnRateRadS = effectiveTurnRateRadS(m, speedForTurn);
     const SphereTarget* guide = nullptr;
 
+    // When true, the active seeker is maintaining track via Home-On-Jam (HOJ)
+    // rather than a clean doppler return (i.e. inside the notch).
+    bool lockViaJam = false;
+
     // Optional: decoy commitment ("minimum dwell") timer.
     if (m.decoyCommitRemainingSimSec > 0.0) {
       m.decoyCommitRemainingSimSec = std::max(0.0, m.decoyCommitRemainingSimSec - dtSim);
@@ -898,7 +902,17 @@ void stepMissiles(std::vector<Missile>& missiles,
               // Radial velocity along the line-of-sight. Near-zero magnitude implies a "beam"/notch.
               const double vrKmS = math::dot(lockedTarget->velKmS - v, toDir);
               if (std::fabs(vrKmS) < notch) {
-                trackable = false;
+                // Inside the doppler notch.
+                //
+                // If HOJ is enabled and the target is actively jamming, allow the
+                // missile to maintain a coarse track by homing on the jammer emission.
+                const bool hoj = (m.homeOnJam &&
+                                  lockedTarget->jammerPower >= std::max(0.0, m.homeOnJamMinJammerPower));
+                if (!hoj) {
+                  trackable = false;
+                } else {
+                  lockViaJam = true;
+                }
               }
             }
           }
@@ -920,6 +934,7 @@ void stepMissiles(std::vector<Missile>& missiles,
           m.hasLastKnownTarget = true;
           m.lastKnownTargetPosKm = lockedTarget->centerKm;
           m.lastKnownTargetVelKmS = lockedTarget->velKmS;
+          m.lastKnownTargetHeatSignature = lockedTarget->heatSignature;
           m.lastKnownTargetAgeSimSec = 0.0;
 
           // APN target acceleration estimation (optional):
@@ -948,7 +963,11 @@ void stepMissiles(std::vector<Missile>& missiles,
           }
 
           baseTarget = lockedTarget;
-          targetScore = 1.0 / (distSq + 1.0e-9);
+          double sig = 1.0;
+          if (m.seeker == MissileSeekerType::Heat) {
+            sig = std::max(0.0, lockedTarget->heatSignature);
+          }
+          targetScore = sig / (distSq + 1.0e-9);
         }
       }
     }
@@ -961,12 +980,17 @@ void stepMissiles(std::vector<Missile>& missiles,
       memoryTarget.id = m.targetId;
       memoryTarget.centerKm = m.lastKnownTargetPosKm + m.lastKnownTargetVelKmS * m.lastKnownTargetAgeSimSec;
       memoryTarget.velKmS = m.lastKnownTargetVelKmS;
+      memoryTarget.heatSignature = m.lastKnownTargetHeatSignature;
       memoryTarget.radiusKm = 0.0;
 
       baseTarget = &memoryTarget;
 
       const math::Vec3d toMem = memoryTarget.centerKm - m.posKm;
-      targetScore = 1.0 / (toMem.lengthSq() + 1.0e-9);
+      double sig = 1.0;
+      if (m.seeker == MissileSeekerType::Heat) {
+        sig = std::max(0.0, m.lastKnownTargetHeatSignature);
+      }
+      targetScore = sig / (toMem.lengthSq() + 1.0e-9);
     }
 
     // --- Seeker track quality (optional) ---
@@ -1011,6 +1035,12 @@ void stepMissiles(std::vector<Missile>& missiles,
             measQ = std::clamp((align - seekerFovCos) / denom, 0.0, 1.0);
           }
         }
+      }
+
+      // HOJ lock has weaker angular accuracy than a clean radar track.
+      if (directTrack && lockViaJam && m.seeker == MissileSeekerType::Radar && m.homeOnJam) {
+        const double cap = std::clamp(m.homeOnJamTrackQualityCap, 0.0, 1.0);
+        measQ = std::min(measQ, cap);
       }
 
       const bool rising = (measQ >= m.trackQuality);
@@ -1183,13 +1213,34 @@ void stepMissiles(std::vector<Missile>& missiles,
             if (notch > 0.0) {
               const double vrKmS = math::dot(t.velKmS - v, toDir);
               if (std::fabs(vrKmS) < notch) {
-                continue;
+                const bool hoj = (m.homeOnJam &&
+                                  t.jammerPower >= std::max(0.0, m.homeOnJamMinJammerPower));
+                if (!hoj) {
+                  continue;
+                }
               }
             }
           }
 
           // Prefer targets close to boresight and nearby.
-          const double score = std::max(0.0, cosAng) / (distSq + 1.0e-9);
+          // Heat seekers also bias toward hotter targets.
+          double sig = 1.0;
+          if (m.seeker == MissileSeekerType::Heat) {
+            sig = std::max(0.0, t.heatSignature);
+          }
+          double score = sig * std::max(0.0, cosAng) / (distSq + 1.0e-9);
+
+          // If HOJ is enabled, bias reacquisition toward active jammers.
+          if (m.homeOnJam && m.seeker == MissileSeekerType::Radar) {
+            const double minJam = std::max(0.0, m.homeOnJamMinJammerPower);
+            if (t.jammerPower >= minJam && t.jammerPower > 0.0) {
+              const double bias = std::max(0.0, m.homeOnJamAcquireBias);
+              if (bias > 0.0) {
+                score *= (1.0 + bias * t.jammerPower);
+              }
+            }
+          }
+
           if (score > bestScore) {
             bestScore = score;
             best = &t;
@@ -1206,6 +1257,7 @@ void stepMissiles(std::vector<Missile>& missiles,
           m.hasLastKnownTarget = true;
           m.lastKnownTargetPosKm = best->centerKm;
           m.lastKnownTargetVelKmS = best->velKmS;
+          m.lastKnownTargetHeatSignature = best->heatSignature;
           m.lastKnownTargetAgeSimSec = 0.0;
 
           // Reset APN estimator state for the new lock (avoids cross-target spikes).
@@ -1214,7 +1266,14 @@ void stepMissiles(std::vector<Missile>& missiles,
           m.targetAccelEstKmS2 = {0, 0, 0};
 
           candidateGuide = best;
-          targetScore = 1.0 / ((best->centerKm - m.posKm).lengthSq() + 1.0e-9);
+          {
+            const double distSq = (best->centerKm - m.posKm).lengthSq();
+            double sig = 1.0;
+            if (m.seeker == MissileSeekerType::Heat) {
+              sig = std::max(0.0, best->heatSignature);
+            }
+            targetScore = sig / (distSq + 1.0e-9);
+          }
         }
       }
     }
@@ -1866,6 +1925,13 @@ FireResult tryFireWeapon(Ship& shooter,
       // Targets with very low radial velocity can be "notched" / beamed.
       m.radarDopplerNotchKmS = 0.75;
 
+      // Home-On-Jam (HOJ): radar seekers can maintain a coarse track against
+      // actively jamming targets even while inside the doppler notch.
+      m.homeOnJam = true;
+      m.homeOnJamMinJammerPower = 0.25;
+      m.homeOnJamTrackQualityCap = 0.70;
+      m.homeOnJamAcquireBias = 0.35;
+
       // Optional decoy discrimination gates: approximate range/angle/doppler track gates.
       // Radar seekers are fairly good at rejecting decoys not close to the true track.
       m.decoyAngleGateCos = std::cos(0.35);
@@ -1986,12 +2052,95 @@ FireResult tryFireWeapon(Ship& shooter,
   if (fwd.lengthSq() < 1e-12) fwd = {0, 0, 1};
   fwd = fwd.normalized();
 
-  const math::Vec3d spawnKm = shooter.positionKm() + fwd * 400.0;
+  math::Vec3d shotDir = fwd;
+
+  // Soft aim assist for ballistic projectiles (Cannon / Railgun):
+  // If the caller supplies candidate targets with a minAimCos cone filter,
+  // gently bias the shot toward a lead solution for the most-aligned target.
+  if (beamTargets && beamTargetCount > 0) {
+    const math::Vec3d originKm = shooter.positionKm();
+    const math::Vec3d shooterVelKmS = shooter.velocityKmS();
+
+    const SphereTarget* best = nullptr;
+    math::Vec3d bestDirTo{0, 0, 0};
+    double bestAim = -1.0;
+    double bestDist = 0.0;
+    double bestCone = -1.0;
+
+    for (std::size_t i = 0; i < beamTargetCount; ++i) {
+      const SphereTarget& t = beamTargets[i];
+      if (t.kind == CombatTargetKind::Decoy) continue;
+      if (fromPlayer && t.kind == CombatTargetKind::Player) continue;
+
+      // Avoid self-lock when ids are available.
+      if (shooterId != 0 && t.id != 0 && t.id == shooterId) continue;
+
+      const math::Vec3d to = t.centerKm - originKm;
+      const double dist = to.length();
+      if (!(dist > 1e-9)) continue;
+      if (rangeKm > 0.0 && dist > rangeKm) continue;
+
+      const math::Vec3d dirTo = to / dist;
+      const double aim = math::dot(fwd, dirTo);
+      if (!(aim > 0.0)) continue;
+
+      const double cone = t.minAimCos;
+      // Require an explicit cone filter to engage aim assist.
+      if (cone < -0.5) continue;
+      if (aim < cone) continue;
+
+      if (!best || aim > bestAim + 1e-9 || (std::abs(aim - bestAim) <= 1e-9 && dist < bestDist)) {
+        best = &t;
+        bestDirTo = dirTo;
+        bestAim = aim;
+        bestDist = dist;
+        bestCone = cone;
+      }
+    }
+
+    if (best) {
+      math::Vec3d aimDir = bestDirTo;
+      if (const auto lead = solveProjectileLeadAccel(originKm,
+                                               shooterVelKmS,
+                                               best->centerKm,
+                                               best->velKmS,
+                                               best->accelKmS2,
+                                               muzzleSpeedKmS,
+                                               ttlSim)) {
+        aimDir = lead->aimDirWorld;
+      }
+
+      // Smoothstep blend weight based on how centered the target already is.
+      // (Prevents snaps at the edge of the assist cone.)
+      const double denom = std::max(1e-9, 1.0 - bestCone);
+      double t0 = (bestAim - bestCone) / denom;
+      t0 = math::clamp(t0, 0.0, 1.0);
+      double w0 = t0 * t0 * (3.0 - 2.0 * t0);
+
+      // Also respect the cone for the lead direction (fast lateral targets can
+      // push the lead point outside the reticle even if the center is inside).
+      const double aimLead = math::dot(fwd, aimDir);
+      double t1 = (aimLead - bestCone) / denom;
+      t1 = math::clamp(t1, 0.0, 1.0);
+      double w1 = t1 * t1 * (3.0 - 2.0 * t1);
+
+      double w = std::min(w0, w1);
+
+      // Allow the caller to scale aim assist strength per-target (e.g. sensor quality).
+      w *= math::clamp(best->aimAssistWeight01, 0.0, 1.0);
+      if (w > 1e-6 && math::isFinite(aimDir)) {
+        const math::Vec3d blended = fwd * (1.0 - w) + aimDir * w;
+        if (blended.lengthSq() > 1e-12) shotDir = blended.normalized();
+      }
+    }
+  }
+
+  const math::Vec3d spawnKm = shooter.positionKm() + shotDir * 400.0;
 
   Projectile p{};
   p.prevKm = spawnKm;
   p.posKm = spawnKm;
-  p.velKmS = shooter.velocityKmS() + fwd * muzzleSpeedKmS;
+  p.velKmS = shooter.velocityKmS() + shotDir * muzzleSpeedKmS;
   p.r = w.r; p.g = w.g; p.b = w.b;
   p.ttlSimSec = ttlSim;
   p.radiusKm = (weapon == WeaponType::Railgun) ? 520.0 : 700.0;
@@ -2004,7 +2153,7 @@ FireResult tryFireWeapon(Ship& shooter,
 
   // Small recoil impulse (matches historical tuning in stellar_game).
   const double recoil = (weapon == WeaponType::Railgun) ? 0.003 : 0.002;
-  shooter.setVelocityKmS(shooter.velocityKmS() - fwd * recoil);
+  shooter.setVelocityKmS(shooter.velocityKmS() - shotDir * recoil);
 
   return out;
 }

@@ -1,7 +1,11 @@
 #include "stellar/render/MeshRenderer.h"
 
+#include "stellar/math/Quat.h"
+
 #include "stellar/render/Gl.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 
@@ -207,6 +211,16 @@ void MeshRenderer::ensureInstanceAttribLayoutBound_() {
 void MeshRenderer::setViewProj(const float* view, const float* proj) {
   std::memcpy(view_, view, sizeof(float) * 16);
   std::memcpy(proj_, proj, sizeof(float) * 16);
+
+  // Cache the frustum once per view/projection update (used by drawInstancesCulled).
+  stellar::math::Mat4d v{};
+  stellar::math::Mat4d p{};
+  for (int i = 0; i < 16; ++i) {
+    v.m[i] = static_cast<double>(view_[i]);
+    p.m[i] = static_cast<double>(proj_[i]);
+  }
+  frustum_ = stellar::math::frustumFromViewProjection(v, p);
+  frustumValid_ = frustum_.isFinite();
 }
 
 void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
@@ -267,6 +281,64 @@ void MeshRenderer::drawInstances(const std::vector<InstanceData>& instances) {
   }
 
   mesh_->drawInstanced(static_cast<std::uint32_t>(instances.size()));
+}
+
+void MeshRenderer::drawInstancesCulled(const std::vector<InstanceData>& instances) {
+  if (!mesh_ || instances.empty()) return;
+
+  // Small batches aren't worth the CPU cost.
+  constexpr std::size_t kMinCullCount = 64;
+  if (instances.size() < kMinCullCount) {
+    drawInstances(instances);
+    return;
+  }
+
+  if (!frustumValid_ || !mesh_->hasLocalBounds()) {
+    drawInstances(instances);
+    return;
+  }
+
+  const auto& localBounds = mesh_->localBounds();
+  const stellar::math::Vec3d localCenter = localBounds.center();
+  const double localRadius = mesh_->localBoundingRadius();
+
+  culledScratch_.clear();
+  culledScratch_.reserve(instances.size());
+
+  for (const auto& inst : instances) {
+    const double sx = static_cast<double>(inst.sx);
+    const double sy = static_cast<double>(inst.sy);
+    const double sz = static_cast<double>(inst.sz);
+
+    const double maxScale = std::max({std::abs(sx), std::abs(sy), std::abs(sz)});
+    const double radius = localRadius * maxScale;
+
+    // World center = T + R * (S * localCenter)
+    const stellar::math::Vec3d scaledCenter{localCenter.x * sx, localCenter.y * sy, localCenter.z * sz};
+
+    stellar::math::Quatd q{static_cast<double>(inst.qw),
+                           static_cast<double>(inst.qx),
+                           static_cast<double>(inst.qy),
+                           static_cast<double>(inst.qz)};
+
+    if (!std::isfinite(q.w) || !std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z)) {
+      q = stellar::math::Quatd::identity();
+    }
+    q = q.normalized();
+
+    const stellar::math::Vec3d worldCenter = q.rotate(scaledCenter) +
+                                             stellar::math::Vec3d{static_cast<double>(inst.px),
+                                                                  static_cast<double>(inst.py),
+                                                                  static_cast<double>(inst.pz)};
+
+    if (frustum_.intersectsSphere(worldCenter, radius)) {
+      culledScratch_.push_back(inst);
+    }
+  }
+
+  if (!culledScratch_.empty()) {
+    drawInstances(culledScratch_);
+  }
 }
 
 } // namespace stellar::render

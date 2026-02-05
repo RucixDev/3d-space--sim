@@ -52,16 +52,24 @@ Mesh::~Mesh() { destroy(); }
 
 Mesh::Mesh(Mesh&& o) noexcept {
   vao_ = o.vao_; vbo_ = o.vbo_; ebo_ = o.ebo_; indexCount_ = o.indexCount_;
+  localBounds_ = o.localBounds_;
+  localBoundingRadius_ = o.localBoundingRadius_;
   o.vao_ = o.vbo_ = o.ebo_ = 0;
   o.indexCount_ = 0;
+  o.localBounds_ = stellar::math::Aabb3d{};
+  o.localBoundingRadius_ = 0.0;
 }
 
 Mesh& Mesh::operator=(Mesh&& o) noexcept {
   if (this == &o) return *this;
   destroy();
   vao_ = o.vao_; vbo_ = o.vbo_; ebo_ = o.ebo_; indexCount_ = o.indexCount_;
+  localBounds_ = o.localBounds_;
+  localBoundingRadius_ = o.localBoundingRadius_;
   o.vao_ = o.vbo_ = o.ebo_ = 0;
   o.indexCount_ = 0;
+  o.localBounds_ = stellar::math::Aabb3d{};
+  o.localBoundingRadius_ = 0.0;
   return *this;
 }
 
@@ -71,10 +79,22 @@ void Mesh::destroy() {
   if (vao_) gl::DeleteVertexArrays(1, &vao_);
   vao_ = vbo_ = ebo_ = 0;
   indexCount_ = 0;
+  localBounds_ = stellar::math::Aabb3d{};
+  localBoundingRadius_ = 0.0;
 }
 
 void Mesh::upload(const std::vector<VertexPNUT>& vertices, const std::vector<std::uint32_t>& indices) {
   destroy();
+
+  // Cache local-space bounds for downstream culling/picking.
+  for (const auto& v : vertices) {
+    localBounds_.expand({static_cast<double>(v.px), static_cast<double>(v.py), static_cast<double>(v.pz)});
+  }
+  if (localBounds_.isFinite()) {
+    localBoundingRadius_ = localBounds_.extents().length();
+  } else {
+    localBoundingRadius_ = 0.0;
+  }
 
   gl::GenVertexArrays(1, &vao_);
   gl::GenBuffers(1, &vbo_);

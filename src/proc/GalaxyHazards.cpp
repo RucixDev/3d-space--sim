@@ -197,4 +197,38 @@ double sampleGalaxyHazardAvgOnSegment(core::u64 universeSeed,
   return sum / static_cast<double>(samples);
 }
 
+
+
+double sampleGalaxyNavDisruptionAvgOnSegment(core::u64 universeSeed,
+                                             const math::Vec3d& aLy,
+                                             const math::Vec3d& bLy,
+                                             const GalaxyHazardsParams& params,
+                                             int samples) {
+  samples = std::clamp(samples, 1, 11);
+  const math::Vec3d d = bLy - aLy;
+  double sum = 0.0;
+  for (int i = 0; i < samples; ++i) {
+    const double t = (static_cast<double>(i) + 0.5) / static_cast<double>(samples);
+    const math::Vec3d p = aLy + d * t;
+    sum += sampleGalaxyHazards(universeSeed, p, params).navDisruption01;
+  }
+  return std::clamp(sum / static_cast<double>(samples), 0.0, 1.0);
+}
+
+double sampleGalaxySensorOcclusionAvgOnSegment(core::u64 universeSeed,
+                                               const math::Vec3d& aLy,
+                                               const math::Vec3d& bLy,
+                                               const GalaxyHazardsParams& params,
+                                               int samples) {
+  samples = std::clamp(samples, 1, 11);
+  const math::Vec3d d = bLy - aLy;
+  double sum = 0.0;
+  for (int i = 0; i < samples; ++i) {
+    const double t = (static_cast<double>(i) + 0.5) / static_cast<double>(samples);
+    const math::Vec3d p = aLy + d * t;
+    sum += sampleGalaxyHazards(universeSeed, p, params).sensorOcclusion01;
+  }
+  return std::clamp(sum / static_cast<double>(samples), 0.0, 1.0);
+}
+
 } // namespace stellar::proc
