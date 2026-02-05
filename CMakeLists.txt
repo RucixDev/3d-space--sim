@@ -209,6 +209,7 @@ set(STELLAR_CORE_SOURCES
   src/sim/TrajectoryAnalysis.cpp
   src/sim/TrajectoryEvents.cpp
   src/sim/ManeuverComputer.cpp
+  src/sim/ManeuverSequenceComputer.cpp
   src/sim/ManeuverProgramComputer.cpp
   src/sim/LambertSolver.cpp
   src/sim/LambertPlanner.cpp
@@ -218,7 +219,12 @@ set(STELLAR_CORE_SOURCES
   src/sim/Countermeasures.cpp
   src/sim/ShipScan.cpp
   src/sim/MissileDefense.cpp
+  src/sim/ThreatAvoidance.cpp
+  src/sim/CollisionWarning.cpp
   src/sim/SensorModel.cpp
+  src/sim/Occlusion.cpp
+  src/sim/ProximityField.cpp
+  src/sim/AgentAvoidance.cpp
   src/sim/ElectronicWarfare.cpp
   src/sim/FlightController.cpp
   src/sim/NavAssistComputer.cpp

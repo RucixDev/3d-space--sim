@@ -50,6 +50,11 @@ int test_hud_settings() {
     s.leadSizePx = 44.0f;
     s.leadMaxTimeSec = 9.0;
 
+    // Fire control (v9)
+    s.fireControlUseSensorTrack = false;
+    s.fireControlMaxAgeSec = 7.5;
+    s.fireControlMaxSigmaKm = 123.0;
+
     s.showFlightPathMarker = true;
     s.flightMarkerUseLocalFrame = false;
     s.flightMarkerClampToEdge = false;
@@ -62,6 +67,15 @@ int test_hud_settings() {
     s.missileWarningAutoCountermeasures = true;
     s.missileWarningAutoDeployTtiSec = 3.5;
     s.missileWarningPreferHeatSinks = false;
+
+    s.collisionWarningEnabled = true;
+    s.collisionWarningHudIndicator = false;
+    s.collisionWarningAvoidanceArrow = false;
+    s.collisionWarningToasts = true;
+    s.collisionWarningAssumeBoostBrake = true;
+    s.collisionWarningHorizonSec = 55.0;
+    s.collisionWarningCautionTtiSec = 18.0;
+    s.collisionWarningDangerTtiSec = 6.0;
 
     s.tacticalOverlayEnabled = false;
     s.tacticalShowLabels = false;
@@ -113,6 +127,10 @@ int test_hud_settings() {
     CHECK(std::fabs(out.leadSizePx - s.leadSizePx) <= 1e-4f);
     CHECK(feq(out.leadMaxTimeSec, s.leadMaxTimeSec));
 
+    CHECK(out.fireControlUseSensorTrack == s.fireControlUseSensorTrack);
+    CHECK(feq(out.fireControlMaxAgeSec, s.fireControlMaxAgeSec));
+    CHECK(feq(out.fireControlMaxSigmaKm, s.fireControlMaxSigmaKm));
+
     CHECK(out.showFlightPathMarker == s.showFlightPathMarker);
     CHECK(out.flightMarkerUseLocalFrame == s.flightMarkerUseLocalFrame);
     CHECK(out.flightMarkerClampToEdge == s.flightMarkerClampToEdge);
@@ -125,6 +143,15 @@ int test_hud_settings() {
     CHECK(out.missileWarningAutoCountermeasures == s.missileWarningAutoCountermeasures);
     CHECK(feq(out.missileWarningAutoDeployTtiSec, s.missileWarningAutoDeployTtiSec));
     CHECK(out.missileWarningPreferHeatSinks == s.missileWarningPreferHeatSinks);
+
+    CHECK(out.collisionWarningEnabled == s.collisionWarningEnabled);
+    CHECK(out.collisionWarningHudIndicator == s.collisionWarningHudIndicator);
+    CHECK(out.collisionWarningAvoidanceArrow == s.collisionWarningAvoidanceArrow);
+    CHECK(out.collisionWarningToasts == s.collisionWarningToasts);
+    CHECK(out.collisionWarningAssumeBoostBrake == s.collisionWarningAssumeBoostBrake);
+    CHECK(feq(out.collisionWarningHorizonSec, s.collisionWarningHorizonSec));
+    CHECK(feq(out.collisionWarningCautionTtiSec, s.collisionWarningCautionTtiSec));
+    CHECK(feq(out.collisionWarningDangerTtiSec, s.collisionWarningDangerTtiSec));
 
     CHECK(out.tacticalOverlayEnabled == s.tacticalOverlayEnabled);
     CHECK(out.tacticalShowLabels == s.tacticalShowLabels);
@@ -158,7 +185,12 @@ int test_hud_settings() {
     f << "reticleSizePx -5\n";          // clamp
     f << "reticleAlpha 123\n";          // clamp
     f << "leadMaxTimeSec -50\n";        // clamp
+    f << "fireControlMaxAgeSec -5\n";      // clamp
+    f << "fireControlMaxSigmaKm -1\n";    // clamp
     f << "missileWarningAutoDeployTtiSec -50\n";  // clamp
+    f << "collisionWarningHorizonSec -1\n";  // clamp
+    f << "collisionWarningDangerTtiSec -50\n";  // clamp
+    f << "collisionWarningCautionTtiSec 0\n";  // clamp
     f << "tacticalRangeKm 99999999\n";  // clamp
     f << "tacticalMaxMarkers -2\n";     // clamp
     f << "overlayBgAlpha -10\n";         // clamp
@@ -175,7 +207,13 @@ int test_hud_settings() {
     CHECK(out.reticleSizePx >= 8.0f - 1e-4f);
     CHECK(out.reticleAlpha <= 1.0f + 1e-4f);
     CHECK(out.leadMaxTimeSec >= 1.0 - 1e-4);
+
+    CHECK(out.fireControlMaxAgeSec >= 0.1);
+    CHECK(out.fireControlMaxSigmaKm >= 0.01);
     CHECK(out.missileWarningAutoDeployTtiSec >= 0.2 - 1e-4);
+    CHECK(out.collisionWarningHorizonSec >= 2.0 - 1e-4);
+    CHECK(out.collisionWarningDangerTtiSec >= 0.2 - 1e-4);
+    CHECK(out.collisionWarningCautionTtiSec >= out.collisionWarningDangerTtiSec - 1e-4);
     CHECK(out.tacticalRangeKm <= 2000000.0 + 1e-4);
     CHECK(out.tacticalMaxMarkers >= 8);
 

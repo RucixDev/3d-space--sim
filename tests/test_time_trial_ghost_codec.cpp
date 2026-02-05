@@ -10,6 +10,39 @@ static bool approxEq(double a, double b, double eps) { return std::abs(a - b) <=
 int test_time_trial_ghost_codec() {
   int fails = 0;
 
+  // --- Legacy v1 decode (backwards compatibility) ---
+  // Two samples: t={0,1}, pos={(1000,0,0),(1001,0,0)}, orient=identity.
+  // (Generated from the v1 writer: magic TTGH + ver=1 + count=2 + 2 full samples.)
+  {
+    const std::string legacyV1 =
+      "VFRHSAECAAAAAAAAAAAAekQAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AEB6RAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAA==";
+
+    std::vector<stellar::sim::TimeTrialGhostSample> out;
+    std::string err;
+    if (!stellar::sim::decodeTimeTrialGhostSamplesB64(legacyV1, &out, &err)) {
+      std::cerr << "[test_time_trial_ghost_codec] legacy v1 decode failed: " << err << "\n";
+      ++fails;
+    } else if (out.size() != 2) {
+      std::cerr << "[test_time_trial_ghost_codec] legacy v1 expected 2 samples, got " << out.size() << "\n";
+      ++fails;
+    } else {
+      if (!approxEq(out[0].tSec, 0.0, 1e-6) || !approxEq(out[1].tSec, 1.0, 1e-6)) {
+        std::cerr << "[test_time_trial_ghost_codec] legacy v1 time mismatch\n";
+        ++fails;
+      }
+      if ((out[0].posKm - stellar::math::Vec3d{1000.0, 0.0, 0.0}).length() > 1e-6 ||
+          (out[1].posKm - stellar::math::Vec3d{1001.0, 0.0, 0.0}).length() > 1e-6) {
+        std::cerr << "[test_time_trial_ghost_codec] legacy v1 pos mismatch\n";
+        ++fails;
+      }
+      const auto q0 = out[0].orient.normalized();
+      if (std::abs(q0.w) < 0.999999) {
+        std::cerr << "[test_time_trial_ghost_codec] legacy v1 orient mismatch\n";
+        ++fails;
+      }
+    }
+  }
+
   // --- Codec round-trip (float32 quantization expected) ---
   std::vector<stellar::sim::TimeTrialGhostSample> in;
   in.reserve(64);

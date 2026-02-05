@@ -1,3 +1,98 @@
+## Round 202 - Home-On-Jam Radar Missiles (EW vs Notch)
+
+Radar missiles now support a **Home-On-Jam (HOJ)** mode: if a locked target is actively emitting a radar noise jammer, the missile can maintain a **coarse track** even while the target sits inside the doppler notch (beaming). HOJ tracks are intentionally lower-fidelity, so countermeasures and maneuvering still matter.
+
+- **Sim/Combat:** added `SphereTarget::jammerPower` + HOJ parameters on `Missile` and integrated HOJ into the radar seeker’s notch handling, track-quality, and reacquisition logic.
+- **Game:** projectile target lists now feed per-contact jammer power into the combat target set so missiles can actually “see” jammers.
+- **Tests:** added coverage ensuring HOJ bypasses notch only when a jammer is present.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 189 - Sensor-Based Fire Control (Lead + Aim Assist)
+
+This round links gunnery assistance to **sensor track quality**: the projectile lead marker and ballistic gun-computer aim assist can now use the radar kinematic track (pos/vel) and gracefully fade out when the track becomes stale or uncertain (occlusion/jamming). This makes active pings and clean lines-of-sight matter more for long-range shots.
+
+- **Sim:** added lightweight `FireControl` helpers to convert a `KinematicTrack3d` into a fire-control estimate + quality scalar.
+- **Sim/Combat:** added `SphereTarget::aimAssistWeight01` so callers can scale ballistic aim assist strength per-target (e.g. sensor quality).
+- **Game/HUD:** added Fire Control sliders (max stale age + max sigma) and a toggle to use the sensor track for lead/assist; holding **Shift** on the lead marker shows `σ` and age, and displays “FC LOST” when no valid solution exists.
+- **Tests:** extended combat + HUD settings coverage for the new fire-control knobs/weighting.
+
+### Files changed/added
+
+- `include/stellar/sim/FireControl.h` *(new)*
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `include/stellar/ui/HudSettings.h`
+- `src/ui/HudSettings.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_combat.cpp`
+- `tests/test_hud_settings.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 188 - Asteroid BVH Frustum Culling
+
+This round speeds up dense asteroid fields by building a **km-space BVH** of inflated render spheres once per system, then querying it each frame using the camera frustum transformed into km coordinates (so it stays correct under the floating-origin shift). Off-screen asteroids are skipped early, reducing per-frame instance work and draw overhead.
+
+- **Sim:** added a `ProximityFieldKm::queryFrustum()` helper for BVH broadphase frustum queries.
+- **Game:** uses a per-system asteroid render-cull BVH to only emit instances for asteroids inside the current view frustum.
+- **Tests:** added coverage for frustum query equivalence vs brute-force.
+
+### Files changed/added
+
+- `include/stellar/sim/ProximityField.h`
+- `apps/stellar_game/main.cpp`
+- `tests/test_proximity_field.cpp`
+- `PATCH_NOTES.md`
+
+---
+
+## Round 183 - Radar Ping Sweep Ring (Per-Target Boost)
+
+This round upgrades the active sensor ping from a global “everything gets louder” boost to a **sweeping ring** that boosts detection only when the wavefront passes a target’s range (with an optional out-and-back return sweep). This makes pings feel more readable, more tactical, and less like a blanket wallhack.
+
+- **Sim:** added `RadarPing` helpers (ping fraction, triangle sweep, smooth ring-boost profile).
+- **Game:** radar ping now applies a per-target sensor-power boost gated by the sweep ring; added tuning sliders (ring thickness + feather + out-&-back toggle) to the Radar HUD context menu.
+- **Tests:** added coverage for sweep fraction and ring boost shape.
+
+### Files changed/added
+
+- `include/stellar/sim/RadarPing.h` *(new)*
+- `apps/stellar_game/main.cpp`
+- `tests/test_radar_ping.cpp` *(new)*
+- `PATCH_NOTES.md`
+
+---
+
+## Round 182 - Nav Assist Orbit Mode (Strafe Orbit)
+
+This round adds a new Nav Assist **Orbit** mode that holds a standoff distance while translating tangentially around the target (useful for scanning patterns and dogfights). It also adds a default keybind (End) and exposes Orbit in the Action Wheel.
+
+- **Sim:** added `NavAssistMode::Orbit` with plane selection + tangential goal generation and optional obstacle biasing.
+- **Game:** added the Orbit toggle action with default keybind + Action Wheel entry.
+- **Tests:** added a regression test for stable orbit standoff + tangential motion.
+
+### Files changed/added
+
+- `include/stellar/sim/NavAssistComputer.h`
+- `src/sim/NavAssistComputer.cpp`
+- `apps/stellar_game/ControlsConfig.h`
+- `apps/stellar_game/ControlsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_nav_assist.cpp` *(new coverage)*
+- `PATCH_NOTES.md`
+
+---
+
 ## Round 155 - AABB Geometry Helpers + Universe Sector Distance Cleanup
 
 This round introduces a small `Aabb3d` helper to centralize point/box distance math and removes duplicated sector-distance code in universe queries.
@@ -4601,5 +4696,397 @@ It reduces missile stacking and encourages multi-axis attacks without adding ran
 
 - `include/stellar/sim/Combat.h`
 - `src/sim/Combat.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 177 - Geometry: frustum culling helpers + AABB ray/segment intersection
+
+This patch expands the geometry toolbelt with two high-leverage primitives:
+- robust ray/segment vs AABB intersection (for picking, collision, broadphase queries)
+- lightweight view-frustum extraction + intersection tests (for future culling and visibility queries)
+
+### Improvements
+
+- `Aabb3d`: added
+  - `intersectsAabb` (inclusive overlap)
+  - `rayIntersectionT` (returns entry/exit distances along the ray; direction need not be normalized)
+  - `segmentIntersectionT` (returns entry/exit parameters in [0,1])
+- Added `math::Plane3d` and `math::Frustumd` in a new header (`Frustum.h`):
+  - `frustumFromClipMatrix` / `frustumFromViewProjection`
+  - point, sphere, and AABB intersection helpers
+
+### Tests
+
+- Added ray/segment AABB intersection regression tests.
+- Added frustum extraction + intersection sanity tests.
+
+### Files changed/added
+
+- `include/stellar/math/Geometry.h`
+- `include/stellar/math/Frustum.h`
+- `tests/test_geometry_aabb_raycast.cpp`
+- `tests/test_geometry_frustum.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 178 - Spatial acceleration: BVH + render frustum-culling hook
+
+### Improvements
+
+- Added a header-only `math::Bvh3d` (median-split BVH over AABB primitives) supporting:
+  - AABB overlap queries
+  - frustum/AABB visibility queries
+  - raycasts against primitive AABBs
+- `render::Mesh` now caches a local-space AABB + derived bounding radius at upload-time.
+- `render::MeshRenderer` gained `drawInstancesCulled()` which applies conservative CPU-side frustum culling.
+- Enabled `drawInstancesCulled()` for asteroid/rock instance draws in the main game forward pass.
+
+### Tests
+
+- Added BVH regression tests (BVH results compared against brute-force).
+
+### Files changed/added
+
+- `include/stellar/math/Bvh.h`
+- `tests/test_geometry_bvh.cpp`
+- `include/stellar/render/Mesh.h`
+- `src/render/Mesh.cpp`
+- `include/stellar/render/MeshRenderer.h`
+- `src/render/MeshRenderer.cpp`
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 179 - Time Trial ghost codec v2 (smaller + backwards compatible)
+
+### Improvements
+
+- Upgraded the Time Trial ghost Base64 codec to **v2**:
+  - Position stored as **quantized deltas** (10cm steps) from the predicted decoded position (bounded error, no drift).
+  - Orientation stored with **"smallest three" quaternion compression** (3×i16 + 2-bit index) for better compactness.
+- Decoder is now **backwards compatible** with v1 blobs.
+- Save/load now accepts ghosts written with **older codec versions** (<= current).
+
+### Tests
+
+- Added a fixed legacy v1 Base64 fixture to ensure backwards compatibility.
+
+### Files changed/added
+
+- `include/stellar/sim/TimeTrialGhostCodec.h`
+- `src/sim/TimeTrialGhostCodec.cpp`
+- `include/stellar/sim/SaveGame.h`
+- `apps/stellar_game/main.cpp`
+- `tests/test_time_trial_ghost_codec.cpp`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 180 - BVH-accelerated partial sensor occlusion (asteroid fields)
+
+### Improvements
+
+- Added `sim::OcclusionFieldKm`: a tiny BVH-backed occlusion helper for fast segment-vs-sphere occlusion queries.
+- Radar/contact sensor logic now uses a **continuous occlusion factor** (0..1) instead of a binary flag.
+- Asteroid belts contribute **partial occlusion** (fuzzy attenuation) using a cached per-system BVH, while stations/planets still fully occlude.
+- Radar/contact tooltips now expose occlusion percentage for debugging/tuning.
+
+### Tests
+
+- Added regression tests for `OcclusionFieldKm` (composition, endpoint-inside skip, refinement cap monotonicity).
+
+### Files changed/added
+
+- `include/stellar/math/Bvh.h`
+- `include/stellar/sim/Occlusion.h`
+- `src/sim/Occlusion.cpp`
+- `include/stellar/sim/SensorModel.h`
+- `src/sim/SensorModel.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_occlusion_field.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 181 - Asteroid-aware nav assist (proximity BVH + local avoidance)
+
+### Improvements
+
+- Added `sim::ProximityFieldKm`: a BVH-backed spherical obstacle field for fast proximity queries:
+  - closest hit raycasts (inflated sphere queries)
+  - linear time-to-impact prediction along current velocity
+- Added `sim::steerAvoidObstacles(...)`: deterministic, low-cost local steering that biases a desired direction away from nearby obstacles (potential-field style).
+- Nav Assist now supports optional **local obstacle avoidance**:
+  - translation guidance is steered around nearby obstacles
+  - ship facing remains locked on the true target direction
+- The main game caches a per-system asteroid proximity BVH and feeds it to Nav Assist (target asteroid can be ignored so you can still approach it).
+
+### Tests
+
+- Added regression tests for `ProximityFieldKm` (ray hits, time-to-impact, ignoreId, and avoidance steering).
+
+### Files changed/added
+
+- `include/stellar/sim/ProximityField.h`
+- `src/sim/ProximityField.cpp`
+- `include/stellar/sim/NavAssistComputer.h`
+- `src/sim/NavAssistComputer.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_proximity_field.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+
+## OpenAI Patch Round 184 - Predictive radar contact tracks (kinematics + uncertainty)
+
+### Improvements
+
+- Added `sim::KinematicTrack3d`: a deterministic alpha-beta filter for position/velocity tracking with a simple scalar uncertainty model.
+- Radar HUD now supports **predictive contact tracks** when the instantaneous measurement drops below a gate:
+  - blips coast using an estimated velocity instead of snapping to true positions
+  - optional **uncertainty ring** (σ) around predicted blips
+- Radar context menu: new **Tracking** section (predictive tracks, uncertainty ring, measurement gate, sigma growth/shrink).
+- Contact tooltips now show track mode (measured/predicted), age since last measurement, and σ.
+
+### Tests
+
+- Added regression tests for `KinematicTrack` (convergence, dropout coasting, uncertainty growth/shrink).
+
+### Files changed/added
+
+- `include/stellar/sim/KinematicTrack.h`
+- `apps/stellar_game/main.cpp`
+- `tests/test_kinematic_track.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 185
+
+- Added a headless collision predictor (time-to-impact + stop-distance margin) built on the existing ProximityField BVH.
+- HUD: optional "COLLISION" indicator + steer arrow cue (uses obstacle-avoidance steering against the current velocity vector).
+- HUD settings (v7): collision warning toggles + thresholds persisted to `hud_settings.txt`.
+- Tests: collision warning unit tests + HudSettings roundtrip/clamp updates.
+
+## OpenAI Patch Round 186 - Smart reticle target acquisition (AimPick + Alt+T)
+
+- Added `sim::AimPick`: deterministic ray→sphere picking (sorted hits + nearest) with optional aim-cone gating and radius padding.
+- New gameplay keybind: **Alt+T** → **Target: under reticle**
+  - ray-picks targets in front of the ship and cycles through multiple hits along the line of fire
+  - supports Contacts, Asteroids, Cargo pods, and Signals
+- Tests: added regression coverage for AimPick hit ordering, padding behavior, and aim-cone filtering.
+
+### Files changed/added
+
+- `include/stellar/sim/AimPick.h`
+- `apps/stellar_game/ControlsConfig.h`
+- `apps/stellar_game/ControlsWindow.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_aim_pick.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 187 - Gun computer for ballistic weapons (soft projectile aim assist)
+
+- Added optional soft aim assist for fixed ballistic projectiles (Cannon/Railgun):
+  - when a contact is already within a small reticle cone, projectile launch direction is biased toward a lead solution
+  - correction strength ramps smoothly with alignment to avoid snapping at the cone edge
+- HUD settings (v8): projectile aim-assist toggle + cone + max lead-time persisted to `hud_settings.txt`.
+- Tests: added a regression check that aim-assisted projectiles can hit an offset target that a non-assisted shot misses.
+
+### Files changed/added
+
+- `include/stellar/ui/HudSettings.h`
+- `src/ui/HudSettings.cpp`
+- `src/sim/Combat.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_combat.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 190 - Hazard-aware K-shortest routes + segment hazard helpers
+
+- Added segment-average galaxy hazard helpers for **nav disruption** and **sensor occlusion** (midpoint sampling, deterministic).
+- Added `plotKRoutesAStarCostHazards` (Yen K-shortest) to produce multiple alternate routes using the hazard-augmented cost model.
+- Refactored `plotRouteAStarCostHazards` to use the shared hazard-aware A* solver for consistent cost accounting and deterministic tie-breaking.
+- Tests: extended nav-route hazards coverage with helper equivalence checks + K-route ordering.
+
+### Files changed/added
+
+- `include/stellar/proc/GalaxyHazards.h`
+- `src/proc/GalaxyHazards.cpp`
+- `include/stellar/sim/NavRoute.h`
+- `src/sim/NavRoute.cpp`
+- `tests/test_nav_route_hazards.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 191 - Bearing-only triangulation track (passive cross-fix)
+
+- Added `sim::BearingTrack`: a deterministic, header-only **bearing-only** triangulation tracker that estimates a 3D contact position from multiple observer bearings using least squares with exponential forgetting + residual-based sigma.
+- Added a minimal `math::Mat3d` (3x3 matrix) utility to support compact linear solves used by sensor/geometry helpers.
+- Tests: added geometry regression coverage for solvability gating (single-bearing stays invalid), exact two-bearing triangulation, and no-measurement coasting stability.
+
+### Files changed/added
+
+- `include/stellar/math/Mat3.h`
+- `include/stellar/sim/BearingTrack.h`
+- `tests/test_geometry_bearing_triangulation.cpp`
+- `PATCH_NOTES.md`
+
+## OpenAI Patch Round 192 - Ghost contact bearing-ranging + sensor strength inversion
+
+- Added `sim::estimateSensorRangeKmFromStrength01`: analytically inverts the sensor strength model (including occlusion attenuation) to provide a **coarse range estimate** from detection strength.
+- Integrated bearing-only tracking into the radar HUD: **unidentified/ghost** contacts now render without leaking perfect range. When enough ownship motion exists, `BearingTrack` can triangulate a cross-fix; otherwise the HUD falls back to the inverted-strength estimate with deterministic jitter.
+- Contacts window now displays an approximate `~range` for unidentified contacts when ghost bearing-only mode is enabled.
+- Tests: added `test_sensor_inversion` to ensure `compute -> invert -> range` round-trips cleanly.
+
+### Files changed/added
+
+- `include/stellar/sim/SensorModel.h`
+- `src/sim/SensorModel.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_sensor_inversion.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 193 - K-shortest alternate route planning + hazard exposure UI
+
+- Added `sim::routeNodeJaccard01`: a small deterministic helper to measure **route overlap** (Jaccard similarity) between two paths (optionally ignoring endpoints) for comparing alternates.
+- Galaxy route planner now supports **K-shortest loopless alternates** in Direct graph mode (Yen’s algorithm). When `K>1`, plotting a route computes up to K candidates ordered by the active planner cost model (hops / distance / fuel, optionally hazard-augmented).
+- Added a route-alternates table in the route planner UI showing hops, distance, cost, estimated fuel, **average storm (nav disruption) exposure**, **average sensor occlusion**, and **overlap vs the cheapest route**. Selecting an alternate updates the active nav route and map overlay.
+
+### Files changed/added
+
+- `include/stellar/sim/NavRoute.h`
+- `src/sim/NavRoute.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_nav_route_similarity.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 194 - ThreatAvoidance defensive assist (collision + missile blending)
+
+- Added `sim::ThreatAvoidance`: a deterministic headless helper that blends collision warning and missile evasion into a suggested thrust/brake/boost overlay.
+- Tests: added `test_threat_avoidance` covering collision-only, missile-only, and blended behavior.
+
+### Files changed/added
+
+- `include/stellar/sim/ThreatAvoidance.h`
+- `src/sim/ThreatAvoidance.cpp`
+- `tests/test_threat_avoidance.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 196 - Tangent bypass waypoint planning for smoother Nav Assist avoidance
+
+- Added `sim::planTangentBypassWaypoint`: a deterministic local planner that returns a single validated waypoint around the nearest blocking spherical obstacle on the straight-line segment to a goal.
+- Nav Assist avoidance now optionally uses tangent-bypass waypoints before falling back to potential-field steering, reducing dithering and “stuck” behavior in sparse asteroid fields.
+- Tests: extended `test_proximity_field` to cover bypass validity (both legs clear) and preferred-side selection.
+
+### Files changed/added
+
+- `include/stellar/sim/ProximityField.h`
+- `src/sim/ProximityField.cpp`
+- `include/stellar/sim/NavAssistComputer.h`
+- `src/sim/NavAssistComputer.cpp`
+- `tests/test_proximity_field.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 197 - Maneuver program planner + direct arming
+
+- Added a new **Maneuver programs (Keplerian)** section to the trajectory/maneuver planner UI.
+- Programs generate maneuver plans for: circularization (peri/apo), raising/lowering apsides, escape, and plane alignment at AN/DN.
+- A computed program can be **applied to the maneuver node RTN fields** (for preview), or **armed directly** into the Maneuver Computer (preview optional).
+
+### Files changed/added
+
+- `apps/stellar_game/main.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 198 - Lambert rendezvous 2-burn sequences + ManeuverSequenceComputer
+
+- Added `sim::ManeuverSequenceComputer`: chains multiple maneuver nodes and executes them in order.
+- Transfer planner (Lambert) can now arm a **2-burn rendezvous** sequence: departure burn + arrival velocity-match burn.
+- Added sequence status/abort/clear UI, and wired maneuver-sequence guidance into the main input override loop.
+
+### Files changed/added
+
+- `include/stellar/sim/ManeuverSequenceComputer.h`
+- `src/sim/ManeuverSequenceComputer.cpp`
+- `tests/test_maneuver_sequence_computer.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 199 - AgentAvoidance local deconfliction steering
+
+- Added `sim::AgentAvoidance`: a deterministic velocity-obstacle / ORCA-inspired local deconfliction helper for moving spherical neighbors.
+- Integrated agent-agent deconfliction into convoy/escort formation steering in the game loop (reduces “bumping” / clustering).
+- Tests: added `test_agent_avoidance` coverage and wired the new module into the build.
+
+### Files changed/added
+
+- `include/stellar/sim/AgentAvoidance.h`
+- `src/sim/AgentAvoidance.cpp`
+- `tests/test_agent_avoidance.cpp`
+- `apps/stellar_game/main.cpp`
+- `CMakeLists.txt`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 200 - Morton-code BVH build mode (LBVH-inspired)
+
+- Added `math::BvhBuildMode::Morton`: a deterministic Morton (Z-order) centroid sort + highest-differing-bit radix split build mode for `math::Bvh3d`.
+- Extended BVH geometry tests to validate Morton-built trees against brute force (AABB, frustum, and raycast queries), including a degenerate centroid regression.
+
+### Files changed/added
+
+- `include/stellar/math/Bvh.h`
+- `tests/test_geometry_bvh.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 201 - Constant-acceleration projectile lead + sensor accel estimate
+
+- Added constant-acceleration intercept / projectile lead solver to `sim::Ballistics` (numeric root find for agile targets).
+- HUD fire control now derives a heavily-filtered acceleration estimate from the radar kinematic track and feeds it into:
+  - projectile lead indicator, and
+  - ballistic aim assist (when sensor fire control is enabled).
+- Tests: added accelerating-target coverage and verified accel=0 parity with the constant-velocity solver.
+
+### Files changed/added
+
+- `include/stellar/sim/Ballistics.h`
+- `src/sim/Ballistics.cpp`
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `apps/stellar_game/main.cpp`
+- `tests/test_ballistics.cpp`
+- `PATCH_NOTES.md`
+
+
+## OpenAI Patch Round 203 - Heat-seeker thermal signature weighting
+
+- Added `SphereTarget::heatSignature` (arbitrary units comparable to flare `heatStrength`) and `Missile::lastKnownTargetHeatSignature` for stable memory guidance.
+- Heat-seeker missiles now weight lock-vs-decoy scoring by target thermal signature, making:
+  - hot targets harder to decoy with weak flares,
+  - heat-sinks more effective both by spawning strong decoys and by rapidly dropping signature.
+- Game combat target list now populates `heatSignature`:
+  - player: derived from heat + silent running + speed,
+  - NPCs: lightweight speed/hull proxy (no full thermal sim).
+- Fix: player `jammerPower` is now propagated into the projectile/missile target list so NPC radar missiles can Home-On-Jam correctly.
+- Tests: added `test_combat` coverage for heat-signature weighting in decoy selection.
+
+### Files changed/added
+
+- `include/stellar/sim/Combat.h`
+- `src/sim/Combat.cpp`
+- `apps/stellar_game/main.cpp`
 - `tests/test_combat.cpp`
 - `PATCH_NOTES.md`

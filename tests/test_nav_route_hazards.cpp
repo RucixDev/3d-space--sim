@@ -26,7 +26,7 @@ stellar::sim::SystemStub makeStub(stellar::sim::SystemId id, const stellar::math
   return s;
 }
 
-double avgNavDisruption01(stellar::core::u64 seed,
+double avgNavDisruption01_ref(stellar::core::u64 seed,
                           const stellar::math::Vec3d& aLy,
                           const stellar::math::Vec3d& bLy,
                           const stellar::proc::GalaxyHazardsParams& hp) {
@@ -38,6 +38,18 @@ double avgNavDisruption01(stellar::core::u64 seed,
     sum += stellar::proc::sampleGalaxyHazards(seed, p, hp).navDisruption01;
   }
   return std::clamp(sum / (double)samples, 0.0, 1.0);
+}
+
+double avgNavDisruption01(stellar::core::u64 seed,
+                          const stellar::math::Vec3d& aLy,
+                          const stellar::math::Vec3d& bLy,
+                          const stellar::proc::GalaxyHazardsParams& hp) {
+  const double v = stellar::proc::sampleGalaxyNavDisruptionAvgOnSegment(seed,
+                                                                        aLy,
+                                                                        bLy,
+                                                                        hp,
+                                                                        /*samples=*/5);
+  return std::clamp(v, 0.0, 1.0);
 }
 
 double navIntegral(stellar::core::u64 seed,
@@ -110,6 +122,19 @@ int test_nav_route_hazards() {
   const math::Vec3d midTop{best.tx + halfSpan, best.ty + dy, 0.0};
   const math::Vec3d midBottom{best.tx + halfSpan, best.ty - dy, 0.0};
 
+  // Sanity: the new proc helper matches our reference midpoint sampling.
+  {
+    const double ref = avgNavDisruption01_ref(seed, start, midTop, hp);
+    const double got = avgNavDisruption01(seed, start, midTop, hp);
+    CHECK(std::abs(ref - got) < 1e-12);
+  }
+
+  // Smoke check for the sensor occlusion segment helper.
+  {
+    const double so = proc::sampleGalaxySensorOcclusionAvgOnSegment(seed, start, midTop, hp, /*samples=*/5);
+    CHECK(so >= 0.0 && so <= 1.0);
+  }
+
   std::vector<sim::SystemStub> nodes;
   nodes.reserve(4);
   nodes.push_back(makeStub(1, start));
@@ -136,6 +161,35 @@ int test_nav_route_hazards() {
   CHECK(route[0] == 1);
   CHECK(route[2] == 4);
   CHECK(route[1] == expectedMid);
+
+  // K-shortest hazard-aware variants should return both disjoint routes in cost order.
+  {
+    const auto routes = sim::plotKRoutesAStarCostHazards(nodes,
+                                                        /*startId=*/1,
+                                                        /*goalId=*/4,
+                                                        maxJumpLy,
+                                                        /*costPerJump=*/0.0,
+                                                        /*costPerLy=*/0.0,
+                                                        /*hazardWeightPerLy=*/5.0,
+                                                        seed,
+                                                        timeDays,
+                                                        /*k=*/2);
+
+    CHECK(routes.size() == 2);
+    CHECK(routes[0].path.size() == 3);
+    CHECK(routes[1].path.size() == 3);
+
+    const sim::SystemId otherMid = (expectedMid == 2) ? 3 : 2;
+    CHECK(routes[0].path[1] == expectedMid);
+    CHECK(routes[1].path[1] == otherMid);
+    CHECK(routes[0].cost <= routes[1].cost + 1e-9);
+
+    // Public helper should reproduce the stored cost.
+    const double c0 = sim::routeCostHazards(nodes, routes[0].path, 0.0, 0.0, 5.0, seed, timeDays);
+    const double c1 = sim::routeCostHazards(nodes, routes[1].path, 0.0, 0.0, 5.0, seed, timeDays);
+    CHECK(std::abs(c0 - routes[0].cost) < 1e-9);
+    CHECK(std::abs(c1 - routes[1].cost) < 1e-9);
+  }
 
   return failures;
 }

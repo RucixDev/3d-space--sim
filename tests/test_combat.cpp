@@ -528,6 +528,191 @@ int test_combat() {
     }
   }
 
+  // --- Heat seekers should weight target thermal signatures when comparing against decoys ---
+  {
+    sim::SphereTarget shipT{};
+    shipT.kind = sim::CombatTargetKind::Ship;
+    shipT.index = 0;
+    shipT.id = 1;
+    shipT.centerKm = {0, 0, 200};
+    shipT.velKmS = {0, 0, 0};
+    shipT.radiusKm = 1.0;
+
+    // A flare-like decoy at a similar range but offset in X so guidance is distinguishable.
+    sim::SphereTarget decoyT{};
+    decoyT.kind = sim::CombatTargetKind::Decoy;
+    decoyT.index = 1;
+    decoyT.id = 100;
+    decoyT.centerKm = {50, 0, 200};
+    decoyT.velKmS = {0, 0, 0};
+    decoyT.radiusKm = 0.5;
+    decoyT.decoyHeat = 15.0;
+    decoyT.decoyRadar = 0.0;
+
+    sim::SphereTarget targets[2]{shipT, decoyT};
+
+    auto makeMissile = [&]() {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 50.0;
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 1;
+
+      m.seeker = sim::MissileSeekerType::Heat;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = 0.0;
+      m.decoyResistance = 1.0;
+      return m;
+    };
+
+    // Case A: a hot ship should not be overridden by a moderately hot decoy.
+    targets[0].heatSignature = 20.0;
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] heatSignature test (A): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot > 0.985) {
+          std::cerr << "[test_combat] heatSignature test (A): missile should favor hot target over decoy. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Case B: a cooler ship should be overridden by the same decoy.
+    targets[0].heatSignature = 10.0;
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile());
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, targets, 2, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] heatSignature test (B): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        const auto toDecoy = (targets[1].centerKm - ms[0].posKm).normalized();
+        const double dot = d.x * toDecoy.x + d.y * toDecoy.y + d.z * toDecoy.z;
+        if (dot < 0.99) {
+          std::cerr << "[test_combat] heatSignature test (B): expected decoy override for cooler target. dot="
+                    << dot << "\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
+  // --- HOJ should allow radar seekers to ignore doppler notch against jamming targets ---
+  {
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 0;
+    tgt.id = 9001;
+    // Place the target to the +X side so the missile must turn.
+    tgt.centerKm = {10, 0, 0};
+    tgt.velKmS = {0, 0, 0};
+    tgt.radiusKm = 1.0;
+    // Active jammer emission.
+    tgt.jammerPower = 1.0;
+
+    auto makeMissile = [&](bool hoj) {
+      sim::Missile m{};
+      m.prevKm = {0, 0, 0};
+      m.posKm = {0, 0, 0};
+      m.velKmS = {0, 0, 10};
+      m.ttlSimSec = 30.0;
+      m.radiusKm = 0.1;
+      m.dmg = 0.0;
+      m.blastRadiusKm = 0.0;
+      m.turnRateRadS = 20.0; // enough to swing to +X in one step
+
+      m.hasTarget = true;
+      m.targetKind = sim::CombatTargetKind::Ship;
+      m.targetId = 9001;
+
+      m.seeker = sim::MissileSeekerType::Radar;
+      m.seekerActivationSimSec = 0.0;
+      m.seekerFovCos = -1.0; // always inside cone
+      m.requireLineOfSight = false;
+
+      // Always notched in this geometry (radial velocity is ~0 along +X).
+      m.radarDopplerNotchKmS = 5.0;
+
+      m.guidance = sim::MissileGuidance::LeadPursuit;
+
+      m.homeOnJam = hoj;
+      m.homeOnJamMinJammerPower = 0.25;
+      m.homeOnJamTrackQualityCap = 0.70;
+      return m;
+    };
+
+    // Without HOJ: lock should break due to notch and the missile should not turn.
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile(false));
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, &tgt, 1, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] HOJ test (disabled): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        if (std::fabs(d.x) > 0.02 || d.z < 0.98) {
+          std::cerr << "[test_combat] HOJ test (disabled): missile turned despite notch. dir=(" << d.x << "," << d.y
+                    << "," << d.z << ")\n";
+          ++fails;
+        }
+      }
+    }
+
+    // With HOJ: the jammer should allow the missile to keep tracking and turn toward +X.
+    {
+      std::vector<sim::Missile> ms;
+      ms.push_back(makeMissile(true));
+
+      std::vector<sim::MissileDetonation> dets;
+      std::vector<sim::MissileHit> hits;
+      sim::stepMissiles(ms, 0.1, &tgt, 1, dets, hits);
+
+      if (ms.empty()) {
+        std::cerr << "[test_combat] HOJ test (enabled): missile unexpectedly destroyed.\n";
+        ++fails;
+      } else {
+        const auto d = ms[0].velKmS.normalized();
+        if (d.x < 0.25) {
+          std::cerr << "[test_combat] HOJ test (enabled): missile did not turn toward jammer. dir=(" << d.x << "," << d.y
+                    << "," << d.z << ")\n";
+          ++fails;
+        }
+      }
+    }
+  }
+
   // --- ProNav steering should match expected sign/magnitude in a simple case ---
   {
     // Geometry picked so the closed-form PN turn command is easy to reason about.
@@ -2046,6 +2231,83 @@ int test_combat() {
       std::cerr << "[test_combat] swarm separation should split laterally. x0=" << ms[0].posKm.x
                 << " x1=" << ms[1].posKm.x << "\n";
       ++fails;
+    }
+  }
+
+  // --- Ballistic projectile aim assist biases shots toward a lead solution ---
+  {
+    // Arrange: shooter faces +Z, target is slightly offset in X so a straight shot misses
+    // (given combined radii), but a small aim correction should score a hit.
+    sim::Ship shooter0{};
+    shooter0.setPositionKm({0, 0, 0});
+    shooter0.setVelocityKmS({0, 0, 0});
+
+    sim::SphereTarget tgt{};
+    tgt.kind = sim::CombatTargetKind::Ship;
+    tgt.index = 0;
+    tgt.id = 77;
+    tgt.centerKm = {900.0, 0.0, 100000.0};
+    tgt.velKmS = {0, 0, 0};
+    tgt.radiusKm = 50.0;
+    tgt.minAimCos = std::cos(math::degToRad(5.0));
+
+    // Fire without providing targets -> no aim assist -> should miss.
+    {
+      sim::Ship shooter = shooter0;
+      const sim::FireResult fr = sim::tryFireWeapon(shooter, sim::WeaponType::Cannon, /*cooldownSimSec*/0.0, /*distributorMk*/1, /*shooterId*/123, /*fromPlayer*/true, nullptr, 0);
+      if (!fr.hasProjectile) {
+        std::cerr << "[test_combat] expected projectile fire result\n";
+        ++fails;
+      } else {
+        std::vector<sim::Projectile> ps;
+        ps.push_back(fr.projectile);
+        std::vector<sim::ProjectileHit> hits;
+        sim::stepProjectiles(ps, /*dtSimSec*/900.0, &tgt, 1, hits);
+        if (!hits.empty()) {
+          std::cerr << "[test_combat] non-assisted projectile should miss (hits=" << hits.size() << ")\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Fire with provided targets -> aim assist can engage -> should hit.
+    {
+      sim::Ship shooter = shooter0;
+      const sim::FireResult fr = sim::tryFireWeapon(shooter, sim::WeaponType::Cannon, /*cooldownSimSec*/0.0, /*distributorMk*/1, /*shooterId*/123, /*fromPlayer*/true, &tgt, 1);
+      if (!fr.hasProjectile) {
+        std::cerr << "[test_combat] expected projectile fire result (assisted)\n";
+        ++fails;
+      } else {
+        std::vector<sim::Projectile> ps;
+        ps.push_back(fr.projectile);
+        std::vector<sim::ProjectileHit> hits;
+        sim::stepProjectiles(ps, /*dtSimSec*/900.0, &tgt, 1, hits);
+        if (hits.size() != 1 || hits[0].targetId != tgt.id) {
+          std::cerr << "[test_combat] assisted projectile should hit (hits=" << hits.size() << ")\n";
+          ++fails;
+        }
+      }
+    }
+
+    // Fire with provided targets but aim-assist weight=0 -> should behave like unassisted and miss.
+    {
+      sim::Ship shooter = shooter0;
+      sim::SphereTarget weak = tgt;
+      weak.aimAssistWeight01 = 0.0;
+      const sim::FireResult fr = sim::tryFireWeapon(shooter, sim::WeaponType::Cannon, /*cooldownSimSec*/0.0, /*distributorMk*/1, /*shooterId*/123, /*fromPlayer*/true, &weak, 1);
+      if (!fr.hasProjectile) {
+        std::cerr << "[test_combat] expected projectile fire result (weighted)\n";
+        ++fails;
+      } else {
+        std::vector<sim::Projectile> ps;
+        ps.push_back(fr.projectile);
+        std::vector<sim::ProjectileHit> hits;
+        sim::stepProjectiles(ps, /*dtSimSec*/900.0, &weak, 1, hits);
+        if (!hits.empty()) {
+          std::cerr << "[test_combat] weight=0 projectile should miss (hits=" << hits.size() << ")\n";
+          ++fails;
+        }
+      }
     }
   }
   if (fails == 0) {

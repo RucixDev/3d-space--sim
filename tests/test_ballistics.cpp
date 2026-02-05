@@ -70,7 +70,65 @@ int test_ballistics() {
     }
   }
 
-  // --- Unsolvable case: target outruns projectile directly away. ---
+  
+  // --- Accelerating target: verify |r + v t + 0.5 a t^2| ~= s t ---
+  {
+    const math::Vec3d sPos{0, 0, 0};
+    const math::Vec3d sVel{0, 0, 0};
+    const math::Vec3d tPos{1500, 0, 0};
+    const math::Vec3d tVel{0, 15, 0};
+    const math::Vec3d tAcc{0, 0.02, 0}; // 0.02 km/s^2 = 20 m/s^2
+    const double speed = 220.0;
+
+    const auto sol = sim::solveProjectileLeadAccel(sPos, sVel, tPos, tVel, tAcc, speed, /*maxTimeSec*/200.0);
+    if (!sol) {
+      std::cerr << "[test_ballistics] expected accel lead solution.\n";
+      ++fails;
+    } else {
+      const double tSec = sol->tSec;
+      const math::Vec3d r = (tPos - sPos) + (tVel - sVel) * tSec + tAcc * (0.5 * tSec * tSec);
+      const double lhs = r.length();
+      const double rhs = speed * tSec;
+      if (!approx(lhs, rhs, 2e-4)) {
+        std::cerr << "[test_ballistics] accel intercept mismatch: lhs=" << lhs << " rhs=" << rhs << "\n";
+        ++fails;
+      }
+
+      const math::Vec3d expectedLead = tPos + tVel * tSec + tAcc * (0.5 * tSec * tSec);
+      if ((sol->leadPointKm - expectedLead).length() > 1e-6) {
+        std::cerr << "[test_ballistics] accel lead point mismatch.\n";
+        ++fails;
+      }
+    }
+  }
+
+  // --- Accel = 0: accel solver matches constant-velocity solver ---
+  {
+    const math::Vec3d sPos{0, 0, 0};
+    const math::Vec3d sVel{0, 0, 0};
+    const math::Vec3d tPos{1200, 300, 0};
+    const math::Vec3d tVel{-5, 8, 0};
+    const math::Vec3d tAcc{0, 0, 0};
+    const double speed = 180.0;
+
+    const auto sol0 = sim::solveProjectileLead(sPos, sVel, tPos, tVel, speed, /*maxTimeSec*/200.0);
+    const auto sol1 = sim::solveProjectileLeadAccel(sPos, sVel, tPos, tVel, tAcc, speed, /*maxTimeSec*/200.0);
+    if (!sol0 || !sol1) {
+      std::cerr << "[test_ballistics] expected both CV and accel(0) solutions.\n";
+      ++fails;
+    } else {
+      if (!approx(sol0->tSec, sol1->tSec, 1e-6)) {
+        std::cerr << "[test_ballistics] accel(0) time mismatch.\n";
+        ++fails;
+      }
+      if ((sol0->leadPointKm - sol1->leadPointKm).length() > 1e-6) {
+        std::cerr << "[test_ballistics] accel(0) lead point mismatch.\n";
+        ++fails;
+      }
+    }
+  }
+
+// --- Unsolvable case: target outruns projectile directly away. ---
   {
     const math::Vec3d sPos{0, 0, 0};
     const math::Vec3d sVel{0, 0, 0};
