@@ -71,6 +71,8 @@
 #include "stellar/sim/TrajectoryPredictor.h"
 #include "stellar/sim/TimeTrialGhostCodec.h"
 #include "stellar/sim/ManeuverComputer.h"
+#include "stellar/sim/ManeuverSequenceComputer.h"
+#include "stellar/sim/ManeuverProgramComputer.h"
 #include "stellar/sim/LambertSolver.h"
 #include "stellar/sim/LambertPlanner.h"
 #include "stellar/sim/MissionAssist.h"
@@ -107,6 +109,16 @@
 #include "stellar/sim/Countermeasures.h"
 #include "stellar/sim/MissileDefense.h"
 #include "stellar/sim/SensorModel.h"
+#include "stellar/sim/RadarPing.h"
+#include "stellar/sim/KinematicTrack.h"
+#include "stellar/sim/BearingTrack.h"
+#include "stellar/sim/FireControl.h"
+#include "stellar/sim/Occlusion.h"
+#include "stellar/sim/ProximityField.h"
+#include "stellar/sim/AgentAvoidance.h"
+#include "stellar/sim/CollisionWarning.h"
+#include "stellar/sim/ThreatAvoidance.h"
+#include "stellar/sim/AimPick.h"
 #include "stellar/sim/ElectronicWarfare.h"
 #include "stellar/sim/Ballistics.h"
 #include "stellar/sim/PowerDistributor.h"
@@ -940,6 +952,14 @@ struct Contact {
 
   // --- Sensors (player radar detection model) ---
   sim::SensorTrack sensorTrack{};
+
+  // Kinematic sensor track used by the radar HUD to coast briefly when
+  // measurements drop out (alpha-beta filter + growing uncertainty).
+  sim::KinematicTrack3d sensorKinematic{};
+  // Smoothed world-space acceleration estimate derived from the kinematic track (km/s^2).
+  math::Vec3d sensorAccelKmS2{0, 0, 0};
+  // Bearing-only track used for weak/ghost contacts (direction-only ranging / triangulation).
+  sim::BearingTrack3d sensorBearing{};
 
   double fireCooldown{0.0}; // simulated seconds
   bool alive{true};
@@ -2472,6 +2492,17 @@ int main(int argc, char** argv) {
   float maneuverDvNormalMS = 0.0f;   // orbital plane normal delta-v (m/s)
   float maneuverDvRadialMS = 0.0f;   // radial-out delta-v (m/s)
 
+  // --- Maneuver programs (Keplerian orbit helpers) ---
+  // Uses sim::ManeuverProgramComputer to generate a maneuver node from high-level goals
+  // like circularize, raise/lower apsis, escape, or plane alignment.
+  int maneuverProgramChoice = (int)sim::ManeuverProgramKind::CircularizeAtPeriapsis;
+  float maneuverProgramTargetAltKm = 200.0f; // used by SetApo/SetPeri programs
+  bool maneuverProgramForcePrograde = false; // used by plane align programs
+
+  bool maneuverProgramHasLast = false;
+  sim::ManeuverProgramResult maneuverProgramLast{};
+
+
   // Maneuver computer (experimental): execute an armed maneuver node as a continuous burn.
   // The plan is captured when arming, so the node time does not "slide" with the preview UI.
   sim::ManeuverComputer maneuverComputer;
@@ -2480,6 +2511,13 @@ int main(int argc, char** argv) {
   sim::ManeuverComputerPhase maneuverComputerPrevPhase = sim::ManeuverComputerPhase::Off;
   bool maneuverComputerDisengageOnManualInput = true;
   float maneuverComputerManualDeadzone = 0.22f;
+
+  // Maneuver sequence computer (experimental): execute multiple planned burns in order.
+  // Used by rendezvous-style planners that need a departure + arrival burn.
+  sim::ManeuverSequenceComputer maneuverSequence;
+  sim::ManeuverSequenceOutput maneuverSequenceLast{};
+  sim::ManeuverSequencePhase maneuverSequencePrevPhase = sim::ManeuverSequencePhase::Off;
+  int maneuverSequencePrevNodeIndex = -1;
 
   // --- Transfer planner (experimental): Lambert solver helper ---
   // Computes a 2-body (star-centric) transfer burn to reach the current target
@@ -2496,6 +2534,12 @@ int main(int argc, char** argv) {
   float lambertLastMissKm = 0.0f;
   float lambertLastAngleDeg = 0.0f;
   int lambertLastIterations = 0;
+
+  // Vector form (for arming multi-burn sequences without re-solving).
+  math::Vec3d lambertLastDvWorldKmS{0,0,0};
+  math::Vec3d lambertLastArriveRelVelKmS{0,0,0}; // sol.v2 - targetVel at arrival
+  double lambertLastNodeTimeDays = 0.0;
+  double lambertLastArriveTimeDays = 0.0;
 
   // --- Lambert planner (incremental porkchop search) ---
   // Uses sim::LambertPorkchopStepper to spread the grid search over multiple frames.
@@ -3983,6 +4027,25 @@ bool focusMissionsWindow = false;
   // (contacts window, scan reports, system map) stays consistent even when the radar HUD is hidden.
   std::vector<sim::SensorTrackResult> contactSense;
   std::vector<bool> contactSenseOccluded;
+  std::vector<double> contactSenseOcclusion01;
+  std::vector<double> contactSenseMeasured01; // instantaneous measurement strength (pre-track filter)
+
+  // Radar kinematic tracking: smooth position/velocity estimates and grow uncertainty
+  // when measurements drop out. Used only for HUD rendering and tooltips.
+  sim::KinematicTrackParams radarKinematicParams{};
+  bool radarPredictiveTracks = true;
+  bool radarShowUncertainty = true;
+  double radarKinematicMeasGate01 = 0.02;
+
+  // Ghost / low-confidence contacts: avoid leaking perfect range by default.
+  // When enabled, unidentified contacts render using bearing-only triangulation when possible,
+  // otherwise a coarse inverted-strength range estimate with deterministic jitter.
+  sim::BearingTrackParams radarBearingParams{};
+  bool radarGhostBearingOnly = true;
+  bool radarShowBearingUncertainty = true;
+  double radarGhostRangeJitter01 = 0.18; // +/- jitter applied to inverted-strength ghost range estimates
+ // min instantaneous strength to count as a kinematic measurement
+
   double radarSensorPower = 0.0; // effective sensor power after occlusion/jamming/ping (1.0 = nominal)
   double radarEnvSensorOcclusion01 = 0.0;
   double radarEwJamming01 = 0.0;
@@ -3996,6 +4059,9 @@ bool focusMissionsWindow = false;
   double sensorPingDurationSec = 1.25;
   double sensorPingCooldownSec = 6.0;
   double sensorPingPowerBoost = 2.5;
+
+  // Ping sweep shaping (ring thickness + out-and-back sweep).
+  sim::RadarPingParams radarPingParams{};
 
   // Electronic warfare (HUD radar): nearby jammers can suppress sensor power and
   // generate false returns (ghost blips).
@@ -4077,6 +4143,18 @@ bool focusMissionsWindow = false;
   float hudLeadSizePx = 22.0f;
   double hudLeadMaxTimeSec = 18.0; // hide very long leads
 
+  // Gun computer: soft aim assist for fixed ballistic projectiles (cannon/railgun).
+  bool hudProjectileAimAssist = true;
+  double hudProjectileAimAssistConeDeg = 4.0;
+  double hudProjectileAimAssistMaxLeadTimeSec = 18.0;
+
+  // Fire control: optionally tie lead/aim assist to radar kinematic track quality.
+  // This makes long-range gunnery sensitive to occlusion/jamming and rewards active sensor pings.
+  bool hudFireControlUseSensorTrack = true;
+  double hudFireControlMaxAgeSec = 4.0;   // seconds since last measurement
+  double hudFireControlMaxSigmaKm = 50.0; // 1-sigma uncertainty threshold (km)
+
+
   bool hudShowFlightPathMarker = true;
   bool hudFlightMarkerUseLocalFrame = true;
   bool hudFlightMarkerClampToEdge = true;
@@ -4114,6 +4192,33 @@ bool focusMissionsWindow = false;
   math::Vec3d hudMissileWarningEvadeDirWorld{0,0,0};
   double hudMissileWarningEvadeDirRefreshUntilDays = 0.0;
 
+
+  // Collision warning predictor (player): time-to-impact to nearby obstacles.
+  bool hudCollisionWarningEnabled = true;
+  bool hudCollisionWarningIndicator = true;
+  bool hudCollisionWarningAvoidanceArrow = true;
+  bool hudCollisionWarningToasts = false;
+  bool hudCollisionWarningAssumeBoostBrake = false;
+  double hudCollisionWarningHorizonSec = 40.0;
+  double hudCollisionWarningCautionTtiSec = 14.0;
+  double hudCollisionWarningDangerTtiSec = 5.0;
+
+  sim::CollisionWarningResult hudCollisionWarning{};
+  sim::AvoidanceResultKm hudCollisionWarningAvoidance{};
+  double hudCollisionWarningToastCooldownUntilDays = 0.0;
+  
+  // Defensive assist (Threat Avoidance): combines collision + missile threat into a suggested thrust overlay.
+  bool hudThreatAssistEnabled = true;
+  bool hudThreatAssistIndicator = true;
+  bool hudThreatAssistAutoApply = false;
+  double hudThreatAssistStrength = 0.80;
+  double hudThreatAssistMaxThrust01 = 1.0;
+  double hudThreatAssistMissileEngageTtiSec = 12.0;
+  bool hudThreatAssistPreferLateralJink = true;
+  bool hudThreatAssistAllowBoost = true;
+
+  sim::ThreatAvoidanceResult hudThreatAvoidance{};
+  bool hudThreatAssistEngaged = false;
   // Tracks last fired weapon for HUD lead indicator (primary LMB vs secondary RMB).
   bool hudLastFiredPrimary = true;
 
@@ -4183,6 +4288,14 @@ bool focusMissionsWindow = false;
     hudSettings.leadSizePx = hudLeadSizePx;
     hudSettings.leadMaxTimeSec = hudLeadMaxTimeSec;
 
+    hudSettings.projectileAimAssist = hudProjectileAimAssist;
+    hudSettings.projectileAimAssistConeDeg = hudProjectileAimAssistConeDeg;
+    hudSettings.projectileAimAssistMaxLeadTimeSec = hudProjectileAimAssistMaxLeadTimeSec;
+
+    hudSettings.fireControlUseSensorTrack = hudFireControlUseSensorTrack;
+    hudSettings.fireControlMaxAgeSec = hudFireControlMaxAgeSec;
+    hudSettings.fireControlMaxSigmaKm = hudFireControlMaxSigmaKm;
+
     hudSettings.showFlightPathMarker = hudShowFlightPathMarker;
     hudSettings.flightMarkerUseLocalFrame = hudFlightMarkerUseLocalFrame;
     hudSettings.flightMarkerClampToEdge = hudFlightMarkerClampToEdge;
@@ -4195,6 +4308,24 @@ bool focusMissionsWindow = false;
     hudSettings.missileWarningAutoCountermeasures = hudMissileWarningAutoCountermeasures;
     hudSettings.missileWarningAutoDeployTtiSec = hudMissileWarningAutoDeployTtiSec;
     hudSettings.missileWarningPreferHeatSinks = hudMissileWarningPreferHeatSinks;
+
+    hudSettings.collisionWarningEnabled = hudCollisionWarningEnabled;
+    hudSettings.collisionWarningHudIndicator = hudCollisionWarningIndicator;
+    hudSettings.collisionWarningAvoidanceArrow = hudCollisionWarningAvoidanceArrow;
+    hudSettings.collisionWarningToasts = hudCollisionWarningToasts;
+    hudSettings.collisionWarningAssumeBoostBrake = hudCollisionWarningAssumeBoostBrake;
+    hudSettings.collisionWarningHorizonSec = hudCollisionWarningHorizonSec;
+    hudSettings.collisionWarningCautionTtiSec = hudCollisionWarningCautionTtiSec;
+    hudSettings.collisionWarningDangerTtiSec = hudCollisionWarningDangerTtiSec;
+
+    hudSettings.threatAssistEnabled = hudThreatAssistEnabled;
+    hudSettings.threatAssistHudIndicator = hudThreatAssistIndicator;
+    hudSettings.threatAssistAutoApply = hudThreatAssistAutoApply;
+    hudSettings.threatAssistStrength = hudThreatAssistStrength;
+    hudSettings.threatAssistMaxThrust01 = hudThreatAssistMaxThrust01;
+    hudSettings.threatAssistMissileEngageTtiSec = hudThreatAssistMissileEngageTtiSec;
+    hudSettings.threatAssistPreferLateralJink = hudThreatAssistPreferLateralJink;
+    hudSettings.threatAssistAllowBoost = hudThreatAssistAllowBoost;
 
     hudSettings.tacticalOverlayEnabled = showTacticalOverlay;
     hudSettings.tacticalShowLabels = tacticalShowLabels;
@@ -4260,6 +4391,14 @@ bool focusMissionsWindow = false;
     hudLeadSizePx = s.leadSizePx;
     hudLeadMaxTimeSec = s.leadMaxTimeSec;
 
+    hudProjectileAimAssist = s.projectileAimAssist;
+    hudProjectileAimAssistConeDeg = s.projectileAimAssistConeDeg;
+    hudProjectileAimAssistMaxLeadTimeSec = s.projectileAimAssistMaxLeadTimeSec;
+
+    hudFireControlUseSensorTrack = s.fireControlUseSensorTrack;
+    hudFireControlMaxAgeSec = s.fireControlMaxAgeSec;
+    hudFireControlMaxSigmaKm = s.fireControlMaxSigmaKm;
+
     hudShowFlightPathMarker = s.showFlightPathMarker;
     hudFlightMarkerUseLocalFrame = s.flightMarkerUseLocalFrame;
     hudFlightMarkerClampToEdge = s.flightMarkerClampToEdge;
@@ -4272,6 +4411,24 @@ bool focusMissionsWindow = false;
     hudMissileWarningAutoCountermeasures = s.missileWarningAutoCountermeasures;
     hudMissileWarningAutoDeployTtiSec = s.missileWarningAutoDeployTtiSec;
     hudMissileWarningPreferHeatSinks = s.missileWarningPreferHeatSinks;
+
+    hudCollisionWarningEnabled = s.collisionWarningEnabled;
+    hudCollisionWarningIndicator = s.collisionWarningHudIndicator;
+    hudCollisionWarningAvoidanceArrow = s.collisionWarningAvoidanceArrow;
+    hudCollisionWarningToasts = s.collisionWarningToasts;
+    hudCollisionWarningAssumeBoostBrake = s.collisionWarningAssumeBoostBrake;
+    hudCollisionWarningHorizonSec = s.collisionWarningHorizonSec;
+    hudCollisionWarningCautionTtiSec = s.collisionWarningCautionTtiSec;
+    hudCollisionWarningDangerTtiSec = s.collisionWarningDangerTtiSec;
+
+    hudThreatAssistEnabled = s.threatAssistEnabled;
+    hudThreatAssistIndicator = s.threatAssistHudIndicator;
+    hudThreatAssistAutoApply = s.threatAssistAutoApply;
+    hudThreatAssistStrength = s.threatAssistStrength;
+    hudThreatAssistMaxThrust01 = s.threatAssistMaxThrust01;
+    hudThreatAssistMissileEngageTtiSec = s.threatAssistMissileEngageTtiSec;
+    hudThreatAssistPreferLateralJink = s.threatAssistPreferLateralJink;
+    hudThreatAssistAllowBoost = s.threatAssistAllowBoost;
 
     showTacticalOverlay = s.tacticalOverlayEnabled;
     tacticalShowLabels = s.tacticalShowLabels;
@@ -4335,6 +4492,12 @@ bool focusMissionsWindow = false;
         && a.leadUseLastFiredWeapon == b.leadUseLastFiredWeapon
         && feq(a.leadSizePx, b.leadSizePx)
         && deq(a.leadMaxTimeSec, b.leadMaxTimeSec)
+        && a.projectileAimAssist == b.projectileAimAssist
+        && deq(a.projectileAimAssistConeDeg, b.projectileAimAssistConeDeg)
+        && deq(a.projectileAimAssistMaxLeadTimeSec, b.projectileAimAssistMaxLeadTimeSec)
+        && a.fireControlUseSensorTrack == b.fireControlUseSensorTrack
+        && deq(a.fireControlMaxAgeSec, b.fireControlMaxAgeSec)
+        && deq(a.fireControlMaxSigmaKm, b.fireControlMaxSigmaKm)
         && a.showFlightPathMarker == b.showFlightPathMarker
         && a.flightMarkerUseLocalFrame == b.flightMarkerUseLocalFrame
         && a.flightMarkerClampToEdge == b.flightMarkerClampToEdge
@@ -4346,6 +4509,22 @@ bool focusMissionsWindow = false;
         && a.missileWarningAutoCountermeasures == b.missileWarningAutoCountermeasures
         && deq(a.missileWarningAutoDeployTtiSec, b.missileWarningAutoDeployTtiSec)
         && a.missileWarningPreferHeatSinks == b.missileWarningPreferHeatSinks
+        && a.collisionWarningEnabled == b.collisionWarningEnabled
+        && a.collisionWarningHudIndicator == b.collisionWarningHudIndicator
+        && a.collisionWarningAvoidanceArrow == b.collisionWarningAvoidanceArrow
+        && a.collisionWarningToasts == b.collisionWarningToasts
+        && a.collisionWarningAssumeBoostBrake == b.collisionWarningAssumeBoostBrake
+        && deq(a.collisionWarningHorizonSec, b.collisionWarningHorizonSec)
+        && deq(a.collisionWarningCautionTtiSec, b.collisionWarningCautionTtiSec)
+        && deq(a.collisionWarningDangerTtiSec, b.collisionWarningDangerTtiSec)
+        && a.threatAssistEnabled == b.threatAssistEnabled
+        && a.threatAssistHudIndicator == b.threatAssistHudIndicator
+        && a.threatAssistAutoApply == b.threatAssistAutoApply
+        && deq(a.threatAssistStrength, b.threatAssistStrength)
+        && deq(a.threatAssistMaxThrust01, b.threatAssistMaxThrust01)
+        && deq(a.threatAssistMissileEngageTtiSec, b.threatAssistMissileEngageTtiSec)
+        && a.threatAssistPreferLateralJink == b.threatAssistPreferLateralJink
+        && a.threatAssistAllowBoost == b.threatAssistAllowBoost
         && a.tacticalOverlayEnabled == b.tacticalOverlayEnabled
         && a.tacticalShowLabels == b.tacticalShowLabels
         && deq(a.tacticalRangeKm, b.tacticalRangeKm)
@@ -4471,6 +4650,23 @@ bool focusMissionsWindow = false;
   // Galaxy navigation / route plotting
   sim::SystemId galaxySelectedSystemId = 0;
   std::vector<sim::SystemId> navRoute;
+  // Optional alternate route candidates (K-shortest loopless paths).
+  //
+  // When populated, navRoute is always the currently selected candidate's path.
+  struct NavRouteAlt {
+    sim::KRoute route{};
+    double fuel{0.0};
+    double stormAvg01{0.0};
+    double occlusionAvg01{0.0};
+    double baseCost{0.0};
+    double hazardPenalty{0.0};
+    double similarityBest01{1.0}; // Jaccard vs best route (ignore endpoints)
+  };
+  std::vector<NavRouteAlt> navRouteAlts;
+  int navRouteAltK = 1;       // requested candidate count
+  int navRouteAltIndex = 0;   // selected candidate index
+  bool navRouteAltOverlay = true; // draw non-selected candidates on the galaxy map
+
   std::size_t navRouteHop = 0;
   bool navAutoRun = false;
   // Prevents surprise immediate jumps after a quickload (or other nav state restoration).
@@ -4710,7 +4906,15 @@ auto fieldOpsStart = [&](FieldOpsMode m, std::string onToast) {
     toast(toasts, "Auto-run canceled (Field Ops engaged).", 2.0);
   }
 
-  // Maneuver computer also drives ship input; disengage to avoid conflicts.
+  // Maneuver guidance also drives ship input; disengage to avoid conflicts.
+  if (maneuverSequence.active()) {
+    maneuverSequence.disengage();
+    maneuverSequenceLast = {};
+    maneuverSequencePrevPhase = maneuverSequence.phase();
+    maneuverSequencePrevNodeIndex = -1;
+    toast(toasts, "Maneuver sequence canceled (Field Ops engaged).", 2.0);
+  }
+
   if (maneuverComputer.active()) {
     maneuverComputer.disengage();
     maneuverComputerLast = {};
@@ -8815,7 +9019,7 @@ progression.unlockWeapon(weaponSecondary);
               if (!(r.bestTimeSec > 0.0)) continue;
               timeTrialWindow.bestTimesSec[r.courseKey] = r.bestTimeSec;
 
-              if (r.ghostCodec == sim::kTimeTrialGhostCodecVersion && !r.ghostB64.empty()) {
+              if (r.ghostCodec > 0 && r.ghostCodec <= sim::kTimeTrialGhostCodecVersion && !r.ghostB64.empty()) {
                 std::vector<sim::TimeTrialGhostSample> samples;
                 if (sim::decodeTimeTrialGhostSamplesB64(r.ghostB64, &samples) && !samples.empty()) {
 	                std::deque<game::FlightRecorderSample> dq;
@@ -9959,6 +10163,51 @@ progression.unlockWeapon(weaponSecondary);
           }
         }
 
+
+
+        if (key(controls.actions.navAssistOrbit) && !io.WantCaptureKeyboard) {
+          const bool fieldOpsWasActive = (fieldOps.mode != FieldOpsMode::Off);
+          const bool navSameMode = fieldOpsWasActive && navAssist.active() && navAssist.mode() == sim::NavAssistMode::Orbit;
+          if (fieldOpsWasActive) {
+            fieldOpsStop("Field Ops disengaged (manual nav assist).");
+          }
+
+          // If Field Ops was already driving this same nav assist mode, treat this keypress as a toggle-off.
+          if (!navSameMode) {
+            if (navAssist.active() && navAssist.mode() == sim::NavAssistMode::Orbit) {
+              navAssist.disengage();
+              navAssistLast = {};
+              toast(toasts, "Nav assist (orbit) disengaged.", 1.6);
+            } else {
+              if (docked) {
+                toast(toasts, "Cannot engage nav assist while docked.", 1.6);
+              } else if (supercruiseState != SupercruiseState::Idle || fsdState != FsdState::Idle) {
+                toast(toasts, "Cannot engage nav assist while in supercruise/FSD.", 2.0);
+              } else {
+                math::Vec3d tPos{0,0,0}, tVel{0,0,0};
+                double standoffKm = 0.0;
+                std::string name;
+                if (!resolveNavAssistTarget(tPos, tVel, standoffKm, name)) {
+                  toast(toasts, "No valid target for nav assist.", 1.8);
+                } else {
+                  // Docking computer and nav assist fight for control; always disengage docking.
+                  if (autopilot) {
+                    autopilot = false;
+                    dockingComputer.reset();
+                  }
+
+                  navAssist.engageOrbit(ship, tPos, tVel, standoffKm);
+                  navAssistLast = {};
+                  toast(toasts,
+                        std::string("Nav assist: orbit ") + name + " (radius " +
+                          std::to_string((int)std::llround(standoffKm)) + " km) [" +
+                          game::chordLabel(controls.actions.navAssistOrbit) + "]",
+                        2.3);
+                }
+              }
+            }
+          }
+        }
         if (key(controls.actions.toggleCargoScoop) && !io.WantCaptureKeyboard) {
           cargoScoopDeployed = !cargoScoopDeployed;
 
@@ -10397,6 +10646,141 @@ progression.unlockWeapon(weaponSecondary);
         break;
       }
       idx = (idx + 1) % contacts.size();
+    }
+  }
+}
+
+        if (key(controls.actions.targetUnderReticle) && !io.WantCaptureKeyboard) {
+          if (fieldOps.mode != FieldOpsMode::Off) {
+            fieldOpsStop("Field Ops disengaged (manual targeting).", true);
+          }
+  // Ray-pick and cycle through targets under aim.
+  //
+  // Notes:
+  // - This is intentionally separate from the existing cycle keys so players can
+  //   quickly acquire what's directly in front of the ship.
+  // - Uses a small deterministic helper (sim::AimPick) for consistent behavior.
+  if (scanning) { scanning = false; scanProgressSec = 0.0; scanLockedId = 0; scanLabel.clear(); }
+
+  const double pickRangeKm = core::cvars().getDouble("game.target_pick.range_km", 350000.0);
+  const double pickMinCos = core::cvars().getDouble("game.target_pick.min_cos", 0.995);
+  const double pickPadKm = core::cvars().getDouble("game.target_pick.pad_km", 0.0);
+
+  const double maxR = std::max(0.0, pickRangeKm);
+  const double pad = std::max(0.0, pickPadKm);
+
+  math::Vec3d originKm = ship.positionKm();
+  math::Vec3d dir = ship.forward();
+  if (dir.lengthSq() < 1.0e-12) {
+    dir = math::Vec3d{0, 0, 1};
+  } else {
+    dir = dir.normalized();
+  }
+
+  struct PickMeta { TargetKind kind; std::size_t index; };
+  const std::size_t reserveN = contacts.size() + asteroids.size() + floatingCargo.size() + signals.size();
+  std::vector<PickMeta> meta;
+  std::vector<sim::AimPickSphere> spheres;
+  meta.reserve(reserveN);
+  spheres.reserve(reserveN);
+
+  auto push = [&](TargetKind kind, std::size_t idx, const math::Vec3d& centerKm, double radiusKm, double minCos) {
+    const std::size_t tag = meta.size();
+    meta.push_back(PickMeta{kind, idx});
+    spheres.push_back(sim::AimPickSphere{tag, centerKm, radiusKm, minCos});
+  };
+
+  constexpr double kPickShipRadiusKm = 900.0;
+  constexpr double kPickCargoRadiusKm = 450.0;
+  constexpr double kPickSignalRadiusKm = 800.0;
+
+  // Contacts (alive only).
+  {
+    const double r = kPickShipRadiusKm + pad;
+    const double maxD2 = (maxR + r) * (maxR + r);
+    for (std::size_t i = 0; i < contacts.size(); ++i) {
+      if (!contacts[i].alive) continue;
+      const math::Vec3d p = contacts[i].ship.positionKm();
+      if ((p - originKm).lengthSq() > maxD2) continue;
+      push(TargetKind::Contact, i, p, kPickShipRadiusKm, pickMinCos);
+    }
+  }
+
+  // Asteroids.
+  {
+    for (std::size_t i = 0; i < asteroids.size(); ++i) {
+      const auto& a = asteroids[i];
+      const double r = std::max(0.0, a.radiusKm) + pad;
+      const double maxD2 = (maxR + r) * (maxR + r);
+      if ((a.posKm - originKm).lengthSq() > maxD2) continue;
+      // Disable aim-cone filtering for rocks to keep intersection-based picking.
+      push(TargetKind::Asteroid, i, a.posKm, a.radiusKm, -1.0);
+    }
+  }
+
+  // Floating cargo pods.
+  {
+    const double r = kPickCargoRadiusKm + pad;
+    const double maxD2 = (maxR + r) * (maxR + r);
+    for (std::size_t i = 0; i < floatingCargo.size(); ++i) {
+      const auto& c = floatingCargo[i];
+      if ((c.posKm - originKm).lengthSq() > maxD2) continue;
+      push(TargetKind::Cargo, i, c.posKm, kPickCargoRadiusKm, pickMinCos);
+    }
+  }
+
+  // Signals (non-physical, but useful for scanning).
+  {
+    const double r = kPickSignalRadiusKm + pad;
+    const double maxD2 = (maxR + r) * (maxR + r);
+    for (std::size_t i = 0; i < signals.size(); ++i) {
+      const auto& s = signals[i];
+      if ((s.posKm - originKm).lengthSq() > maxD2) continue;
+      push(TargetKind::Signal, i, s.posKm, kPickSignalRadiusKm, pickMinCos);
+    }
+  }
+
+  std::vector<sim::AimPickHit> hits;
+  sim::aimPickSphereRayHitsKm(hits,
+                              originKm,
+                              dir,
+                              maxR,
+                              spheres.data(),
+                              spheres.size(),
+                              pad);
+
+  if (hits.empty()) {
+    toast(toasts, "No target under aim.", 1.2);
+  } else {
+    // If the current target is among the hits, advance to the next one.
+    std::size_t chosen = 0;
+    for (std::size_t hi = 0; hi < hits.size(); ++hi) {
+      const std::size_t tag = hits[hi].tag;
+      if (tag >= meta.size()) continue;
+      const PickMeta& m = meta[tag];
+      if (m.kind == target.kind && m.index == target.index) {
+        chosen = (hi + 1) % hits.size();
+        break;
+      }
+    }
+
+    const std::size_t tag = hits[chosen].tag;
+    if (tag < meta.size()) {
+      const PickMeta& m = meta[tag];
+      target.kind = m.kind;
+      target.index = m.index;
+
+      std::string label = "Target acquired.";
+      if (m.kind == TargetKind::Contact && m.index < contacts.size()) {
+        label = std::string("Target: ") + contacts[m.index].name;
+      } else if (m.kind == TargetKind::Asteroid && m.index < asteroids.size()) {
+        label = "Target: Asteroid";
+      } else if (m.kind == TargetKind::Cargo && m.index < floatingCargo.size()) {
+        label = std::string("Target: Cargo (") + econ::commodityDef(floatingCargo[m.index].commodity).name.c_str() + ")";
+      } else if (m.kind == TargetKind::Signal && m.index < signals.size()) {
+        label = std::string("Target: ") + signalTypeName(signals[m.index].type);
+      }
+      toast(toasts, label, 1.4);
     }
   }
 }
@@ -10948,8 +11332,12 @@ progression.unlockWeapon(weaponSecondary);
             if (wType == WeaponType::PulseLaser) contactCone = 0.993;
             if (w.guided) contactCone = 0.985;
 
+            const bool ballisticProjectile = (!w.beam && !w.guided);
+            const double projAimConeCos = ballisticProjectile ? std::cos(math::degToRad(hudProjectileAimAssistConeDeg)) : -1.0;
+            const double projAimMaxDistKm = ballisticProjectile ? (w.projSpeedKmS * hudProjectileAimAssistMaxLeadTimeSec) : 0.0;
+
             // Build target list on demand so combat logic stays reusable.
-            // (Beams need asteroids, missiles need lockable ships/player.)
+            // (Beams need asteroids, missiles need lockable ships/player, projectiles use targets for soft lead assist.)
             std::vector<sim::SphereTarget> fireTargets;
             if (w.beam) {
               fireTargets.reserve(contacts.size() + asteroids.size());
@@ -10997,8 +11385,44 @@ progression.unlockWeapon(weaponSecondary);
                   fireTargets.push_back(t);
                 }
               }
-            }
+            } else if (ballisticProjectile && hudProjectileAimAssist) {
+              // Fixed projectile weapons can use a small lead correction when a target is near the reticle.
+              // If enabled, fire control uses the radar kinematic track (sensor-limited) and scales assist
+              // strength by track quality.
+              fireTargets.reserve(contacts.size());
+              const math::Vec3d originKm = ship.positionKm();
+              for (std::size_t i = 0; i < contacts.size(); ++i) {
+                const auto& c = contacts[i];
+                if (!c.alive) continue;
 
+                sim::SphereTarget t{};
+                t.kind = sim::CombatTargetKind::Ship;
+                t.index = i;
+                t.id = c.id;
+                t.radiusKm = 900.0;
+                t.minAimCos = projAimConeCos;
+
+                if (hudFireControlUseSensorTrack) {
+                  const sim::FireControlEstimate fc = sim::estimateFireControlFromTrack(c.sensorKinematic,
+                                                                                        hudFireControlMaxAgeSec,
+                                                                                        hudFireControlMaxSigmaKm);
+                  if (!fc.valid) continue;
+                  t.centerKm = fc.posKm;
+                  t.velKmS = fc.velKmS;
+                  t.accelKmS2 = contacts[i].sensorAccelKmS2 * std::clamp(fc.quality01, 0.0, 1.0);
+                  t.aimAssistWeight01 = fc.quality01;
+                } else {
+                  t.centerKm = c.ship.positionKm();
+                  t.velKmS = c.ship.velocityKmS();
+                  t.aimAssistWeight01 = 1.0;
+                }
+
+                const double distKm = (t.centerKm - originKm).length();
+                if (distKm > projAimMaxDistKm) continue;
+
+                fireTargets.push_back(t);
+              }
+            }            }
 
             const sim::FireResult fr = sim::tryFireWeapon(
               ship,
@@ -11153,6 +11577,8 @@ progression.unlockWeapon(weaponSecondary);
 
     // Input (6DOF)
     sim::ShipInput input{};
+    bool defensiveAssistHold = false;
+    hudThreatAssistEngaged = false;
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
     const bool captureKeys = io.WantCaptureKeyboard;
@@ -11181,6 +11607,7 @@ progression.unlockWeapon(weaponSecondary);
         fieldRepairStop("Field repairs canceled (boost).");
       }
       input.brake = game::holdDown(controls.holds.brake, keys);
+      defensiveAssistHold = game::holdDown(controls.holds.defensiveAssist, keys);
 
       static bool dampers = true;
       if (game::holdDown(controls.holds.dampersEnable, keys)) dampers = true;
@@ -11463,15 +11890,25 @@ progression.unlockWeapon(weaponSecondary);
     }
 
 
-    // Maneuver computer: execute an armed maneuver node as a continuous burn.
+    // Maneuver guidance: execute armed maneuver node(s) as continuous burn(s).
     // (Automatically disengages if the simulation leaves normal-space.)
-    if (maneuverComputer.active() &&
+    if ((maneuverSequence.active() || maneuverComputer.active()) &&
         (docked || autopilot || navAssist.active() ||
          fsdState != FsdState::Idle || supercruiseState != SupercruiseState::Idle)) {
-      maneuverComputer.disengage();
-      maneuverComputerLast = {};
-      maneuverComputerPrevPhase = maneuverComputer.phase();
-      toast(toasts, "Maneuver computer disengaged (not in normal space).", 1.6);
+      if (maneuverSequence.active()) {
+        maneuverSequence.disengage();
+        maneuverSequenceLast = {};
+        maneuverSequencePrevPhase = maneuverSequence.phase();
+        maneuverSequencePrevNodeIndex = -1;
+      }
+
+      if (maneuverComputer.active()) {
+        maneuverComputer.disengage();
+        maneuverComputerLast = {};
+        maneuverComputerPrevPhase = maneuverComputer.phase();
+      }
+
+      toast(toasts, "Maneuver guidance disengaged (not in normal space).", 1.6);
     }
 
 
@@ -11814,7 +12251,35 @@ if (thrustMag > navAssistManualDeadzone || torqueMag > navAssistManualDeadzone |
           navAssistLast = {};
           toast(toasts, "Nav assist disengaged (lost target).", 1.6);
         } else {
-          navAssistLast = navAssist.update(ship, tPosKm, tVelKmS, dtSim);
+          // Asteroid proximity BVH (for local obstacle avoidance). We cache per-system.
+          struct AsteroidProxCache {
+            core::u64 systemId{0};
+            std::size_t asteroidCount{0};
+            sim::ProximityFieldKm field;
+          };
+          static AsteroidProxCache asteroidProx{};
+
+          if (asteroidProx.systemId != currentSystem->stub.id || asteroidProx.asteroidCount != asteroids.size()) {
+            asteroidProx.systemId = currentSystem->stub.id;
+            asteroidProx.asteroidCount = asteroids.size();
+
+            std::vector<sim::SphereObstacleKm> obs;
+            obs.reserve(asteroids.size());
+            for (const auto& a : asteroids) {
+              const double rKm = std::max(0.0, a.radiusKm);
+              const double hard = std::clamp(0.65 + 0.35 * std::clamp(a.density01, 0.0, 1.0), 0.0, 1.0);
+              obs.push_back(sim::SphereObstacleKm{a.posKm, rKm, hard});
+            }
+
+            asteroidProx.field.build(std::move(obs), /*leafSize=*/6);
+          }
+
+          int ignoreAsteroidId = -1;
+          if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+            ignoreAsteroidId = (int)target.index;
+          }
+
+          navAssistLast = navAssist.update(ship, tPosKm, tVelKmS, dtSim, &asteroidProx.field, ignoreAsteroidId);
 
           input.thrustLocal = navAssistLast.input.thrustLocal;
           input.torqueLocal = navAssistLast.input.torqueLocal;
@@ -12914,8 +13379,10 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
           stepShipMaybeGravity(ship, dtSim, hold, /*allowGravity=*/false);
         } else {
 
-          // Maneuver computer guidance runs here so it can use dtSim (for burn throttling).
-          if (maneuverComputer.active() &&
+          // Maneuver guidance runs here so it can use dtSim (for burn throttling).
+          // The sequence computer is a small wrapper that chains multiple burns
+          // (e.g. Lambert rendezvous: depart + arrival match velocity).
+          if ((maneuverSequence.active() || maneuverComputer.active()) &&
               !autopilot &&
               !navAssist.active() &&
               supercruiseState == SupercruiseState::Idle) {
@@ -12928,14 +13395,55 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
               const double thrustMag = magMax(input.thrustLocal.x, input.thrustLocal.y, input.thrustLocal.z);
               const double torqueMag = magMax(input.torqueLocal.x, input.torqueLocal.y, input.torqueLocal.z);
               if (thrustMag > maneuverComputerManualDeadzone || torqueMag > maneuverComputerManualDeadzone || input.boost || input.brake) {
-                maneuverComputer.disengage();
-                maneuverComputerLast = {};
-                maneuverComputerPrevPhase = maneuverComputer.phase();
-                toast(toasts, "Maneuver computer disengaged (manual override).", 1.6);
+                const bool wasSeq = maneuverSequence.active();
+                const bool wasMc = maneuverComputer.active();
+
+                if (wasSeq) {
+                  maneuverSequence.disengage();
+                  maneuverSequenceLast = {};
+                  maneuverSequencePrevPhase = maneuverSequence.phase();
+                  maneuverSequencePrevNodeIndex = -1;
+                }
+
+                if (wasMc) {
+                  maneuverComputer.disengage();
+                  maneuverComputerLast = {};
+                  maneuverComputerPrevPhase = maneuverComputer.phase();
+                }
+
+                if (wasSeq || wasMc) {
+                  toast(toasts, "Maneuver guidance disengaged (manual override).", 1.6);
+                }
               }
             }
 
-            if (maneuverComputer.active()) {
+            if (maneuverSequence.active()) {
+              const auto seqOut = maneuverSequence.update(ship, timeDays, dtSim, maneuverComputerParams);
+              maneuverSequenceLast = seqOut;
+
+              // Override ship inputs.
+              input.thrustLocal = seqOut.input.thrustLocal;
+              input.torqueLocal = seqOut.input.torqueLocal;
+              input.dampers = seqOut.input.dampers;
+              input.boost = seqOut.input.boost;
+              input.brake = seqOut.input.brake;
+
+              if (seqOut.advanced) {
+                const int completedIdx = std::max(0, seqOut.nodeIndex - 1);
+                toast(toasts, "Sequence burn " + std::to_string(completedIdx + 1) + " complete; next burn armed.", 1.8);
+              }
+
+              if (maneuverSequencePrevPhase != seqOut.phase) {
+                if (seqOut.phase == sim::ManeuverSequencePhase::Complete) {
+                  toast(toasts, "Maneuver sequence complete.", 2.0);
+                } else if (seqOut.phase == sim::ManeuverSequencePhase::Aborted) {
+                  toast(toasts, "Maneuver sequence aborted (missed node).", 2.0);
+                }
+              }
+              maneuverSequencePrevPhase = seqOut.phase;
+              maneuverSequencePrevNodeIndex = seqOut.nodeIndex;
+
+            } else if (maneuverComputer.active()) {
               const auto mcOut = maneuverComputer.update(ship, timeDays, dtSim, maneuverComputerParams);
               maneuverComputerLast = mcOut;
 
@@ -12954,6 +13462,30 @@ if (!navRoute.empty() && navRouteHop + 1 < navRoute.size()) {
                 }
               }
               maneuverComputerPrevPhase = mcOut.phase;
+            }
+          }
+
+          // Threat assist: soft additive overlay (computed last frame).
+          // Designed to be safe-by-default: only affects translation, never rotation.
+          hudThreatAssistEngaged = false;
+          if (hudThreatAssistEnabled &&
+              (hudThreatAssistAutoApply || defensiveAssistHold) &&
+              hudThreatAvoidance.active &&
+              !autopilot &&
+              supercruiseState == SupercruiseState::Idle) {
+            // Don't fight the maneuver guidance unless the player is explicitly holding the panic key.
+            if ((!maneuverComputer.active() && !maneuverSequence.active()) || defensiveAssistHold) {
+              const double strength = std::clamp(defensiveAssistHold ? 1.0 : hudThreatAssistStrength, 0.0, 1.0);
+              input.thrustLocal = input.thrustLocal + hudThreatAvoidance.input.thrustLocal * strength;
+              auto clamp11 = [](double v) { return std::clamp(v, -1.0, 1.0); };
+              input.thrustLocal.x = clamp11(input.thrustLocal.x);
+              input.thrustLocal.y = clamp11(input.thrustLocal.y);
+              input.thrustLocal.z = clamp11(input.thrustLocal.z);
+
+              // Merge discrete actions.
+              input.brake = input.brake || hudThreatAvoidance.input.brake;
+              input.boost = input.boost || hudThreatAvoidance.input.boost;
+              hudThreatAssistEngaged = true;
             }
           }
 
@@ -14881,7 +15413,56 @@ auto spawnPolicePack = [&](int maxCount) -> int {
 	        const math::Vec3d offL = sim::formationOffsetLocalKm(pat, slotIndex, slotCount, fp, fseed);
 	        const math::Vec3d desiredPos = sim::formationTargetWorldKm(followTarget->ship.positionKm(), basis, offL);
 	        const double holdDistKm = std::clamp(standoff * 0.08, 1500.0, 8000.0);
-	        chaseTarget(c.ship, ai, desiredPos, leaderVel, holdDistKm, 0.22, 1.8);
+
+	        math::Vec3d chasePos = desiredPos;
+	        // Dynamic local deconfliction: avoid bumping into other escorts while holding formation.
+	        if (slotCount > 1) {
+	          std::vector<sim::AgentSphere> neigh;
+	          if (auto itN = escortIdsByFollow.find(c.followId); itN != escortIdsByFollow.end()) {
+	            const auto& ids = itN->second;
+	            neigh.reserve(std::min<std::size_t>((std::size_t)ids.size(), (std::size_t)16));
+	            for (core::u64 nid : ids) {
+	              if (nid == c.id) continue;
+	              auto itC = contactById.find(nid);
+	              if (itC == contactById.end()) continue;
+	              const Contact* oc = itC->second;
+	              if (!oc || !oc->alive) continue;
+	              sim::AgentSphere a{};
+	              a.id = oc->id;
+	              a.posKm = oc->ship.positionKm();
+	              a.velKmS = oc->ship.velocityKmS();
+	              a.radiusKm = 0.03;
+	              a.hardness01 = 1.0;
+	              neigh.push_back(a);
+	              if (neigh.size() >= 16) break;
+	            }
+	          }
+
+	          if (!neigh.empty()) {
+	            sim::AgentAvoidanceParams ap{};
+	            ap.enabled = true;
+	            ap.selfRadiusKm = 0.03;
+	            ap.padKm = 0.05;
+	            ap.horizonSec = 16.0;
+	            ap.nearMissExtraKm = 0.55;
+	            ap.minRelSpeedKmS = 0.02;
+	            ap.selfVelBlend01 = 0.55;
+	            ap.strength = 1.35;
+	            ap.maxSteerDeg = 40.0;
+
+	            const math::Vec3d d = (desiredPos - c.ship.positionKm()).normalized();
+	            if (d.lengthSq() > 1e-12) {
+	              const core::u64 aseed = core::hashCombine(fseed ^ 0x41564f4944ull, c.id); // "AVOID"
+	              const auto ar = sim::steerAvoidAgents(c.ship.positionKm(), c.ship.velocityKmS(), d, 0.22, neigh, aseed, ap);
+	              if (ar.steering) {
+	                const double dist = (desiredPos - c.ship.positionKm()).length();
+	                if (dist > 1e-6) chasePos = c.ship.positionKm() + ar.safeDirUnit * dist;
+	              }
+	            }
+	          }
+	        }
+
+	        chaseTarget(c.ship, ai, chasePos, leaderVel, holdDistKm, 0.22, 1.8);
 	      } else if (currentSystem && !currentSystem->stations.empty()) {
 	        // Patrol around home station.
 	        const auto& st = currentSystem->stations[std::min(c.homeStationIndex, currentSystem->stations.size()-1)];
@@ -17943,6 +18524,35 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         std::vector<sim::SphereTarget> projTargets;
         projTargets.reserve(1 + contacts.size() + asteroids.size() + countermeasures.size());
 
+        // Thermal/IR signature model used by heat seekers.
+        // The units are arbitrary; they are meant to be comparable to flare heatStrength.
+        auto baseHeatSigForHull = [](ShipHullClass hc) {
+          switch (hc) {
+            case ShipHullClass::Scout: return 6.5;
+            case ShipHullClass::Fighter: return 7.5;
+            case ShipHullClass::Hauler: return 8.5;
+            default: return 7.0;
+          }
+        };
+
+        const auto computeHeatSignature = [&](double heatVal, bool silent, ShipHullClass hc, const math::Vec3d& velKmS) {
+          const double base = baseHeatSigForHull(hc);
+          const double h = std::clamp(heatVal, 0.0, 160.0);
+          // Heat scaling is tuned so typical ship temps put signature in the same range as flare strength.
+          double sig = base + 0.055 * h;
+
+          // Faster relative motion tends to look "hotter" to IR seekers (exhaust / plume).
+          const double spd = velKmS.length();
+          const double spd01 = std::clamp(spd / 260.0, 0.0, 1.0);
+          sig += 1.5 * spd01;
+
+          // Silent running reduces radiated signature despite rising internal heat.
+          if (silent) sig *= 0.55;
+
+          // Clamp to avoid pathological values.
+          return std::clamp(sig, 0.05, 50.0);
+        };
+
         sim::SphereTarget playerT{};
         playerT.kind = sim::CombatTargetKind::Player;
         playerT.index = 0;
@@ -17950,6 +18560,8 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         playerT.centerKm = ship.positionKm();
         playerT.velKmS = ship.velocityKmS();
         playerT.radiusKm = 900.0;
+        playerT.jammerPower = jammerPower;
+        playerT.heatSignature = computeHeatSignature(heat, silentRunning, shipHullClass, playerT.velKmS);
         projTargets.push_back(playerT);
 
         for (std::size_t i = 0; i < contacts.size(); ++i) {
@@ -17962,6 +18574,10 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           t.centerKm = c.ship.positionKm();
           t.velKmS = c.ship.velocityKmS();
           t.radiusKm = 900.0;
+          t.jammerPower = c.jammerPower;
+          // NPCs do not simulate a full thermal system; use a simple speed/hull proxy.
+          const double pseudoHeat = 30.0 + 80.0 * std::clamp(t.velKmS.length() / 260.0, 0.0, 1.0);
+          t.heatSignature = computeHeatSignature(pseudoHeat, /*silent=*/false, c.hullClass, t.velKmS);
           projTargets.push_back(t);
         }
 
@@ -18229,6 +18845,161 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
               }
             } else {
               hudMissileWarningEvadeDirWorld = math::Vec3d{0,0,0};
+            }
+          }
+
+
+
+          const sim::ProximityFieldKm* threatAssistObstacles = nullptr;
+          int threatAssistIgnoreObstacleId = -1;
+
+          // Collision warning predictor (player): time-to-impact to nearby asteroids + optional avoidance cue.
+          {
+            hudCollisionWarning = sim::CollisionWarningResult{};
+            hudCollisionWarningAvoidance = sim::AvoidanceResultKm{};
+
+            if ((hudCollisionWarningEnabled || hudThreatAssistEnabled)
+                && !docked
+                && playerHull > 0.0
+                && (supercruiseState == SupercruiseState::Idle)
+                && (fsdState == FsdState::Idle)
+                && currentSystem
+                && !asteroids.empty()) {
+
+              static struct AsteroidProxCache {
+                core::u64 systemId{0};
+                std::size_t asteroidCount{0};
+                sim::ProximityFieldKm field;
+              } asteroidProx;
+
+              const bool sysChanged = (asteroidProx.systemId != (core::u64)currentSystem->stub.id);
+              const bool countChanged = (asteroidProx.asteroidCount != asteroids.size());
+              if (sysChanged || countChanged) {
+                asteroidProx.systemId = (core::u64)currentSystem->stub.id;
+                asteroidProx.asteroidCount = asteroids.size();
+
+                std::vector<sim::SphereObstacleKm> obs;
+                obs.reserve(asteroids.size());
+                for (const auto& a : asteroids) {
+                  sim::SphereObstacleKm s;
+                  s.centerKm = a.posKm;
+                  s.radiusKm = a.radiusKm;
+                  s.hardness01 = 1.0;
+                  obs.push_back(s);
+                }
+                asteroidProx.field.build(std::move(obs));
+              }
+
+              threatAssistObstacles = &asteroidProx.field;
+              if (target.kind == TargetKind::Asteroid && target.index < asteroids.size()) {
+                threatAssistIgnoreObstacleId = (int)target.index;
+              }
+
+              if (hudCollisionWarningEnabled) {
+                sim::CollisionWarningParams p;
+              p.horizonSec = hudCollisionWarningHorizonSec;
+              p.cautionTtiSec = hudCollisionWarningCautionTtiSec;
+              p.dangerTtiSec = hudCollisionWarningDangerTtiSec;
+              p.minSpeedKmS = 0.05;
+              // Safety bubble: ship radius (~30m) + cushion (~50m).
+              p.padKm = 0.03 + 0.05;
+              p.useStopDistance = true;
+              p.stopMarginFactor = 0.10;
+
+              const double payload = ship.payloadHandlingScale();
+              const double lin = hudCollisionWarningAssumeBoostBrake ? ship.maxLinearAccelBoostKmS2() : ship.maxLinearAccelKmS2();
+              const double maxDecel = std::max(0.01, lin * payload * 2.0);
+
+              hudCollisionWarning = sim::computeCollisionWarning(
+                asteroidProx.field,
+                ship.positionKm(),
+                ship.velocityKmS(),
+                maxDecel,
+                p
+              );
+
+              // Direction cue: apply the obstacle-avoidance steering to the current velocity direction.
+              if (hudCollisionWarningAvoidanceArrow && hudCollisionWarning.hasImpact && hudCollisionWarning.speedKmS > 0.05) {
+                const math::Vec3d vel = ship.velocityKmS();
+                const math::Vec3d desiredDir = (vel.lengthSq() > 1e-12) ? vel.normalized() : ship.forward();
+
+                sim::AvoidanceParamsKm ap;
+                ap.enabled = true;
+                ap.shipRadiusKm = 0.03;
+                ap.padKm = 0.05;
+                ap.lookaheadTimeSec = std::clamp(hudCollisionWarning.ttiSec, 2.0, 10.0);
+                ap.lookaheadBaseKm = 0.0;
+                ap.minSpeedForLookaheadKmS = 0.05;
+                ap.nearMissExtraKm = 0.35;
+                ap.strength = 1.25;
+                ap.maxSteerDeg = 40.0;
+
+                hudCollisionWarningAvoidance = sim::steerAvoidObstacles(
+                  asteroidProx.field,
+                  ship.positionKm(),
+                  ship.velocityKmS(),
+                  desiredDir,
+                  hudCollisionWarning.speedKmS,
+                  ap
+                );
+              }
+
+              // Throttled toast only for imminent impact (keeps it useful / non-spammy).
+              if (hudCollisionWarningToasts
+                  && hudCollisionWarning.level == sim::CollisionWarningLevel::Danger
+                  && hudCollisionWarning.ttiSec > 1e-6
+                  && timeDays > hudCollisionWarningToastCooldownUntilDays) {
+                toast(toasts, fmt::format("COLLISION WARNING ({:.1f}s)", hudCollisionWarning.ttiSec), 1.4);
+                hudCollisionWarningToastCooldownUntilDays = timeDays + (3.0 / 86400.0);
+              }
+
+              }
+            }
+          }
+          // Threat avoidance assist (player): combined thrust cue.
+          {
+            hudThreatAvoidance = sim::ThreatAvoidanceResult{};
+            if (hudThreatAssistEnabled
+                && !docked
+                && playerHull > 0.0f
+                && supercruiseState == SupercruiseState::Idle
+                && fsdState == FsdState::Idle) {
+              sim::ThreatAvoidanceParams tp;
+              tp.collisionEnable = true;
+              tp.collision.horizonSec = hudCollisionWarningHorizonSec;
+              tp.collision.cautionTtiSec = hudCollisionWarningCautionTtiSec;
+              tp.collision.dangerTtiSec = hudCollisionWarningDangerTtiSec;
+              tp.collision.minSpeedKmS = 0.05;
+              tp.collision.padKm = 0.03 + 0.05;
+              tp.collision.useStopDistance = true;
+              tp.collision.stopMarginFactor = 0.10;
+
+              tp.missileEnable = true;
+              tp.missileThreat = hudMissileWarningThreatParams;
+              tp.missileEvasion = hudMissileWarningEvasionParams;
+              tp.missileEngageTtiSec = hudThreatAssistMissileEngageTtiSec;
+              tp.maxThrust01 = hudThreatAssistMaxThrust01;
+              tp.preferLateralJink = hudThreatAssistPreferLateralJink;
+              tp.allowBoost = hudThreatAssistAllowBoost;
+
+              const double payload = ship.payloadHandlingScale();
+              const double lin = hudCollisionWarningAssumeBoostBrake ? ship.maxLinearAccelBoostKmS2() : ship.maxLinearAccelKmS2();
+              const double maxDecel = std::max(0.01, lin * payload * 2.0);
+
+              const core::u64 phase = (core::u64)std::floor((timeDays * 86400.0) / 0.60);
+              const core::u64 seed = core::hashCombine(core::hashCombine(universe.seed(), 0x5448524541544153ull), phase);
+              hudThreatAvoidance = sim::computeThreatAvoidance(
+                ship,
+                threatAssistObstacles,
+                maxDecel,
+                missiles.empty() ? nullptr : missiles.data(),
+                missiles.size(),
+                sim::CombatTargetKind::Player,
+                0,
+                seed,
+                tp,
+                threatAssistIgnoreObstacleId
+              );
             }
           }
 
@@ -19810,6 +20581,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     shipFighters.reserve(contacts.size());
     rockInstances.reserve(asteroids.size());
 
+    const bool asteroidProcMeshesRebuiltThisFrame = asteroidMeshesDirty;
     if (asteroidMeshesDirty) {
       rebuildAsteroidProcMeshes();
     }
@@ -19934,7 +20706,18 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	      asteroidSpinCache.reserve(asteroids.size() * 2 + 64);
 	    }
 
-	    for (const auto& a : asteroids) {
+	    static struct AsteroidRenderCullCache {
+	      core::u64 systemId{0};
+	      std::size_t asteroidCount{0};
+	      bool procMeshes{false};
+	      std::size_t variantCount{0};
+	      sim::ProximityFieldKm field;
+	    } asteroidRenderCull;
+
+	    static std::vector<int> asteroidVisibleIds;
+	    asteroidVisibleIds.clear();
+
+	    auto emitAsteroidInst = [&](const auto& a) {
 	      const float r = 0.55f, g = 0.55f, b = 0.58f;
 	      const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
 
@@ -19966,6 +20749,73 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
 	        asteroidVariantInstances[vi].push_back(inst);
 	      } else {
 	        rockInstances.push_back(inst);
+	      }
+	    };
+
+	    // BVH frustum cull in km-space (floating-origin safe):
+	    // build once per system (inflated render spheres), query per-frame against
+	    // the camera frustum transformed into km coordinates.
+	    const bool allowAsteroidBvhCull = (asteroids.size() >= 256);
+	    if (allowAsteroidBvhCull && currentSystem) {
+	      const bool wantProc = (vfxAsteroidProcMeshEnabled && !asteroidVariantMeshes.empty());
+	      const std::size_t varCount = wantProc ? asteroidVariantMeshes.size() : 0;
+
+	      const bool sysChanged = (asteroidRenderCull.systemId != (core::u64)currentSystem->stub.id);
+	      const bool countChanged = (asteroidRenderCull.asteroidCount != asteroids.size());
+	      const bool modeChanged = (asteroidRenderCull.procMeshes != wantProc) || (asteroidRenderCull.variantCount != varCount);
+	      if (asteroidProcMeshesRebuiltThisFrame || sysChanged || countChanged || modeChanged) {
+	        asteroidRenderCull.systemId = (core::u64)currentSystem->stub.id;
+	        asteroidRenderCull.asteroidCount = asteroids.size();
+	        asteroidRenderCull.procMeshes = wantProc;
+	        asteroidRenderCull.variantCount = varCount;
+
+	        std::vector<sim::SphereObstacleKm> obs;
+	        obs.reserve(asteroids.size());
+
+	        const double rockBaseRadiusKm = rockSphere.localBoundingRadius() * kRENDER_UNIT_KM;
+	        std::vector<double> variantBaseRadiusKm;
+	        if (wantProc) {
+	          variantBaseRadiusKm.reserve(varCount);
+	          for (const auto& m : asteroidVariantMeshes) {
+	            variantBaseRadiusKm.push_back(m.localBoundingRadius() * kRENDER_UNIT_KM);
+	          }
+	        }
+
+	        for (const auto& a : asteroids) {
+	          const double s = std::clamp(a.radiusKm / 3500.0, 0.35, 1.25);
+	          const double scaleU = 0.55 * s;
+	          double baseKm = rockBaseRadiusKm;
+	          if (wantProc && varCount > 0) {
+	            const core::u64 h = core::hashCombine(a.id, core::fnv1a64("astMeshVariant"));
+	            const std::size_t vi = (std::size_t)(h % varCount);
+	            baseKm = variantBaseRadiusKm[vi];
+	          }
+	          const double rKm = std::max(0.0, baseKm * scaleU);
+	          obs.push_back(sim::SphereObstacleKm{a.posKm, rKm, 1.0});
+	        }
+
+	        asteroidRenderCull.field.build(std::move(obs), /*leafSize=*/8);
+	      }
+
+	      const math::Vec3d o = gRenderOriginKm;
+	      const math::Mat4d kmToU = math::Mat4d::scale(kINV_RENDER_UNIT_KM)
+	                               * math::Mat4d::translation({-o.x, -o.y, -o.z});
+	      const math::Frustumd frKm = math::frustumFromClipMatrix(proj * view * kmToU);
+	      if (frKm.isFinite() && !asteroidRenderCull.field.empty()) {
+	        asteroidRenderCull.field.queryFrustum(frKm, [&](int id) { asteroidVisibleIds.push_back(id); });
+	        std::sort(asteroidVisibleIds.begin(), asteroidVisibleIds.end());
+	        asteroidVisibleIds.erase(std::unique(asteroidVisibleIds.begin(), asteroidVisibleIds.end()), asteroidVisibleIds.end());
+	      }
+	    }
+
+	    if (!asteroidVisibleIds.empty()) {
+	      for (int idx : asteroidVisibleIds) {
+	        if (idx < 0 || (std::size_t)idx >= asteroids.size()) continue;
+	        emitAsteroidInst(asteroids[(std::size_t)idx]);
+	      }
+	    } else {
+	      for (const auto& a : asteroids) {
+	        emitAsteroidInst(a);
 	      }
 	    }
 	    // Mining seam markers: when targeting a prospected asteroid, highlight its seam poles
@@ -20387,7 +21237,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
     meshRenderer.setNormalTexture(nullptr);
     meshRenderer.setUnlit(false);
     meshRenderer.setAlphaFromTexture(false);
-    meshRenderer.drawInstances(cubes);
+    meshRenderer.drawInstancesCulled(cubes);
 
     // Asteroids (procedural mesh variants / fallback sphere)
     if (vfxAsteroidProcMeshEnabled && !asteroidVariantMeshes.empty()) {
@@ -20419,7 +21269,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           meshRenderer.setNormalTexture(nullptr);
         }
 
-        meshRenderer.drawInstances(inst);
+        meshRenderer.drawInstancesCulled(inst);
       }
 
       // Restore for the rest of the forward pass.
@@ -20430,7 +21280,7 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
       meshRenderer.setTexture(&checker);
       meshRenderer.setUnlit(false);
       meshRenderer.setAlphaFromTexture(false);
-      meshRenderer.drawInstances(rockInstances);
+      meshRenderer.drawInstancesCulled(rockInstances);
     }
 
 
@@ -23240,6 +24090,145 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
         }
 
 
+
+        // Collision warning predictor (player): HUD indicator + avoidance arrow.
+        if (hudCollisionWarningEnabled && hudCollisionWarningIndicator && hudCollisionWarning.hasImpact && !docked) {
+          using sim::CollisionWarningLevel;
+
+          const bool show = (hudCollisionWarning.level == CollisionWarningLevel::Caution)
+                         || (hudCollisionWarning.level == CollisionWarningLevel::Danger);
+          if (show) {
+            const float ttiSec = (float)hudCollisionWarning.ttiSec;
+            const float urgency01 = std::clamp((float)hudCollisionWarning.hazard01, 0.0f, 1.0f);
+            const bool danger = (hudCollisionWarning.level == CollisionWarningLevel::Danger) || (!hudCollisionWarning.canStopBeforeImpact);
+            const float pulse = 0.55f + 0.45f * std::sinf((float)timeRealSec * (4.5f + 6.5f * urgency01));
+            const float a = danger ? std::clamp(retA * (0.45f + 0.55f * pulse), 0.0f, 1.0f) : (retA * 0.85f);
+            const ImU32 col = hudU32(danger ? hudColorDanger : hudColorAccent, a);
+
+            const std::string txt = (ttiSec > 1e-3f)
+              ? (danger ? fmt::format("COLLISION • {:.1f}s • BRAKE", ttiSec)
+                        : fmt::format("COLLISION • {:.1f}s", ttiSec))
+              : (danger ? std::string("COLLISION • BRAKE") : std::string("COLLISION"));
+
+            const ImVec2 sz = ImGui::CalcTextSize(txt.c_str());
+            const ImVec2 p(center.x, center.y + baseR + 28.0f);
+            const float padX = 7.0f;
+            const float padY = 4.0f;
+            const ImVec2 tl(p.x - sz.x * 0.5f - padX, p.y - padY);
+            const ImVec2 br(p.x + sz.x * 0.5f + padX, p.y + sz.y + padY);
+
+            draw->AddRectFilled(tl, br, hudU32(hudColorBackground, 0.20f * a), 4.0f);
+            draw->AddRect(tl, br, hudU32(hudColorGrid, 0.55f * a), 4.0f);
+            draw->AddText(ImVec2(p.x - sz.x * 0.5f, p.y), col, txt.c_str());
+
+            if (hudCollisionWarningAvoidanceArrow && hudCollisionWarningAvoidance.steering) {
+              const math::Vec3d dirW = hudCollisionWarningAvoidance.safeDirUnit;
+              if (dirW.lengthSq() > 1e-12) {
+                const math::Vec3d aimKm = ship.positionKm() + dirW.normalized() * 80000.0;
+                ImVec2 aimPx;
+                bool off = false;
+                if (projectToScreenAny(toRenderPosU(aimKm), view, proj, w, h, aimPx, off)) {
+                  ImVec2 d(aimPx.x - center.x, aimPx.y - center.y);
+                  float dl = std::sqrt(d.x * d.x + d.y * d.y);
+                  if (dl > 1e-3f) { d.x /= dl; d.y /= dl; }
+                  const float r = baseR + 58.0f;
+                  const ImVec2 tip(center.x + d.x * r, center.y + d.y * r);
+                  const float arrowLen = 16.0f;
+                  const float arrowW = 12.0f;
+                  const ImVec2 base(tip.x - d.x * arrowLen, tip.y - d.y * arrowLen);
+                  const ImVec2 perp(-d.y, d.x);
+                  const ImVec2 p1(base.x + perp.x * (arrowW * 0.5f), base.y + perp.y * (arrowW * 0.5f));
+                  const ImVec2 p2(base.x - perp.x * (arrowW * 0.5f), base.y - perp.y * (arrowW * 0.5f));
+                  draw->AddTriangleFilled(tip, p1, p2, col);
+                  draw->AddTriangle(tip, p1, p2, hudU32(hudColorText, 0.35f * a), 1.0f);
+                }
+              }
+            }
+          }
+        }
+
+        // Threat assist indicator: combined evasion cue.
+        if (hudThreatAssistEnabled && hudThreatAssistIndicator && hudThreatAvoidance.active && !docked) {
+          double urgency = 0.0;
+          if (hudThreatAvoidance.collisionActive) {
+            urgency = std::max(urgency, hudThreatAvoidance.collision.hazard01);
+          }
+          if (hudThreatAvoidance.missileActive) {
+            const double denom = std::max(0.1, hudThreatAssistMissileEngageTtiSec);
+            const double t = hudThreatAvoidance.missileThreat.ttiSec;
+            if (t > 0.0) {
+              urgency = std::max(urgency, std::clamp(1.0 - (t / denom), 0.0, 1.0));
+            } else {
+              urgency = std::max(urgency, 0.85);
+            }
+          }
+
+          const bool hard = urgency > 0.72 || (hudThreatAvoidance.missileActive && hudThreatAvoidance.missileThreat.ttiSec > 0.0
+                                              && hudThreatAvoidance.missileThreat.ttiSec <= 4.0);
+          const math::Vec3f c = hard ? hudColorDanger : hudColorAccent;
+          const float pulse = 0.65f + 0.35f * std::sin((float)(timeDays * 86400.0 * (hard ? 6.0 : 4.0)));
+          const float a = std::clamp((hard ? 0.95f : 0.80f) * pulse, 0.0f, 1.0f);
+          const ImU32 col = hudU32(c, a);
+
+          std::string txt = "EVADE ASSIST";
+          if (hudThreatAssistEngaged) {
+            txt += defensiveAssistHold ? " â¢ PANIC" : (hudThreatAssistAutoApply ? " â¢ AUTO" : " â¢ ENGAGED");
+          } else if (!hudThreatAssistAutoApply) {
+            const std::string holdKey = game::scancodeLabel(controls.holds.defensiveAssist);
+            if (!holdKey.empty() && holdKey != "Unbound") {
+              txt += " â¢ HOLD " + holdKey;
+            }
+          }
+          if (hudThreatAvoidance.input.brake) txt += " â¢ BRAKE";
+          if (hudThreatAvoidance.input.boost) txt += " â¢ BOOST";
+
+          double tti = 0.0;
+          if (hudThreatAvoidance.missileActive && hudThreatAvoidance.missileThreat.ttiSec > 0.0) {
+            tti = hudThreatAvoidance.missileThreat.ttiSec;
+          } else if (hudThreatAvoidance.collisionActive && hudThreatAvoidance.collision.timeToImpactSec > 0.0) {
+            tti = hudThreatAvoidance.collision.timeToImpactSec;
+          }
+          if (tti > 0.0) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), " â¢ %.1fs", tti);
+            txt += buf;
+          }
+
+          const float y = center.y + baseR + 34.0f;
+          ImVec2 p(center.x, y);
+          const ImVec2 sz = ImGui::CalcTextSize(txt.c_str());
+          const float padX = 8.0f;
+          const float padY = 4.0f;
+          const ImVec2 tl(p.x - sz.x * 0.5f - padX, p.y - padY);
+          const ImVec2 br(p.x + sz.x * 0.5f + padX, p.y + sz.y + padY);
+          draw->AddRectFilled(tl, br, hudU32(hudColorBackground, 0.20f * a), 4.0f);
+          draw->AddRect(tl, br, hudU32(hudColorGrid, 0.55f * a), 4.0f);
+          draw->AddText(ImVec2(p.x - sz.x * 0.5f, p.y), col, txt.c_str());
+
+          // Direction arrow.
+          const math::Vec3d dirW = hudThreatAvoidance.dirWorld;
+          if (dirW.lengthSq() > 1e-12) {
+            const math::Vec3d aimKm = ship.positionKm() + dirW.normalized() * 80000.0;
+            ImVec2 aimPx;
+            bool off = false;
+            if (projectToScreenAny(toRenderPosU(aimKm), view, proj, w, h, aimPx, off)) {
+              ImVec2 d(aimPx.x - center.x, aimPx.y - center.y);
+              float dl = std::sqrt(d.x * d.x + d.y * d.y);
+              if (dl > 1e-3f) { d.x /= dl; d.y /= dl; }
+              const float r = baseR + 78.0f;
+              const ImVec2 tip(center.x + d.x * r, center.y + d.y * r);
+              const float arrowLen = 16.0f;
+              const float arrowW = 12.0f;
+              const ImVec2 base(tip.x - d.x * arrowLen, tip.y - d.y * arrowLen);
+              const ImVec2 perp(-d.y, d.x);
+              const ImVec2 p1(base.x + perp.x * (arrowW * 0.5f), base.y + perp.y * (arrowW * 0.5f));
+              const ImVec2 p2(base.x - perp.x * (arrowW * 0.5f), base.y - perp.y * (arrowW * 0.5f));
+              draw->AddTriangleFilled(tip, p1, p2, col);
+              draw->AddTriangle(tip, p1, p2, hudU32(hudColorText, 0.35f * a), 1.0f);
+            }
+          }
+        }
+
       } else {
         // Minimal crosshair if the combat HUD is disabled.
         draw->AddLine({center.x - 8, center.y}, {center.x + 8, center.y}, hudU32(hudColorText, (140.0f/255.0f)), 1.0f);
@@ -23446,58 +24435,93 @@ if (scanning && !docked && fsdState == FsdState::Idle && supercruiseState == Sup
           draw->AddText({textX, px.y - 8}, hudU32(hudColorAccent, (210.0f/255.0f)), s.c_str());
 
           // Combat HUD: projectile lead indicator (contacts only).
-          if (hudCombatHud && hudShowLeadIndicator && tgtVelKmS && target.kind == TargetKind::Contact && !docked) {
-            WeaponType wLeadType = hudLeadUseLastFiredWeapon ? (hudLastFiredPrimary ? weaponPrimary : weaponSecondary) : weaponPrimary;
+          if (hudCombatHud && hudShowLeadIndicator && tgtKm && tgtVelKmS && target.kind == TargetKind::Contact && !docked) {
+            const std::size_t ci = (std::size_t)target.index;
+            if (ci < contacts.size()) {
+              WeaponType wLeadType = hudLeadUseLastFiredWeapon ? (hudLastFiredPrimary ? weaponPrimary : weaponSecondary) : weaponPrimary;
 
-            auto pickLeadWeapon = [&](WeaponType preferred) -> std::optional<WeaponType> {
-              const WeaponDef& w0 = weaponDef(preferred);
-              if (!w0.beam && w0.projSpeedKmS > 1e-6) return preferred;
-              const WeaponType other = (preferred == weaponPrimary) ? weaponSecondary : weaponPrimary;
-              const WeaponDef& w1 = weaponDef(other);
-              if (!w1.beam && w1.projSpeedKmS > 1e-6) return other;
-              return std::nullopt;
-            };
+              auto pickLeadWeapon = [&](WeaponType preferred) -> std::optional<WeaponType> {
+                const WeaponDef& w0 = weaponDef(preferred);
+                if (!w0.beam && w0.projSpeedKmS > 1e-6) return preferred;
+                const WeaponType other = (preferred == weaponPrimary) ? weaponSecondary : weaponPrimary;
+                const WeaponDef& w1 = weaponDef(other);
+                if (!w1.beam && w1.projSpeedKmS > 1e-6) return other;
+                return std::nullopt;
+              };
 
-            if (auto wTypeOpt = pickLeadWeapon(wLeadType)) {
-              wLeadType = *wTypeOpt;
-              const WeaponDef& wLead = weaponDef(wLeadType);
-              const double s = wLead.projSpeedKmS;
+              sim::FireControlEstimate fc{};
+              if (hudFireControlUseSensorTrack) {
+                // Sensor-limited fire control: use kinematic track (pos/vel) and fade with uncertainty.
+                fc = sim::estimateFireControlFromTrack(contacts[ci].sensorKinematic,
+                                                      hudFireControlMaxAgeSec,
+                                                      hudFireControlMaxSigmaKm);
+              } else {
+                // Legacy behavior: assume perfect target kinematics.
+                fc.valid = true;
+                fc.posKm = *tgtKm;
+                fc.velKmS = *tgtVelKmS;
+                fc.quality01 = 1.0;
+                fc.sigmaKm = 0.0;
+                fc.ageSinceMeasSec = 0.0;
+              }
 
-              const double ttl = wLead.rangeKm / std::max(1e-9, s);
-              const double maxT = std::min(ttl, hudLeadMaxTimeSec);
+              if (!fc.valid) {
+                // Optional hint for why the marker vanished (hold SHIFT).
+                if (io.KeyShift) {
+                  draw->AddText(ImVec2(px.x + 10.0f, px.y + 12.0f), hudU32(hudColorDanger, (210.0f/255.0f)), "FC LOST");
+                }
+              } else if (auto wTypeOpt = pickLeadWeapon(wLeadType)) {
+                wLeadType = *wTypeOpt;
+                const WeaponDef& wLead = weaponDef(wLeadType);
+                const double s = wLead.projSpeedKmS;
 
-              if (auto sol = sim::solveProjectileLead(ship.positionKm(), ship.velocityKmS(),
-                                                      *tgtKm, *tgtVelKmS,
-                                                      s, maxT)) {
-                const double t = sol->tSec;
-                const math::Vec3d leadKm = sol->leadPointKm;
-                ImVec2 leadPx{};
-                if (projectToScreen(toRenderPosU(leadKm), view, proj, w, h, leadPx)) {
-                  const auto uv = hudAtlas.get(render::SpriteKind::HudLead,
-                                               core::hashCombine(core::fnv1a64("hud_lead"), (core::u64)(int)wLeadType));
+                const double ttl = wLead.rangeKm / std::max(1e-9, s);
+                const double maxT = std::min(ttl, hudLeadMaxTimeSec);
 
-                  auto clampByte = [](double x) -> int { return (int)std::clamp(x, 0.0, 255.0); };
-                  const int cr = clampByte((double)wLead.r * 255.0);
-                  const int cg = clampByte((double)wLead.g * 255.0);
-                  const int cb = clampByte((double)wLead.b * 255.0);
+                const math::Vec3d fcAccelKmS2 = hudFireControlUseSensorTrack
+                                                  ? (contacts[ci].sensorAccelKmS2 * std::clamp(fc.quality01, 0.0, 1.0))
+                                                  : math::Vec3d{0, 0, 0};
 
-                  // Connector line from target to lead.
-                  draw->AddLine(px, leadPx, IM_COL32(cr, cg, cb, 70), 1.0f);
+                if (auto sol = sim::solveProjectileLeadAccel(ship.positionKm(), ship.velocityKmS(),
+                                                            fc.posKm, fc.velKmS, fcAccelKmS2,
+                                                            s, maxT)) {
+                  const double t = sol->tSec;
+                  const math::Vec3d leadKm = sol->leadPointKm;
+                  ImVec2 leadPx{};
+                  if (projectToScreen(toRenderPosU(leadKm), view, proj, w, h, leadPx)) {
+                    const auto uv = hudAtlas.get(render::SpriteKind::HudLead,
+                                                 core::hashCombine(core::fnv1a64("hud_lead"), (core::u64)(int)wLeadType));
 
-                  const float sz = std::max(8.0f, hudLeadSizePx);
-                  const float oSz = sz * 1.12f;
-                  const ImVec2 o0(leadPx.x - oSz * 0.5f, leadPx.y - oSz * 0.5f);
-                  const ImVec2 o1(leadPx.x + oSz * 0.5f, leadPx.y + oSz * 0.5f);
-                  const ImVec2 p0(leadPx.x - sz * 0.5f, leadPx.y - sz * 0.5f);
-                  const ImVec2 p1(leadPx.x + sz * 0.5f, leadPx.y + sz * 0.5f);
+                    auto clampByte = [](double x) -> int { return (int)std::clamp(x, 0.0, 255.0); };
+                    const int cr = clampByte((double)wLead.r * 255.0);
+                    const int cg = clampByte((double)wLead.g * 255.0);
+                    const int cb = clampByte((double)wLead.b * 255.0);
 
-                  draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(0,0,0,120));
-                  draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(cr, cg, cb, 230));
+                    const double q = std::clamp(fc.quality01, 0.0, 1.0);
+                    auto a = [&](double base) -> int { return clampByte(base * q); };
 
-                  if (io.KeyShift) {
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), "%.1fs", t);
-                    draw->AddText(ImVec2(leadPx.x + sz * 0.58f, leadPx.y - 7.0f), IM_COL32(cr, cg, cb, 200), buf);
+                    // Connector line from target to lead.
+                    draw->AddLine(px, leadPx, IM_COL32(cr, cg, cb, a(70.0)), 1.0f);
+
+                    const float sz = std::max(8.0f, hudLeadSizePx);
+                    const float oSz = sz * 1.12f;
+                    const ImVec2 o0(leadPx.x - oSz * 0.5f, leadPx.y - oSz * 0.5f);
+                    const ImVec2 o1(leadPx.x + oSz * 0.5f, leadPx.y + oSz * 0.5f);
+                    const ImVec2 p0(leadPx.x - sz * 0.5f, leadPx.y - sz * 0.5f);
+                    const ImVec2 p1(leadPx.x + sz * 0.5f, leadPx.y + sz * 0.5f);
+
+                    draw->AddImage(atlasId, o0, o1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(0,0,0,a(120.0)));
+                    draw->AddImage(atlasId, p0, p1, ImVec2(uv.u0, uv.v0), ImVec2(uv.u1, uv.v1), IM_COL32(cr, cg, cb, a(230.0)));
+
+                    if (io.KeyShift) {
+                      char buf[96];
+                      if (hudFireControlUseSensorTrack) {
+                        std::snprintf(buf, sizeof(buf), "%.1fs  σ%.1fkm  age%.1fs", t, fc.sigmaKm, fc.ageSinceMeasSec);
+                      } else {
+                        std::snprintf(buf, sizeof(buf), "%.1fs", t);
+                      }
+                      draw->AddText(ImVec2(leadPx.x + sz * 0.58f, leadPx.y - 7.0f), IM_COL32(cr, cg, cb, a(200.0)), buf);
+                    }
                   }
                 }
               }
@@ -24112,8 +25136,11 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
 {
   radarPingActive = (timeRealSec < sensorPingActiveUntilRealSec);
   radarPingFrac = radarPingActive
-                    ? std::clamp((timeRealSec - sensorPingStartRealSec) / std::max(0.001, sensorPingDurationSec), 0.0, 1.0)
+                    ? sim::pingFrac01(timeRealSec, sensorPingStartRealSec, sensorPingDurationSec, radarPingParams)
                     : 0.0;
+
+  radarPingParams.ringThicknessFrac = std::clamp(radarPingParams.ringThicknessFrac, 0.01, 0.25);
+  radarPingParams.ringFeatherFrac = std::clamp(radarPingParams.ringFeatherFrac, 0.0, 1.0);
 
   radarEnvSensorOcclusion01 = 0.0;
   radarEwJamming01 = 0.0;
@@ -24121,6 +25148,8 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
 
   contactSense.resize(contacts.size());
   contactSenseOccluded.assign(contacts.size(), false);
+  contactSenseOcclusion01.assign(contacts.size(), 0.0);
+  contactSenseMeasured01.assign(contacts.size(), 0.0);
 
   // If we're not in local-space flight, decay tracks toward zero so stale contacts fade.
   const bool canSense = (currentSystem != nullptr)
@@ -24130,13 +25159,43 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
 
   if (!canSense) {
     for (std::size_t i = 0; i < contacts.size(); ++i) {
+      contactSenseMeasured01[i] = 0.0;
+
       if (!contacts[i].alive) {
         contacts[i].sensorTrack.strength01 = 0.0;
         contacts[i].sensorTrack.identified = false;
+        contacts[i].sensorKinematic = sim::KinematicTrack3d{};
+        contacts[i].sensorAccelKmS2 = {0,0,0};
+        contacts[i].sensorBearing = sim::BearingTrack3d{};
         contactSense[i] = sim::SensorTrackResult{};
         continue;
       }
+
       contactSense[i] = sim::updateSensorTrack(contacts[i].sensorTrack, dtReal, 0.0, sensorTrackParams);
+
+      // Coast the kinematic track briefly even when sensors are suppressed
+      // (e.g., docked/supercruise). It won't render unless the strength stays
+      // above the ghost threshold.
+      sim::updateKinematicTrack(contacts[i].sensorKinematic,
+                                dtReal,
+                                /*hasMeasurement=*/false,
+                                /*measPosKm=*/math::Vec3d{},
+                                /*strength01=*/0.0,
+                                radarKinematicParams);
+      {
+        const double hlSec = 0.35;
+        const double dt = dtReal;
+        const double decay = (dt > 0.0 && hlSec > 1.0e-6) ? std::pow(0.5, dt / hlSec) : 0.0;
+        contacts[i].sensorAccelKmS2 = contacts[i].sensorAccelKmS2 * decay;
+      }
+      sim::updateBearingTrack(contacts[i].sensorBearing,
+                              dtReal,
+                              /*hasMeasurement=*/false,
+                              /*observerPosKm=*/math::Vec3d{},
+                              /*bearingDirWorld=*/math::Vec3d{},
+                              /*strength01=*/0.0,
+                              radarBearingParams);
+
     }
   } else {
     const math::Vec3d shipPosKm = ship.positionKm();
@@ -24150,7 +25209,7 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
     const auto envHaz = sampleLocalGalaxyHazards();
     radarEnvSensorOcclusion01 = std::clamp(envHaz.sensorOcclusion01, 0.0, 1.0);
 
-    double sensorPower = radarPingActive ? sensorPingPowerBoost : 1.0;
+    double sensorPower = 1.0;
     if (silentRunning) sensorPower *= 0.80;
 
     // Galaxy-scale sensor occlusion (nebulae, dust).
@@ -24174,14 +25233,53 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
       occluders.push_back(Occluder{pKm, rKm});
     }
 
-    auto isOccluded = [&](const math::Vec3d& aKm, const math::Vec3d& bKm) -> bool {
+    // Cache a BVH over asteroid occluders (static per-system) so sensor occlusion
+    // doesn't degrade to O(N_asteroids * N_contacts) each frame.
+    static core::u64 asteroidOccCacheSystemId = 0;
+    static std::size_t asteroidOccCacheCount = 0;
+    static sim::OcclusionFieldKm asteroidOccField;
+
+    if (asteroidOccCacheSystemId != currentSystem->stub.id || asteroidOccCacheCount != asteroids.size()) {
+      asteroidOccCacheSystemId = currentSystem->stub.id;
+      asteroidOccCacheCount = asteroids.size();
+
+      std::vector<sim::SphereOccluderKm> aOcc;
+      aOcc.reserve(asteroids.size());
+
+      // Strength is intentionally gentle so belts produce "fuzzy" radar falloff
+      // rather than hard binary occlusion.
+      const double rRefKm = 9000.0;
+      const double minRKm = 200.0;
+
+      for (const auto& a : asteroids) {
+        const double rKm = std::max(0.0, a.radiusKm) * 1.05;
+        if (!(rKm > minRKm)) continue;
+
+        const double rNorm = std::clamp(rKm / rRefKm, 0.0, 1.0);
+        const double dNorm = std::clamp(a.density01, 0.0, 1.0);
+        double strength = 0.03 + 0.20 * rNorm * (0.35 + 0.65 * dNorm);
+        strength = std::clamp(strength, 0.02, 0.28);
+
+        aOcc.push_back(sim::SphereOccluderKm{a.posKm, rKm, strength});
+      }
+
+      asteroidOccField.build(std::move(aOcc), /*leafSize=*/6);
+    }
+
+    auto occlusion01Between = [&](const math::Vec3d& aKm, const math::Vec3d& bKm) -> double {
+      // Large bodies (stations/planets) produce full occlusion.
       for (const auto& o : occluders) {
         // If either endpoint is inside the occluder, skip it (prevents always-occluded artifacts).
         if ((aKm - o.cKm).length() < o.rKm * 0.98) continue;
         if ((bKm - o.cKm).length() < o.rKm * 0.98) continue;
-        if (sim::segmentHitsSphereKm(aKm, bKm, o.cKm, o.rKm)) return true;
+        if (sim::segmentHitsSphereKm(aKm, bKm, o.cKm, o.rKm)) return 1.0;
       }
-      return false;
+
+      // Asteroid fields yield partial occlusion.
+      if (!asteroidOccField.empty()) {
+        return asteroidOccField.occlusion01Segment(aKm, bKm, /*maxSphereTests=*/26);
+      }
+      return 0.0;
     };
 
     // --- Electronic warfare: aggregate jammer field and suppress sensor power ---
@@ -24198,10 +25296,10 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
 
         const math::Vec3d pKm = ctc.ship.positionKm();
         const double distKm = (pKm - shipPosKm).length();
-        const bool occ = isOccluded(shipPosKm, pKm);
+        const double occ01 = occlusion01Between(shipPosKm, pKm);
 
         double snr = sim::computeJammingSnr(distKm, ctc.jammerPower, ewJammerParams);
-        if (occ) snr *= 0.20;
+        snr *= (1.0 - 0.80 * std::clamp(occ01, 0.0, 1.0)); // 0->1, 1->0.20
         jamSnr += snr;
       }
 
@@ -24235,18 +25333,77 @@ auto hudCaptureWindowPosToLayout = [&](ui::HudWidgetId id, float padXpx = 0.0f, 
       if (!contacts[i].alive) {
         contacts[i].sensorTrack.strength01 = 0.0;
         contacts[i].sensorTrack.identified = false;
+        contacts[i].sensorKinematic = sim::KinematicTrack3d{};
+        contacts[i].sensorAccelKmS2 = {0,0,0};
+        contactSenseMeasured01[i] = 0.0;
         contactSense[i] = sim::SensorTrackResult{};
         continue;
       }
 
       const math::Vec3d pKm = contacts[i].ship.positionKm();
       const double distKm = (pKm - shipPosKm).length();
-      const bool occ = isOccluded(shipPosKm, pKm);
-      contactSenseOccluded[i] = occ;
+      const double occ01 = occlusion01Between(shipPosKm, pKm);
+      contactSenseOcclusion01[i] = occ01;
+      contactSenseOccluded[i] = occ01 >= 0.55;
 
       const double sig = contactSignature(contacts[i]);
-      const double meas = sim::computeSensorStrength01(distKm, sig, sensorPower, occ, sensorParams);
+      double sensorPowerThis = sensorPower;
+      if (radarPingActive) {
+        // Boost only when the ping ring is near this target's range.
+        const double ringBoost01 = sim::pingRingBoost01(distKm, radarPingFrac, rangeKm, radarPingParams);
+        const double peakBoost = std::max(1.0, sensorPingPowerBoost);
+        sensorPowerThis *= (1.0 + (peakBoost - 1.0) * ringBoost01);
+      }
+
+      const double meas = sim::computeSensorStrength01Occlusion01(distKm, sig, sensorPowerThis, occ01, sensorParams);
+      contactSenseMeasured01[i] = meas;
       contactSense[i] = sim::updateSensorTrack(contacts[i].sensorTrack, dtReal, meas, sensorTrackParams);
+
+      // Kinematic smoothing for the HUD: treat very small signals as "no measurement"
+      // so the track coasts and the uncertainty grows.
+      const bool hasMeas = meas >= radarKinematicMeasGate01;
+      const math::Vec3d prevVelKmS = contacts[i].sensorKinematic.velKmS;
+      sim::updateKinematicTrack(contacts[i].sensorKinematic,
+                                dtReal,
+                                hasMeas,
+                                pKm,
+                                meas,
+                                radarKinematicParams);
+
+      // Approximate target acceleration from smoothed velocity updates.
+      // Heavily filtered + clamped: used only for HUD lead solves and aim assist.
+      {
+        const double hlSec = 0.35;
+        const double dt = dtReal;
+        const double decay = (dt > 0.0 && hlSec > 1.0e-6) ? std::pow(0.5, dt / hlSec) : 0.0;
+
+        if (hasMeas && dt > 1.0e-6 && contacts[i].sensorKinematic.initialized) {
+          math::Vec3d aMeas = (contacts[i].sensorKinematic.velKmS - prevVelKmS) / dt;
+          if (!math::isFinite(aMeas)) aMeas = {0,0,0};
+
+          const double maxA = 0.35;
+          const double len = aMeas.length();
+          if (len > maxA) aMeas *= (maxA / len);
+
+          contacts[i].sensorAccelKmS2 = contacts[i].sensorAccelKmS2 * decay + aMeas * (1.0 - decay);
+        } else {
+          contacts[i].sensorAccelKmS2 = contacts[i].sensorAccelKmS2 * decay;
+        }
+      }
+
+      // Bearing-only track update for weak/ghost contacts.
+      // Normalize weight against the ghost threshold so barely-visible returns still contribute.
+      const bool hasBearing = contactSense[i].visible;
+      const double ghostTh = std::clamp(sensorTrackParams.ghostThreshold, 0.02, 1.0);
+      const double bearingW = hasBearing ? std::clamp(meas / ghostTh, 0.0, 1.0) : 0.0;
+      sim::updateBearingTrack(contacts[i].sensorBearing,
+                              dtReal,
+                              hasBearing,
+                              shipPosKm,
+                              pKm - shipPosKm,
+                              bearingW,
+                              radarBearingParams);
+
     }
   }
 }
@@ -24291,6 +25448,38 @@ if (showRadarHud && currentSystem) {
     const double maxKm = 1200000.0;
     ImGui::DragScalar("Range (km)", ImGuiDataType_Double, &radarRangeKm, 5000.0, &minKm, &maxKm, "%.0f");
     ImGui::SliderInt("Max blips", &radarMaxBlips, 16, 160);
+    ImGui::Separator();
+    ImGui::TextDisabled("Sensor Ping");
+    ImGui::Checkbox("Out & back sweep", &radarPingParams.outAndBack);
+    const double minRing = 0.01;
+    const double maxRing = 0.25;
+    ImGui::DragScalar("Ring thickness", ImGuiDataType_Double, &radarPingParams.ringThicknessFrac, 0.003, &minRing, &maxRing, "%.3f");
+    const double minFeather = 0.0;
+    const double maxFeather = 1.0;
+    ImGui::SliderScalar("Ring feather", ImGuiDataType_Double, &radarPingParams.ringFeatherFrac, &minFeather, &maxFeather, "%.2f");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Tracking");
+    ImGui::Checkbox("Predictive tracks", &radarPredictiveTracks);
+    ImGui::Checkbox("Uncertainty ring", &radarShowUncertainty);
+    ImGui::Checkbox("Ghosts: bearing-only range", &radarGhostBearingOnly);
+    if (radarGhostBearingOnly) {
+      ImGui::Checkbox("Ghost sigma ring", &radarShowBearingUncertainty);
+      const double jMin = 0.0;
+      const double jMax = 0.60;
+      ImGui::SliderScalar("Ghost range jitter", ImGuiDataType_Double, &radarGhostRangeJitter01, &jMin, &jMax, "%.2f");
+    }
+
+    const double minGate = 0.0;
+    const double maxGate = 0.25;
+    ImGui::SliderScalar("Meas gate", ImGuiDataType_Double, &radarKinematicMeasGate01, &minGate, &maxGate, "%.3f");
+    const double minGrow = 0.0;
+    const double maxGrow = 10.0;
+    ImGui::SliderScalar("Sigma grow (km/s)", ImGuiDataType_Double, &radarKinematicParams.sigmaGrowthKmPerSec, &minGrow, &maxGrow, "%.2f");
+    const double minShrink = 0.10;
+    const double maxShrink = 1.0;
+    ImGui::SliderScalar("Sigma shrink", ImGuiDataType_Double, &radarKinematicParams.sigmaShrinkFactor, &minShrink, &maxShrink, "%.2f");
+
     ImGui::Separator();
     ImGui::TextDisabled("Electronic Warfare");
     ImGui::Checkbox("Enable jamming", &radarEnableEw);
@@ -24405,6 +25594,68 @@ if (showRadarHud && currentSystem) {
     }
   };
 
+    auto contactBlipPosKm = [&](std::size_t idx, bool force) -> math::Vec3d {
+      const auto& ctc = contacts[idx];
+      const math::Vec3d truePosKm = ctc.ship.positionKm();
+      if (force) return truePosKm;
+  
+      const double meas01 = (idx < contactSenseMeasured01.size())
+                              ? std::clamp(contactSenseMeasured01[idx], 0.0, 1.0)
+                              : 0.0;
+      const bool hasMeas = meas01 >= radarKinematicMeasGate01;
+  
+      bool memIdent = false;
+      {
+        const auto it = contactScanIntelById.find(ctc.id);
+        if (it != contactScanIntelById.end()) memIdent = timeDays < it->second.identifiedUntilDays;
+      }
+      const bool identified = ((idx < contactSense.size()) ? contactSense[idx].identified : false) || memIdent;
+  
+      if (identified) {
+        if (radarPredictiveTracks && !hasMeas && ctc.sensorKinematic.initialized) {
+          return ctc.sensorKinematic.posKm;
+        }
+        return truePosKm;
+      }
+  
+      // Weak / un-identified contacts: optionally avoid leaking true range.
+      if (radarGhostBearingOnly) {
+        // If the bearing-only triangulation has a fix, use it.
+        if (ctc.sensorBearing.initialized && math::isFinite(ctc.sensorBearing.posKm)) {
+          return ctc.sensorBearing.posKm;
+        }
+  
+        const double occ01 = (idx < contactSenseOcclusion01.size())
+                               ? std::clamp(contactSenseOcclusion01[idx], 0.0, 1.0)
+                               : 0.0;
+        const double s01 = (idx < contactSense.size())
+                             ? std::clamp(contactSense[idx].strength01, 1.0e-4, 0.999)
+                             : 0.0;
+  
+        double distEstKm = sim::estimateSensorRangeKmFromStrength01(s01, 1.0, radarSensorPower, occ01, sensorParams);
+        if (!std::isfinite(distEstKm)) distEstKm = rangeKm;
+  
+        // Deterministic jitter (keeps unknown ranges from feeling too perfect).
+        const core::u64 phase = (core::u64)std::llround(timeRealSec * 0.75); // ~0.75 Hz reseed
+        core::SplitMix64 rng(core::hashCombine(core::hashCombine(core::fnv1a64("ghost_range"), ctc.id), phase));
+        const double u = rng.nextDouble(); // [0,1)
+        const double j = 1.0 + radarGhostRangeJitter01 * (2.0 * u - 1.0);
+        distEstKm *= std::clamp(j, 0.25, 4.0);
+  
+        distEstKm = std::clamp(distEstKm, 0.0, rangeKm);
+  
+        const math::Vec3d dir = math::safeNormalized(truePosKm - shipPos, {0, 0, 0}, 1e-18);
+        if (dir.lengthSq() <= 1e-18) return shipPos;
+        return shipPos + dir * distEstKm;
+      }
+  
+      if (radarPredictiveTracks && !hasMeas && ctc.sensorKinematic.initialized) {
+        return ctc.sensorKinematic.posKm;
+      }
+      return truePosKm;
+    };
+
+
   // Always include current target (clamped to edge if out of range)
   if (target.kind != TargetKind::None) {
     if (target.kind == TargetKind::Station && target.index < currentSystem->stations.size()) {
@@ -24418,7 +25669,7 @@ if (showRadarHud && currentSystem) {
         const auto it = contactScanIntelById.find(contacts[target.index].id);
         if (it != contactScanIntelById.end()) memIdent = timeDays < it->second.identifiedUntilDays;
       }
-      addBlip(TargetKind::Contact, target.index, contacts[target.index].ship.positionKm(), true, sr.strength01, sr.identified || memIdent);
+      addBlip(TargetKind::Contact, target.index, contactBlipPosKm(target.index, /*force=*/true), true, sr.strength01, sr.identified || memIdent);
     } else if (target.kind == TargetKind::Signal && target.index < signals.size()) {
       addBlip(TargetKind::Signal, target.index, signals[target.index].posKm, true);
     } else if (target.kind == TargetKind::Cargo && target.index < floatingCargo.size()) {
@@ -24444,7 +25695,7 @@ if (showRadarHud && currentSystem) {
       const auto it = contactScanIntelById.find(ctc.id);
       if (it != contactScanIntelById.end()) memIdent = timeDays < it->second.identifiedUntilDays;
     }
-    addBlip(TargetKind::Contact, i, ctc.ship.positionKm(), false, sr.strength01, sr.identified || memIdent);
+    addBlip(TargetKind::Contact, i, contactBlipPosKm(i, /*force=*/false), false, sr.strength01, sr.identified || memIdent);
   }
 
   // Signals, floating cargo, asteroids
@@ -24641,6 +25892,27 @@ if (showRadarHud && currentSystem) {
                             (int)std::round(b.sensorStrength01 * 100.0),
                             b.distKm,
                             local.y);
+
+        if (b.index < contactSenseOcclusion01.size()) {
+          const double occ01 = std::clamp(contactSenseOcclusion01[b.index], 0.0, 1.0);
+          if (occ01 > 0.01) {
+            ImGui::TextDisabled("Occlusion: %d%%", (int)std::llround(occ01 * 100.0));
+          }
+        }
+
+        if (radarPredictiveTracks && b.index < contacts.size()) {
+          const auto& kt = contacts[b.index].sensorKinematic;
+          if (kt.initialized) {
+            const double meas01 = (b.index < contactSenseMeasured01.size())
+                                  ? std::clamp(contactSenseMeasured01[b.index], 0.0, 1.0)
+                                  : 0.0;
+            const bool hasMeas = meas01 >= radarKinematicMeasGate01;
+            ImGui::TextDisabled("Track: %s | Age %.1fs | sigma %.1f km",
+                                hasMeas ? "measured" : "predicted",
+                                kt.ageSinceMeasSec,
+                                kt.sigmaKm);
+          }
+        }
       } else {
         ImGui::TextDisabled("Dist %.0f km | RelY %.0f km", b.distKm, local.y);
       }
@@ -24720,6 +25992,35 @@ if (showRadarHud && currentSystem) {
                       hudU32(hudColorAccent, (210.0f/255.0f)),
                       0,
                       1.5f * std::max(0.75f, uiScale));
+    }
+
+    // Uncertainty ring for predicted contact tracks (when we have no fresh measurement).
+    if (radarShowUncertainty
+        && radarPredictiveTracks
+        && b.kind == TargetKind::Contact
+        && !b.force
+        && b.index < contacts.size()) {
+      const auto& kt = contacts[b.index].sensorKinematic;
+      if (kt.initialized && kt.sigmaKm > 0.0) {
+        const double meas01 = (b.index < contactSenseMeasured01.size())
+                              ? std::clamp(contactSenseMeasured01[b.index], 0.0, 1.0)
+                              : 0.0;
+        const bool hasMeas = meas01 >= radarKinematicMeasGate01;
+        if (!hasMeas) {
+          float sigPx = (float)(kt.sigmaKm * (double)s);
+          sigPx = std::clamp(sigPx, 2.0f * uiScale, rad * 0.90f);
+
+          const float a = std::clamp(0.08f + 0.55f * (1.0f - (float)std::clamp(b.sensorStrength01, 0.0, 1.0)),
+                                     0.05f,
+                                     0.65f);
+
+          draw->AddCircle(bp,
+                          sigPx,
+                          hudU32(hudColorAccent, a),
+                          0,
+                          1.0f * std::max(0.75f, uiScale));
+        }
+      }
     }
 
     // Vertical hint for off-plane objects (up/down)
@@ -28427,6 +29728,240 @@ if (trajCache.valid) {
           }
         }
 
+        // Maneuver programs (Keplerian helpers).
+        // Generates maneuver nodes from high-level orbit goals around the selected reference body.
+        {
+          ImGui::Separator();
+          ImGui::Text("Maneuver programs (Keplerian)");
+          ImGui::TextDisabled("Generates a maneuver node from an orbit goal around the reference body.");
+
+          const char* progLabels[] = {
+            "Circularize at periapsis",
+            "Circularize at apoapsis",
+            "Set apoapsis at periapsis",
+            "Set periapsis at apoapsis",
+            "Escape now",
+            "Align plane at ascending node",
+            "Align plane at descending node",
+          };
+          const int kProgCount = (int)(sizeof(progLabels) / sizeof(progLabels[0]));
+          maneuverProgramChoice = std::clamp(maneuverProgramChoice, 0, kProgCount - 1);
+          ImGui::SetNextItemWidth(260.0f);
+          ImGui::Combo("Program##maneuverProgram", &maneuverProgramChoice, progLabels, kProgCount);
+
+          const sim::ManeuverProgramKind progKind = (sim::ManeuverProgramKind)maneuverProgramChoice;
+
+          if (progKind == sim::ManeuverProgramKind::SetApoapsisAtPeriapsis ||
+              progKind == sim::ManeuverProgramKind::SetPeriapsisAtApoapsis) {
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::InputFloat("Target altitude (km)", &maneuverProgramTargetAltKm, 50.0f, 500.0f, "%.0f");
+            maneuverProgramTargetAltKm = std::clamp(maneuverProgramTargetAltKm, 0.0f, 5.0e8f);
+          }
+
+          if (progKind == sim::ManeuverProgramKind::AlignPlaneAtAscendingNode ||
+              progKind == sim::ManeuverProgramKind::AlignPlaneAtDescendingNode) {
+            ImGui::Checkbox("Force prograde", &maneuverProgramForcePrograde);
+          }
+
+          auto computeProgram = [&](double nowDays) -> sim::ManeuverProgramResult {
+            // Choose gravity scale consistent with the preview mode.
+            const int gMode = std::clamp(trajPreviewGravityMode, 0, 2);
+            sim::GravityParams gParams = gravityParams;
+            double gScale = 1.0;
+            if (gMode == 1) {
+              gScale = gParams.scale;
+            } else if (gMode == 2) {
+              gParams.scale = 1.0;
+              gParams.maxAccelKmS2 = 0.0;
+              gScale = 1.0;
+            } else {
+              // Ballistic preview: still plan using physical gravity scale=1.
+              gScale = 1.0;
+            }
+
+            sim::GravityBody ref{};
+            bool refOk = false;
+
+            if (trajRefBodyChoice == -1) {
+              // Pick the dominant body. If preview is ballistic, pick using physical gravity.
+              sim::GravityParams pick = gParams;
+              if (gMode == 0) { pick.scale = 1.0; pick.maxAccelKmS2 = 0.0; }
+              const auto dom = sim::dominantGravityBody(*currentSystem, nowDays, ship.positionKm(), pick);
+              if (dom.valid) {
+                ref = dom.body;
+                refOk = true;
+              }
+            } else if (trajRefBodyChoice == 0) {
+              refOk = true;
+              ref.kind = sim::GravityBody::Kind::Star;
+              ref.id = currentSystem->stub.id;
+              ref.name = "Star";
+              ref.posKm = {0, 0, 0};
+              ref.velKmS = {0, 0, 0};
+              ref.muKm3S2 = sim::muStarKm3S2(currentSystem->star);
+              ref.radiusKm = sim::radiusStarKm(currentSystem->star);
+            } else {
+              const int pi = trajRefBodyChoice - 1;
+              if (pi >= 0 && pi < (int)currentSystem->planets.size()) {
+                const auto& p = currentSystem->planets[(std::size_t)pi];
+                refOk = true;
+                ref.kind = sim::GravityBody::Kind::Planet;
+                ref.id = (core::u64)pi;
+                ref.name = p.name;
+                ref.posKm = sim::planetPosKm(p, nowDays);
+                ref.velKmS = sim::planetVelKmS(p, nowDays);
+                ref.muKm3S2 = sim::muPlanetKm3S2(p);
+                ref.radiusKm = sim::radiusPlanetKm(p);
+              }
+            }
+
+            if (!refOk) {
+              sim::ManeuverProgramResult bad{};
+              bad.valid = false;
+              bad.reason = "No reference body";
+              return bad;
+            }
+
+            switch (progKind) {
+              case sim::ManeuverProgramKind::CircularizeAtPeriapsis:
+              case sim::ManeuverProgramKind::CircularizeAtApoapsis:
+                return sim::planCircularize(ship, nowDays, ref, progKind, gScale);
+
+              case sim::ManeuverProgramKind::SetApoapsisAtPeriapsis: {
+                const double targetR = std::max(ref.radiusKm, ref.radiusKm + (double)maneuverProgramTargetAltKm);
+                return sim::planSetApoapsisAtPeriapsis(ship, nowDays, ref, targetR, gScale);
+              }
+
+              case sim::ManeuverProgramKind::SetPeriapsisAtApoapsis: {
+                const double targetR = std::max(ref.radiusKm, ref.radiusKm + (double)maneuverProgramTargetAltKm);
+                return sim::planSetPeriapsisAtApoapsis(ship, nowDays, ref, targetR, gScale);
+              }
+
+              case sim::ManeuverProgramKind::EscapeNow:
+                return sim::planEscapeNow(ship, nowDays, ref, gScale);
+
+              case sim::ManeuverProgramKind::AlignPlaneAtAscendingNode:
+                return sim::planAlignPlaneAtAscendingNode(ship, nowDays, ref, maneuverProgramForcePrograde, gScale);
+
+              case sim::ManeuverProgramKind::AlignPlaneAtDescendingNode:
+                return sim::planAlignPlaneAtDescendingNode(ship, nowDays, ref, maneuverProgramForcePrograde, gScale);
+            }
+
+            sim::ManeuverProgramResult bad{};
+            bad.valid = false;
+            bad.reason = "Unsupported program";
+            return bad;
+          };
+
+          if (ImGui::SmallButton("Compute program##maneuverProgram")) {
+            maneuverProgramLast = computeProgram(timeDays);
+            maneuverProgramHasLast = true;
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Clear##maneuverProgram")) {
+            maneuverProgramHasLast = false;
+            maneuverProgramLast = {};
+          }
+
+          if (!maneuverProgramHasLast) {
+            ImGui::TextDisabled("No program computed.");
+          } else if (!maneuverProgramLast.valid) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "Invalid: %s", maneuverProgramLast.reason.c_str());
+          } else {
+            const double dvMs = maneuverProgramLast.dvKmS * 1000.0;
+            ImGui::Text("Ref: %s", maneuverProgramLast.refBody.name.c_str());
+            ImGui::Text("Node: T+%.1f s | Δv %.1f m/s", maneuverProgramLast.timeToNodeSec, dvMs);
+            ImGui::TextDisabled("Node alt: %.0f km | speed: %.3f km/s", maneuverProgramLast.nodeAltitudeKm, maneuverProgramLast.nodeSpeedKmS);
+
+            if (ImGui::Button("Apply to maneuver node fields")) {
+              const auto& res = maneuverProgramLast;
+
+              // Ensure the preview horizon can at least reach the node (subject to UI limits).
+              const float needMin = (float)std::clamp(res.timeToNodeSec / 60.0 + 2.0, 1.0, 180.0);
+              trajPreviewHorizonMin = std::max(trajPreviewHorizonMin, needMin);
+
+              maneuverNodeEnabled = true;
+              maneuverNodeTimeSec = (float)std::clamp(res.timeToNodeSec, 0.0, 86400.0);
+
+              // RTN basis at node from body-relative state.
+              math::Vec3d r = res.nodeRelPosKm;
+              math::Vec3d v = res.nodeRelVelKmS;
+
+              math::Vec3d radial = r.normalized();
+              if (radial.lengthSq() < 1e-12) radial = {1, 0, 0};
+
+              math::Vec3d normal = math::cross(r, v);
+              if (normal.lengthSq() < 1e-12) normal = {0, 1, 0};
+              normal = normal.normalized();
+
+              math::Vec3d along = math::cross(normal, radial);
+              if (along.lengthSq() < 1e-12) {
+                along = (v - radial * math::dot(v, radial)).normalized();
+              } else {
+                along = along.normalized();
+              }
+
+              const math::Vec3d dvW = res.plan.deltaVWorldKmS;
+              maneuverDvAlongMS = (float)(math::dot(dvW, along) * 1000.0);
+              maneuverDvNormalMS = (float)(math::dot(dvW, normal) * 1000.0);
+              maneuverDvRadialMS = (float)(math::dot(dvW, radial) * 1000.0);
+
+              // Lock the reference body so the node frame stays consistent.
+              if (res.refBody.kind == sim::GravityBody::Kind::Star) {
+                trajRefBodyChoice = 0;
+              } else {
+                trajRefBodyChoice = (int)res.refBody.id + 1;
+              }
+
+              const double horizonSec = (double)trajPreviewHorizonMin * 60.0;
+              if (res.timeToNodeSec > horizonSec - 1e-3) {
+                toast(toasts, "Node time beyond preview horizon (max 180 min). You can still arm directly from program.", 2.2);
+              } else {
+                toast(toasts, "Maneuver program applied to node.", 1.6);
+              }
+            }
+
+            ImGui::SameLine();
+
+            const bool canArmProgram =
+              !docked &&
+              fsdState == FsdState::Idle &&
+              supercruiseState == SupercruiseState::Idle &&
+              !maneuverComputer.active() &&
+              !maneuverSequence.active();
+
+            if (ImGui::Button("Arm maneuver computer (program)")) {
+              if (canArmProgram) {
+                const sim::ManeuverProgramResult fresh = computeProgram(timeDays);
+                if (fresh.valid) {
+                  // Disengage other assist systems to avoid fighting over inputs.
+                  if (autopilot) {
+                    autopilot = false;
+                    dockingComputer.reset();
+                  }
+                  if (navAssist.active()) {
+                    navAssist.disengage();
+                    navAssistLast = {};
+                  }
+
+                  maneuverComputer.engage(ship, fresh.plan);
+                  maneuverComputerLast = {};
+                  maneuverComputerPrevPhase = maneuverComputer.phase();
+
+                  maneuverProgramLast = fresh;
+                  maneuverProgramHasLast = true;
+
+                  toast(toasts, "Maneuver computer armed (program).", 1.8);
+                } else {
+                  toast(toasts, std::string("Maneuver program invalid: ") + fresh.reason, 2.2);
+                }
+              } else {
+                toast(toasts, "Cannot arm maneuver program (dock/FSD/SC or maneuver computer already active).", 2.2);
+              }
+            }
+          }
+        }
+
         // Lambert transfer helper (star-centric).
         // This is intentionally a *planning* tool: it computes the instantaneous burn
         // needed to reach the target's future position under a 2-body star model.
@@ -28472,6 +30007,11 @@ if (trajCache.valid) {
             lambertLastDvMS = 0.0f;
             lambertLastAngleDeg = 0.0f;
             lambertLastIterations = 0;
+
+            lambertLastDvWorldKmS = {0,0,0};
+            lambertLastArriveRelVelKmS = {0,0,0};
+            lambertLastNodeTimeDays = 0.0;
+            lambertLastArriveTimeDays = 0.0;
 
             if (!targetOk) {
               // nothing to do
@@ -28555,8 +30095,14 @@ if (trajCache.valid) {
                   lambertLastAngleDeg = (float)math::radToDeg(sol.transferAngleRad);
                   lambertLastIterations = sol.iterations;
 
+
+                  lambertLastNodeTimeDays = timeDays + (tNode / 86400.0);
+                  lambertLastArriveTimeDays = arriveDays;
+                  lambertLastDvWorldKmS = dvWorldKmS;
+
                   const math::Vec3d vRelArrive = sol.v2KmS - tgtVelArriveKmS;
                   lambertLastArrivalRelMS = (float)(vRelArrive.length() * 1000.0);
+                  lambertLastArriveRelVelKmS = vRelArrive;
 
                   if (lambertValidateCoarse) {
                     // Coarse propagation out to arrival to estimate miss distance.
@@ -28588,6 +30134,60 @@ if (trajCache.valid) {
             if (lambertValidateCoarse) {
               ImGui::Text("Coarse miss dist: %.0f km", lambertLastMissKm);
             }
+
+            ImGui::TextDisabled("Rendezvous sequence: depart + match velocity (2 burns)");
+            const float matchDvMS = (float)(lambertLastArriveRelVelKmS.length() * 1000.0);
+            ImGui::Text("Match-v at arrival: %.1f m/s", matchDvMS);
+
+            const bool canArmLambertSeq = (!docked && fsdState == FsdState::Idle && supercruiseState == SupercruiseState::Idle);
+
+            if (!canArmLambertSeq) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Arm: rendezvous sequence (2 burns)")) {
+              // Cancel other input-driving modes that would prevent the sequence from running.
+              if (autopilot) {
+                autopilot = false;
+                dockingComputer.reset();
+                toast(toasts, "Autopilot disengaged (maneuver sequence armed).", 1.6);
+              }
+              if (navAssist.active()) {
+                navAssist.disengage();
+                toast(toasts, "Nav assist disengaged (maneuver sequence armed).", 1.6);
+              }
+              if (navAutoRun) {
+                navAutoRun = false;
+                toast(toasts, "Auto-run canceled (maneuver sequence armed).", 1.6);
+              }
+
+              // Clear any existing maneuver guidance.
+              if (maneuverComputer.active()) {
+                maneuverComputer.disengage();
+                maneuverComputerLast = {};
+                maneuverComputerPrevPhase = maneuverComputer.phase();
+              }
+              if (maneuverSequence.active()) {
+                maneuverSequence.disengage();
+                maneuverSequenceLast = {};
+                maneuverSequencePrevPhase = maneuverSequence.phase();
+                maneuverSequencePrevNodeIndex = -1;
+              }
+
+              // Build a 2-burn sequence: departure burn, then match velocity at arrival.
+              std::vector<sim::ManeuverPlan> seqPlans;
+              seqPlans.push_back(sim::ManeuverPlan{lambertLastNodeTimeDays, lambertLastDvWorldKmS});
+
+              const math::Vec3d dvMatchKmS = -lambertLastArriveRelVelKmS;
+              if (dvMatchKmS.lengthSq() > 1e-12) {
+                seqPlans.push_back(sim::ManeuverPlan{lambertLastArriveTimeDays, dvMatchKmS});
+              }
+
+              maneuverSequence.engage(ship, seqPlans, /*sortByTime=*/true);
+              maneuverSequenceLast = {};
+              maneuverSequencePrevPhase = maneuverSequence.phase();
+              maneuverSequencePrevNodeIndex = maneuverSequence.nodeIndex();
+
+              toast(toasts, "Maneuver sequence armed (Lambert rendezvous).", 2.0);
+            }
+            if (!canArmLambertSeq) ImGui::EndDisabled();
           } else {
             ImGui::TextDisabled("Last: (no solution yet)");
           }
@@ -28845,6 +30445,20 @@ if (trajCache.valid) {
               lambertLastAngleDeg = (float)math::radToDeg(c.lambert.transferAngleRad);
               lambertLastIterations = c.lambert.iterations;
 
+
+              // Store vector form for optional 2-burn rendezvous sequences.
+              lambertLastNodeTimeDays = departAbsDays;
+              lambertLastArriveTimeDays = departAbsDays + c.tofSec / 86400.0;
+              lambertLastDvWorldKmS = dvWorldKmS;
+
+              math::Vec3d tgtPos{0,0,0};
+              math::Vec3d tgtVel{0,0,0};
+              const double arriveDays = lambertLastArriveTimeDays;
+              if (lambertAuto.arriveEphem) {
+                lambertAuto.arriveEphem(arriveDays, tgtPos, tgtVel);
+              }
+              lambertLastArriveRelVelKmS = c.lambert.v2KmS - tgtVel;
+
               // Optional coarse validation (from current state) for immediate feedback.
               lambertLastMissKm = 0.0f;
               if (lambertValidateCoarse && departFromNowSec >= 0.0) {
@@ -29020,6 +30634,74 @@ if (trajCache.valid) {
         }
 
         ImGui::Separator();
+        ImGui::Text("Maneuver sequence");
+        ImGui::TextDisabled("Chains multiple maneuver nodes (e.g. Lambert rendezvous depart+match).");
+
+        auto seqPhaseLabel = [](sim::ManeuverSequencePhase p) -> const char* {
+          switch (p) {
+            case sim::ManeuverSequencePhase::Off: return "Off";
+            case sim::ManeuverSequencePhase::Executing: return "Executing";
+            case sim::ManeuverSequencePhase::Complete: return "Complete";
+            case sim::ManeuverSequencePhase::Aborted: return "Aborted";
+            default: return "Unknown";
+          }
+        };
+
+        ImGui::Text("Status: %s", seqPhaseLabel(maneuverSequence.phase()));
+
+        if (maneuverSequence.phase() != sim::ManeuverSequencePhase::Off) {
+          ImGui::Text("Node: %d / %d", maneuverSequence.nodeIndex() + 1, maneuverSequence.nodeCount());
+
+          // Quick plan summary
+          const auto& seqPlans = maneuverSequence.plans();
+          for (int i = 0; i < (int)seqPlans.size(); ++i) {
+            const double dtToNodeSec = (seqPlans[i].nodeTimeDays - timeDays) * 86400.0;
+            const double dvMS = seqPlans[i].deltaVWorldKmS.length() * 1000.0;
+            ImGui::Text("%d) T%+.0f s | Δv %.1f m/s", i + 1, dtToNodeSec, dvMS);
+          }
+
+          if (maneuverSequence.active()) {
+            if (ImGui::Button("Abort maneuver sequence")) {
+              maneuverSequence.disengage();
+              maneuverSequenceLast = {};
+              maneuverSequencePrevPhase = maneuverSequence.phase();
+              maneuverSequencePrevNodeIndex = -1;
+              toast(toasts, "Maneuver sequence aborted.", 1.6);
+            }
+          } else {
+            if (maneuverSequence.phase() == sim::ManeuverSequencePhase::Complete ||
+                maneuverSequence.phase() == sim::ManeuverSequencePhase::Aborted) {
+              ImGui::SameLine();
+              if (ImGui::SmallButton("Clear sequence")) {
+                maneuverSequence.disengage();
+                maneuverSequenceLast = {};
+                maneuverSequencePrevPhase = maneuverSequence.phase();
+                maneuverSequencePrevNodeIndex = -1;
+              }
+            }
+          }
+
+          auto nodePhaseLabel = [](sim::ManeuverComputerPhase p) -> const char* {
+            switch (p) {
+              case sim::ManeuverComputerPhase::Off: return "Off";
+              case sim::ManeuverComputerPhase::Orient: return "Orienting";
+              case sim::ManeuverComputerPhase::Burn: return "Burning";
+              case sim::ManeuverComputerPhase::Complete: return "Complete";
+              case sim::ManeuverComputerPhase::Aborted: return "Aborted";
+              default: return "Unknown";
+            }
+          };
+
+          // Telemetry from the currently executing node (if any).
+          if (maneuverSequenceLast.nodeCount > 0) {
+            ImGui::TextDisabled("Current node: %s | t=%.2f s | dv remaining=%.1f m/s",
+                                nodePhaseLabel(maneuverSequenceLast.node.phase),
+                                maneuverSequenceLast.node.timeToNodeSec,
+                                maneuverSequenceLast.node.dvRemainingKmS * 1000.0);
+          }
+        }
+
+        ImGui::Separator();
         ImGui::Text("Maneuver computer");
         ImGui::TextDisabled("Execute the node as a continuous burn (prototype).");
 
@@ -29089,7 +30771,9 @@ if (trajCache.valid) {
                             fsdState == FsdState::Idle &&
                             supercruiseState == SupercruiseState::Idle;
 
-        if (!maneuverComputer.active()) {
+        if (maneuverSequence.active()) {
+          ImGui::TextDisabled("Maneuver sequence executing; single-node maneuver computer disabled.");
+        } else if (!maneuverComputer.active()) {
           if (maneuverComputer.phase() == sim::ManeuverComputerPhase::Complete ||
               maneuverComputer.phase() == sim::ManeuverComputerPhase::Aborted) {
             ImGui::SameLine();
@@ -35662,11 +37346,11 @@ if (showContacts) {
     toast(toasts, "Contacts cleared.", 2.0);
   }
 
-  ImGui::Separator();
-
-  struct ContactRow {
+  ImGui::Separator();  struct ContactRow {
     std::size_t idx{0};
-    double distKm{0.0};
+    double distKm{0.0};      // true distance (for range gating / actions)
+    double distDispKm{0.0};  // displayed distance (may be estimated for unidentified contacts)
+    bool distEstimated{false};
     double strength01{0.0};
     double threat01{0.0};
     bool visible{false};
@@ -35718,6 +37402,24 @@ if (showContacts) {
 
     const bool identified = sr.identified || scanIdent;
 
+    double distDispKm = distKm;
+    bool distEstimated = false;
+    if (!identified && radarGhostBearingOnly) {
+      const double occ01 = (i < contactSenseOcclusion01.size()) ? std::clamp(contactSenseOcclusion01[i], 0.0, 1.0) : 0.0;
+      const double s01 = std::clamp(sr.strength01, 1.0e-4, 0.999);
+      double estKm = sim::estimateSensorRangeKmFromStrength01(s01, 1.0, radarSensorPower, occ01, sensorParams);
+      if (std::isfinite(estKm)) {
+        const core::u64 phase = (core::u64)std::llround(timeRealSec * 0.50);
+        core::SplitMix64 rng(core::hashCombine(core::hashCombine(core::fnv1a64("contacts_range"), c.id), phase));
+        const double u = rng.nextDouble();
+        const double j = 1.0 + radarGhostRangeJitter01 * (2.0 * u - 1.0);
+        estKm *= std::clamp(j, 0.25, 4.0);
+        distDispKm = std::max(0.0, estKm);
+        distEstimated = true;
+      }
+    }
+
+
     // Threat estimate even without a scan (only if the contact is identified).
     if (!hasScanIntel && identified) {
 	      sim::ShipScanInput in{};
@@ -35749,7 +37451,7 @@ if (showContacts) {
     if (useSensorFilter && !sr.visible) continue;
     if (!contactsShowUnidentified && !identified) continue;
 
-    rows.push_back(ContactRow{i, distKm, sr.strength01, threat01, sr.visible, identified, hasScanIntel, scanAgeSec});
+    rows.push_back(ContactRow{i, distKm, distDispKm, distEstimated, sr.strength01, threat01, sr.visible, identified, hasScanIntel, scanAgeSec});
   }
 
   if (useSensorFilter) {
@@ -35818,9 +37520,15 @@ if (showContacts) {
           ImGui::Text("Signal: %.0f%%", std::clamp(r.strength01, 0.0, 1.0) * 100.0);
           ImGui::Text("Ghost threshold: %.0f%%", sensorTrackParams.ghostThreshold * 100.0);
           ImGui::Text("Identify threshold: %.0f%%", sensorTrackParams.identifyThreshold * 100.0);
-          if (r.idx < contactSenseOccluded.size() && contactSenseOccluded[r.idx]) {
-            ImGui::Separator();
-            ImGui::Text("Occluded by a body (station/planet)");
+          if (r.idx < contactSenseOcclusion01.size()) {
+            const double occ01 = std::clamp(contactSenseOcclusion01[r.idx], 0.0, 1.0);
+            if (occ01 > 0.01) {
+              ImGui::Separator();
+              ImGui::Text("Occlusion: %d%%", (int)std::llround(occ01 * 100.0));
+              if (r.idx < contactSenseOccluded.size() && contactSenseOccluded[r.idx]) {
+                ImGui::TextDisabled("Heavily occluded (bodies / asteroid fields)");
+              }
+            }
           }
           ImGui::EndTooltip();
         }
@@ -35835,7 +37543,8 @@ if (showContacts) {
 
         if (ImGui::IsItemHovered()) {
           ImGui::BeginTooltip();
-          ImGui::Text("Dist: %.0f km", r.distKm);
+          if (r.distEstimated) ImGui::Text("Dist: ~%.0f km", r.distDispKm);
+          else ImGui::Text("Dist: %.0f km", r.distDispKm);
           if (c.factionId != 0) {
             ImGui::Text("Faction: %s", factionName(c.factionId).c_str());
           }
@@ -35924,7 +37633,8 @@ if (showContacts) {
 
         // Distance
         ImGui::TableNextColumn();
-        ImGui::Text("%.0f", r.distKm);
+        if (r.distEstimated) ImGui::Text("~%.0f", r.distDispKm);
+        else ImGui::Text("%.0f", r.distDispKm);
 
         // Actions
         ImGui::TableNextColumn();
@@ -36081,6 +37791,11 @@ if (showContacts) {
           return;
         }
 
+        // Reset any previously computed alternates; direct-graph planning will
+        // repopulate this when K>1.
+        navRouteAlts.clear();
+        navRouteAltIndex = 0;
+
         // Work from a local copy so we can append required stubs even when the
         // query is capped by maxResults.
         auto nodes = nearby;
@@ -36132,45 +37847,32 @@ if (showContacts) {
           costPerJump = 0.0;
           costPerLy = 0.0;
         } else {
+          // Direct range graph (A*). When requested, compute K-shortest loopless
+          // alternatives so the player can trade risk/storm exposure vs cost.
+          navRouteAlts.clear();
+          navRouteAltIndex = 0;
+
+          // Choose cost model.
           if (navRouteMode == NavRouteMode::Hops) {
             costPerJump = 1.0;
             costPerLy = 0.0;
-            if (navHazardWeight > 0.0) {
-              navRoute = sim::plotRouteAStarCostHazards(nodes,
-                                                       currentSystem->stub.id,
-                                                       dstId,
-                                                       planMaxLy,
-                                                       costPerJump,
-                                                       costPerLy,
-                                                       navHazardWeight,
-                                                       universe.seed(),
-                                                       timeDays,
-                                                       &stats);
-            } else {
-              navRoute = sim::plotRouteAStarHops(nodes, currentSystem->stub.id, dstId, planMaxLy, &stats);
-            }
           } else if (navRouteMode == NavRouteMode::Distance) {
             costPerJump = 0.0;
             costPerLy = 1.0;
-            if (navHazardWeight > 0.0) {
-              navRoute = sim::plotRouteAStarCostHazards(nodes,
-                                                       currentSystem->stub.id,
-                                                       dstId,
-                                                       planMaxLy,
-                                                       costPerJump,
-                                                       costPerLy,
-                                                       navHazardWeight,
-                                                       universe.seed(),
-                                                       timeDays,
-                                                       &stats);
-            } else {
-              navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
-            }
           } else {
             costPerJump = kFsdFuelBase;
             costPerLy = kFsdFuelPerLy;
+          }
+
+          const int kRequested = std::clamp(navRouteAltK, 1, 8);
+          const bool wantAlts = (kRequested > 1);
+
+          if (wantAlts) {
+            std::vector<sim::KRoute> routes;
+            const std::size_t k = (std::size_t)kRequested;
+
             if (navHazardWeight > 0.0) {
-              navRoute = sim::plotRouteAStarCostHazards(nodes,
+              routes = sim::plotKRoutesAStarCostHazards(nodes,
                                                        currentSystem->stub.id,
                                                        dstId,
                                                        planMaxLy,
@@ -36179,9 +37881,165 @@ if (showContacts) {
                                                        navHazardWeight,
                                                        universe.seed(),
                                                        timeDays,
-                                                       &stats);
+                                                       k);
             } else {
-              navRoute = sim::plotRouteAStarCost(nodes, currentSystem->stub.id, dstId, planMaxLy, costPerJump, costPerLy, &stats);
+              if (navRouteMode == NavRouteMode::Hops) {
+                routes = sim::plotKRoutesAStarHops(nodes,
+                                                  currentSystem->stub.id,
+                                                  dstId,
+                                                  planMaxLy,
+                                                  k);
+              } else {
+                routes = sim::plotKRoutesAStarCost(nodes,
+                                                  currentSystem->stub.id,
+                                                  dstId,
+                                                  planMaxLy,
+                                                  costPerJump,
+                                                  costPerLy,
+                                                  k);
+              }
+            }
+
+            if (!routes.empty()) {
+              // Fast lookup for positions (avoid universe.getSystem() calls in the loop).
+              std::unordered_map<sim::SystemId, const sim::SystemStub*> stubById;
+              stubById.reserve(nodes.size());
+              for (const auto& s : nodes) {
+                stubById.emplace(s.id, &s);
+              }
+
+              proc::GalaxyHazardsParams hp{};
+              hp.timeDays = timeDays;
+
+              for (const auto& r : routes) {
+                NavRouteAlt alt{};
+                alt.route = r;
+                alt.baseCost = sim::routeCost(nodes, r.path, costPerJump, costPerLy);
+                alt.fuel = sim::routeCost(nodes, r.path, kFsdFuelBase, kFsdFuelPerLy);
+
+                const double totalDist = (r.distanceLy > 0.0) ? r.distanceLy
+                                                             : sim::routeDistanceLy(nodes, r.path);
+
+                double stormInt = 0.0;
+                double occlInt = 0.0;
+
+                if (totalDist > 0.0 && r.path.size() >= 2) {
+                  for (std::size_t i = 0; i + 1 < r.path.size(); ++i) {
+                    const auto itA = stubById.find(r.path[i]);
+                    const auto itB = stubById.find(r.path[i + 1]);
+                    if (itA == stubById.end() || itB == stubById.end()) continue;
+
+                    const sim::SystemStub* a = itA->second;
+                    const sim::SystemStub* b = itB->second;
+                    const double d = (b->posLy - a->posLy).length();
+                    if (d <= 0.0) continue;
+
+                    const double nd = std::clamp(proc::sampleGalaxyNavDisruptionAvgOnSegment(universe.seed(),
+                                                                                             a->posLy,
+                                                                                             b->posLy,
+                                                                                             hp,
+                                                                                             /*samples=*/5),
+                                                0.0, 1.0);
+                    const double oc = std::clamp(proc::sampleGalaxySensorOcclusionAvgOnSegment(universe.seed(),
+                                                                                               a->posLy,
+                                                                                               b->posLy,
+                                                                                               hp,
+                                                                                               /*samples=*/5),
+                                                0.0, 1.0);
+
+                    stormInt += nd * d;
+                    occlInt += oc * d;
+                  }
+
+                  alt.stormAvg01 = std::clamp(stormInt / totalDist, 0.0, 1.0);
+                  alt.occlusionAvg01 = std::clamp(occlInt / totalDist, 0.0, 1.0);
+                }
+
+                if (navHazardWeight > 0.0) {
+                  alt.hazardPenalty = std::max(0.0, r.cost - alt.baseCost);
+                }
+
+                navRouteAlts.push_back(std::move(alt));
+              }
+
+              // Similarity vs the cheapest route (ignore endpoints).
+              if (!navRouteAlts.empty()) {
+                const auto& bestPath = navRouteAlts.front().route.path;
+                for (auto& alt : navRouteAlts) {
+                  alt.similarityBest01 = sim::routeNodeJaccard01(bestPath, alt.route.path, /*ignoreEndpoints=*/true);
+                }
+              }
+
+              navRoute = navRouteAlts.front().route.path;
+
+              stats.expansions = -1; // not tracked for K-route mode
+              stats.visited = -1;
+              stats.hops = (int)navRoute.size() - 1;
+              stats.distanceLy = navRouteAlts.front().route.distanceLy;
+              stats.cost = navRouteAlts.front().route.cost;
+              stats.reached = true;
+            } else {
+              navRoute.clear();
+            }
+          } else {
+            // Single-route solve (includes expansion diagnostics).
+            if (navRouteMode == NavRouteMode::Hops) {
+              if (navHazardWeight > 0.0) {
+                navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                         currentSystem->stub.id,
+                                                         dstId,
+                                                         planMaxLy,
+                                                         costPerJump,
+                                                         costPerLy,
+                                                         navHazardWeight,
+                                                         universe.seed(),
+                                                         timeDays,
+                                                         &stats);
+              } else {
+                navRoute = sim::plotRouteAStarHops(nodes, currentSystem->stub.id, dstId, planMaxLy, &stats);
+              }
+            } else if (navRouteMode == NavRouteMode::Distance) {
+              if (navHazardWeight > 0.0) {
+                navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                         currentSystem->stub.id,
+                                                         dstId,
+                                                         planMaxLy,
+                                                         costPerJump,
+                                                         costPerLy,
+                                                         navHazardWeight,
+                                                         universe.seed(),
+                                                         timeDays,
+                                                         &stats);
+              } else {
+                navRoute = sim::plotRouteAStarCost(nodes,
+                                                   currentSystem->stub.id,
+                                                   dstId,
+                                                   planMaxLy,
+                                                   costPerJump,
+                                                   costPerLy,
+                                                   &stats);
+              }
+            } else {
+              if (navHazardWeight > 0.0) {
+                navRoute = sim::plotRouteAStarCostHazards(nodes,
+                                                         currentSystem->stub.id,
+                                                         dstId,
+                                                         planMaxLy,
+                                                         costPerJump,
+                                                         costPerLy,
+                                                         navHazardWeight,
+                                                         universe.seed(),
+                                                         timeDays,
+                                                         &stats);
+              } else {
+                navRoute = sim::plotRouteAStarCost(nodes,
+                                                   currentSystem->stub.id,
+                                                   dstId,
+                                                   planMaxLy,
+                                                   costPerJump,
+                                                   costPerLy,
+                                                   &stats);
+              }
             }
           }
         }
@@ -36218,6 +38076,12 @@ if (showContacts) {
         msg += " ly, est fuel ";
         msg += std::to_string((int)std::round(totalFuel));
         msg += ")";
+        if (!navRouteAlts.empty() && navRouteAlts.size() > 1) {
+          msg += ", ";
+          msg += std::to_string((int)navRouteAlts.size());
+          msg += " alt";
+          if (navRouteAlts.size() != 1) msg += "s";
+        }
         if (usedHyperlanes) {
           msg += ", lane risk ";
           msg += std::to_string((int)std::round(hyperMetrics.risk01 * 100.0));
@@ -36505,15 +38369,30 @@ if (showContacts) {
             }
           }
 
-          // Plotted route overlay.
-          if (mapShowRoute && navRoute.size() >= 2) {
-            for (std::size_t i = 0; i + 1 < navRoute.size(); ++i) {
-              auto itA = stubPosById.find(navRoute[i]);
-              auto itB = stubPosById.find(navRoute[i + 1]);
-              if (itA == stubPosById.end() || itB == stubPosById.end()) continue;
-              const ImVec2 a = toPx(itA->second);
-              const ImVec2 b = toPx(itB->second);
-              draw->AddLine(a, b, IM_COL32(255, 140, 80, 210), 2.5f);
+          // Plotted route overlay (selected path + optional alternates).
+          if (mapShowRoute) {
+            auto drawRoutePath = [&](const std::vector<sim::SystemId>& path, ImU32 col, float thickness) {
+              if (path.size() < 2) return;
+              for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+                auto itA = stubPosById.find(path[i]);
+                auto itB = stubPosById.find(path[i + 1]);
+                if (itA == stubPosById.end() || itB == stubPosById.end()) continue;
+                const ImVec2 a = toPx(itA->second);
+                const ImVec2 b = toPx(itB->second);
+                draw->AddLine(a, b, col, thickness);
+              }
+            };
+
+            const ImU32 colSel = IM_COL32(255, 140, 80, 210);
+            const ImU32 colAlt = IM_COL32(180, 195, 220, 90);
+
+            if (!navRouteAlts.empty() && navRouteAltOverlay) {
+              for (int i = 0; i < (int)navRouteAlts.size(); ++i) {
+                const bool sel = (i == navRouteAltIndex);
+                drawRoutePath(navRouteAlts[(std::size_t)i].route.path, sel ? colSel : colAlt, sel ? 2.5f : 1.4f);
+              }
+            } else {
+              drawRoutePath(navRoute, colSel, 2.5f);
             }
           }
 
@@ -37208,6 +39087,14 @@ if (showContacts) {
                 ImGui::SliderScalar("Avoid hazards", ImGuiDataType_Double, &navHazardWeight, &mn, &mx, "%.2f");
                 ImGui::TextDisabled("Adds cost proportional to nav disruption (storms) along each jump leg.");
               }
+
+
+              ImGui::SeparatorText("Alternates");
+              ImGui::SliderInt("K routes", &navRouteAltK, 1, 8);
+              ImGui::SameLine();
+              ImGui::Checkbox("Overlay", &navRouteAltOverlay);
+              ImGui::TextDisabled("When K>1, Plot route computes up to K loopless alternatives (ordered by planner cost)." );
+              ImGui::TextDisabled("Use this to trade distance/fuel vs storm exposure; K-route mode hides expansion diagnostics." );
             } else {
               ImGui::SeparatorText("Hyperlane travel");
               ImGui::Checkbox("Lane hazards (drifting)", &navHyperlaneHazards);
@@ -37242,6 +39129,8 @@ if (showContacts) {
             ImGui::SameLine();
             if (ImGui::Button("Clear route")) {
               navRoute.clear();
+              navRouteAlts.clear();
+              navRouteAltIndex = 0;
               navRouteHop = 0;
               navAutoRun = false;
               navRoutePlanStatsValid = false;
@@ -37277,6 +39166,80 @@ if (showContacts) {
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "Warning: route needs %.1f fuel, you have %.1f.", totalFuel, fuel);
               }
 
+              if (!navRouteAlts.empty() && navRouteAlts.size() > 1) {
+                ImGui::SeparatorText("Route alternates");
+                ImGui::TextDisabled("Click to select. Share = Jaccard similarity vs cheapest route (ignoring endpoints)." );
+
+                if (ImGui::BeginTable("nav_route_alts", 8,
+                                      ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_BordersInnerV |
+                                      ImGuiTableFlags_SizingFixedFit |
+                                      ImGuiTableFlags_ScrollY,
+                                      ImVec2(0, 160))) {
+                  ImGui::TableSetupColumn("#");
+                  ImGui::TableSetupColumn("Jumps");
+                  ImGui::TableSetupColumn("Dist (ly)");
+                  ImGui::TableSetupColumn("Cost");
+                  ImGui::TableSetupColumn("Fuel");
+                  ImGui::TableSetupColumn("Storm");
+                  ImGui::TableSetupColumn("Occl");
+                  ImGui::TableSetupColumn("Share");
+                  ImGui::TableHeadersRow();
+
+                  for (int i = 0; i < (int)navRouteAlts.size(); ++i) {
+                    const auto& alt = navRouteAlts[(std::size_t)i];
+                    const bool sel = (i == navRouteAltIndex);
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    std::string label = "#" + std::to_string(i + 1);
+                    if (ImGui::Selectable(label.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns)) {
+                      navRouteAltIndex = i;
+                      navRoute = alt.route.path;
+                      navRouteHop = 0;
+                      navAutoRun = false;
+
+                      // Update planner summary (K-route mode: expansions n/a).
+                      navRoutePlanStats.reached = true;
+                      navRoutePlanStats.expansions = -1;
+                      navRoutePlanStats.visited = -1;
+                      navRoutePlanStats.hops = alt.route.hops;
+                      navRoutePlanStats.distanceLy = alt.route.distanceLy;
+                      navRoutePlanStats.cost = alt.route.cost;
+                      navRoutePlanStatsValid = true;
+
+                      toast(toasts, "Selected route #" + std::to_string(i + 1) + ".", 1.2);
+                    }
+
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%d", alt.route.hops);
+
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.1f", alt.route.distanceLy);
+
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.2f", alt.route.cost);
+                    if (ImGui::IsItemHovered() && navHazardWeight > 0.0) {
+                      ImGui::SetTooltip("Base %.2f + hazard %.2f", alt.baseCost, alt.hazardPenalty);
+                    }
+
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%.1f", alt.fuel);
+
+                    ImGui::TableSetColumnIndex(5);
+                    ImGui::Text("%.0f%%", alt.stormAvg01 * 100.0);
+
+                    ImGui::TableSetColumnIndex(6);
+                    ImGui::Text("%.0f%%", alt.occlusionAvg01 * 100.0);
+
+                    ImGui::TableSetColumnIndex(7);
+                    ImGui::Text("%.0f%%", alt.similarityBest01 * 100.0);
+                  }
+
+                  ImGui::EndTable();
+                }
+              }
+
               if (navRoutePlanStatsValid) {
                 const bool usedHyper = (navRoutePlannedGraphMode == NavGraphMode::Hyperlanes);
                 const char* graphName = usedHyper ? "Hyperlanes" : "Direct";
@@ -37294,10 +39257,16 @@ if (showContacts) {
                                       navRoutePlanHyperlane.bottleneckBandwidth01 * 100.0,
                                       navRoutePlanHyperlane.hops);
                 } else {
-                  ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly | expansions %d",
-                                      navRoutePlanCostPerJump,
-                                      navRoutePlanCostPerLy,
-                                      navRoutePlanStats.expansions);
+                  if (navRoutePlanStats.expansions >= 0) {
+                    ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly | expansions %d",
+                                        navRoutePlanCostPerJump,
+                                        navRoutePlanCostPerLy,
+                                        navRoutePlanStats.expansions);
+                  } else {
+                    ImGui::TextDisabled("Cost model: %.2f/jump + %.2f/ly | expansions n/a (K routes)",
+                                        navRoutePlanCostPerJump,
+                                        navRoutePlanCostPerLy);
+                  }
                 }
 
                 ImGui::TextDisabled("Constraint: %s", navRoutePlannedUsedCurrentFuelRange ? "current-fuel range" : "max range");
@@ -39704,6 +41673,41 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
             ImGui::Unindent();
           }
 
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Gun computer");
+          ImGui::Checkbox("Projectile aim assist", &hudProjectileAimAssist);
+          if (hudProjectileAimAssist) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(260.0f);
+            const double minDeg = 0.25;
+            const double maxDeg = 25.0;
+            ImGui::SliderScalar("Aim cone (deg)", ImGuiDataType_Double, &hudProjectileAimAssistConeDeg, &minDeg, &maxDeg, "%.2f");
+            ImGui::SetNextItemWidth(260.0f);
+            const double minT = 1.0;
+            const double maxT = 120.0;
+            ImGui::SliderScalar("Max lead time (sec)##projassist", ImGuiDataType_Double, &hudProjectileAimAssistMaxLeadTimeSec, &minT, &maxT, "%.1f");
+            ImGui::TextDisabled("Applies to ballistic weapons (cannon/railgun).\nAssist engages only when a target is already near the reticle.");
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Fire control (sensors)");
+          ImGui::Checkbox("Use sensor track for lead/assist", &hudFireControlUseSensorTrack);
+          if (hudFireControlUseSensorTrack) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(260.0f);
+            const double minAge = 0.1;
+            const double maxAge = 30.0;
+            ImGui::SliderScalar("Max stale age (sec)", ImGuiDataType_Double, &hudFireControlMaxAgeSec, &minAge, &maxAge, "%.1f");
+            ImGui::SetNextItemWidth(260.0f);
+            const double minSigma = 0.01;
+            const double maxSigma = 5000.0;
+            ImGui::SliderScalar("Max sigma (km)", ImGuiDataType_Double, &hudFireControlMaxSigmaKm, &minSigma, &maxSigma, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::TextDisabled("Affected by occlusion/jamming. A short active sensor ping can tighten solutions.");
+            ImGui::Unindent();
+          }
+
           ImGui::Separator();
           ImGui::Checkbox("Flight path marker", &hudShowFlightPathMarker);
           if (hudShowFlightPathMarker) {
@@ -39733,6 +41737,75 @@ row("Weapon: Radar Missile", progression.isWeaponUnlocked(WeaponType::RadarMissi
             }
             if (!hudMissileWarningAutoCountermeasures) ImGui::EndDisabled();
             ImGui::Checkbox("Prefer heat sinks", &hudMissileWarningPreferHeatSinks);
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Collision warning predictor");
+          ImGui::Checkbox("Enable collision warning", &hudCollisionWarningEnabled);
+          if (hudCollisionWarningEnabled) {
+            ImGui::Indent();
+            ImGui::Checkbox("HUD indicator", &hudCollisionWarningIndicator);
+            ImGui::Checkbox("Avoidance arrow", &hudCollisionWarningAvoidanceArrow);
+            ImGui::Checkbox("Toast warnings", &hudCollisionWarningToasts);
+            ImGui::Checkbox("Assume boost brake", &hudCollisionWarningAssumeBoostBrake);
+
+            float horizon = (float)hudCollisionWarningHorizonSec;
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("Lookahead horizon (sec)", &horizon, 2.0f, 120.0f, "%.0f");
+            hudCollisionWarningHorizonSec = (double)horizon;
+
+            float caution = (float)hudCollisionWarningCautionTtiSec;
+            float danger = (float)hudCollisionWarningDangerTtiSec;
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("Caution TTI (sec)", &caution, 0.5f, 60.0f, "%.1f");
+            ImGui::SetNextItemWidth(260.0f);
+            ImGui::SliderFloat("Danger TTI (sec)", &danger, 0.2f, 30.0f, "%.1f");
+            if (danger > horizon) danger = horizon;
+            if (caution > horizon) caution = horizon;
+            if (caution < danger) caution = danger;
+            hudCollisionWarningCautionTtiSec = (double)caution;
+            hudCollisionWarningDangerTtiSec = (double)danger;
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::TextDisabled("Defensive assist (Threat Avoidance)");
+          ImGui::Checkbox("Enable defensive assist", &hudThreatAssistEnabled);
+          if (hudThreatAssistEnabled) {
+            ImGui::Indent();
+            ImGui::Checkbox("HUD indicator", &hudThreatAssistIndicator);
+            ImGui::Checkbox("Auto apply (soft)", &hudThreatAssistAutoApply);
+
+            {
+              float v = (float)hudThreatAssistStrength;
+              ImGui::SetNextItemWidth(260.0f);
+              ImGui::SliderFloat("Assist strength", &v, 0.0f, 1.0f, "%.2f");
+              hudThreatAssistStrength = (double)v;
+            }
+            {
+              float v = (float)hudThreatAssistMaxThrust01;
+              ImGui::SetNextItemWidth(260.0f);
+              ImGui::SliderFloat("Max assist thrust", &v, 0.15f, 1.0f, "%.2f");
+              hudThreatAssistMaxThrust01 = (double)v;
+            }
+            {
+              float v = (float)hudThreatAssistMissileEngageTtiSec;
+              ImGui::SetNextItemWidth(260.0f);
+              ImGui::SliderFloat("Missile engage TTI (sec)", &v, 2.0f, 25.0f, "%.0f");
+              hudThreatAssistMissileEngageTtiSec = (double)v;
+            }
+
+            ImGui::Checkbox("Prefer lateral jink", &hudThreatAssistPreferLateralJink);
+            ImGui::Checkbox("Allow boost recommendation", &hudThreatAssistAllowBoost);
+
+            const std::string holdKey = game::scancodeLabel(controls.holds.defensiveAssist);
+            if (!holdKey.empty() && holdKey != "Unbound") {
+              ImGui::TextDisabled("Hold %s to engage (Controls â¸ Flight holds)", holdKey.c_str());
+            } else {
+              ImGui::TextDisabled("Bind 'Defensive assist' in Controls â¸ Flight holds");
+            }
+            ImGui::TextDisabled("Soft-adds translation only; never touches rotation.");
             ImGui::Unindent();
           }
 
@@ -40304,6 +42377,8 @@ const char* pageName =
                   [&]() { pushChord(controls.actions.navAssistMatchVelocity); });
           addItem("Follow", "Nav Assist", game::chordLabel(controls.actions.navAssistFollow), canAct,
                   [&]() { pushChord(controls.actions.navAssistFollow); });
+          addItem("Orbit", "Nav Assist", game::chordLabel(controls.actions.navAssistOrbit), canAct,
+                  [&]() { pushChord(controls.actions.navAssistOrbit); });
           addItem("Tactical", (showTacticalOverlay ? "Enabled" : "Disabled"), game::chordLabel(controls.actions.toggleTacticalOverlay), canAct,
                   [&]() { pushChord(controls.actions.toggleTacticalOverlay); });
 

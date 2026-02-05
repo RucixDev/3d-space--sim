@@ -54,6 +54,9 @@ struct FlightHolds {
   SDL_Scancode brake{SDL_SCANCODE_UNKNOWN};
   SDL_Scancode dampersEnable{SDL_SCANCODE_UNKNOWN};
   SDL_Scancode dampersDisable{SDL_SCANCODE_UNKNOWN};
+
+  // Hold: engage defensive assist / panic evasion (Threat Avoidance)
+  SDL_Scancode defensiveAssist{SDL_SCANCODE_UNKNOWN};
 };
 
 // Discrete actions (triggered on KEYDOWN).
@@ -94,6 +97,7 @@ struct ActionBinds {
   KeyChord navAssistApproach;
   KeyChord navAssistMatchVelocity;
   KeyChord navAssistFollow;
+  KeyChord navAssistOrbit;
   KeyChord toggleMouseSteer;
   KeyChord supercruise;
   KeyChord fsdJump;
@@ -108,6 +112,7 @@ struct ActionBinds {
   KeyChord targetStationCycle;
   KeyChord targetPlanetCycle;
   KeyChord targetContactCycle;
+  KeyChord targetUnderReticle;
   KeyChord targetStar;
   KeyChord clearTarget;
 
@@ -271,6 +276,7 @@ inline ControlsConfig makeDefaultControls() {
   c.holds.brake = SDL_SCANCODE_X;
   c.holds.dampersEnable  = SDL_SCANCODE_Z;
   c.holds.dampersDisable = SDL_SCANCODE_C;
+  c.holds.defensiveAssist = SDL_SCANCODE_LEFTBRACKET;
 
   // Discrete actions
   c.actions.quit = {SDL_SCANCODE_ESCAPE, KMOD_NONE};
@@ -308,6 +314,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.navAssistApproach = {SDL_SCANCODE_PAGEUP, KMOD_NONE};
   c.actions.navAssistMatchVelocity = {SDL_SCANCODE_PAGEDOWN, KMOD_NONE};
   c.actions.navAssistFollow = {SDL_SCANCODE_HOME, KMOD_NONE};
+  c.actions.navAssistOrbit = {SDL_SCANCODE_END, KMOD_NONE};
   c.actions.toggleMouseSteer = {SDL_SCANCODE_M, KMOD_NONE};
   c.actions.supercruise = {SDL_SCANCODE_H, KMOD_NONE};
   c.actions.fsdJump = {SDL_SCANCODE_J, KMOD_NONE};
@@ -322,6 +329,7 @@ inline ControlsConfig makeDefaultControls() {
   c.actions.targetStationCycle = {SDL_SCANCODE_T, KMOD_NONE};
   c.actions.targetPlanetCycle  = {SDL_SCANCODE_B, KMOD_NONE};
   c.actions.targetContactCycle = {SDL_SCANCODE_N, KMOD_NONE};
+  c.actions.targetUnderReticle = {SDL_SCANCODE_T, KMOD_ALT};
   c.actions.targetStar         = {SDL_SCANCODE_U, KMOD_NONE};
   c.actions.clearTarget  = {SDL_SCANCODE_Y, KMOD_NONE};
 
@@ -373,6 +381,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveHold(f, "Brake", cfg.holds.brake);
   saveHold(f, "DampersEnable", cfg.holds.dampersEnable);
   saveHold(f, "DampersDisable", cfg.holds.dampersDisable);
+  saveHold(f, "DefensiveAssist", cfg.holds.defensiveAssist);
   f << "\n";
 
   // Actions
@@ -408,6 +417,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "NavAssistApproach", a.navAssistApproach);
   saveKeyChord(f, "NavAssistMatchVelocity", a.navAssistMatchVelocity);
   saveKeyChord(f, "NavAssistFollow", a.navAssistFollow);
+  saveKeyChord(f, "NavAssistOrbit", a.navAssistOrbit);
   saveKeyChord(f, "ToggleMouseSteer", a.toggleMouseSteer);
   saveKeyChord(f, "Supercruise", a.supercruise);
   saveKeyChord(f, "FsdJump", a.fsdJump);
@@ -420,6 +430,7 @@ inline bool saveToFile(const ControlsConfig& cfg, const std::string& path) {
   saveKeyChord(f, "TargetStationCycle", a.targetStationCycle);
   saveKeyChord(f, "TargetPlanetCycle", a.targetPlanetCycle);
   saveKeyChord(f, "TargetContactCycle", a.targetContactCycle);
+  saveKeyChord(f, "TargetUnderReticle", a.targetUnderReticle);
   saveKeyChord(f, "TargetStar", a.targetStar);
   saveKeyChord(f, "ClearTarget", a.clearTarget);
   saveKeyChord(f, "ComplyOrSubmit", a.complyOrSubmit);
@@ -482,6 +493,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("NavAssistApproach", &a.navAssistApproach);
     addB("NavAssistMatchVelocity", &a.navAssistMatchVelocity);
     addB("NavAssistFollow", &a.navAssistFollow);
+    addB("NavAssistOrbit", &a.navAssistOrbit);
     addB("ToggleMouseSteer", &a.toggleMouseSteer);
     addB("Supercruise", &a.supercruise);
     addB("FsdJump", &a.fsdJump);
@@ -494,6 +506,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addB("TargetStationCycle", &a.targetStationCycle);
     addB("TargetPlanetCycle", &a.targetPlanetCycle);
     addB("TargetContactCycle", &a.targetContactCycle);
+    addB("TargetUnderReticle", &a.targetUnderReticle);
     addB("TargetStar", &a.targetStar);
     addB("ClearTarget", &a.clearTarget);
     addB("ComplyOrSubmit", &a.complyOrSubmit);
@@ -517,6 +530,7 @@ inline bool loadFromFile(const std::string& path, ControlsConfig& out) {
     addH("Brake", &cfg.holds.brake);
     addH("DampersEnable", &cfg.holds.dampersEnable);
     addH("DampersDisable", &cfg.holds.dampersDisable);
+    addH("DefensiveAssist", &cfg.holds.defensiveAssist);
   }
 
   std::string line;

@@ -387,6 +387,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Nav Assist: Approach", a.navAssistApproach);
   addAction("Nav Assist: Match Velocity", a.navAssistMatchVelocity);
   addAction("Nav Assist: Follow (formation)", a.navAssistFollow);
+  addAction("Nav Assist: Orbit (strafe)", a.navAssistOrbit);
   addAction("Toggle Mouse steer", a.toggleMouseSteer);
   addAction("Supercruise", a.supercruise);
   addAction("FSD Jump", a.fsdJump);
@@ -399,6 +400,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addAction("Target: station", a.targetStationCycle);
   addAction("Target: planet", a.targetPlanetCycle);
   addAction("Target: contact", a.targetContactCycle);
+  addAction("Target: under reticle", a.targetUnderReticle);
   addAction("Target: star", a.targetStar);
   addAction("Clear target", a.clearTarget);
   addAction("Comply / submit", a.complyOrSubmit);
@@ -417,6 +419,7 @@ void drawControlsWindow(ControlsWindowState& st,
   addHold("Brake", controls.holds.brake);
   addHold("Dampers enable", controls.holds.dampersEnable);
   addHold("Dampers disable", controls.holds.dampersDisable);
+  addHold("Defensive assist", controls.holds.defensiveAssist);
 
   auto addAxisUse = [&](const char* name, SDL_Scancode sc) {
     if (sc == SDL_SCANCODE_UNKNOWN) return;
@@ -639,6 +642,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Brake", controls.holds.brake, defaults.holds.brake);
     add("Dampers enable", controls.holds.dampersEnable, defaults.holds.dampersEnable);
     add("Dampers disable", controls.holds.dampersDisable, defaults.holds.dampersDisable);
+    add("Defensive assist", controls.holds.defensiveAssist, defaults.holds.defensiveAssist);
 
     std::vector<HoldRow> filtered;
     filtered.reserve(rows.size());
@@ -776,6 +780,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Nav Assist: Approach", controls.actions.navAssistApproach, ad.navAssistApproach);
     add("Nav Assist: Match Velocity", controls.actions.navAssistMatchVelocity, ad.navAssistMatchVelocity);
     add("Nav Assist: Follow (formation)", controls.actions.navAssistFollow, ad.navAssistFollow);
+    add("Nav Assist: Orbit (strafe)", controls.actions.navAssistOrbit, ad.navAssistOrbit);
     add("Mouse steer", controls.actions.toggleMouseSteer, ad.toggleMouseSteer);
     add("Supercruise", controls.actions.supercruise, ad.supercruise);
     add("FSD Jump", controls.actions.fsdJump, ad.fsdJump);
@@ -790,6 +795,7 @@ void drawControlsWindow(ControlsWindowState& st,
     add("Target: station", controls.actions.targetStationCycle, ad.targetStationCycle);
     add("Target: planet", controls.actions.targetPlanetCycle, ad.targetPlanetCycle);
     add("Target: contact", controls.actions.targetContactCycle, ad.targetContactCycle);
+    add("Target: under reticle", controls.actions.targetUnderReticle, ad.targetUnderReticle);
     add("Target: star", controls.actions.targetStar, ad.targetStar);
     add("Clear target", controls.actions.clearTarget, ad.clearTarget);
 
