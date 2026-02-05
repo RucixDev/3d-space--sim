@@ -42,6 +42,35 @@ double computeSensorStrength01(double distKm,
                                bool occluded,
                                const SensorParams& params = {});
 
+// Continuous-occlusion variant of computeSensorStrength01.
+//
+// occlusion01 is a [0,1] factor where:
+//  - 0: unobstructed
+//  - 1: fully occluded (equivalent to occluded=true)
+//
+// Internally this linearly interpolates between no attenuation (1.0) and
+// params.occlusionAtten.
+double computeSensorStrength01Occlusion01(double distKm,
+                                          double signature,
+                                          double sensorPower,
+                                          double occlusion01,
+                                          const SensorParams& params = {});
+
+
+// Invert `computeSensorStrength01Occlusion01` to estimate a range (km) from a measured
+// detection strength in [0,1].
+//
+// This is primarily intended for UI/AI that wants a coarse range guess for low-confidence
+// contacts (e.g. ghost targets). The caller supplies an assumed signature (often 1.0 when
+// the target class is unknown).
+//
+// Returns +inf if the estimate is undefined (e.g. strength==0 or gain==0).
+double estimateSensorRangeKmFromStrength01(double strength01,
+                                          double signature,
+                                          double sensorPower,
+                                          double occlusion01,
+                                          const SensorParams& params = {});
+
 struct SensorTrackParams {
   // Response half-life for rising/falling strength (seconds).
   double riseHalfLifeSec{0.30};

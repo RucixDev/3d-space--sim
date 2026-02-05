@@ -88,6 +88,112 @@ struct Aabb3d {
     return distanceSqToPoint(c) <= r * r;
   }
 
+
+  bool intersectsAabb(const Aabb3d& b) const {
+    if (!isFinite() || !b.isFinite()) return false;
+    // Inclusive overlap.
+    return !(b.min.x > max.x || b.max.x < min.x ||
+             b.min.y > max.y || b.max.y < min.y ||
+             b.min.z > max.z || b.max.z < min.z);
+  }
+
+  // Ray-AABB intersection (slab method).
+  //
+  // `dir` does not need to be normalized; distances are returned in world units.
+  // If the ray origin lies inside the box, outTEnter is clamped to 0.
+  //
+  // Returns false when the box only intersects the *backwards* extension of the ray
+  // (i.e., when outTExit < 0).
+  bool rayIntersectionT(const Vec3d& origin,
+                        const Vec3d& dir,
+                        double& outTEnter,
+                        double& outTExit,
+                        double eps = 1e-12) const {
+    outTEnter = 0.0;
+    outTExit = 0.0;
+
+    if (!isFinite() || !stellar::math::isFinite(origin) || !stellar::math::isFinite(dir)) return false;
+
+    const Vec3d d = safeNormalized(dir, {0.0, 0.0, 0.0}, 1e-18);
+    if (!(d.lengthSq() > 1e-18)) return false;
+
+    double tMin = 0.0;
+    double tMax = std::numeric_limits<double>::infinity();
+
+    const auto slab = [&](double o, double da, double lo, double hi) {
+      if (std::abs(da) <= eps) {
+        // Parallel: must be inside slab.
+        return (o >= lo && o <= hi);
+      }
+      const double inv = 1.0 / da;
+      double t1 = (lo - o) * inv;
+      double t2 = (hi - o) * inv;
+      if (t1 > t2) std::swap(t1, t2);
+      tMin = std::max(tMin, t1);
+      tMax = std::min(tMax, t2);
+      return tMax >= tMin;
+    };
+
+    if (!slab(origin.x, d.x, min.x, max.x)) return false;
+    if (!slab(origin.y, d.y, min.y, max.y)) return false;
+    if (!slab(origin.z, d.z, min.z, max.z)) return false;
+
+    // Entire intersection interval behind the ray origin.
+    if (tMax < 0.0) return false;
+
+    outTEnter = std::max(0.0, tMin);
+    outTExit = tMax;
+    return true;
+  }
+
+  // Segment-AABB intersection (slab method).
+  //
+  // Returns true when the segment [a,b] intersects the box. If so:
+  //  - outTEnter/outTExit are the normalized segment parameters in [0,1]
+  //    for the entry/exit points (clamped to the segment domain).
+  //
+  // If the segment starts inside the box, outTEnter is clamped to 0.
+  bool segmentIntersectionT(const Vec3d& a,
+                            const Vec3d& b,
+                            double& outTEnter,
+                            double& outTExit,
+                            double eps = 1e-12) const {
+    outTEnter = 0.0;
+    outTExit = 0.0;
+
+    if (!isFinite() || !stellar::math::isFinite(a) || !stellar::math::isFinite(b)) return false;
+
+    const Vec3d d = b - a;
+
+    double tMin = 0.0;
+    double tMax = 1.0;
+
+    const auto slab = [&](double o, double da, double lo, double hi) {
+      if (std::abs(da) <= eps) {
+        // Parallel: must be inside slab.
+        return (o >= lo && o <= hi);
+      }
+      const double inv = 1.0 / da;
+      double t1 = (lo - o) * inv;
+      double t2 = (hi - o) * inv;
+      if (t1 > t2) std::swap(t1, t2);
+      tMin = std::max(tMin, t1);
+      tMax = std::min(tMax, t2);
+      return tMax >= tMin;
+    };
+
+    if (!slab(a.x, d.x, min.x, max.x)) return false;
+    if (!slab(a.y, d.y, min.y, max.y)) return false;
+    if (!slab(a.z, d.z, min.z, max.z)) return false;
+
+    // Reject if the intersection is entirely outside the segment domain.
+    if (tMax < 0.0 || tMin > 1.0) return false;
+
+    outTEnter = std::clamp(tMin, 0.0, 1.0);
+    outTExit = std::clamp(tMax, 0.0, 1.0);
+    return true;
+  }
+
   void expand(const Vec3d& p) {
     if (!stellar::math::isFinite(p)) return;
 

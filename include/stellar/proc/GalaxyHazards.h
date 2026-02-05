@@ -88,4 +88,27 @@ double sampleGalaxyHazardAvgOnSegment(core::u64 universeSeed,
                                       const GalaxyHazardsParams& params = {},
                                       int samples = 3);
 
+// Convenience: average nav disruption (storm01) sampled along a straight segment.
+//
+// This is useful for hazard-aware route planning and for gameplay systems that
+// care specifically about navigation disruption rather than the combined hazard.
+//
+// Sampling uses midpoints (avoids hitting exact endpoints). A small sample
+// count (3-7) is usually enough for smooth galaxy-scale noise.
+double sampleGalaxyNavDisruptionAvgOnSegment(core::u64 universeSeed,
+                                             const math::Vec3d& aLy,
+                                             const math::Vec3d& bLy,
+                                             const GalaxyHazardsParams& params = {},
+                                             int samples = 3);
+
+// Convenience: average sensor occlusion (nebula01) sampled along a straight segment.
+//
+// This can be used for sensor range attenuation, stealth/cover models, and
+// mission seeding.
+double sampleGalaxySensorOcclusionAvgOnSegment(core::u64 universeSeed,
+                                               const math::Vec3d& aLy,
+                                               const math::Vec3d& bLy,
+                                               const GalaxyHazardsParams& params = {},
+                                               int samples = 3);
+
 } // namespace stellar::proc

@@ -34,7 +34,11 @@ struct HudSettings {
   // 4: adds procedural Ship HUD cosmetics (decor/glyphs/microtext/dropouts)
   // 5: adds Ship HUD segment-display readouts (procedural vector text)
   // 6: adds Missile Warning Receiver / defensive aids settings
-  int version{6};
+  // 7: adds collision prediction warning settings
+  // 8: adds ballistic projectile aim-assist tuning
+  // 9: adds sensor-based fire control tuning (lead/aim assist quality gating)
+  // 10: adds Threat Avoidance "defensive assist" tuning
+  int version{10};
 
   // Persist this file on exit.
   bool autoSaveOnExit{true};
@@ -81,6 +85,21 @@ struct HudSettings {
   float leadSizePx{22.0f};
   double leadMaxTimeSec{18.0};
 
+  // Soft aim assist for ballistic projectiles (v8+).
+  // When enabled, fixed projectile weapons (cannon/railgun) can bias shots toward a
+  // lead solution if a target is already near the reticle.
+  bool projectileAimAssist{true};
+  double projectileAimAssistConeDeg{4.0};
+  double projectileAimAssistMaxLeadTimeSec{18.0};
+
+  // Sensor-based fire control gating (v9+).
+  // When enabled, lead indicators and the ballistic gun computer can optionally
+  // use the radar kinematic track instead of perfect target kinematics, and
+  // fade out when sensor data becomes stale or uncertain (jamming/occlusion).
+  bool fireControlUseSensorTrack{true};
+  double fireControlMaxAgeSec{4.0};   // seconds since last measurement
+  double fireControlMaxSigmaKm{50.0}; // 1-sigma uncertainty threshold (km)
+
   bool showFlightPathMarker{true};
   bool flightMarkerUseLocalFrame{true};
   bool flightMarkerClampToEdge{true};
@@ -101,6 +120,52 @@ struct HudSettings {
   bool missileWarningAutoCountermeasures{false};
   double missileWarningAutoDeployTtiSec{1.6};
   bool missileWarningPreferHeatSinks{true};
+
+  // --- Collision warning predictor (v7+) ---
+  // Enables time-to-impact prediction against nearby obstacles (currently asteroids).
+  bool collisionWarningEnabled{true};
+
+  // Draw a compact warning near the combat reticle.
+  bool collisionWarningHudIndicator{true};
+
+  // Show a directional avoidance cue arrow when steering is recommended.
+  bool collisionWarningAvoidanceArrow{true};
+
+  // Show throttled toast notifications when a collision is imminent.
+  bool collisionWarningToasts{false};
+
+  // Assume boost-capable braking for stop distance estimates.
+  bool collisionWarningAssumeBoostBrake{false};
+
+  // Lookahead horizon (seconds) for collision prediction.
+  double collisionWarningHorizonSec{40.0};
+
+  // Caution/danger thresholds (seconds to predicted impact).
+  double collisionWarningCautionTtiSec{14.0};
+  double collisionWarningDangerTtiSec{5.0};
+
+  // --- Defensive assist (Threat Avoidance) (v10+) ---
+  // Blends collision prediction + inbound missile threat into a suggested thrust overlay.
+  bool threatAssistEnabled{true};
+
+  // Draw a combined evasion suggestion near the reticle.
+  bool threatAssistHudIndicator{true};
+
+  // If enabled, apply the assist overlay automatically (soft add + clamp).
+  bool threatAssistAutoApply{false};
+
+  // Scaling applied when auto-apply is enabled (0..1). Hold key uses full strength.
+  double threatAssistStrength{0.80};
+
+  // Clamp the assist output (0.1..1).
+  double threatAssistMaxThrust01{1.0};
+
+  // Engage missile evasion when missile TTI is below this (seconds).
+  double threatAssistMissileEngageTtiSec{12.0};
+
+  // Output shaping.
+  bool threatAssistPreferLateralJink{true};
+  bool threatAssistAllowBoost{true};
 
   // --- Tactical overlay ---
   bool tacticalOverlayEnabled{true};

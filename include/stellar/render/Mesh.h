@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stellar/math/Geometry.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -29,6 +31,17 @@ public:
   void drawInstanced(std::uint32_t instanceCount) const;
 
   std::uint32_t indexCount() const { return indexCount_; }
+
+  // Local-space bounds for the uploaded mesh.
+  //
+  // These are computed at upload-time from the vertex positions.
+  // For empty meshes, the bounds are non-finite.
+  const stellar::math::Aabb3d& localBounds() const { return localBounds_; }
+  bool hasLocalBounds() const { return localBounds_.isFinite(); }
+
+  // Bounding sphere radius derived from the local AABB (half diagonal).
+  // Intended for conservative culling/picking.
+  double localBoundingRadius() const { return localBoundingRadius_; }
 
   static Mesh makeCube();
   static Mesh makeUvSphere(int slices = 32, int stacks = 16);
@@ -61,6 +74,10 @@ private:
   unsigned int vbo_{0};
   unsigned int ebo_{0};
   std::uint32_t indexCount_{0};
+
+  // Cached local-space bounds.
+  stellar::math::Aabb3d localBounds_{};
+  double localBoundingRadius_{0.0};
 };
 
 } // namespace stellar::render

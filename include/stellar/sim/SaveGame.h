@@ -341,7 +341,7 @@ struct Mission {
 struct TimeTrialBestRecord {
   core::u64 courseKey{0};
   double bestTimeSec{0.0};
-  core::u32 ghostCodec{0}; // 0 = none, else kTimeTrialGhostCodecVersion
+  core::u32 ghostCodec{0}; // 0 = none; else codec version at time of save (<= kTimeTrialGhostCodecVersion)
   std::string ghostB64{};  // empty if none
 };
 

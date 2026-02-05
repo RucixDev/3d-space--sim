@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stellar/math/Frustum.h"
+
 #include "stellar/render/Mesh.h"
 #include "stellar/render/Shader.h"
 #include "stellar/render/Texture.h"
@@ -99,6 +101,14 @@ public:
   void setViewProj(const float* view, const float* proj);
   void drawInstances(const std::vector<InstanceData>& instances);
 
+  // Like drawInstances(), but applies conservative CPU-side view-frustum culling.
+  //
+  // Implementation details:
+  // - Builds a frustum from the last setViewProj(view,proj) call.
+  // - Uses the mesh's local bounding sphere derived from its local AABB.
+  // - Falls back to drawInstances() when frustum/bounds are unavailable.
+  void drawInstancesCulled(const std::vector<InstanceData>& instances);
+
 private:
   void ensureInstanceAttribLayoutBound_();
 
@@ -137,6 +147,13 @@ private:
 
   float view_[16]{};
   float proj_[16]{};
+
+  // Cached frustum derived from the current view/projection.
+  stellar::math::Frustumd frustum_{};
+  bool frustumValid_{false};
+
+  // Scratch buffer used by drawInstancesCulled to avoid reallocations.
+  std::vector<InstanceData> culledScratch_{};
 };
 
 } // namespace stellar::render

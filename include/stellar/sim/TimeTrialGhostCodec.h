@@ -17,7 +17,9 @@ namespace stellar::sim {
 //  - Deterministic and robust: explicit little-endian encoding + validation.
 //  - Lightweight: stores only what is required to replay a ghost ship (pose over time).
 
-static constexpr core::u32 kTimeTrialGhostCodecVersion = 1;
+// Current / maximum supported codec version.
+// The decoder is backwards compatible with earlier versions.
+static constexpr core::u32 kTimeTrialGhostCodecVersion = 2;
 
 struct TimeTrialGhostSample {
   double tSec{0.0};

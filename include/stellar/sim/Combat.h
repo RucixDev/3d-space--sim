@@ -68,6 +68,10 @@ struct SphereTarget {
   // Optional kinematics for guidance / lead solves.
   // Leave at zero if unknown.
   math::Vec3d velKmS{0, 0, 0};
+
+  // Optional constant world-space acceleration estimate (km/s^2).
+  // Leave at zero if unknown.
+  math::Vec3d accelKmS2{0, 0, 0};
   double radiusKm{1.0};
 
   // Optional aim-cone filter for soft aim assist.
@@ -76,10 +80,35 @@ struct SphereTarget {
   // Use -1.0 to disable the filter.
   double minAimCos{-1.0};
 
+  // Optional scalar [0,1] to scale the strength of ballistic projectile aim assist.
+  //
+  // This can be used by callers to reflect sensor/fire-control quality (e.g. radar uncertainty).
+  // A value of 1 preserves historical behavior; 0 disables the assist for this target.
+  double aimAssistWeight01{1.0};
+
   // Optional decoy signatures for missile seekers.
   // Only consulted when kind == CombatTargetKind::Decoy.
   double decoyHeat{0.0};
   double decoyRadar{0.0};
+
+  // Optional thermal signature used by heat seekers.
+  //
+  // This is an arbitrary-unit scalar that scales the attractiveness of a
+  // non-decoy target to heat/IR seekers.
+  //
+  // Design notes:
+  //  - It is intended to be in roughly the same magnitude range as
+  //    SphereTarget::decoyHeat so flares/heat-sinks can meaningfully compete.
+  //  - 1.0 preserves legacy "all targets equal" behavior.
+  //  - Callers are responsible for mapping game state (heat, silent running,
+  //    engine load, etc.) into this scalar.
+  double heatSignature{1.0};
+
+  // Optional electronic-warfare noise jammer emission strength.
+  // Only meaningful for kind == Ship or Player.
+  //
+  // Used by radar seekers that support Home-On-Jam (HOJ) style behavior.
+  double jammerPower{0.0};
 };
 
 
@@ -337,6 +366,25 @@ struct Missile {
   // notch / "beaming" behavior.
   double radarDopplerNotchKmS{0.0};
 
+  // Optional: Home-On-Jam (HOJ) support (radar seekers).
+  //
+  // When enabled and seeker == Radar, a jamming target can be tracked even while
+  // inside the doppler notch (radarDopplerNotchKmS).
+  //
+  // This is a deterministic approximation of anti-radiation / noise-homing behavior.
+  bool homeOnJam{false};
+
+  // Minimum SphereTarget::jammerPower required before HOJ behavior activates.
+  double homeOnJamMinJammerPower{0.0};
+
+  // When tracking is maintained via HOJ (i.e. notch-bypass), clamp the seeker's
+  // measurement quality to this value to model reduced angular accuracy.
+  double homeOnJamTrackQualityCap{0.75};
+
+  // Optional bias used during autonomous reacquisition: when > 0, targets that are
+  // actively jamming are easier to reacquire.
+  double homeOnJamAcquireBias{0.0};
+
   // Optional decoy discrimination gates (seeker-active only).
   //
   // These parameters help seekers (especially radar) reject decoys that are
@@ -462,6 +510,11 @@ struct Missile {
   bool hasLastKnownTarget{false};
   math::Vec3d lastKnownTargetPosKm{0, 0, 0};
   math::Vec3d lastKnownTargetVelKmS{0, 0, 0};
+  // Last observed thermal signature of the locked target.
+  //
+  // This is not serialized/persisted; it only exists to keep heat-seeker
+  // scoring stable while guiding on target memory.
+  double lastKnownTargetHeatSignature{1.0};
   double lastKnownTargetAgeSimSec{0.0};
 
   // Internal: missile age (sim seconds). Used for seeker activation timing.

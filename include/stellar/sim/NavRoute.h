@@ -135,6 +135,21 @@ std::vector<KRoute> plotKRoutesAStarCostRisk(const std::vector<SystemStub>& node
                                             std::size_t k,
                                             std::size_t maxExpansionsPerSolve = 250000);
 
+
+// K-shortest routes variant using the hazard-augmented leg cost model.
+// See plotRouteAStarCostHazards() for the cost definition.
+std::vector<KRoute> plotKRoutesAStarCostHazards(const std::vector<SystemStub>& nodes,
+                                                SystemId startId,
+                                                SystemId goalId,
+                                                double maxJumpLy,
+                                                double costPerJump,
+                                                double costPerLy,
+                                                double hazardWeightPerLy,
+                                                core::u64 universeSeed,
+                                                double timeDays,
+                                                std::size_t k,
+                                                std::size_t maxExpansionsPerSolve = 250000);
+
 // Convenience wrapper for hop-minimizing K-shortest paths.
 std::vector<KRoute> plotKRoutesAStarHops(const std::vector<SystemStub>& nodes,
                                         SystemId startId,
@@ -163,6 +178,38 @@ double routeCostRisk(const std::vector<SystemStub>& nodes,
                      double costPerLy,
                      double riskWeightPerLy,
                      std::span<const double> risk01PerNode);
+
+
+// Helper: total cost of a route using the hazard-augmented model.
+//
+// Hazard cost is computed as:
+//   hazardWeightPerLy * avgNavDisruption01 * segmentDistanceLy
+// where avgNavDisruption01 is sampled along the segment using the galaxy hazard field.
+//
+// Returns 0 for empty/single-node routes.
+double routeCostHazards(const std::vector<SystemStub>& nodes,
+                        const std::vector<SystemId>& route,
+                        double costPerJump,
+                        double costPerLy,
+                        double hazardWeightPerLy,
+                        core::u64 universeSeed,
+                        double timeDays);
+
+
+// Helper: node-set similarity (Jaccard) between two routes.
+//
+// If ignoreEndpoints is true, the first and last SystemId of each route are
+// excluded from the comparison. This makes it easier to compare alternate routes
+// to the same destination without start/goal dominating the similarity.
+// Routes with no internal nodes under the chosen endpoint rule yield an empty
+// node set; two empty node sets compare as identical (returns 1).
+//
+// Returns a value in [0,1].
+//  - 1: identical node sets (under the chosen endpoint rule)
+//  - 0: no shared nodes
+double routeNodeJaccard01(const std::vector<SystemId>& a,
+                          const std::vector<SystemId>& b,
+                          bool ignoreEndpoints = true);
 
 // Helper: validate that a route is contiguous (each hop <= maxJumpLy) and that all ids exist.
 // Useful for tests/tooling.
